@@ -49,7 +49,7 @@ public class PrivatePreparationResourcesTests extends EngineTestCase {
                 assertEquals(new PreparationEngineAdmission.Stats(1, RESIDENT_BYTES, 0), admission.stats());
                 assertTrue(Files.exists(generation.resolve("preparation.claim")));
                 assertTrue(resources.engine().config().getIndexingBufferSize().getBytes() <= BUFFER_BYTES);
-                final var result = resources.engine().index(indexForDoc(createParsedDoc("speculative", null)));
+                final var result = resources.index(indexForDoc(createParsedDoc("speculative", null)));
                 assertEquals(Engine.Result.Type.SUCCESS, result.getResultType());
                 assertVisibleCount(resources.engine(), 1);
                 assertVisibleCount(fixture.serving, 0);

@@ -179,6 +179,34 @@ public final class PrivatePreparationResources implements Closeable {
         }
     }
 
+    /**
+     * Apply a parsed, unassigned primary operation to the private engine. Like IndexShard's
+     * primary path, a required dynamic mapping must be resolved before native indexing assigns
+     * a sequence number or changes the private history. The host must hold the ownership/schema
+     * and lifecycle permits; these checks establish neither a committed schema nor ownership.
+     */
+    Engine.IndexResult index(Engine.Index operation) throws IOException {
+        final var target = engine();
+        requireUnassignedPrimary(target, operation);
+        final var mapping = operation.parsedDoc().dynamicMappingsUpdate();
+        return mapping == null ? target.index(operation) : new Engine.IndexResult(mapping);
+    }
+
+    Engine.DeleteResult delete(Engine.Delete operation) throws IOException {
+        final var target = engine();
+        requireUnassignedPrimary(target, operation);
+        return target.delete(operation);
+    }
+
+    private static void requireUnassignedPrimary(InternalEngine target, Engine.Operation operation) {
+        Objects.requireNonNull(operation);
+        if (operation.origin() != Engine.Operation.Origin.PRIMARY
+            || operation.seqNo() != SequenceNumbers.UNASSIGNED_SEQ_NO
+            || operation.primaryTerm() != target.config().getPrimaryTermSupplier().getAsLong()) {
+            throw new IllegalArgumentException("private preparation requires an unassigned primary operation in its fixed term");
+        }
+    }
+
     synchronized InternalEngine engine() {
         if (closed) {
             throw new IllegalStateException("private preparation resources are closed", closeFailure);

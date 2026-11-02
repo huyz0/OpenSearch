@@ -16,7 +16,7 @@ S3 archival remain pending.
 | M2 | Three-replica persisted-log/restart probe, committed-serving engine boundary probe, group footprint benchmark, [consensus ADR](low-latency-consensus-adr.md) | Shell preparation-service integration, duplicate-indexing overhead, failure and security gates |
 | M3 | Engine-independent checksummed journal, durable metadata/volume identity and activation catalog, bounded peer-only mTLS runtime, committed replay, crash/storage-error tests, authorized learner replacement, bounded host controller and file-based launch configuration | Remaining partition/hardware histories and sustained resource qualification |
 | M3a | [Cell/active-state design](low-latency-capacity-adr.md), runnable models/raw results, per-group proposal/peer isolation and resident-context admission primitive | Metadata routing, dynamic group admission, owned bounded engines and broader isolation pending |
-| M4 | Committed-serving adapter, resolved payload, fixed-binding replay, admitted private resources, dependency gate and shared-mapper TLS/native-shard probe | Native mutation compatibility and bounded dispatch, buffer/SSD governors, ownership/schema/lifecycle controllers and shell integration |
+| M4 | Committed-serving adapter, resolved payload, fixed-binding replay, admitted private resources, mapping/identity guard, dependency gate and shared-mapper TLS/native-shard probe | Native mutation compatibility and bounded dispatch, buffer/SSD governors, ownership/schema/lifecycle controllers and shell integration |
 | M5–M9 | Not implemented | Fresh readers, selective replication, archival, lifecycle, migration |
 | M4a | Planned; no runtime completion claimed | Healthy-cell write continuity, durable internal retry outcomes, bounded failover queues and route generations |
 | M6a | Planned; no runtime completion claimed | Missing-chunk/resumable bulk shard copies, peer/S3 source selection and live-versus-recovery scheduling |
@@ -322,3 +322,14 @@ three-AZ durability, millisecond quorum latency, or production readiness.
   explicitly waiting for initial catch-up before disk failure. Native snapshot
   notifications remain available for full-log learner catch-up. Capacity estimates
   now charge the added peer message/worker allowances; these are not measured RSS.
+
+- Private primary application now stops unresolved dynamic mappings before native
+  indexing can assign sequence numbers. The regression first reproduced a bare
+  engine returning success for that document, then passed through the resource
+  owner's guarded path. Tests cover reparse after a quiescent mapping update,
+  routing, conditional conflicts, missing deletes and rejection of assigned,
+  replica or wrong-fixed-term operations. The shared engine/resource suite passed
+  132 cases, including external-version/delete/recreation coverage, and real
+  journal replay passed 15 cases over three iterations. Shell check and root
+  precommit passed. A local mapping update
+  in this test is not a committed schema/ownership barrier or enabled client mode.

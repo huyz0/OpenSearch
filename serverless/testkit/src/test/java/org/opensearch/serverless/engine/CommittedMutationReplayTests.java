@@ -107,7 +107,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                             SequenceNumbers.UNASSIGNED_SEQ_NO,
                             0
                         );
-                    final var result = preparation.engine().index(index);
+                    final var result = preparation.index(index);
                     assertEquals(Engine.Result.Type.SUCCESS, result.getResultType());
                     preparation.engine().refresh("uncommitted private refresh");
                     return new ResolvedMutation(UUID.randomUUID(), new Translog.Index(index, result), ResolvedMutation.Outcome.CREATED);
@@ -144,7 +144,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                             original.seqNo(),
                             original.primaryTerm()
                         );
-                    final var result = preparation.engine().delete(delete);
+                    final var result = preparation.delete(delete);
                     assertEquals(Engine.Result.Type.SUCCESS, result.getResultType());
                     assertTrue(result.isFound());
                     return new ResolvedMutation(UUID.randomUUID(), new Translog.Delete(delete, result), ResolvedMutation.Outcome.DELETED);
@@ -196,7 +196,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                         SequenceNumbers.UNASSIGNED_SEQ_NO,
                         0
                     );
-                final var first = preparation.engine().index(prepared);
+                final var first = preparation.index(prepared);
                 assertTrue(first.isCreated());
                 preparation.engine().refresh("private speculative refresh");
                 assertTrue(replay.poll().isEmpty());
@@ -231,7 +231,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                         first.getSeqNo(),
                         first.getTerm()
                     );
-                final var deleted = preparation.engine().delete(preparedDelete);
+                final var deleted = preparation.delete(preparedDelete);
                 assertTrue(deleted.isFound());
                 final var deletion = new ResolvedMutation(
                     UUID.randomUUID(),

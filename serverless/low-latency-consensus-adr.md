@@ -163,6 +163,21 @@ The real local journal probe now uses this resource owner rather than a second
 preparation shard or a test-only native-store helper. It still enables no client
 storage mode.
 
+Private mutation application now goes through the resource owner's index/delete
+boundary. A bare native engine accepted a parsed document with an unresolved
+dynamic mapping as `SUCCESS`. The owner checks that update before invoking native
+indexing and returns the same `MAPPING_UPDATE_REQUIRED` result as `IndexShard`,
+without consuming a sequence number. A retry reparses against the installed
+mapping. Assigned/replayed operations, replica origins and operations in a
+different fixed term are rejected before private history changes.
+
+The boundary preserves native results, including conditional failures and missing
+deletes. Only successful resolved operations can proceed to append; callers must
+inspect the result type. An assigned-sequence failure or ambiguous IO still needs
+to fence/rebuild the private context. The tests' quiescent local mapping update
+is not a durable schema barrier, current ownership proof, a script adapter or
+public lifecycle integration. The real journal probes use this boundary too.
+
 `PreparationCommitSequencer` adds a dependency gate around preparation, append
 and verified application. A stream has one pending preparation until the prior
 record is durably appended and applied. Failure fences that context; caller
