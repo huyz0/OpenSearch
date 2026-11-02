@@ -214,12 +214,25 @@ success is reported.
 This initial gate conservatively fences every preparation exception and does
 not pipeline independent keys. The native adapter still needs proven no-change
 rejection handling, mapping barriers, request-byte admission and bounded runtime
-dispatch. It executes preparation on its caller and application on the append
-completion thread; the local probe is not a production thread-pool design. A
-real journal test holds a committed reply, cancels the client view, verifies
+dispatch and host-level admission. Preparation/application now require an
+explicit executor: runtime callers must supply bounded group workers with room
+for already-admitted application handoffs, without inline/caller-runs fallback.
+The real local probe uses a one-worker, one-slot executor and asserts worker
+ownership for native preparation/application. A real journal test holds a committed reply, cancels the client view, verifies
 that a dependent preparation is rejected, then applies the insert and performs
 a conditional delete. No client storage mode or throughput qualification is
 claimed.
+
+The sequencer distinguishes queued jobs from currently running native work.
+Close can skip queued work safely; running preparation/application must finish
+before resources can close. Each job balances its work count in its own finally
+block, even if dispatch or callback registration reports a failure after work
+starts. Rejection fences the private state and never runs native application on
+the journal callback as a fallback. Closed/fenced queued attempts clear retained
+preparer/payload references; closed gates also detach their resource callbacks.
+An accepted journal append still runs to its real outcome. Per-host request-byte
+admission and group worker ownership are integration requirements, not supplied
+by the executor parameter alone.
 
 The adapter itself is not a commit verifier and is not enabled by the launcher.
 Assigned operation identities are not evidence of commitment. The host must

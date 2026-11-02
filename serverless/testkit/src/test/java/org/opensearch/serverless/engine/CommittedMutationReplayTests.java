@@ -71,7 +71,15 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
             final var committed = new CompletableFuture<LogCheckpoint>();
             final var heldReply = new CompletableFuture<LogCheckpoint>();
             final var holdFirst = new AtomicBoolean(true);
-            final var gate = new PreparationCommitSequencer(mutation -> {
+            final var context = new org.opensearch.common.util.concurrent.ThreadContext(Settings.EMPTY);
+            final var worker = org.opensearch.common.util.concurrent.OpenSearchExecutors.newFixed(
+                "private-preparation-probe",
+                1,
+                1,
+                org.opensearch.common.util.concurrent.OpenSearchExecutors.daemonThreadFactory("private-preparation-probe"),
+                context
+            );
+            final var gate = new PreparationCommitSequencer(worker, mutation -> {
                 final var append = fixture.leader.append(fixture.group.id(), envelope(serving, stream, mutation, 1));
                 if (holdFirst.compareAndSet(true, false)) {
                     return append.thenCompose(checkpoint -> {
@@ -81,6 +89,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                 }
                 return append;
             }, (mutation, checkpoint) -> {
+                assertTrue(Thread.currentThread().getName().contains("private-preparation-probe"));
                 for (int batch = 0; batch < 64 && replay.throughIndex() < checkpoint.index(); batch++) {
                     for (var applied : replay.poll()) {
                         if (applied.checkpoint().equals(checkpoint)) {
@@ -93,6 +102,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
             try {
                 final long term = serving.getOperationPrimaryTerm();
                 final var first = gate.submit(() -> {
+                    assertTrue(Thread.currentThread().getName().contains("private-preparation-probe"));
                     final var index = preparation.engine()
                         .prepareIndex(
                             preparation.engine().config().getDocumentMapperForTypeSupplier().get(),
@@ -132,6 +142,7 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                 assertDocCount(serving, 1);
                 final var original = applied.mutation().operation();
                 final var removed = gate.submit(() -> {
+                    assertTrue(Thread.currentThread().getName().contains("private-preparation-probe"));
                     final var delete = preparation.engine()
                         .prepareDelete(
                             "id",
@@ -154,7 +165,12 @@ public class CommittedMutationReplayTests extends IndexShardTestCase {
                 assertDocCount(serving, 0);
                 assertEquals(1, serving.getProcessedLocalCheckpoint());
             } finally {
-                gate.closeAsync().toCompletableFuture().get(20, TimeUnit.SECONDS);
+                try {
+                    gate.closeAsync().toCompletableFuture().get(20, TimeUnit.SECONDS);
+                } finally {
+                    worker.shutdown();
+                    assertTrue(worker.awaitTermination(20, TimeUnit.SECONDS));
+                }
             }
         } finally {
             closeShards(serving);
