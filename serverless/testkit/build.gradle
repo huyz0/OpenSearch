@@ -19,8 +19,8 @@ dependencies {
   testImplementation project(':plugins:repository-s3')
 }
 
-// Spikes (S0, S1) live here. They are disposable probes, not a regression suite —
-// see s0-findings.md and s1-findings.md.
+// Spikes (package org.opensearch.serverless.spike) live here. They are disposable probes, not a
+// regression suite.
 tasks.named('forbiddenApisMain').configure {
   replaceSignatureFiles 'jdk-signatures'
 }
@@ -184,3 +184,5 @@ tasks.named('processTestResources').configure {
     into 'rest-api-spec/api'
   }
 }
+
+apply from: "${rootDir}/serverless/forbidden-references.gradle"

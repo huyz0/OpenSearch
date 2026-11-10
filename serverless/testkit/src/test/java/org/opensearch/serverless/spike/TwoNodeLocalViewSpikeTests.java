@@ -48,16 +48,16 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * S1 — the two-node probe that S0 could not be. Closes RFC §11 Q4 and R1.
+ * The two-node probe: what a single-node spike cannot show about node-local views.
  *
  * <p>Three questions, each with an assertion on a number that is zero when the seam is broken:
  * <ol>
- *   <li>Do two nodes holding <em>different</em> node-local views both serve? (§5, never shown at N&gt;1)</li>
- *   <li>Does a projected view that omits a hosted index endanger the shard? (R1)</li>
- *   <li>Are per-node state versions safe to feed to {@code updateShardState}? (Q4, §5.3)</li>
+ *   <li>Do two nodes holding <em>different</em> node-local views both serve?</li>
+ *   <li>Does a projected view that omits a hosted index endanger the shard?</li>
+ *   <li>Are per-node state versions safe to feed to {@code updateShardState}?</li>
  * </ol>
  */
-public class S1TwoNodeTests extends OpenSearchTestCase {
+public class TwoNodeLocalViewSpikeTests extends OpenSearchTestCase {
 
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
 
@@ -73,16 +73,16 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
                     .build()
             )
             .putMapping(MAPPING)
-            .primaryTerm(0, shardHeadTerm)   // S0/F4: the data plane refuses term 0
+            .primaryTerm(0, shardHeadTerm)   // the data plane refuses term 0
             .build();
     }
 
     /**
-     * S1-A. The core §5 claim at two nodes: each node computes its own view, containing only what it
+     * The node-local view claim at two nodes: each node computes its own view, containing only what it
      * hosts, and neither is aware of the other's indices. Both serve.
      */
     public void testTwoNodesWithDisjointLocalViewsBothServe() throws Exception {
-        try (S1Node a = new S1Node("s1-a", createTempDir()); S1Node b = new S1Node("s1-b", createTempDir())) {
+        try (SpikeNode a = new SpikeNode("spike-a", createTempDir()); SpikeNode b = new SpikeNode("spike-b", createTempDir())) {
             final IndexMetadata alpha = index("alpha", "uuid-alpha-000000", 1L);
             final IndexMetadata beta = index("beta", "uuid-beta-0000000", 1L);
 
@@ -107,20 +107,20 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
             assertFalse("node B's view leaked alpha", b.clusterService.state().metadata().hasIndex("alpha"));
 
             // ...and the two nodes' state versions are equal here purely by coincidence of construction.
-            // S1-C is about what happens when they are not.
-            logger.info("S1-A passed: disjoint local views, both nodes serving");
+            // The version test below is about what happens when they are not.
+            logger.info("two-node views passed: disjoint local views, both nodes serving");
         }
     }
 
     /**
-     * S1-B / R1. A projected view that omits an index the node still hosts.
+     * A projected view that omits an index the node still hosts.
      *
      * <p>Measures two things separately: that the shard itself is undisturbed (the shell's reconciler
      * is what closes shards, not the applier), and that a <em>diff-based</em> reconciler would have
-     * closed it — which is the hazard §5.2 names, quantified rather than assumed.
+     * closed it — which is the hazard of treating absence as removal, quantified rather than assumed.
      */
     public void testProjectedViewOmittingAHostedIndexDoesNotDisturbTheShard() throws Exception {
-        try (S1Node a = new S1Node("s1-partial", createTempDir())) {
+        try (SpikeNode a = new SpikeNode("spike-partial", createTempDir())) {
             final IndexMetadata alpha = index("alpha", "uuid-alpha-000000", 1L);
             a.apply(a.project(1L, alpha));
             final IndexShard shard = a.openAndStart(alpha, 1L);
@@ -145,22 +145,22 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
                 .collect(Collectors.toSet());
 
             assertEquals(
-                "R1 quantified: a diff-based reconciler would close this many live shards under projection",
+                "quantified: a diff-based reconciler would close this many live shards under projection",
                 locallyOpen,
                 naiveCloseSet
             );
             assertFalse("the hazard is only meaningful if a shard was actually open", locallyOpen.isEmpty());
 
-            logger.info("S1-B passed: shard survives a partial view; naive close-set would have been {}", naiveCloseSet);
+            logger.info("partial view passed: shard survives a partial view; naive close-set would have been {}", naiveCloseSet);
         }
     }
 
     /**
-     * S1-C / Q4. Per-node state versions are not comparable, and {@code updateShardState} silently
+     * Per-node state versions are not comparable, and {@code updateShardState} silently
      * ignores an update whose version is not greater than the last applied one.
      */
     public void testPerNodeVersionsAreSilentlyIgnoredWhileShardHeadGenerationsAreNot() throws Exception {
-        try (S1Node a = new S1Node("s1-version", createTempDir())) {
+        try (SpikeNode a = new SpikeNode("spike-version", createTempDir())) {
             final IndexMetadata alpha = index("alpha", "uuid-alpha-000000", 1L);
             a.apply(a.project(1L, alpha));
             final IndexShard shard = a.openAndStart(alpha, 1L);
@@ -174,7 +174,7 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
             assertEquals(500L, appliedVersion(shard));
 
             // A relocation target's counter is low — a fresh node that has applied few states.
-            // §5.3: PrimaryContext carries the source's version across, and this comparison is `>`.
+            // PrimaryContext carries the source's version across, and this comparison is `>`.
             update(shard, routing, shardId, allocId, 4L, nodes);
             assertEquals("a lower per-node version was applied — the hazard would be absent", 500L, appliedVersion(shard));
 
@@ -182,11 +182,11 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
             update(shard, routing, shardId, allocId, 501L, nodes);
             assertEquals("a higher version was ignored", 501L, appliedVersion(shard));
 
-            logger.info("S1-C hazard confirmed: version 4 silently ignored after 500; 501 applied");
+            logger.info("version hazard confirmed: version 4 silently ignored after 500; 501 applied");
         }
 
         // ---- and now the fix: one monotonic source per shard, shared by every node that touches it --
-        try (S1Node b = new S1Node("s1-head-gen", createTempDir())) {
+        try (SpikeNode b = new SpikeNode("s1-head-gen", createTempDir())) {
             final IndexMetadata alpha = index("alpha", "uuid-alpha-000000", 1L);
             b.apply(b.project(1L, alpha));
             final IndexShard shard = b.openAndStart(alpha, 1L);
@@ -195,7 +195,7 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
             final String allocId = routing.allocationId().getId();
             final org.opensearch.cluster.node.DiscoveryNodes nodes = b.clusterService.state().nodes();
 
-            // Stands in for the shard-head register's CAS generation (§9.3). There is exactly one of
+            // Stands in for the shard-head register's CAS generation. There is exactly one of
             // these per shard, so a node cannot have "its own, lower" value — which is the entire fix.
             final java.util.concurrent.atomic.AtomicLong shardHeadGeneration = new java.util.concurrent.atomic.AtomicLong(1L);
 
@@ -210,7 +210,7 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
             update(shard, routing, shardId, allocId, afterHandoff, nodes);
             assertEquals("post-handoff generation was ignored", afterHandoff, appliedVersion(shard));
 
-            logger.info("S1-C fix verified: {} consecutive shard-head generations, none ignored", 6);
+            logger.info("version fix verified: {} consecutive shard-head generations, none ignored", 6);
         }
     }
 
@@ -233,7 +233,7 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
         );
     }
 
-    @SuppressForbidden(reason = "reads ReplicationTracker's private applied version; the cross-node comparison in RFC §5.3 has no public accessor")
+    @SuppressForbidden(reason = "reads ReplicationTracker's private applied version; the cross-node comparison has no public accessor")
     private static long appliedVersion(IndexShard shard) throws Exception {
         final java.lang.reflect.Field tracker = IndexShard.class.getDeclaredField("replicationTracker");
         tracker.setAccessible(true);
@@ -254,12 +254,12 @@ public class S1TwoNodeTests extends OpenSearchTestCase {
             false
         );
         if (result.getResultType() != Engine.Result.Type.SUCCESS) {
-            throw new AssertionError("indexing failed with " + result.getResultType() + " (S0/F5: this is a value, not a throw)");
+            throw new AssertionError("indexing failed with " + result.getResultType() + " (this is a value, not a throw)");
         }
         shard.sync();
     }
 
-    private static long hits(S1Node node, ShardId shardId, String... terms) throws Exception {
+    private static long hits(SpikeNode node, ShardId shardId, String... terms) throws Exception {
         final SearchRequest searchRequest = new SearchRequest(shardId.getIndexName()).allowPartialSearchResults(false)
             .source(new SearchSourceBuilder().query(QueryBuilders.matchQuery("msg", String.join(" ", terms))).trackTotalHits(true));
         final ShardSearchRequest request = new ShardSearchRequest(

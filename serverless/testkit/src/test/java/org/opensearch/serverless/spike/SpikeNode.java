@@ -49,12 +49,12 @@ import java.util.concurrent.TimeUnit;
 
 /**
  * One self-contained serverless node: its own {@link NodeEnvironment}, {@link ClusterService} and data
- * plane, with no control plane. Several may exist in one JVM, which is the point — S1 tests what S0
- * could not, namely that two nodes holding *different* node-local views both work.
+ * plane, with no control plane. Several may exist in one JVM, which is the point — this tests what a
+ * single-node spike could not, namely that two nodes holding *different* node-local views both work.
  *
  * <p>Disposable, like the rest of {@code org.opensearch.s0}.
  */
-final class S1Node implements Closeable {
+final class SpikeNode implements Closeable {
 
     final String name;
     final DiscoveryNode discoveryNode;
@@ -65,9 +65,9 @@ final class S1Node implements Closeable {
     final IndicesService indicesService;
     final SearchService searchService;
 
-    S1Node(String name, Path home) throws Exception {
+    SpikeNode(String name, Path home) throws Exception {
         this.name = name;
-        this.settings = Settings.builder().put("node.name", name).put("cluster.name", "s1-cluster").put("path.home", home).build();
+        this.settings = Settings.builder().put("node.name", name).put("cluster.name", "spike-cluster").put("path.home", home).build();
         final Environment environment = TestEnvironment.newEnvironment(settings);
         final ClusterSettings clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
         this.threadPool = new TestThreadPool(name);
@@ -79,10 +79,10 @@ final class S1Node implements Closeable {
             DiscoveryNodeRole.BUILT_IN_ROLES,
             Version.CURRENT
         );
-        this.clusterService = S0Wiring.clusterService(settings, clusterSettings, threadPool, discoveryNode);
-        this.indicesService = S0Wiring.indicesService(settings, environment, nodeEnv, threadPool, clusterService, clusterSettings);
+        this.clusterService = SpikeWiring.clusterService(settings, clusterSettings, threadPool, discoveryNode);
+        this.indicesService = SpikeWiring.indicesService(settings, environment, nodeEnv, threadPool, clusterService, clusterSettings);
         this.indicesService.start();
-        this.searchService = S0Wiring.searchService(
+        this.searchService = SpikeWiring.searchService(
             settings,
             clusterSettings,
             threadPool,
@@ -101,7 +101,7 @@ final class S1Node implements Closeable {
             metadata.put(im, false);
             routing.addAsRecovery(im);
         }
-        return ClusterState.builder(new ClusterName("s1-cluster"))
+        return ClusterState.builder(new ClusterName("spike-cluster"))
             .version(version)
             .nodes(DiscoveryNodes.builder().add(discoveryNode).localNodeId(discoveryNode.getId()).build())
             .metadata(metadata.build())
@@ -111,10 +111,10 @@ final class S1Node implements Closeable {
     }
 
     void apply(ClusterState state) throws Exception {
-        S0Wiring.applyLocally(clusterService, state);
+        SpikeWiring.applyLocally(clusterService, state);
     }
 
-    /** The four-call reconciler S0 measured, with the shard-head term supplied from outside. */
+    /** The four-call reconciler the single-node spike measured, with the shard-head term supplied from outside. */
     IndexShard openAndStart(IndexMetadata indexMetadata, long shardHeadTerm) throws Exception {
         final IndexService indexService = indicesService.createIndex(indexMetadata, Collections.emptyList(), false);
         indexService.updateMapping(null, indexMetadata);
@@ -127,8 +127,8 @@ final class S1Node implements Closeable {
             ShardRoutingState.INITIALIZING,
             RecoverySource.EmptyStoreRecoverySource.INSTANCE
         );
-        final IndexShard shard = S0Wiring.openShard(indexService, initializing, discoveryNode, clusterService);
-        shard.markAsRecovering("s1-store", new org.opensearch.indices.recovery.RecoveryState(initializing, discoveryNode, null));
+        final IndexShard shard = SpikeWiring.openShard(indexService, initializing, discoveryNode, clusterService);
+        shard.markAsRecovering("spike-store", new org.opensearch.indices.recovery.RecoveryState(initializing, discoveryNode, null));
         final org.opensearch.action.support.PlainActionFuture<Boolean> recovered = org.opensearch.action.support.PlainActionFuture
             .newFuture();
         shard.recoverFromStore(recovered);

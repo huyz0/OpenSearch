@@ -72,7 +72,7 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * S0 — the falsification spike for {@code rfc-serverless-shell.md} §11.
+ * The falsification spike for the serverless shell: can a shard run without a control plane?
  *
  * <p><b>This class is disposable.</b> It exists to answer four questions and then be deleted or
  * rewritten as {@code serverless/shell}. It deliberately does not extend {@code IndexShardTestCase}
@@ -80,14 +80,14 @@ import java.util.Set;
  * the spike, and the latter starts a {@code Node}, which is the thing being disproved as necessary.
  * Every dependency is constructed by hand so that the constructor closure is visible.
  *
- * <p>The claim under test (RFC §5): a shard can be opened and searched with no {@code Coordinator},
+ * <p>The claim under test: a shard can be opened and searched with no {@code Coordinator},
  * no {@code GatewayMetaState}, no {@code AllocationService}, no discovery and no {@code Node} —
  * driven instead by a hand-built {@link ClusterState} handed to {@link ClusterApplier}.
  *
- * <p>Assertions follow {@code HANDOFF.md}'s rule: every check is on a number that is zero when the
+ * <p>Every check is on a number that is zero when the
  * seam is broken. Nothing here asserts merely that a call did not throw.
  */
-public class S0ShellSpikeTests extends OpenSearchTestCase {
+public class NoControlPlaneShardSpikeTests extends OpenSearchTestCase {
 
     /** Classes whose presence anywhere in the constructed object graph falsifies the spike. */
     private static final Set<String> FORBIDDEN = Set.of(
@@ -97,8 +97,8 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
         "org.opensearch.node.Node"
     );
 
-    private static final String INDEX = "s0-index";
-    /** Stands in for the shard-head register's CAS term (RFC §5.3, §9.3). */
+    private static final String INDEX = "spike-index";
+    /** Stands in for the shard-head register's CAS term. */
     private static final long SHARD_HEAD_TERM = 1L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
 
@@ -127,7 +127,7 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
     private void buildAndRun() throws Exception {
         final Settings settings = Settings.builder()
             .put("node.name", "s0")
-            .put("cluster.name", "s0-cluster")
+            .put("cluster.name", "spike-cluster")
             .put("path.home", createTempDir())
             .build();
 
@@ -139,25 +139,25 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
         teardown.add(nodeEnv::close);
 
         final DiscoveryNode localNode = new DiscoveryNode(
-            "s0-node",
+            "spike-node",
             buildNewFakeTransportAddress(),
             Collections.emptyMap(),
             DiscoveryNodeRole.BUILT_IN_ROLES,
             Version.CURRENT
         );
 
-        // ---- RFC §5.1: a real ClusterService with no Coordinator behind it -------------------
-        clusterService = S0Wiring.clusterService(settings, clusterSettings, threadPool, localNode);
+        // ---- a real ClusterService with no Coordinator behind it -------------------------
+        clusterService = SpikeWiring.clusterService(settings, clusterSettings, threadPool, localNode);
         teardown.add(clusterService::close);
 
         // ---- the data plane ------------------------------------------------------------------
-        indicesService = S0Wiring.indicesService(settings, environment, nodeEnv, threadPool, clusterService, clusterSettings);
-        // FINDING (S0): IndicesService and SearchService are AbstractLifecycleComponents — start() is
+        indicesService = SpikeWiring.indicesService(settings, environment, nodeEnv, threadPool, clusterService, clusterSettings);
+        // FINDING: IndicesService and SearchService are AbstractLifecycleComponents — start() is
         // required before either will accept work. Node does this via its own lifecycle; the shell must too.
         indicesService.start();
         teardown.add(() -> IOUtils.closeWhileHandlingException(indicesService));
 
-        searchService = S0Wiring.searchService(
+        searchService = SpikeWiring.searchService(
             settings,
             clusterSettings,
             threadPool,
@@ -176,17 +176,17 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
             .settings(
                 Settings.builder()
                     .put(IndexMetadata.SETTING_VERSION_CREATED, Version.CURRENT)
-                    .put(IndexMetadata.SETTING_INDEX_UUID, "s0-uuid-0000000000")
+                    .put(IndexMetadata.SETTING_INDEX_UUID, "spike-uuid-000000000")
                     .put(IndexMetadata.SETTING_NUMBER_OF_SHARDS, 1)
                     .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
                     .put(IndexMetadata.SETTING_REPLICATION_TYPE, ReplicationType.DOCUMENT)
                     .build()
             )
             .putMapping(MAPPING)
-            // FINDING (S0): the data plane REFUSES to start a primary at term 0
+            // FINDING: the data plane REFUSES to start a primary at term 0
             // (ReplicationTracker.activatePrimaryMode -> RetentionLeases: "primary term must be positive").
             // Today the elected manager bumps this on allocation. In the shell it is the shard-head's
-            // CAS term — RFC §5.3's proposal is not an optimisation, it is load-bearing.
+            // CAS term — taking the term from it is not an optimisation, it is load-bearing.
             .primaryTerm(0, SHARD_HEAD_TERM)
             .build();
 
@@ -200,7 +200,7 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
         );
 
         // ---- Q1: the minimum ClusterState a shard will accept --------------------------------
-        final ClusterState state = ClusterState.builder(new ClusterName("s0-cluster"))
+        final ClusterState state = ClusterState.builder(new ClusterName("spike-cluster"))
             .nodes(DiscoveryNodes.builder().add(localNode).localNodeId(localNode.getId()).build())
             .metadata(Metadata.builder().put(indexMetadata, false).build())
             .routingTable(RoutingTable.builder().addAsRecovery(indexMetadata).build())
@@ -208,17 +208,17 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
             .build();
 
         // The shell is a second caller of ClusterApplier.onNewClusterState. Coordinator is the first.
-        S0Wiring.applyLocally(clusterService, state);
+        SpikeWiring.applyLocally(clusterService, state);
 
         // ---- Q2: the shell-owned reconciler, in the smallest form that works ------------------
         final IndexService indexService = indicesService.createIndex(indexMetadata, Collections.emptyList(), false);
-        // FINDING (S0): createIndex does NOT apply the mapping to MapperService. The real reconciler
+        // FINDING: createIndex does NOT apply the mapping to MapperService. The real reconciler
         // (IndicesClusterStateService:888) follows it with updateMapping(null, metadata); without that,
         // the first write returns MAPPING_UPDATE_REQUIRED. This is reconciler step 2 of 4.
         indexService.updateMapping(null, indexMetadata);
-        final IndexShard shard = S0Wiring.openShard(indexService, initializing, localNode, clusterService);
+        final IndexShard shard = SpikeWiring.openShard(indexService, initializing, localNode, clusterService);
 
-        shard.markAsRecovering("s0-store", new RecoveryState(initializing, localNode, null));
+        shard.markAsRecovering("spike-store", new RecoveryState(initializing, localNode, null));
         final PlainActionFuture<Boolean> recovered = PlainActionFuture.newFuture();
         shard.recoverFromStore(recovered);
         assertTrue("recoverFromStore reported failure", recovered.actionGet());
@@ -252,7 +252,7 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
         // ---- criterion 5: nothing forbidden was constructed ----------------------------------
         assertNoControlPlane(clusterService, indicesService, searchService, shard, indexService);
 
-        logger.info("S0 PASSED: 3 docs indexed and searched with no Coordinator/AllocationService/GatewayMetaState/Node");
+        logger.info("spike passed: 3 docs indexed and searched with no Coordinator/AllocationService/GatewayMetaState/Node");
     }
 
     private void indexDoc(IndexShard shard, String id, String source) throws IOException {
@@ -266,7 +266,7 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
             false
         );
         assertEquals(
-            "mapping update required — S0 pre-declares its mapping precisely so this cannot happen",
+            "mapping update required — the spike pre-declares its mapping precisely so this cannot happen",
             Engine.Result.Type.SUCCESS,
             result.getResultType()
         );
@@ -275,7 +275,7 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
 
     /** Runs a real query through SearchService and returns the hit count. Zero when the seam is broken. */
     private long queryHitCount(ShardId shardId, String term) throws Exception {
-        // FINDING (S0): allowPartialSearchResults defaults to null and is normally filled in by
+        // FINDING: allowPartialSearchResults defaults to null and is normally filled in by
         // TransportSearchAction. A shell that calls SearchService directly must set it.
         final SearchRequest searchRequest = new SearchRequest(INDEX).allowPartialSearchResults(false)
             .source(new SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.matchQuery("msg", term)).trackTotalHits(true));
@@ -316,7 +316,7 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
             r.found.isEmpty()
         );
         // Without a floor this assertion passes vacuously if the walk ever stops working —
-        // the exact "confident empty answer" failure HANDOFF.md warns about.
+        // a "confident empty answer".
         assertTrue("object-graph walk was vacuous: only " + r.visited + " objects visited", r.visited > 1000);
         logger.info("criterion 5: walked {} objects, none forbidden", r.visited);
     }
