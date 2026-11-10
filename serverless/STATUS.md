@@ -796,8 +796,23 @@ file held locally is not fetched. `serverless.block_cache.prefetch_on_open=false
 | same, 100 ms | 1,474 / 2,949 ms | 1,059 / 2,639 ms |
 
 The cold harness's shards hold one tiny segment, so it shows the floor of the gain; a shard with many segments
-gains with its segment count. What a cold search still waits for after the open is the reader check: the head,
-the manifest again, and three listings of the log, one after another.
+gains with its segment count.
+
+**The reader check after an open: three round trips, not five.** Before a reader nobody is writing ahead of
+answers, it reads the head, then the manifest (to see it was not superseded), then lists the log for records
+past the commit -- the log's term containers, the compaction marker, the term itself. The log listing does not
+depend on the manifest's answer, so it now runs alongside the manifest read; both still start after the head
+read, which is what makes the check sound (a writer that published since had to take the head first). The
+compaction marker is read only when more than one term is at or past the commit's: a compacted term holds only
+fences, so listing it answers no, and for a current commit there is one such term.
+
+| `ServerlessColdActivationMeasurementTests`, RustFS, first search p50 | before | after |
+| --- | --- | --- |
+| 20 ms per request | 235 ms, 12 requests | 183 ms, 11 requests |
+| 100 ms per request | 1,059 ms, 13 requests | 852 ms, 12 requests |
+
+Against the start of this round (before the open prefetch), a cold first search at 100 ms went from 1,474 ms to
+852 ms. What remains serial in front of it: the index descriptor and the membership register are each read twice.
 
 **Wide searches: a sliding window, a pruning digest, and an activation budget.**
 

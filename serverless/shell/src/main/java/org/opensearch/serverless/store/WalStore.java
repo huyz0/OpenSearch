@@ -831,10 +831,18 @@ public final class WalStore {
      * @throws IOException if the log cannot be listed
      */
     public boolean landedPast(long term, long ordinal) throws IOException {
-        for (Map.Entry<Long, BlobContainer> each : termsInOrder().entrySet()) {
-            if (each.getKey() < term) {
-                continue;
-            }
+        final Map<String, BlobContainer> children = blobStore.blobContainer(shardBase.add("wal")).children();
+        Map<Long, BlobContainer> candidates = termsIn(children);
+        candidates.keySet().removeIf(t -> t < term);
+        if (candidates.size() > 1) {
+            // Several terms to list: the compaction marker rules out the ones holding only fences, for one request.
+            candidates = liveTerms(children);
+            candidates.keySet().removeIf(t -> t < term);
+        }
+        // One term or none -- what a reader check of a current commit finds -- is listed without reading the marker: a
+        // compacted term holds only fences, which are not records, so listing it answers no, and the marker read was a
+        // round trip in front of every reader check.
+        for (Map.Entry<Long, BlobContainer> each : candidates.entrySet()) {
             for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : each.getValue().listBlobs().entrySet()) {
                 if (RECORD_NAME.matcher(blob.getKey()).matches()
                     && blob.getValue().length() > 0L
