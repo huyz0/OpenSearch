@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Without this a new node took only what happened to arrive at it, and the full ones stayed full until their
  * shards went idle five minutes later.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessScaleOutTests extends OpenSearchTestCase {
 

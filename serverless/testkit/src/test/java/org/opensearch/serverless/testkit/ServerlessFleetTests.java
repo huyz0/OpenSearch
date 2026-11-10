@@ -40,7 +40,7 @@ import java.util.concurrent.TimeUnit;
  * that, a run where a single node happened to take everything would pass while testing nothing, and it
  * would do so silently.
  *
- * <p><b>D5:</b> a shared local directory stands in for the object store.
+ * <p>A shared local directory stands in for the object store.
  */
 public class ServerlessFleetTests extends OpenSearchTestCase {
 

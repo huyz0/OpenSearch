@@ -207,7 +207,7 @@ public class ConformanceSuiteSelfTests extends OpenSearchTestCase {
 
         assertEquals("this test is meaningless unless the read really was stale", "v0", seen.value().utf8ToString());
         assertFalse(
-            "a store serving overwritten values must be caught, or R11 would pass against one",
+            "a store serving overwritten values must be caught, or the conformance suite would pass against one",
             LinearizabilityChecker.check(history.entries(), initial, "v0").linearizable()
         );
     }

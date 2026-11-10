@@ -21,7 +21,7 @@ import java.util.Set;
 /**
  * Walks a constructed object graph and reports which forbidden classes are reachable.
  *
- * <p>This is how {@code rfc-serverless-shell.md} §11 criterion 5 is asserted: the claim "there is no
+ * <p>This is how the no-control-plane property is asserted: the claim "there is no
  * control plane in this process" is checked against the object graph rather than against the source,
  * because the interesting failure is a dependency pulled in transitively by something else.
  *
@@ -37,7 +37,7 @@ public final class ControlPlaneAbsence {
         "org.opensearch.cluster.routing.allocation.AllocationService",
         "org.opensearch.gateway.GatewayMetaState",
         "org.opensearch.node.Node",
-        // The rest of §6.2's "never constructed" list. MetaStateService was constructed for real for a
+        // The rest of the "never constructed" list. MetaStateService was constructed for real for a
         // long time because IndicesService wants one; a no-op subclass satisfies it and is what the
         // section asks for, and this scan would not have noticed the real one.
         "org.opensearch.gateway.MetaStateService",
@@ -70,7 +70,7 @@ public final class ControlPlaneAbsence {
      * @param roots objects to start from; nulls are ignored
      * @return what was found and how much was searched
      */
-    @SuppressForbidden(reason = "the object-graph walk is the mechanism of RFC §11 criterion 5; reflection is the point")
+    @SuppressForbidden(reason = "the object-graph walk is the mechanism of no-control-plane check; reflection is the point")
     public static Result scan(Set<String> forbidden, Object... roots) {
         final IdentityHashMap<Object, Boolean> seen = new IdentityHashMap<>();
         final Deque<Object> queue = new ArrayDeque<>();

@@ -39,7 +39,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * bounded cost. That the cache cannot answer from a deleted incarnation is
  * {@link ServerlessRoutingFreshnessTests}.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessRequestPathCostTests extends OpenSearchTestCase {
 

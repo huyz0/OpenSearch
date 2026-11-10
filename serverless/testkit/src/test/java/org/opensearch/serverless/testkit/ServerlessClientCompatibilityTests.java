@@ -24,13 +24,13 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M50: what an ordinary OpenSearch client does, done against this shell.
+ * What an ordinary OpenSearch client does, done against this shell.
  *
  * <p><b>What the audit these tests came from found.</b> The shell's stated posture is an explicit
  * allowlist: an unimplemented endpoint returns 501 with a reason, and nothing silently returns a wrong
  * answer. Reading every handler's routes and then driving a running node over HTTP found three groups of
  * things that had drifted off it — a create-index call that succeeded while discarding most of what it was
- * asked for, refusals whose stated reasons had stopped being true when M48 shipped conditional writes, and
+ * asked for, refusals whose stated reasons had stopped being true once conditional writes shipped, and
  * a dozen endpoints that fell through to core's default 400 instead of the promised 501.
  *
  * <p><b>Why these tests go over HTTP.</b> Every finding was about what a client sees, and a test that calls
@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * status that core rewrites on the way out. The previous audit's own lesson was that assuming from names
  * gets it wrong; this suite refuses to assume from method signatures for the same reason.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessClientCompatibilityTests extends OpenSearchTestCase {
 
@@ -239,7 +239,7 @@ public class ServerlessClientCompatibilityTests extends OpenSearchTestCase {
     /**
      * {@code _bulk} does create and per-item conditions, and says something true about what it still cannot do.
      *
-     * <p><b>The refusals here were the ones that had gone false.</b> M48 gave the single-document path
+     * <p><b>The refusals here were the ones that had gone false.</b> The single-document path has
      * conditional writes; {@code _bulk} went on telling callers that {@code create} "requires
      * version-conditional writes, which this system does not have" and that "every write is a plain
      * overwrite". Both were true when written and neither was true afterwards. The obstacle was never a
@@ -342,8 +342,8 @@ public class ServerlessClientCompatibilityTests extends OpenSearchTestCase {
             call("PUT", "/alpha", "{\"settings\":{\"number_of_shards\":1}}");
 
             for (String[] expected : new String[][] {
-                // This list keeps shrinking as endpoints get built: _count went in M52, _field_caps in M53,
-                // _msearch in M55. What is left needs something this design does not have.
+                // This list keeps shrinking as endpoints get built (_count, _field_caps and _msearch are
+                // served now). What is left needs something this design does not have.
                 { "/alpha/_refresh", "refresh=true" },
                 { "/_reindex", "search_after" },
                 { "/alpha/_forcemerge", "merging is the shard writer" },

@@ -347,7 +347,7 @@ public class S0ShellSpikeTests extends OpenSearchTestCase {
         }
     }
 
-    @SuppressForbidden(reason = "the object-graph walk is the mechanism of RFC §11 criterion 5; reflection is the point")
+    @SuppressForbidden(reason = "the object-graph walk is the mechanism of no-control-plane check; reflection is the point")
     private ScanResult scan(Set<String> forbidden, Object... roots) {
         final IdentityHashMap<Object, Boolean> seen = new IdentityHashMap<>();
         final Deque<Object> queue = new ArrayDeque<>();

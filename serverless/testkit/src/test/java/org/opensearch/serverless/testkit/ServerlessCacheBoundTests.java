@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * distinct indices, gigabytes on a coordinator. Past a threshold, entries no reader would believe are
  * dropped; entries a reader would still believe are kept, so no answer changes.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessCacheBoundTests extends OpenSearchTestCase {
 

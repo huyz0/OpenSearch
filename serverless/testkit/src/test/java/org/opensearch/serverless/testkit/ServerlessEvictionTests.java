@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * thrash. Both halves are tested, because only having the first would be a node that thrashes and only
  * having the second is where this started.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessEvictionTests extends OpenSearchTestCase {
 

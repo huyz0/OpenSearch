@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * What this system does when the object store is not what it was promised to be.
  *
- * <p><b>Why this exists.</b> R11 asks whether a provider's compare-and-swap is linearizable, and it cannot
+ * <p><b>Why this exists.</b> Provider conformance asks whether a provider's compare-and-swap is linearizable, and it cannot
  * be answered without an account to ask. The question underneath it never needed one and had never been
  * asked: <em>if the store did deviate, what would break, how far, and would anybody notice?</em> "Everything
  * is downstream of that assumption" is a sentence. These turn it into a measurement.
@@ -49,7 +49,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * correctness failure into a bounded data-loss failure. That is much better than divergence and it is still
  * silent: the client that got its acknowledgement is never told.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} underneath, deviations injected on top.
+ * <p>{@code FsBlobContainer} underneath, deviations injected on top.
  */
 public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
 
@@ -98,7 +98,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
      *
      * <p>Worth establishing rather than assuming: it is the deviation a real provider is most likely to
      * have, and finding that the design does not depend on read freshness for <em>ownership</em> is what
-     * narrows R11's blast radius from "everything" to one specific failure.
+     * narrows a non-conforming provider's blast radius from "everything" to one specific failure.
      */
     public void testAStaleHeadReadDoesNotProduceTwoOwners() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

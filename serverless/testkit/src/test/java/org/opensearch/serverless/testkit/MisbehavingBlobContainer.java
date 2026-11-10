@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <p><b>What this is for, and what it is not.</b> It cannot tell anybody whether S3 is linearizable — no
  * fake can, and pretending otherwise would be worse than not having one. What it answers is the question
- * underneath R11 that has never been asked at all: <em>if the store did deviate, what would this system
+ * underneath provider conformance that has never been asked at all: <em>if the store did deviate, what would this system
  * do about it?</em> "Everything is downstream of that assumption" is a sentence; these turn it into a
  * measurement of which things, how, and whether anybody would notice.
  *

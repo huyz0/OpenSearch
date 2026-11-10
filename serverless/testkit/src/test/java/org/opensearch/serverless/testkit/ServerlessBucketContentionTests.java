@@ -44,7 +44,7 @@ import java.util.concurrent.TimeUnit;
  * <p>It also exercises the part of the design a filesystem hides entirely: a crashed node's data is
  * recovered by a process that has never seen its disk, because there is nothing on its disk to see.
  *
- * <p><b>D5 is finally retired for these tests.</b> Everything here goes over HTTP to an S3 API.
+ * <p><b>Not filesystem-only.</b> Everything here goes over HTTP to an S3 API.
  */
 // The AWS SDK keeps event-loop threads alive past the test; they belong to the client, not to us.
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)

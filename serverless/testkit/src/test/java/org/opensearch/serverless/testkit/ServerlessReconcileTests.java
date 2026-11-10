@@ -27,13 +27,13 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Phase 8: background reconciliation, garbage collection, and routing hints.
+ * Background reconciliation, garbage collection, and routing hints.
  *
  * <p>Nothing here is privileged. Every node runs the same loop, any number may run it at once, and a
  * node that stops running it harms only its own shards — because every action goes through the same
  * compare-and-swap as everyone else.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only. No durability claim for S3 or GCS until R11 runs.
+ * <p>Runs against {@code FsBlobContainer} only, so it makes no durability claim for S3 or GCS.
  */
 public class ServerlessReconcileTests extends OpenSearchTestCase {
 
@@ -70,7 +70,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
 
     // ---- reconciliation -------------------------------------------------------------------------
 
-    /** The gap phase 6 named: something has to notice an unowned shard and pick it up. */
+    /** Something has to notice an unowned shard and pick it up. */
     public void testATickReacquiresAShardAfterTheLeaseIsLost() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final Deployment d = deploy(createTempDir(), clock, false);
@@ -189,7 +189,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
                 );
             }
             assertTrue("GC must not have deleted every term-1 blob", term1BlobsBefore > 0);
-            logger.info("phase 8 GC: deleted {} orphan blobs, kept {} inherited files", deleted.size(), inheritedFromTerm1);
+            logger.info("GC: deleted {} orphan blobs, kept {} inherited files", deleted.size(), inheritedFromTerm1);
 
             // And the successor's data is still served after collection.
             assertEquals(2L, ShardOps.hits(successor.searchService(), onSuccessor, "msg", "kept"));
@@ -394,7 +394,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
         }
     }
 
-    // ---- the gossip gate (§10.3) -----------------------------------------------------------------
+    // ---- the gossip gate ------------------------------------------------------------------------
 
     /**
      * A pass does not go looking for points in time on every tick.
@@ -500,7 +500,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
     }
 
     /**
-     * §10.3 builds gossip only if polling turns out to be insufficient, measured rather than assumed.
+     * Gossip is built only if polling turns out to be insufficient, measured rather than assumed.
      * This produces the number that decision needs: object-store operations per reconciliation pass.
      */
     public void testMeasureTheCostOfOneReconciliationPass() throws Exception {
@@ -529,7 +529,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             // N nodes polling at interval T cost N * opsPerTick / T requests per second.
             final double atOneSecond = opsPerTick;
             logger.info(
-                "phase 8 gossip gate: {} ops per tick per shard ({} reads, {} writes over {} passes). "
+                "gossip gate: {} ops per tick per shard ({} reads, {} writes over {} passes). "
                     + "At a 1s interval that is {} req/s per node-shard; a 10k-node fleet polling 1 shard "
                     + "each every second would be {} req/s.",
                 opsPerTick,

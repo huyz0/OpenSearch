@@ -43,7 +43,7 @@ import java.util.regex.Pattern;
  * paging caller and look like corruption. So the test that matters here is the one that publishes over a
  * view, sweeps, and then reads it anyway.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessPointInTimeTests extends OpenSearchTestCase {
 

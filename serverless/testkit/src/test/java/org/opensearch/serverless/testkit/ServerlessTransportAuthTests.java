@@ -66,7 +66,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * <p>Signed sends carry only a per-request MAC. A raw legacy sender can still present a static token,
  * but presenting a MAC always requires it to verify: a valid token beside a bad MAC is not a fallback.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessTransportAuthTests extends OpenSearchTestCase {
 

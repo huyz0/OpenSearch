@@ -24,7 +24,7 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M56: index and component templates — configuration a new index inherits.
+ * Index and component templates — configuration a new index inherits.
  *
  * <p><b>The refusal these replace was wrong about itself.</b> It said "there is no cluster state for a
  * template to live in". A template needs somewhere to live, not specifically cluster state, and a register on
@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * answer, and it keeps the cost on the operation that caused it rather than on index creation, which has to
  * read them all.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessTemplateTests extends OpenSearchTestCase {
 
@@ -409,19 +409,19 @@ public class ServerlessTemplateTests extends OpenSearchTestCase {
     }
 
     /**
-     * Ingest pipelines run, which is what M56's refusal said it would take to change.
+     * Ingest pipelines run, which is what an earlier refusal said it would take to change.
      *
      * <p>That refusal named the obstacle precisely — storing was never the problem, running was, and every
      * processor lives in a module this shell did not load — and said enabling it was "a decision about
-     * loading modules, not about adding an endpoint". M57 made that decision and M58 applied it. The
-     * assertion here is that the milestone this test belongs to left an accurate account behind it.
+     * loading modules, not about adding an endpoint". The shell now loads the ingest module by name, and the
+     * assertion here is that pipelines are served.
      */
     public void testIngestPipelinesRunSinceTheModuleDecisionWasMade() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         try (ServerlessNode node = running(plane(clock, createTempDir()), "tmpl-pipeline")) {
             assertNotNull(node);
             final Answer stored = call("PUT", "/_ingest/pipeline/x", "{\"processors\":[{\"set\":{\"field\":\"seen\",\"value\":true}}]}");
-            assertEquals("pipelines are served since M58: " + stored.body(), 200, stored.status());
+            assertEquals("pipelines are served: " + stored.body(), 200, stored.status());
             assertTrue(call("GET", "/_ingest/pipeline/x", null).has("\"seen\""));
         }
     }

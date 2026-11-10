@@ -21,15 +21,14 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M10: durability. Publication happens on its own, and a write is durable before it is acknowledged.
+ * Durability. Publication happens on its own, and a write is durable before it is acknowledged.
  *
- * <p>Two gaps close here, and they are different. <b>M10-a</b>: until now {@code publishShard} was only
+ * <p>Two gaps close here, and they are different. <b>Automatic publication</b>: until now {@code publishShard} was only
  * ever called by hand, so the loss window was not "since the last commit" — it was unbounded, and a node
- * could index for hours and lose all of it. <b>M10-b</b>: even with automatic publication, everything
- * written since the last publish was lost, which is what phase 6's zombie test measured and recorded as
- * the WAL gap.
+ * could index for hours and lose all of it. <b>The write-ahead log</b>: even with automatic publication, everything
+ * written since the last publish was lost, which is what a zombie test measured as the durability gap.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessDurabilityTests extends OpenSearchTestCase {
 
@@ -64,7 +63,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         assertEquals(original.source(), parsed.source());
     }
 
-    /** M10-a: a tick publishes what changed, and publishes nothing when nothing did. */
+    /** Automatic publication: a tick publishes what changed, and publishes nothing when nothing did. */
     public void testATickPublishesWithoutAnyoneAskingIt() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = freshIndex(clock, createTempDir());
@@ -96,9 +95,9 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
     }
 
     /**
-     * M10 end to end: nobody calls publish, the node dies mid-stream, and nothing is lost.
+     * Durability end to end: nobody calls publish, the node dies mid-stream, and nothing is lost.
      *
-     * <p>This is the test phase 4 could not write and phase 6 could only measure the absence of.
+     * <p>Without automatic publication and the write-ahead log, this loses data.
      */
     public void testNothingIsLostWhenAWriterDiesBetweenPublications() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

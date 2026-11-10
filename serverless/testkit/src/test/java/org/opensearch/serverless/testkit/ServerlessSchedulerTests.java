@@ -30,7 +30,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M13: the node runs by itself, and each driver runs for its own reason.
+ * The node runs by itself, and each driver runs for its own reason.
  *
  * <p>Before this, every loop in the shell was called by a test. {@code tick()} and {@code heartbeat()}
  * worked and nothing invoked them, so a real deployment would have let its leases lapse, published
@@ -43,7 +43,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * would be measuring patience. Disabling it is the negative control: if the edge is broken, nothing
  * happens at all.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessSchedulerTests extends OpenSearchTestCase {
 
@@ -814,7 +814,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
      * The one call a bootstrap makes. Nothing here drives anything: the node is handed a plane and a
      * reconciler, and from that point it acquires, writes, publishes and renews on its own.
      *
-     * <p>This is the test that would have been impossible to write before M13, because there was no
+     * <p>This is the test that would have been impossible to write without the scheduler, because there would be no
      * arrangement of the shell in which a node did anything without being told to.
      */
     public void testANodeHandedAPlaneRunsWithoutBeingDriven() throws Exception {

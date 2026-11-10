@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>The tests assert that the numbers <em>move</em> rather than that they exist. A stats endpoint that
  * returns plausible constants is worse than none: it answers the question wrongly instead of not at all.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessStatsTests extends OpenSearchTestCase {
 

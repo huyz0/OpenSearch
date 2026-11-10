@@ -41,7 +41,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>The limit is set absurdly low by configuration rather than by allocating absurdly much, because a test
  * that has to exhaust a real heap to prove a point is a test that intermittently exhausts the build's.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
 

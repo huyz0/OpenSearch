@@ -36,7 +36,7 @@ import java.util.regex.Pattern;
  * A <b>prefix</b> pattern costs one bounded listing on top of that — a single {@code ListObjectsV2} with a
  * maximum key count, whose cost is set by the cap rather than by the population. Anything else stays
  * refused: {@code *-2026} cannot be answered by a listing at all, only by reading every name in the
- * deployment, which is the operation &sect;6.3 declines to offer on a request path.
+ * deployment, which is an operation a request path does not offer.
  *
  * <p>The rule was never "listings are forbidden". It was that a request must not cost the size of the
  * deployment and must not answer from a subset while looking complete — so a pattern matching more than the
@@ -46,7 +46,7 @@ import java.util.regex.Pattern;
  * the window is cut once over everything — so page two of a search over three indices is the page two it
  * would be over one.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
 
@@ -129,7 +129,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
     /**
      * A prefix pattern is answered, by one bounded listing.
      *
-     * <p><b>What changed, and why the old refusal was right until it was not.</b> &sect;6.3 refuses
+     * <p><b>What changed, and why the old refusal was right until it was not.</b> A request path refuses
      * enumeration on a request path, and resolving {@code logs-*} by reading every index name in the
      * deployment is exactly that. But the rule was never "listings are forbidden" — it was that a request
      * must not cost the size of the deployment and must not answer from a subset while looking complete.

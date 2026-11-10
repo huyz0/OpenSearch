@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * way that happens is two operations sharing a number. Opened, the shard would drop one silently and its next publish
  * would trim the record away for good. Refused, it is an outage, named in the log, with both operations still there.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
 

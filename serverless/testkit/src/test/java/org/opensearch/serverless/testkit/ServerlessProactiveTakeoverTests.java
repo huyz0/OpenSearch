@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * dead node waited for a write or a get to find it, fail to reach the owner, and raise a doubt. Now each survivor
  * hears the departure and takes the shards that hash to it.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessProactiveTakeoverTests extends OpenSearchTestCase {
 

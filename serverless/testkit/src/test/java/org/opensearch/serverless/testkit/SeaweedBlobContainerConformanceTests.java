@@ -21,7 +21,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
  *
  * <p><b>What it still is not.</b> Neither MinIO nor SeaweedFS is AWS S3, GCS or R2. Two compatible
  * implementations agreeing is evidence that the assumptions are not artefacts of one of them; it is not
- * evidence about a provider neither of them is. R11 stays open until it runs against an account.
+ * evidence about a provider neither of them is. Real providers stay unverified until the suite runs against an account.
  *
  * <p>LocalStack was the obvious second target and is not usable: its free S3 image was discontinued in
  * March 2026 and the remaining images require a licence.

@@ -25,13 +25,13 @@ import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Phase 4: the write path, and the object store as the thing that actually holds the data.
+ * The write path, and the object store as the thing that actually holds the data.
  *
- * <p>Phase 3 could move shard <em>ownership</em> but not shard <em>data</em>, and said so. These tests
- * are what that gap looked like once it closed: a document indexed on one node is served by another
+ * <p>Moving shard <em>ownership</em> is not enough; shard <em>data</em> has to move too. These tests
+ * show it does: a document indexed on one node is served by another
  * after failover, with no peer recovery and nothing copied between nodes.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only. No durability claim for S3 or GCS until R11 runs.
+ * <p>Runs against {@code FsBlobContainer} only, so it makes no durability claim for S3 or GCS.
  */
 public class ServerlessWritePathTests extends OpenSearchTestCase {
 

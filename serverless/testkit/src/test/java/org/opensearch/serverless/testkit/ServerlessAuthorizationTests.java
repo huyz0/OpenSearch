@@ -47,9 +47,9 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * Authentication and authorization, together, on a shell with no action layer.
  *
- * <p>Every milestone since M24 has ended with the same sentence: the shell authenticates and does not
+ * <p>Without this, the shell authenticates and does not
  * authorize, because privilege evaluation in OpenSearch is keyed on action names at the
- * {@code ActionFilter} layer and §6.3 left that layer unbuilt. A plugin could learn who was calling and
+ * {@code ActionFilter} layer and the shell has no action layer. A plugin could learn who was calling and
  * could do nothing about what they then did.
  *
  * <p>It can now, and the demonstration is the one that matters rather than a unit test of a chain: one node
@@ -64,7 +64,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * have to fail open or fail closed for everybody — so the test asserts on <em>who</em> was refused, not
  * merely that something was.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessAuthorizationTests extends OpenSearchTestCase {
 

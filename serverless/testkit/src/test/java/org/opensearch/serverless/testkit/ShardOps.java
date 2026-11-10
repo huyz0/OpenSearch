@@ -59,7 +59,7 @@ public final class ShardOps {
             IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
             false
         );
-        // s0-findings.md F5: MAPPING_UPDATE_REQUIRED is a return value, not an exception. A caller that
+        // MAPPING_UPDATE_REQUIRED is a return value, not an exception. A caller that
         // ignores it indexes nothing and reports no error.
         if (result.getResultType() != Engine.Result.Type.SUCCESS) {
             throw new AssertionError("indexing " + id + " returned " + result.getResultType() + " rather than SUCCESS");

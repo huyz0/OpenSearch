@@ -13,10 +13,10 @@ import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
- * Phase 1 acceptance for {@code rfc-serverless-shell.md}: the production {@link ServerlessNode} boots,
+ * The production {@link ServerlessNode} boots,
  * starts, contains no control plane and shuts down cleanly.
  *
- * <p>S0 proved this shape was possible using disposable spike code. These tests assert it of the real
+ * <p>A spike proved this shape was possible using disposable code. These tests assert it of the real
  * class, which is a different claim — the promotion from spike to production already surfaced one
  * difference (the spike leaned on {@code DefaultRecoverySettings}, which lives in {@code test/framework}
  * and production code cannot see).
@@ -46,7 +46,7 @@ public class ServerlessNodeTests extends OpenSearchTestCase {
             assertNotNull(node.searchService());
             assertNotNull(node.clusterService());
 
-            // The node holds a node-local view naming itself, and no elected manager (§10.5).
+            // The node holds a node-local view naming itself, and no elected manager.
             assertEquals(node.localNode().getId(), node.clusterService().state().nodes().getLocalNodeId());
             assertNull(
                 "a serverless node must never believe a cluster-manager was elected",
@@ -62,12 +62,12 @@ public class ServerlessNodeTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("phase1-b"))) {
             node.start();
             // Scanned from the node itself rather than from named services: the transport and HTTP
-            // layers added in phase 1 are reachable only through its fields, and a check that covers
+            // layers are reachable only through its fields, and a check that covers
             // less than the node does would quietly stop being the assertion it claims to be.
             final ControlPlaneAbsence.Result r = ControlPlaneAbsence.scan(ControlPlaneAbsence.CONTROL_PLANE, node);
             assertEquals("a control plane was constructed: " + r.found, java.util.Set.of(), r.found);
             assertTrue("the object-graph walk was vacuous: only " + r.visited + " objects visited", r.visited > 1000);
-            logger.info("phase 1: production ServerlessNode walked {} objects, no control plane", r.visited);
+            logger.info("production ServerlessNode walked {} objects, no control plane", r.visited);
         }
     }
 
@@ -81,7 +81,7 @@ public class ServerlessNodeTests extends OpenSearchTestCase {
             assertNotEquals("two nodes must not share an identity", a.localNode().getId(), b.localNode().getId());
             assertEquals(a.localNode().getId(), a.clusterService().state().nodes().getLocalNodeId());
             assertEquals(b.localNode().getId(), b.clusterService().state().nodes().getLocalNodeId());
-            // Neither node knows the other exists. Membership is derived, not published (§10.1).
+            // Neither node knows the other exists. Membership is derived, not published.
             assertEquals(1, a.clusterService().state().nodes().getSize());
             assertEquals(1, b.clusterService().state().nodes().getSize());
         }

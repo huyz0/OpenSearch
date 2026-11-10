@@ -26,11 +26,11 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * The items M61 left, each now served and pinned over HTTP.
+ * Compatibility items once left undone, each now served and pinned over HTTP.
  *
  * <p>Creation metadata on an index, core's alias shapes and the reverse lookup, stored scripts, search
  * templates, ranking evaluation, search pipelines, rollover, and data streams. Each was listed as
- * "deliberately still not done" at the end of M61; none of them turned out to need what this design does
+ * "deliberately still not done"; none of them turned out to need what this design does
  * not have, once the thing it does have was looked at again.
  */
 public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {

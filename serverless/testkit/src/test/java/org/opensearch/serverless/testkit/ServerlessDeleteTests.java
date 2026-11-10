@@ -40,7 +40,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * reports success, to a caller that was told the delete worked. That is the failure this suite exists to
  * make impossible, and the canary for it is planted rather than assumed.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessDeleteTests extends OpenSearchTestCase {
 

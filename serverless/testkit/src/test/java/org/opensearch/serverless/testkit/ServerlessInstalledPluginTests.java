@@ -47,7 +47,7 @@ import java.util.stream.Stream;
  * would pass with the loading removed. This class exists nowhere until the test writes it, and the node
  * can only reach it through the loader.
  *
- * <p><b>D5:</b> no object store is involved.
+ * <p>No object store is involved.
  */
 /*
  * ExtrasFS, the test framework's mock filesystem, plants a stray entry in every directory it creates --

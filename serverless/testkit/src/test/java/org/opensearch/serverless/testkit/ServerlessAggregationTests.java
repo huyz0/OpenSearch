@@ -43,7 +43,7 @@ import java.util.regex.Pattern;
  * one shard, so a count that came from a single shard, or a merge that took the first answer and discarded
  * the rest, is a different and visibly wrong number.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessAggregationTests extends OpenSearchTestCase {
 

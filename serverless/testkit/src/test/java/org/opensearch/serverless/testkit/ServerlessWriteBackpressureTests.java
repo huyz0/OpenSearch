@@ -40,7 +40,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * and an answer the client could not tell from a lost write. Now a node lets only so many writes wait on the store,
  * fewer the slower it gets, and refuses the rest with {@code 429} and {@code Retry-After} before applying anything.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
 

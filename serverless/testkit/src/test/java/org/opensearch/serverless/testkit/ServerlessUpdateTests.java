@@ -31,7 +31,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * without the version model classic OpenSearch's {@code _update} uses to make it one. See
  * {@code ShardOperations#update} for the reasoning in full.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessUpdateTests extends OpenSearchTestCase {
 
@@ -327,7 +327,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
             node.activateWriter(plane, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"x\",\"n\":1}");
 
-            // Since M57 a scripted update runs: an engine is registered, chosen by name the same way the
+            // A scripted update runs: an engine is registered, chosen by name the same way the
             // transport is. What is still refused is a script referenced by id, because a stored script
             // resolves through cluster state this design does not have.
             final Response ran = send(http, "POST", "/alpha/_update/1", "{\"script\":{\"source\":\"ctx._source.n += 1\"}}");

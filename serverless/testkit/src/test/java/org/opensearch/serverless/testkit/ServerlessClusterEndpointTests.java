@@ -25,14 +25,13 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M51: the cluster-shaped endpoints this design can answer without a cluster manager.
+ * The cluster-shaped endpoints this design can answer without a cluster manager.
  *
- * <p><b>What changed and why it is not a softening of D2.</b> These endpoints were refused with one reason —
+ * <p><b>What changed and why it is not a softening of the allowlist.</b> These endpoints were refused with one reason —
  * "there is no cluster-wide state; no node can answer this, and a node-local answer would be misleading". The
  * first clause is true. The second stopped being true when leases became an address book: every node
  * publishes one and reads the others' in order to forward writes, so a node answering "who is in this fleet"
- * is answering a question it already answers on every heartbeat. Refusing it was the same stale-refusal shape
- * M50 found in {@code _bulk}.
+ * is answering a question it already answers on every heartbeat. Refusing it was a stale refusal.
  *
  * <p>What actually separates answerable from refused here is <b>cost class</b>, not locality. A question about
  * nodes is one bounded listing. A question about one index's shards is a descriptor plus a head per shard. A
@@ -44,7 +43,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * a system where shards activate on demand, which is why {@link #testADormantShardIsHealthyNotDegraded} is the
  * test that matters most in this suite.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
 

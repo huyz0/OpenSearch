@@ -24,7 +24,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M14's last unmeasured claim: what an open shard costs this node, and whether that cost is flat in how
+ * What an open shard costs this node, and whether that cost is flat in how
  * many are already open.
  *
  * <p>Core's own {@code rfc-100m-index-architecture.md} measured 150,888 B and 3.0 file descriptors per
@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * There is no equivalent here to measure: this shell has no state lighter than an open shard. An index
  * with no shard open costs one register read to describe and nothing else; the number that bounds how
  * many indices a node can actually serve at once is what one <em>open</em> shard costs, which is what
- * {@code maxShardsHeld} (M13) is a bound on. That number had never been measured, only reasoned about.
+ * {@code maxShardsHeld} is a bound on. That number had never been measured, only reasoned about.
  *
  * <p><b>What "flat" means here, and why nothing is asserted on an absolute byte count.</b> A wall-clock or
  * byte-count threshold would make this suite a JVM-version detector rather than an architecture check —
@@ -49,7 +49,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * are not the claim; the trend across two batches of the same size, forced through the same GC in the same
  * JVM, is.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only. A local filesystem is not an object store, and shard opening
+ * <p>Runs against {@code FsBlobContainer} only. A local filesystem is not an object store, and shard opening
  * does not touch the network here regardless — this measures JVM heap and file descriptors, not
  * object-store cost, which {@code ServerlessCostTests} already covers.
  */

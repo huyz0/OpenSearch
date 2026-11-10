@@ -25,7 +25,7 @@ import java.util.Map;
  * logic and not enough for the claim the design actually rests on: that a node which <em>dies</em> is
  * recovered from. {@code close()} unwinds cleanly, releases its lease and is the opposite of a crash.
  *
- * <p><b>D5:</b> a shared local directory stands in for the object store.
+ * <p>A shared local directory stands in for the object store.
  */
 public class ServerlessContentionTests extends OpenSearchTestCase {
 

@@ -44,7 +44,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * written so that the old behaviour fails it. {@link ServerlessAuthTests} keeps the doubling-and-recovery
  * arithmetic; this file is about who a wait may and may not touch.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessThrottleTests extends OpenSearchTestCase {
 

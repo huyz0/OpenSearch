@@ -25,14 +25,14 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Phase 7: the allowlisted admin surface, served from the metadata plane over real HTTP.
+ * The allowlisted admin surface, served from the metadata plane over real HTTP.
  *
  * <p>Every endpoint here is one or two object-store reads. None of them consults a cluster-manager,
  * because there isn't one, and none of them answers a question it cannot actually answer — which is the
- * whole of decision D2 and the reason the classic endpoints still return 501 rather than something
+ * whole of the allowlist rule and the reason the classic endpoints still return 501 rather than something
  * plausible.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessAdminRestTests extends OpenSearchTestCase {
 
@@ -93,7 +93,7 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
 
             final Response fetched = send(http, "GET", "/alpha", null);
             assertEquals(200, fetched.status());
-            // OpenSearch's own shape, keyed by index name, since M50: settings under "index", the mapping
+            // OpenSearch's own shape, keyed by index name: settings under "index", the mapping
             // itself rather than a flag saying one exists.
             assertTrue(fetched.body().contains("\"number_of_shards\":\"2\""));
             assertTrue("the mapping should have been stored and returned", fetched.body().contains("\"mappings\""));
@@ -187,14 +187,14 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
             assertEquals(200, health.status());
             assertTrue(health.body().contains("\"status\":\"serving\""));
 
-            // D2 still holds: the classic endpoints refuse rather than answering as an index would.
-            // Since M51, health and the node list are answered rather than refused -- they need only the
+            // The allowlist still holds: the classic endpoints refuse rather than answering as an index would.
+            // Health and the node list are answered rather than refused -- they need only the
             // lease registry, which is the address book write forwarding already routes through. What is
             // still refused needs a snapshot across every index, an allocator, or a task queue.
             for (String path : new String[] { "/_cluster/state", "/_cluster/stats", "/_cluster/reroute" }) {
                 final Response refused = send(http, "GET", path, null);
                 assertEquals("classic endpoint " + path + " stopped refusing", 501, refused.status());
-                // As above: each refusal carries its own reason since M53, so this asserts that there is
+                // As above: each refusal carries its own reason, so this asserts that there is
                 // one rather than which one.
                 assertTrue(refused.body().contains("is not available here:"));
             }

@@ -44,7 +44,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * covered. And a pattern refused the whole search the moment a plugin's index matched it, naming the
  * index in the refusal.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessSearchSemanticsTests extends OpenSearchTestCase {
 

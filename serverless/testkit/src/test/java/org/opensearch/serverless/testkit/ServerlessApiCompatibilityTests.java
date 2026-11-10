@@ -26,17 +26,17 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M47: response shapes that cost nothing to make real-OpenSearch-compatible — field names, envelopes and
+ * Response shapes that cost nothing to make real-OpenSearch-compatible — field names, envelopes and
  * defaults that were shell-specific inventions with no reason to differ, as opposed to the endpoints and
- * request shapes D2 deliberately refuses (conditional writes, non-prefix wildcards, a cluster-wide surface)
+ * request shapes the allowlist deliberately refuses (conditional writes, non-prefix wildcards, a cluster-wide surface)
  * because supporting them for real would mean building the thing this architecture exists not to need.
  *
- * <p><b>The line this milestone stays on the right side of.</b> Every fix here is a response-shape change:
+ * <p><b>The line these fixes stay on the right side of.</b> Every fix here is a response-shape change:
  * a field renamed, a field added from a value already computed, an envelope restructured. Nothing here
  * adds a new object-store request, a new listing, or a new piece of state a node has to hold. Real
- * scalability-driven refusals — see {@code rfc-serverless-shell.md}'s D2 and §6.3 — are untouched.
+ * scalability-driven refusals, such as enumeration on a request path, are untouched.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessApiCompatibilityTests extends OpenSearchTestCase {
 

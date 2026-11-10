@@ -16,7 +16,7 @@ import java.util.List;
 /**
  * The checker, checked.
  *
- * <p><b>An instrument nobody has ever seen reject anything is not evidence.</b> When R11 finally runs
+ * <p><b>An instrument nobody has ever seen reject anything is not evidence.</b> When the conformance suite runs
  * against a real provider, the answer will be a green test — and a green test from a checker that cannot
  * fail is exactly as informative as no test. So each way a register can deviate is written out here as a
  * history the checker must reject, and the reason it must is the reason the design cares.
@@ -123,7 +123,7 @@ public class LinearizabilityCheckerTests extends OpenSearchTestCase {
      * Two swaps against the same generation both win.
      *
      * <p>This is the failure the whole design turns on: two nodes both believe they own the shard, both
-     * publish at the same term, and the fence in §9.6 never fires because both sides think they are the
+     * publish at the same term, and the term fence never fires because both sides think they are the
      * one holding it.
      */
     public void testTwoWinnersOnOneGenerationAreRejected() {

@@ -25,12 +25,11 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M11: the data path. A document can be written and found over HTTP, by a user, with nothing else.
+ * The data path. A document can be written and found over HTTP, by a user, with nothing else.
  *
- * <p>Everything M10 built sat behind a Java method until now — the durable write path existed and
- * nothing outside a test could reach it. These tests use only HTTP.
+ * <p>The durable write path is reachable over HTTP, not only from a Java method. These tests use only HTTP.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessDataPathTests extends OpenSearchTestCase {
 
@@ -69,7 +68,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         return new MetadataPlane(new FsBlobStore(1024, dir, false), BlobPath.cleanPath(), clock::get, TTL);
     }
 
-    /** The milestone, in one test: write a document over HTTP and find it over HTTP. */
+    /** The data path, in one test: write a document over HTTP and find it over HTTP. */
     public void testWriteAndSearchOverHttp() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = planeOver(createTempDir(), clock);
@@ -101,7 +100,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
     }
 
     /**
-     * M10 and M11 together: a write that arrives over HTTP and is never published still survives its
+     * Durability over HTTP: a write that arrives over HTTP and is never published still survives its
      * writer dying.
      */
     public void testAWriteOverHttpSurvivesTheWriterDying() throws Exception {
@@ -219,7 +218,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         }
     }
 
-    /** The milestone's other half: a search on one node covers shards held by another. */
+    /** The other half: a search on one node covers shards held by another. */
     public void testSearchFansOutAcrossNodes() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = planeOver(createTempDir(), clock);
@@ -404,7 +403,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             // request, not a state the index gets stuck in.
             assertEquals(201, send(http, "PUT", "/conditional/_doc/1", "{\"msg\":\"x\"}").status());
 
-            // Bulk carries conditions on the action line, and since M50 it honours them. What it refuses
+            // Bulk carries conditions on the action line, and it honours them. What it refuses
             // is what it cannot honour: external versioning, and a condition spelled with the names a
             // response uses rather than the ones a request does. Both are refused per item rather than
             // dropped, which is the property this test is about and which did not change.

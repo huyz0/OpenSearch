@@ -57,7 +57,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * touched through the alias API, a backing index that inherits the template that declared its stream, and
  * template settings honoured in each spelling core accepts.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessAliasAtomicityTests extends OpenSearchTestCase {
 

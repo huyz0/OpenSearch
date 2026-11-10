@@ -32,7 +32,7 @@ import java.util.concurrent.locks.LockSupport;
  * <p>After a minute of SlowDown on half its requests, a fleet ran at a quarter of its writes refused for minutes after
  * the store had recovered, and during the burst admitted writes that then timed out rather than refusing them early.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessSlowdownRecoveryTests extends OpenSearchTestCase {
 

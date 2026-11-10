@@ -36,9 +36,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p><b>The refusal test matters as much as the working ones.</b> {@code AbstractClient} funnels dozens of
  * methods through one {@code doExecute}, so an unimplemented action is one line away from returning a
  * default-constructed response — "no results" for a search, "done" for a delete. Refusing by name is the
- * same rule D2 applies to REST, one layer down.
+ * same rule the allowlist applies to REST, one layer down.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessClientTests extends OpenSearchTestCase {
 

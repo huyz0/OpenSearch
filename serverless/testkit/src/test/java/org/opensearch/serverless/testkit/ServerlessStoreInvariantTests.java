@@ -47,7 +47,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * what an orphan sweep leaves alone, what a sweep does with a pin it cannot read, what a template change
  * looks like from a node that did not make it, and how a block is fetched when everyone misses at once.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
 

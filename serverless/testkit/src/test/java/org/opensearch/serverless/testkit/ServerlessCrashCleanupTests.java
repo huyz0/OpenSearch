@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Each node has its own metadata plane over one shared store, as separate processes would.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
 

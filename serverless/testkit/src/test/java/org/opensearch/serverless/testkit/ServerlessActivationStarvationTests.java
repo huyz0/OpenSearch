@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * all 128 GENERIC threads waiting, and the activations they waited for queued behind them: each started only when a
  * waiting write timed out. Shards went unserved for ten minutes and more.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessActivationStarvationTests extends OpenSearchTestCase {
 

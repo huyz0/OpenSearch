@@ -32,11 +32,11 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * M48: {@code _seq_no}, {@code _primary_term} and {@code _version} — assigned, survived, and conditioned on.
+ * {@code _seq_no}, {@code _primary_term} and {@code _version} — assigned, survived, and conditioned on.
  *
  * <p><b>The fields were never missing; their durability was.</b> This shell has always run core's own
  * engine, so every write has always been assigned a sequence number — {@code BackgroundReconciler} has
- * depended on one for its publish decision since M10. What was missing is that the numbers did not survive
+ * depends on one for its publish decision. What was missing is that the numbers did not survive
  * a failover: the write-ahead log recorded only an id and a source, so a successor re-applied every record
  * as a fresh primary operation and the engine minted new numbers for all of them. A token a client held
  * across a failover therefore meant nothing, which is exactly why conditional writes were refused rather
@@ -48,7 +48,7 @@ import java.util.regex.Pattern;
  * token against the successor. That is
  * {@link #testAConditionalWriteTokenMintedBeforeAFailoverStillWorksAfterIt}.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
 
@@ -106,7 +106,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
      * The sequence numbers a predecessor assigned are the sequence numbers the successor serves — for
      * documents that were published, and for documents that only ever reached the log.
      *
-     * <p>This is the property the whole milestone exists for. Before it, a successor re-applied the log as
+     * <p>This is the property the sequence-number work exists for. Before it, a successor re-applied the log as
      * fresh primary operations and every replayed document came back with a different number.
      */
     public void testSequenceNumbersSurviveAFailover() throws Exception {
@@ -358,7 +358,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
      * {@code StoreRecovery#internalRecoverFromStore} ends with {@code fillSeqNoGaps} — inside
      * {@code IndexShard#recoverFromStore}, which is the only way this shell ever opens a writer. Replayed
      * operations are already in the engine by then, because {@code ServerlessWriterEngine} feeds them in
-     * during recovery, so the gaps core fills are the gaps the log left. M48's notes claimed this shell had
+     * during recovery, so the gaps core fills are the gaps the log left. It was once believed this shell had
      * no analogue of {@code fillSeqNoGaps} because the method is unreachable from outside {@code IndexShard};
      * it does not need to reach it, because the recovery path it already uses calls it.
      *

@@ -37,7 +37,7 @@ import java.util.regex.Pattern;
  * {@code wait_for_nodes=<3} that meant {@code >=3}, and a busy shard reported dormant thirty seconds after
  * its owner took it. None of them threw; every one of them was a confident answer.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessAdminTruthTests extends OpenSearchTestCase {
 

@@ -25,7 +25,7 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M60: {@code _explain}, and the two answers it has to keep apart.
+ * {@code _explain}, and the two answers it has to keep apart.
  *
  * <p><b>The refusal it replaces was another stale reason.</b> It said explaining a score "needs the scorer for
  * one document on one shard; the fan-out here merges hits rather than exposing per-shard scoring internals" —
@@ -36,7 +36,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * Lucene's account of which clause failed — not a 404. Collapsing it into "not found" would answer the
  * question a caller can already answer with a get.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessExplainTests extends OpenSearchTestCase {
 

@@ -241,7 +241,7 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
      *
      * <p>Requiring a client certificate is what changes it, and it is a deployment's decision expressed
      * entirely in the provider a plugin supplies. The shell's part is only to let the plugin's provider
-     * reach the transport, which is what M39 fixed; this shows the decision is actually available.
+     * reach the transport, which the shell does; this shows the decision is actually available.
      */
     public void testMutualTlsAuthenticatesThePeer() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

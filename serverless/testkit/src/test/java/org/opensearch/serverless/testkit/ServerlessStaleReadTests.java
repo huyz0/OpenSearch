@@ -36,7 +36,7 @@ import java.util.regex.Pattern;
  * leaves it unpublished, takes the writer away, and asks another node -- which must find the document or say it
  * cannot, never answer as though it did not exist.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessStaleReadTests extends OpenSearchTestCase {
 
