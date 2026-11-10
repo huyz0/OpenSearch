@@ -87,6 +87,7 @@ public final class BlockCache {
     private final AtomicLong coalesced = new AtomicLong();
     private final AtomicLong bytesFetched = new AtomicLong();
     private final AtomicLong bytesResident = new AtomicLong();
+    private volatile java.util.concurrent.Executor prefetchExecutor;
 
     /**
      * Creates a cache.
@@ -114,6 +115,37 @@ public final class BlockCache {
      */
     public int blockSize() {
         return blockSize;
+    }
+
+    /**
+     * Returns the most blocks this cache holds.
+     *
+     * @return the capacity in blocks
+     */
+    public int maxBlocks() {
+        return maxBlocks;
+    }
+
+    /**
+     * Lets a directory opened over this cache fetch the blocks its open will read concurrently, before
+     * Lucene asks for them one after another. Without an executor nothing is fetched ahead.
+     *
+     * @param executor where the helper reads run, or null to fetch nothing ahead
+     * @return this, for chaining
+     */
+    public BlockCache prefetchingWith(java.util.concurrent.Executor executor) {
+        this.prefetchExecutor = executor;
+        return this;
+    }
+
+    /** Where opens fetch ahead, or null when they do not. */
+    java.util.concurrent.Executor prefetchExecutor() {
+        return prefetchExecutor;
+    }
+
+    /** Looks up a block without counting a hit or a miss: a prefetch asking what it can skip is not a reader. */
+    byte[] peek(String key) {
+        return stripeFor(key).get(key);
     }
 
     /**

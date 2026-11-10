@@ -134,7 +134,38 @@ public final class BlockCacheDirectory extends FilterDirectory {
                 }
             }
         }
+        final java.util.concurrent.Executor prefetch = cache.prefetchExecutor();
+        if (prefetch != null && files.isEmpty() == false) {
+            // A file this node holds locally is read from there, so fetching it would be a request for nothing.
+            final Set<String> held = new LinkedHashSet<>(java.util.Arrays.asList(local.listAll()));
+            final Map<String, OpenPrefetch.Target> targets = new LinkedHashMap<>();
+            for (Map.Entry<String, RemoteFile> entry : files.entrySet()) {
+                if (held.contains(entry.getKey())) {
+                    continue;
+                }
+                final RemoteFile file = entry.getValue();
+                targets.put(
+                    entry.getKey(),
+                    new OpenPrefetch.Target(
+                        file.container(),
+                        file.blobName(),
+                        keyPrefix(cacheScope, file.termDir(), entry.getKey()),
+                        file.length()
+                    )
+                );
+            }
+            // Before the directory is handed out, so the open that follows reads from memory.
+            OpenPrefetch.run(targets, cache, prefetch);
+        }
         return new BlockCacheDirectory(local, files, cache, cacheScope);
+    }
+
+    /**
+     * The prefix of every cache key of one published file. The term directory is part of it: a same-named
+     * file from another term is other bytes, and a cache that keyed on the name alone served them as this file's.
+     */
+    private static String keyPrefix(String cacheScope, String termDir, String name) {
+        return cacheScope + "/" + termDir + "/" + name;
     }
 
     @Override
@@ -174,9 +205,7 @@ public final class BlockCacheDirectory extends FilterDirectory {
                 file.container(),
                 cache,
                 file.blobName(),
-                // The term directory is part of the key: a same-named file from another term is other
-                // bytes, and a cache that keyed on the name alone served them as this file's.
-                cacheScope + "/" + file.termDir() + "/" + name,
+                keyPrefix(cacheScope, file.termDir(), name),
                 file.length()
             );
         }

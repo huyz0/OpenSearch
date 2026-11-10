@@ -760,6 +760,11 @@ public final class ServerlessNode implements Closeable {
                 "thread_pool." + FORWARDED_READ_POOL
             )
         );
+        // An open fetches the blocks it will read concurrently rather than one round trip at a time, on GENERIC as
+        // the log replay's reads do; the opening thread reads too, so a busy pool costs width only.
+        if (settings.getAsBoolean("serverless.block_cache.prefetch_on_open", true)) {
+            blockCache.prefetchingWith(threadPool.generic());
+        }
         boolean success = false;
         NodeEnvironment openedEnvironment = null;
         try {
