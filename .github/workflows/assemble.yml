@@ -1,6 +1,8 @@
 name: Gradle Assemble
 on:
+  # Fork: only build main; feature branches skip CI to stay within Actions limits.
   pull_request:
+    branches: [ main ]
     # Skip this check unless files that could plausibly impact a
     # distribution have changed.
     paths:
