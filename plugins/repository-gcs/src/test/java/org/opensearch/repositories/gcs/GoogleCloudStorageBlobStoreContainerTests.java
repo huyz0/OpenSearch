@@ -75,6 +75,54 @@ public class GoogleCloudStorageBlobStoreContainerTests extends OpenSearchTestCas
         }
     }
 
+    public void testRegisterReadFollowsAGenerationReplacedBetweenMetadataAndContent() throws Exception {
+        final Storage storage = mock(Storage.class);
+        when(storage.get("bucket")).thenReturn(mock(Bucket.class));
+        final var replaced = mock(com.google.cloud.storage.Blob.class);
+        when(replaced.getGeneration()).thenReturn(7L);
+        when(replaced.getContent()).thenThrow(new StorageException(404, "No such object"));
+        final var current = mock(com.google.cloud.storage.Blob.class);
+        when(current.getGeneration()).thenReturn(8L);
+        when(current.getContent()).thenReturn("next".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        when(storage.get(any(BlobId.class))).thenReturn(replaced, current);
+        final GoogleCloudStorageService service = mock(GoogleCloudStorageService.class);
+        when(service.client(any(String.class), any(String.class), any(GoogleCloudStorageOperationsStats.class))).thenReturn(storage);
+        try (var store = new GoogleCloudStorageBlobStore("bucket", "test", "repo", service, 1024)) {
+            final var register = store.readRegister("head").orElseThrow();
+            assertEquals(8L, register.generation());
+            assertEquals("next", register.value().utf8ToString());
+        }
+    }
+
+    public void testRegisterReadReportsAbsenceWhenTheRegisterIsDeletedMidRead() throws Exception {
+        final Storage storage = mock(Storage.class);
+        when(storage.get("bucket")).thenReturn(mock(Bucket.class));
+        final var deleted = mock(com.google.cloud.storage.Blob.class);
+        when(deleted.getContent()).thenThrow(new StorageException(404, "No such object"));
+        when(storage.get(any(BlobId.class))).thenReturn(deleted, (com.google.cloud.storage.Blob) null);
+        final GoogleCloudStorageService service = mock(GoogleCloudStorageService.class);
+        when(service.client(any(String.class), any(String.class), any(GoogleCloudStorageOperationsStats.class))).thenReturn(storage);
+        try (var store = new GoogleCloudStorageBlobStore("bucket", "test", "repo", service, 1024)) {
+            assertTrue(store.readRegister("head").isEmpty());
+        }
+    }
+
+    public void testRegisterReadGivesUpUnderEndlessReplacement() throws Exception {
+        final Storage storage = mock(Storage.class);
+        when(storage.get("bucket")).thenReturn(mock(Bucket.class));
+        final var replaced = mock(com.google.cloud.storage.Blob.class);
+        when(replaced.getContent()).thenThrow(new StorageException(404, "No such object"));
+        when(storage.get(any(BlobId.class))).thenReturn(replaced);
+        final GoogleCloudStorageService service = mock(GoogleCloudStorageService.class);
+        when(service.client(any(String.class), any(String.class), any(GoogleCloudStorageOperationsStats.class))).thenReturn(storage);
+        try (var store = new GoogleCloudStorageBlobStore("bucket", "test", "repo", service, 1024)) {
+            final StorageException e = expectThrows(StorageException.class, () -> store.readRegister("head"));
+            assertEquals(404, e.getCode());
+            org.mockito.Mockito.verify(storage, org.mockito.Mockito.times(GoogleCloudStorageBlobStore.MAX_REGISTER_READ_ATTEMPTS))
+                .get(any(BlobId.class));
+        }
+    }
+
     @SuppressWarnings("unchecked")
     public void testDeleteBlobsIgnoringIfNotExistsThrowsIOException() throws Exception {
         final List<String> blobs = Arrays.asList("blobA", "blobB");

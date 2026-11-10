@@ -10,7 +10,6 @@ package org.opensearch.serverless.testkit;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
-import org.apache.lucene.tests.util.LuceneTestCase.AwaitsFix;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.repositories.gcs.GcsEmulatorBlobStores;
 
@@ -81,20 +80,6 @@ public class GcsEmulatorBlobContainerConformanceTests extends EmulatorConformanc
     public void testAConditionalDeleteRefusesAStaleGeneration() throws Exception {
         assumeTrue("this emulator ignores the generation condition on a delete", honoursConditionalDelete());
         super.testAConditionalDeleteRefusesAStaleGeneration();
-    }
-
-    /**
-     * Fails today, and the failure is in the GCS register read, not the emulator.
-     *
-     * <p>{@code GoogleCloudStorageBlobStore.readRegister} fetches the metadata and then downloads that exact
-     * generation. When a concurrent swap lands between the two requests, the old generation is gone (as it is on
-     * real GCS without object versioning) and the download throws a 404 where the read should return the current
-     * value. Re-enable once the read retries on a vanished generation.
-     */
-    @Override
-    @AwaitsFix(bugUrl = "GoogleCloudStorageBlobStore.readRegister throws 404 when a concurrent swap replaces the generation it read")
-    public void testAConcurrentHistoryIsLinearizable() throws Exception {
-        super.testAConcurrentHistoryIsLinearizable();
     }
 
     /** Removes the buckets this test made, so one run's leftovers cannot decide another's listing assertions. */
