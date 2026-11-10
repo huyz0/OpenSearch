@@ -274,13 +274,15 @@ public final class ShardReconciler {
             // a newer term and cannot tell two nodes holding the same one apart.
             final org.opensearch.serverless.store.PruningDigest digest = digestOf(shard, commit.get());
             // Recorded where a coordinator looks for it before the commit is published, never after: a publish
-            // that fails in between leaves the record wider than what is searchable, never narrower.
+            // that fails in between leaves the record wider than what is searchable, never narrower. The hook may
+            // skip the record while the writer's own mark keeps the shard from being ruled out; clearing the mark
+            // then widens it.
             final BeforePublish hook = beforePublish;
             // Even for an empty digest -- no digested fields, or one that could not be computed. Skipping it left an
             // entry holding an earlier, narrower digest while the commit grew past it; an empty one widens the entry
             // to rule nothing out.
             if (hook != null) {
-                hook.accept(shardId, shard.indexSettings().getNumberOfShards(), digest);
+                hook.accept(shardId, shard.indexSettings().getNumberOfShards(), term, digest);
             }
             manifest = publisherCache.computeIfAbsent(shardId, publishers)
                 .publish(shard.store(), commit.get(), term, localNode.getId(), digest, walOrdinal);
@@ -332,10 +334,11 @@ public final class ShardReconciler {
          *
          * @param shardId the shard
          * @param shards the index's shard count
+         * @param term the publishing writer's term
          * @param digest the commit's digest
          * @throws IOException if it could not be done
          */
-        void accept(ShardId shardId, int shards, org.opensearch.serverless.store.PruningDigest digest) throws IOException;
+        void accept(ShardId shardId, int shards, long term, org.opensearch.serverless.store.PruningDigest digest) throws IOException;
     }
 
     private volatile BeforePublish beforePublish;

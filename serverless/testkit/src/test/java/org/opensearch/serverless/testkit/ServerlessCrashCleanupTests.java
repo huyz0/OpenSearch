@@ -126,7 +126,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         // What earlier releases left: entries marked and cleared, never published.
         for (String index : List.of("hollow", "logged")) {
             plane.rollups().markOwned(index, descriptor(index).uuid(), 1, 0, 1L);
-            plane.rollups().clearOwned(index, descriptor(index).uuid(), 0, 1L);
+            plane.rollups().clearOwned(index, descriptor(index).uuid(), 0, 1L, null);
             assertNotNull(entryOf(plane, index));
         }
         // One of them has a record in its log nobody published.
@@ -142,7 +142,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             final long term = plane.heads().read("logged", 0).orElseThrow().term();
             node.reconciler().releaseShard(logged, "test: given back unpublished, as a lapsed owner does");
             assertTrue(plane.heads().release("logged", 0, node.localNode().getId(), term));
-            plane.rollups().clearOwned("logged", descriptor("logged").uuid(), 0, term);
+            plane.rollups().clearOwned("logged", descriptor("logged").uuid(), 0, term, null);
 
             final int slots = plane.rollups().groups().size() * DigestRollups.BUCKETS;
             for (int i = 0; i < slots; i++) {
@@ -183,7 +183,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             for (String index : List.of("digested", "undigested")) {
                 plane.rollups().markOwned(index, "uuid-elsewhere", 1, 0, 99L);
                 plane.rollups().markOwned(index, descriptor(index).uuid(), 1, 0, 100L);
-                plane.rollups().clearOwned(index, descriptor(index).uuid(), 0, 100L);
+                plane.rollups().clearOwned(index, descriptor(index).uuid(), 0, 100L, null);
                 assertNull(entryOf(plane, index).states().get(0).digest());
             }
 

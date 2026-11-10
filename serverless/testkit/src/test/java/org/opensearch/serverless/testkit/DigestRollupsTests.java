@@ -94,9 +94,9 @@ public class DigestRollupsTests extends OpenSearchTestCase {
         assertFalse(entry(rollups, "logs-a").rulesOut(QueryBuilders.rangeQuery("n").gte(10_000), NOW));
         // The successor takes it at term 4; the predecessor's clear at term 3 arrives after.
         rollups.markOwned("logs-a", "uuid-a", 1, 0, 4L);
-        rollups.clearOwned("logs-a", "uuid-a", 0, 3L);
+        rollups.clearOwned("logs-a", "uuid-a", 0, 3L, null);
         assertFalse("still held by term 4", entry(rollups, "logs-a").rulesOut(QueryBuilders.rangeQuery("n").gte(10_000), NOW));
-        rollups.clearOwned("logs-a", "uuid-a", 0, 4L);
+        rollups.clearOwned("logs-a", "uuid-a", 0, 4L, null);
         assertTrue(entry(rollups, "logs-a").rulesOut(QueryBuilders.rangeQuery("n").gte(10_000), NOW));
     }
 
