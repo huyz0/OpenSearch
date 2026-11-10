@@ -13,7 +13,7 @@ dependencies {
    * `:server` and nothing else -- deliberately, and it is the point of this module.
    *
    * The shell is not on this classpath, so nothing here can reach a ServerlessNode, a MetadataPlane or
-   * a shard. If authentication needed any of that, then the plugin host built in M23 would not really be
+   * a shard. If authentication needed any of that, then the shell's plugin host would not really be
    * a plugin host: it would be a place where privileged code is allowed to live. Everything this module
    * uses -- Plugin, ActionPlugin, IdentityPlugin, Client, RestHandler -- is API that any third-party
    * plugin has, which is what makes it evidence.
@@ -58,3 +58,5 @@ tasks.register('checkAuthDoesNotReferenceTheShell') {
 }
 
 tasks.named('check').configure { dependsOn 'checkAuthDoesNotReferenceTheShell' }
+
+apply from: "${rootDir}/serverless/forbidden-references.gradle"

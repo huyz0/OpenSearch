@@ -25,8 +25,8 @@ import java.util.function.IntSupplier;
  *
  * <p>Deliberately not {@code _cluster/health}. There is no cluster-wide health in this design: there is
  * no elected node to compute it and no global state to compute it from. Reporting a green cluster from
- * a node that can only see itself would be exactly the confident-empty-answer failure D2 exists to
- * prevent, so the endpoint reports what this node actually knows and says so in its own name.
+ * a node that can only see itself would be exactly the confident-empty-answer failure the allowlist
+ * exists to prevent, so the endpoint reports what this node actually knows and says so in its own name.
  */
 public final class ServerlessHealthHandler extends BaseRestHandler {
 

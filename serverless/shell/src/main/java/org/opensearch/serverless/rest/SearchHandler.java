@@ -34,7 +34,7 @@ import java.util.function.Supplier;
  * <p><b>The response always reports shard coverage, and that is the point of this class.</b> A node
  * serves the shards it holds; with no cross-node fan-out yet it may hold some of an index and not the
  * rest. Returning a hit count without saying how much of the index it came from would be the exact
- * failure {@code HANDOFF.md} records eight times — a confident answer computed over a fraction of the
+ * "confident empty answer" failure — a confident answer computed over a fraction of the
  * data, indistinguishable from a complete one.
  *
  * <p>So {@code _shards.total} and {@code _shards.successful} are always present, and a partial search
@@ -617,7 +617,7 @@ public final class SearchHandler extends BaseRestHandler {
      * ListObjectsV2 with a maximum key count, whose cost is set by the cap rather than by the
      * population, so a deployment with a hundred million indices pays what one with ten pays.
      *
-     * <p>That is why §6.3's refusal of enumeration does not refuse this. The rule was never "listings are
+     * <p>That is why the rule against enumerating on a request path does not refuse this. The rule was never "listings are
      * forbidden"; it was that a request must not cost the size of the deployment and must not answer
      * from a subset while looking complete. A capped listing costs a fixed amount, and a pattern that
      * matches more than the cap is refused rather than truncated.
@@ -928,7 +928,7 @@ public final class SearchHandler extends BaseRestHandler {
     /**
      * Names the part of a search this cannot answer correctly across shards, or null if it can.
      *
-     * <p><b>Refused rather than ignored, and the distinction is the whole of D2.</b> Every feature below
+     * <p><b>Refused rather than ignored, and the distinction is the whole of the allowlist rule.</b> Every feature below
      * parses happily and runs happily on a single shard; what none of them survives is being run on
      * several shards and having the answers concatenated. An aggregation needs a reduce step this does
      * not have — returning one shard's buckets as if they were the index's would be a number that is
@@ -1224,7 +1224,7 @@ public final class SearchHandler extends BaseRestHandler {
      * Reports whether a name is a pattern this system can answer.
      *
      * <p>One trailing star and nothing else, because that is exactly what a prefix listing can do. A star
-     * anywhere else needs the whole population read and matched, which is the operation §6.3 refuses; a
+     * anywhere else needs the whole population read and matched, which is the operation a request path refuses; a
      * bare {@code *} is a prefix of nothing at all and is allowed, since the cap bounds it like any other.
      *
      * @param name the name as the caller wrote it

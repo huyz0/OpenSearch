@@ -11,6 +11,6 @@
  *
  * <p>Nothing in this package is replicated, agreed, or published. Each node computes its own view from
  * descriptors and the shard assignments it actually holds; two nodes are expected to hold different
- * views and never to reconcile them with each other. See {@code rfc-serverless-shell.md} §5.
+ * views and never to reconcile them with each other.
  */
 package org.opensearch.serverless.cluster;

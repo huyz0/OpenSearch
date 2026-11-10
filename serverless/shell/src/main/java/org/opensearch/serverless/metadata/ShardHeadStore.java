@@ -22,7 +22,7 @@ import java.util.function.LongSupplier;
 /**
  * Shard ownership, arbitrated by compare-and-swap on one register per shard.
  *
- * <p>This is section 6 of {@code rfc-serverless-metadata-plane.md} in code. There is no allocator and
+ * <p>This is shard ownership without an allocator. There is no allocator and
  * no elected node: a candidate acquires a shard by winning a CAS on its head, and concurrent attempts
  * are made safe by the register rather than by agreement. Placement <em>quality</em> is somebody else's
  * problem — load-aware candidate selection, gossip hints. Placement <em>safety</em> is entirely here.
@@ -34,11 +34,10 @@ import java.util.function.LongSupplier;
  *
  * <p><b>Rule: a live lease is not stolen.</b> If the head is held and unexpired by another node, this
  * refuses and returns the winner's head so the caller can route to it. The alternative — retrying
- * elsewhere — produces exactly the ping-pong the RFC warns about, where two nodes take turns owning a
+ * elsewhere — produces exactly the ownership ping-pong, where two nodes take turns owning a
  * shard neither can keep.
  *
- * <p>Per D5, exercised against {@code FsBlobContainer} only. R11 is what would let any of this be
- * claimed of S3 or GCS.
+ * <p>See this package's documentation for which object stores this has been verified against.
  */
 public final class ShardHeadStore {
 

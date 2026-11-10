@@ -23,9 +23,8 @@ import java.util.Optional;
  * wrong entry costs a retry rather than correctness. Nothing here is agreed with anyone, no node is
  * obliged to keep it fresh, and two nodes holding different hints forever is the normal case.
  *
- * <p>{@code rfc-serverless-shell.md} §10.3 dissolved the dedicated directory tier this would have lived
- * in: gossip, if it is ever built, is how these spread. Until then a node refreshes its own, which is
- * the cheapest thing that works and is honest about what it is.
+ * <p>There is no dedicated directory tier for these to live in: gossip, if it is ever built, is how
+ * these spread. Until then a node refreshes its own, which is the cheapest thing that works and is honest about what it is.
  *
  * <p>The one rule: <b>never write based on a hint.</b> Ownership is answered by the shard-head, which
  * is a read away. A hint may say a node owns a shard it lost a second ago, and acting on that without

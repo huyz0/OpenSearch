@@ -26,14 +26,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * The write-ahead log that closes the durability window.
  *
  * <p>Before this, a shard's data reached the object store only when a commit was published, so
- * everything written since the last publish was lost on failover. Phase 6's zombie test measured
- * exactly that: the zombie's unpublished document was gone, and the notes recorded it as the WAL gap
- * rather than a fencing failure. This is that gap closed — a record is durable before the write is
- * acknowledged, so a successor can replay what the previous writer never published.
+ * everything written since the last publish was lost on failover: a zombie test showed the zombie's
+ * unpublished document gone, a durability gap rather than a fencing failure. This closes that gap — a record is
+ * durable before the write is acknowledged, so a successor can replay what the previous writer never published.
  *
  * <p><b>Term-scoped, like segments.</b> A writer at term T appends under {@code wal/t=T}, so a zombie
  * appending after it lost the shard writes where the successor is not reading, for the same reason and
- * by the same mechanism as §9.6's fencing of segment blobs.
+ * by the same mechanism as the fencing of segment blobs.
  *
  * <p><b>Truncation happens on two different rules, and they are not the same rule.</b> Records under the
  * publishing writer's own term are trimmed a cycle late, for the reason below. Records under

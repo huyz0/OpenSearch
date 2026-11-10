@@ -25,11 +25,10 @@ import java.util.concurrent.ExecutionException;
 /**
  * Compiling and running an ingest pipeline over a document, without a cluster.
  *
- * <p><b>Why this can exist now and could not in M56.</b> The refusal then said the problem was not storing a
- * pipeline — templates store the same way — but running one: every processor a real pipeline uses lives in the
- * {@code ingest-common} module, and this shell loads no modules. M57 answered that by choosing
- * {@code lang-painless} by name, the way the transport had always been chosen, and establishing that "no
- * modules are loaded" was about discovery from disk rather than about the code in {@code modules/}. So this is
+ * <p><b>How this runs without loading modules.</b> Storing a pipeline is easy — templates store the same
+ * way — but running one is not: every processor a real pipeline uses lives in the {@code ingest-common}
+ * module. The shell chooses {@code lang-painless} by name, the way it chooses its transport, because "no
+ * modules are loaded" is about discovery from disk rather than about the code in {@code modules/}. So this is
  * the same decision applied a third time, not a new one.
  *
  * <p><b>What replaces {@code IngestService}.</b> Core's ingest service holds pipelines in cluster state and

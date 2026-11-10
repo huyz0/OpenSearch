@@ -31,9 +31,9 @@ import java.util.function.Supplier;
  * Index lifecycle over the metadata plane: {@code PUT}, {@code GET} and {@code DELETE} on {@code /{index}}.
  *
  * <p>Each of these is one object-store operation, not a cluster-state update. Creation is a
- * put-if-absent whose cost does not depend on how many indices already exist — the ceiling
- * {@code plan-area-h-metadata-off-cluster-state.md} measured, where creating the 6,000th index took
- * 98.8 ms because {@code Metadata.Builder.build()} rebuilds name lookups across every index each time.
+ * put-if-absent whose cost does not depend on how many indices already exist. In classic cluster state,
+ * creating the 6,000th index was measured at 98.8 ms because {@code Metadata.Builder.build()} rebuilds
+ * name lookups across every index each time.
  *
  * <p>Name uniqueness is arbitrated by the object store rather than by an elected node, so a duplicate
  * create returns 400 without anything having been serialised anywhere.
@@ -165,9 +165,9 @@ public final class IndexAdminHandler extends BaseRestHandler {
         // <b>Why a backstop rather than one refusal per endpoint.</b> The GET /{index} route matches any
         // single-segment path, so every top-level API that is not separately registered lands here and is
         // answered "no such index: _stats" -- a confident wrong answer about something that was never an
-        // index, which sends a caller looking for a missing index instead of a missing endpoint. M50 fixed
-        // exactly this for /_search by routing /_search; that fixes one path and leaves the next one. This
-        // catches the whole class, including endpoints nobody has thought of yet.
+        // index, which sends a caller looking for a missing index instead of a missing endpoint. Routing each
+        // top-level path explicitly fixes one path and leaves the next one. This catches the whole class,
+        // including endpoints nobody has thought of yet.
         if (index != null && index.startsWith("_")) {
             return channel -> channel.sendResponse(
                 error(
@@ -460,7 +460,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
         settings.put("number_of_replicas", "0");
         settings.put("uuid", descriptor.uuid());
         settings.put("provided_name", descriptor.name());
-        // Recorded at creation since M62; a descriptor from before then has neither, and omitting them is
+        // Recorded at creation; a descriptor written by an older version has neither, and omitting them is
         // truer than inventing a moment or a version.
         if (descriptor.createdAtMillis() != 0L) {
             settings.put("creation_date", Long.toString(descriptor.createdAtMillis()));

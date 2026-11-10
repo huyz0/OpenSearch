@@ -27,7 +27,7 @@ import java.util.Map;
 import java.util.function.Supplier;
 
 /**
- * {@code /_cluster/settings} — §9.3's {@code /cluster/config} register, at the surface a caller reaches.
+ * {@code /_cluster/settings} — the {@code cluster/config} register, at the surface a caller reaches.
  *
  * <p>The one piece of {@code /_cluster/*} that is not refused. Everything else under that prefix answers
  * for cluster-wide state this design does not have — routing tables, node lists, health computed across a

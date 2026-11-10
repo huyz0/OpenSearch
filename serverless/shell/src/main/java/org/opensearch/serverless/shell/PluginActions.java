@@ -29,12 +29,12 @@ import java.util.Optional;
  * calling {@code client.execute(itsOwnAction, request)} was told the shell does not implement it. That is
  * not a small corner: an action is how a plugin does anything that is not a document operation.
  *
- * <p><b>Why this is not an action layer.</b> &sect;6.3 declined to build one, and this does not build one
+ * <p><b>Why this is not an action layer.</b> The shell declines to build one, and this does not build one
  * either. There is no registry of core's actions, no dispatch table for the shell's own work, no wrapping
  * of index or search. This holds only what plugins brought, and the shell's client asks it after its own
  * allowlist has not matched.
  *
- * <p><b>Constructor resolution, not injection.</b> Core binds these with Guice; R4 says plugins run here
+ * <p><b>Constructor resolution, not injection.</b> Core binds these with Guice; plugins run here
  * without it. So each action is built by picking the constructor whose parameters can all be supplied from
  * what this node has — its services, and whatever <em>that</em> plugin itself returned from
  * {@code createComponents}. Never another plugin's components: the aggregate list was once offered to every

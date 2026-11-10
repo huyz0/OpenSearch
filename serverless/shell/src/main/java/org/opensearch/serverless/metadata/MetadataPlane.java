@@ -30,10 +30,10 @@ import java.util.function.LongSupplier;
  * in {@link RegisterMap}, and the reason it is a map rather than a single object is in that class's
  * documentation.
  *
- * <p><b>Decision D5:</b> everything here is exercised against {@code FsBlobContainer} only. Passing
- * there says nothing about whether a provider's conditional write is genuinely linearizable, which is
- * R11 and the thing the entire safety argument rests on. No durability claim is made for S3, GCS or
- * Azure until that conformance suite runs.
+ * <p><b>Which stores this is verified on.</b> Passing on {@code FsBlobContainer} says nothing about whether
+ * a provider's conditional write is genuinely linearizable, which is the thing the entire safety argument
+ * rests on. No durability claim is made for a provider until the blob-store conformance suite has run
+ * against it; see this package's documentation.
  */
 public final class MetadataPlane {
 
@@ -247,7 +247,7 @@ public final class MetadataPlane {
      *
      * <p><b>A shallow snapshot names these bytes directly rather than a copy of them.</b> Its whole
      * argument for costing nothing at capture time is that a captured commit's blobs are the same ones the
-     * live shard already wrote — see {@code m45-snapshot-notes.md}. Deleting the index unconditionally
+     * live shard already wrote. Deleting the index unconditionally
      * would delete exactly those blobs out from under a snapshot nobody had touched, which is not a corner
      * case: taking a snapshot and then deleting the index it was taken from is the normal shape a backup
      * is used for. A standard (non-shallow) snapshot already copied its own bytes into the repository's own
@@ -1319,7 +1319,7 @@ public final class MetadataPlane {
      *
      * <p>A {@link TemplateStore} because the shape is identical: named JSON documents, one register each,
      * bounded on creation, and a prefix so a foreign object in the container is not read as one. Reusing it
-     * rather than copying it means the ExtrasFS lesson M56 learned applies here without being re-learned.
+     * rather than copying it means its handling of foreign files such as the ones ExtrasFS plants in tests applies here too.
      *
      * @return the pipeline store
      */
@@ -1753,7 +1753,7 @@ public final class MetadataPlane {
         final List<ShardAssignment> assignments = new ArrayList<>();
 
         // One listing of this node's own claims, rather than a sweep of every index in the deployment.
-        // Phase 9 measured the difference: the old form cost 2N+1 operations in the population, on the
+        // Measured: a sweep cost 2N+1 operations in the population, on the
         // steady-state path, on every node -- the exact O(population) shape this design exists to remove.
         for (String claim : blobStore.blobContainer(RegisterMap.assignments(base, nodeId)).listBlobs().keySet()) {
             final int separator = claim.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
@@ -1805,7 +1805,7 @@ public final class MetadataPlane {
                 continue;
             }
             // The term comes from the head, which is the one monotonic number every node touching this
-            // shard agrees on. Never a per-node counter -- see s1-findings.md.
+            // shard agrees on. Never a per-node counter, which can make the update be silently ignored.
             assignments.add(new ShardAssignment(indexName, shard, head.get().term()));
             hosted.put(indexName, descriptor.get());
         }

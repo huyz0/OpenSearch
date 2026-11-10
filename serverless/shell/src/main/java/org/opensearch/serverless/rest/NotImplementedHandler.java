@@ -19,14 +19,14 @@ import java.util.List;
 /**
  * Answers a classic OpenSearch endpoint that this shell does not implement with an explicit 501.
  *
- * <p>Decision D2 of {@code rfc-serverless-shell.md} makes the REST surface an allowlist. The reason it
+ * <p>The REST surface is an allowlist. The reason it
  * is worth registering handlers whose only job is to refuse: an unrouted path already fails, but it
  * fails as "no handler for uri", which reads like a typo. These endpoints are not missing — they are
  * absent by design, because there is no elected node to compute a cluster-wide answer and no global
  * state to compute it from.
  *
  * <p>The alternative — implementing them against a node-local view — is precisely the
- * "confident empty answer" failure {@code HANDOFF.md} records eight times, where a green cluster health
+ * "confident empty answer" failure, where a green cluster health
  * or an empty cat listing is returned by a node that simply cannot see anything. A 501 is a worse user
  * experience and a far better answer.
  */
@@ -73,7 +73,7 @@ public final class NotImplementedHandler extends BaseRestHandler {
         }
         // The shared error helper, so a refusal renders the same nested "error" object every other
         // deliberate refusal on this surface does. This handler built its own body with "error" as a bare
-        // string -- the shape M47 removed everywhere else and missed here, which meant the responses
+        // string, unlike every other refusal, which meant the responses
         // trying hardest to explain themselves were the ones a structurally-parsing client broke on.
         // The path is carried in the reason rather than as a field of its own, because the error object's
         // shape is core's and is not this handler's to extend.

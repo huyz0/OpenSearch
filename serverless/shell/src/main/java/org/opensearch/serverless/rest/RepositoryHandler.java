@@ -57,7 +57,7 @@ import java.util.function.Supplier;
  *
  * <p><b>A repository here is a namespace within this deployment's own object store, not a distinct
  * storage backend.</b> Classic OpenSearch's repository abstraction exists to let a snapshot land on
- * storage distinct from the cluster's own data; this shell has exactly one configured object store (D3),
+ * storage distinct from the cluster's own data; this shell has exactly one configured object store,
  * and a snapshot's data already lives durably in it. {@code type} and {@code settings} are accepted and
  * stored the way real OpenSearch's request body shape has them — see {@link RepositoryDescriptor} — but
  * only {@link RepositoryDescriptor#TYPE_NATIVE} is functional; any other {@code type} is refused rather
@@ -190,7 +190,7 @@ public final class RepositoryHandler extends BaseRestHandler {
                                     + selected.type()
                                     + "' is not supported; this deployment has exactly one object store, reached with type '"
                                     + RepositoryDescriptor.TYPE_NATIVE
-                                    + "' (D3)"
+                                    + "'"
                             );
                         }
                         if (selected.cryptoSettings() != null) {

@@ -23,9 +23,8 @@ import java.util.concurrent.CountDownLatch;
 /**
  * A serverless node as a process.
  *
- * <p>This closes the last of M13's headline gap. The scheduler made a node capable of running by itself;
- * until this existed nothing ever built one outside a test, so "a node runs unattended" was true of an
- * arrangement that only ever occurred inside a JUnit method.
+ * <p>The scheduler makes a node capable of running by itself; this is what builds one outside a test, so
+ * that "a node runs unattended" holds for a real process and not only inside a JUnit method.
  *
  * <p><b>What a fresh node serves.</b> A booted node is handed no assignments, because there is nothing
  * to hand them out — that is the point of the design. So it starts with
@@ -36,12 +35,12 @@ import java.util.concurrent.CountDownLatch;
  * anything would be useless. Both defaults are visible, and
  * {@code serverless.activation.on_demand} turns this one off.
  *
- * <p><b>D5, and what it says about the store.</b> A node runs on a local directory ({@code fs}) or on an
- * S3-compatible store ({@code s3}), and the two are not equally proven. The conformance suite R11 wrote
+ * <p><b>What is proven about the store.</b> A node runs on a local directory ({@code fs}) or on an
+ * S3-compatible store ({@code s3}), and the two are not equally proven. The blob-store conformance suite
  * has been run against the filesystem container, MinIO and SeaweedFS; the linearizability of a
  * provider's conditional writes -- the property every register here leans on -- has not been closed for
- * Amazon S3 itself, and D5 says a node may ship on such a provider only behind a flag that says so. So an
- * {@code s3} store boots, and boots with a warning naming R11 and the providers actually tested, unless
+ * Amazon S3 itself, so a node runs on such a provider only behind a flag that says so. An
+ * {@code s3} store boots, and boots with a warning naming the providers actually tested, unless
  * {@link #PROVIDER_ACK} records that the operator has read it. A process that accepted a bucket it has
  * never been run against and said nothing would be worse than one that says what it is.
  */
@@ -173,12 +172,12 @@ public final class ServerlessBootstrap implements Closeable {
 
     /**
      * Set to {@code true} to record that the operator knows an {@code s3} store's conditional writes have
-     * not been proven linearizable by R11's suite against their provider. Silences the boot warning and
+     * not been proven linearizable by the conformance suite against their provider. Silences the boot warning and
      * nothing else: the node behaves the same either way.
      */
     public static final String PROVIDER_ACK = "serverless.store.provider_ack";
 
-    /** The providers R11's conformance suite has actually been run against. */
+    /** The providers the blob-store conformance suite has actually been run against. */
     static final String TESTED_PROVIDERS = "the filesystem container, MinIO and SeaweedFS";
 
     /**
@@ -246,10 +245,10 @@ public final class ServerlessBootstrap implements Closeable {
             throw new IllegalArgumentException(STORE_PATH + " is required: it is where the metadata plane and segments live");
         }
         if ("s3".equals(storeType) && settings.getAsBoolean(PROVIDER_ACK, false) == false) {
-            // D5's flag, as a warning rather than a refusal: a deployment already on such a store must
+            // The provider flag, as a warning rather than a refusal: a deployment already on such a store must
             // not stop booting on upgrade, and an operator who has read this sets the setting once.
             logger.warn(
-                "running on an s3 store: R11's conformance suite has been run against {}, and the linearizability of this "
+                "running on an s3 store: the blob-store conformance suite has been run against {}, and the linearizability of this "
                     + "provider's conditional writes -- which every register here depends on -- has not been closed for it. "
                     + "Set {}=true to record that this is understood.",
                 TESTED_PROVIDERS,

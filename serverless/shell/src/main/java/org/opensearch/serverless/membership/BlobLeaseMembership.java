@@ -25,15 +25,15 @@ import java.util.function.LongSupplier;
 
 /**
  * The default {@link MembershipSource}: one register per node under a shared prefix, listed and
- * filtered by expiry. {@code rfc-serverless-shell.md} §10.2.
+ * filtered by expiry.
  *
  * <p>Zero new infrastructure — it needs only a {@link BlobContainer} that implements the register
  * primitive, which S3, GCS, Azure and the filesystem all do. It is fate-shared with the data: if the
  * object store is gone, membership being unreadable is not the pressing problem.
  *
  * <p><b>Poll-only.</b> Object stores have no watch, so this learns about change only when
- * {@link #refresh()} is called. That is the cost §9.5 records, and the reason §10.2 treats a Kubernetes
- * informer as interesting rather than redundant — it is a real push channel for exactly this.
+ * {@link #refresh()} is called. That is the cost of polling, and the reason a Kubernetes informer is an
+ * interesting alternative rather than a redundant one — it is a real push channel for exactly this.
  *
  * <p><b>What the expiry check assumes, and the margin that makes the assumption a budget.</b> A lease
  * carries an expiry stamped by its writer, compared against the reader's clock. Two clocks are involved
@@ -197,7 +197,7 @@ public final class BlobLeaseMembership implements MembershipSource {
     /**
      * Writes or renews this node's own lease, stamping expiry at {@code now + ttl}.
      *
-     * <p>Uses compare-and-swap against the generation this node last wrote. §9.3 gives each node sole
+     * <p>Uses compare-and-swap against the generation this node last wrote. Each node has sole
      * ownership of its own lease register, so a conflict means something unexpected — a duplicate node
      * id, or a restart that lost track — and is resolved by re-reading rather than by forcing.
      *
@@ -758,7 +758,7 @@ public final class BlobLeaseMembership implements MembershipSource {
                 lastRead.remove(nodeId);
                 // A lease being deleted underneath a read is normal, not exceptional. Skipping an
                 // unreadable one is safe: it can only make us believe fewer nodes exist, and nothing
-                // about safety depends on the member list (§10.1).
+                // about safety depends on the member list.
             }
         }
         if (prunable.isEmpty() == false && index.isPresent()) {
