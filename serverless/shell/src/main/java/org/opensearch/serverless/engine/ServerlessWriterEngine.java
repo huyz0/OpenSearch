@@ -44,7 +44,7 @@ import java.util.List;
  * nothing appended after it is read — so a writer which has lost its head but has not yet noticed, and
  * which goes on appending correctly-tagged records under its own still-valid-looking term, cannot have
  * that history replayed as though it had been acknowledged. See {@link WalStore#position()} for why a
- * snapshot is sufficient, and {@code m49-fencing-notes.md} for the window it does not close.
+ * snapshot is sufficient, and {@code rfc-fencing-closure.md} for the window it does not close.
  */
 public final class ServerlessWriterEngine extends InternalEngine {
 

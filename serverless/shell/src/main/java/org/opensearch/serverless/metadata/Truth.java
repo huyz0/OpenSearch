@@ -19,9 +19,7 @@ import java.util.List;
  *
  * <p>Deliberately not "the cluster state". It contains only the indices this node owns a shard of,
  * which is the property that makes residency proportional to a node's working set rather than to the
- * number of indices in the world — the ceiling
- * {@code plan-area-h-metadata-off-cluster-state.md} measured and the cell-diet design failed to get
- * under from inside the old shell.
+ * number of indices in the world, a ceiling that classic cluster state cannot get under.
  */
 public final class Truth {
 

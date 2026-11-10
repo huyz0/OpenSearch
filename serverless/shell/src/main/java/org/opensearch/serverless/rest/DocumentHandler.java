@@ -27,8 +27,7 @@ import java.util.function.Supplier;
 /**
  * {@code PUT|POST /{index}/_doc/{id}} — the durable write path, reachable by a user.
  *
- * <p>Everything M10 built sat behind a Java method until this existed. A write here reaches the
- * write-ahead log before it is acknowledged, so it survives the writer dying before the next publication.
+ * <p>A write here reaches the write-ahead log before it is acknowledged, so it survives the writer dying before the next publication.
  *
  * <p><b>A node that does not own the shard forwards to the one that does</b>, over transport, and answers
  * as if it had done the write itself. Losing an activation race is still a routing instruction rather
@@ -39,7 +38,7 @@ import java.util.function.Supplier;
  * {@code if_seq_no} and {@code if_primary_term} are passed to the engine, which performs the
  * compare-and-swap itself against the live version map; a lost race is a 409. That became possible when
  * the log started recording each operation's sequence number, so the numbers survive a failover and a
- * token stays meaningful across one — see {@code m48-sequence-numbers-notes.md}.
+ * token stays meaningful across one.
  *
  * <p><b>{@code version} is still refused</b>, and the difference matters: external versioning asks this
  * system to order writes by a number the caller maintains and this system does not keep, which is a

@@ -39,7 +39,7 @@ public final class ForeignWriterException extends StaleWriterException {
                 + "] has already published at that term and this node is ["
                 + attempting
                 + "]. Two nodes hold one term, which means the shard-head compare-and-swap admitted two "
-                + "winners -- the assumption R11 exists to check."
+                + "winners -- the store's conditional writes may not be linearizable."
         );
     }
 }

@@ -34,7 +34,7 @@ import java.util.Optional;
  * property the whole architecture is for: node loss recovers by re-opening from the object store rather
  * than by copying between peers.
  *
- * <p><b>Fencing (section 9.6, R9).</b> A writer holding term T writes segment blobs under
+ * <p><b>Fencing.</b> A writer holding term T writes segment blobs under
  * {@code t=T/}, and the manifest register refuses a publish from a term older than the one it already
  * holds. Both halves are needed and they do different jobs. The manifest CAS stops a stale writer from
  * <em>being believed</em>; the term-scoped prefix stops it from <em>overwriting</em> anything, because

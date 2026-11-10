@@ -49,8 +49,8 @@ import java.util.function.Supplier;
  * node has been near its limit for an hour or was hit by one enormous request. These are the numbers behind
  * those refusals.
  *
- * <p><b>And what it costs.</b> The object store is priced per request, and the RFC treats request counts
- * as service levels from day one; until now the only counter lived in the test kit, so a deployment could
+ * <p><b>And what it costs.</b> The object store is priced per request, and request counts are service
+ * levels from day one; until now the only counter lived in the test kit, so a deployment could
  * not see its own bill forming. The store's counters, the block cache's, the scheduler's and this node's
  * own lease are reported here from memory: nothing below reads the object store to describe it.
  *

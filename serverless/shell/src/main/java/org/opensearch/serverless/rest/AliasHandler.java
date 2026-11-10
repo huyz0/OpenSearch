@@ -33,7 +33,7 @@ import java.util.function.Supplier;
  *
  * <p><b>There is no {@code GET /_alias} that lists them all</b>, and there will not be one for the same
  * reason there is no way to list indices: enumerating a deployment is not an operation this system offers
- * on a request path (&sect;6.3). An alias is looked up by name, like everything else here.
+ * on a request path. An alias is looked up by name, like everything else here.
  *
  * <p><b>Replacing an alias wholesale is a delete and a create; changing its membership is a
  * compare-and-swap.</b> Every add or remove reads the record and the register generation it sits at in one
@@ -152,7 +152,7 @@ public final class AliasHandler extends BaseRestHandler {
             new Route(RestRequest.Method.DELETE, "/_alias/{name}"),
             // OpenSearch's own spellings. This shell shipped a name-scoped API of its own invention and
             // refused these, which was the last shape on this surface that differed from classic for no
-            // architectural reason -- the category M47 cleared out everywhere else.
+            // architectural reason.
             new Route(RestRequest.Method.PUT, "/{index}/_alias/{name}"),
             new Route(RestRequest.Method.POST, "/{index}/_alias/{name}"),
             new Route(RestRequest.Method.GET, "/{index}/_alias/{name}"),

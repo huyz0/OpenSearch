@@ -30,10 +30,9 @@ import java.util.function.Supplier;
 /**
  * {@code PUT /{index}/_settings} — the other half of changing an index after it exists.
  *
- * <p>M52 made mappings mutable and left settings write-once. Both compared serverless products ship both, and
- * the shape of the work is the same: compare-and-swap the descriptor, then apply to the shards this node
- * already holds. What is different, and the reason it was not folded into M52, is that settings have a
- * validity question mappings do not.
+ * <p>The counterpart of the mapping update. The shape of the work is the same: compare-and-swap the
+ * descriptor, then apply to the shards this node already holds. What is different, and the reason it is a
+ * separate handler, is that settings have a validity question mappings do not.
  *
  * <p><b>Which settings may change, and who decides.</b> Core divides index settings into dynamic ones, which
  * may be changed on a live index, and static ones, which classic OpenSearch will only change on a

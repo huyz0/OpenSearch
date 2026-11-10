@@ -19,7 +19,7 @@ import org.opensearch.core.action.ActionListener;
  *
  * <p>In classic OpenSearch this role belongs to {@code Coordinator}, which publishes a consensus-agreed
  * state to every node. Here each node computes its own view from object-store truth, so "publish" means
- * "apply to myself". See {@code rfc-serverless-shell.md} §5.
+ * "apply to myself".
  */
 public final class LocalOnlyPublisher implements ClusterStatePublisher {
 

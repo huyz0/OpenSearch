@@ -37,12 +37,11 @@ import java.nio.file.Path;
  * <p>Everything above this treats the object store as one interface with compare-and-swap registers,
  * ranged reads and listing on it. This is the one place that decides which implementation provides them,
  * and it exists because until now there was no such place: {@code ServerlessBootstrap} constructed an
- * {@code FsBlobStore} inline, so a node could only ever run on a local directory. R11 had established
- * what an object store must provide and that MinIO provides it, and the shell still could not be pointed
- * at one.
+ * {@code FsBlobStore} inline, which meant a node could only run on a local directory even though the
+ * conformance suite had established what an object store must provide.
  *
  * <p><b>S3 is reached through {@link S3RepositoryPlugin#getRepositories}, the supported plugin API.</b>
- * The R11 harness builds an {@code S3BlobStore} directly, from inside the plugin's own package, because a
+ * The conformance tests build an {@code S3BlobStore} directly, from inside the plugin's own package, because a
  * conformance suite has to exercise exactly the container production uses and nothing else. Production
  * code copying that would be depending on package-private constructors — so it does not. The cost is a
  * repository's worth of scaffolding; the benefit is that this keeps working when those internals change.
@@ -172,8 +171,8 @@ public final class ObjectStores {
     /**
      * The store every node runs on: the real one, with every request counted on the way through.
      *
-     * <p>The object store is priced per request and the RFC treats request counts as service levels
-     * from day one, yet the only counter lived in the test kit and production returned the raw store.
+     * <p>The object store is priced per request and request counts are service levels from day
+     * one, yet the only counter lived in the test kit and production returned the raw store.
      * A deployment could measure its cost in a test and not in the field. This is that counter, in the
      * one place every store is built, so {@code /_serverless/stats} can report what the node has spent.
      *

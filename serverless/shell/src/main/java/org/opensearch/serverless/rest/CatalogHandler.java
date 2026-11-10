@@ -30,7 +30,7 @@ import java.util.function.Supplier;
  * <p>These replace the classic APIs that {@link NotImplementedHandler} refuses. The names are different
  * on purpose. {@code _cat/shards} and {@code _cluster/state} promise a cluster-wide answer computed by
  * whoever is asked; these promise a read of the object store, which is a different and weaker claim, and
- * pretending otherwise is how the eight bugs in {@code HANDOFF.md} happened.
+ * pretending otherwise produces confident answers computed from a partial view.
  *
  * <p>{@code /_serverless/nodes} is derived from live leases, not from a member list anyone agreed on —
  * so two nodes may legitimately return different answers, and neither is wrong.

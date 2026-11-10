@@ -29,10 +29,9 @@ import java.util.Objects;
 /**
  * The truth record for one index.
  *
- * <p>In phase 3 this is a blob in the object store, addressed by name and created with a
- * compare-and-swap on a register ({@code plan-area-h-metadata-off-cluster-state.md}). Phase 2 takes it
- * as an in-memory value so the projection and reconciliation paths can be built and tested before the
- * storage layer exists — the shape is the contract, not where it currently lives.
+ * <p>Stored as a blob in the object store, addressed by name and created with a compare-and-swap on a
+ * register. It is also usable as a plain in-memory value, so the projection and reconciliation paths
+ * can be tested without a store: the shape is the contract, not where it lives.
  *
  * <p>Note what is <em>not</em> here: no routing table, no allocation, no in-sync set. Those are not
  * properties of an index, they are properties of who happens to be serving it, and in this design they
@@ -353,7 +352,7 @@ public final class IndexDescriptor {
         builder.mappingVersion(mappingVersion);
         builder.settingsVersion(settingsVersion);
         for (int shard = 0; shard < numberOfShards; shard++) {
-            // S0/F4: the data plane refuses to activate a primary at term 0, so a term must always be
+            // The data plane refuses to activate a primary at term 0, so a term must always be
             // supplied. In this design its only legitimate source is the shard-head's CAS generation.
             builder.primaryTerm(shard, primaryTerms.getOrDefault(shard, 1L));
         }

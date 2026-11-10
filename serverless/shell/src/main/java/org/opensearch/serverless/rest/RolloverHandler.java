@@ -40,7 +40,7 @@ import java.util.function.Supplier;
  *
  * <p>The refusal this replaces said the alias move was the part this design could not do, since each
  * alias is its own compare-and-swap. That is exactly why it can: moving one alias from one index to
- * another is one swap, and M59 already served {@code POST /_aliases} for that case. What is not atomic is
+ * another is one swap, which is what {@code POST /_aliases} already does. What is not atomic is
  * the pair -- create the index, then move the name -- and that is reported rather than hidden: a swap lost
  * to a concurrent rollover removes the index it created, answers 409, and says so; if the removal itself
  * fails, the 409 names the index that was created and not adopted, so nothing is left behind unmentioned.

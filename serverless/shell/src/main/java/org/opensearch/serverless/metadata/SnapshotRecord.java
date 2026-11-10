@@ -291,8 +291,8 @@ public final class SnapshotRecord {
      * this snapshot did not capture that index's uuid, or captured it without that shard.
      *
      * <p>Keyed by uuid rather than by index name on purpose, tighter than {@link PointInTime#referencedBlobs}
-     * is today: a name can be reused by an unrelated later index (M32 is the whole reason storage no longer
-     * is), and a snapshot durable enough to outlive that reuse must not let a later index's shard be
+     * is today: a name can be reused by an unrelated later index (which is why shard storage is keyed by uuid,
+     * not by name), and a snapshot durable enough to outlive that reuse must not let a later index's shard be
      * mistaken for the one it actually captured.
      *
      * <p><b>Always empty for a standard (non-shallow) snapshot.</b> Its bytes were copied into the

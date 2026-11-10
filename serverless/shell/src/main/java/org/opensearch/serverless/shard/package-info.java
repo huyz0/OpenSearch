@@ -11,6 +11,6 @@
  *
  * <p>This package replaces {@code IndicesClusterStateService}, which is the only class in the reused
  * tree that assumes an elected cluster-manager and the only place a projected view could be misread as
- * an instruction to close shards. See {@code rfc-serverless-shell.md} sections 5.2 and 10.5.
+ * an instruction to close shards.
  */
 package org.opensearch.serverless.shard;

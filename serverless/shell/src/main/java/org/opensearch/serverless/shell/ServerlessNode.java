@@ -74,18 +74,15 @@ import static java.util.Collections.emptyMap;
 /**
  * A serverless node: the OpenSearch data plane with no control plane.
  *
- * <p>This is the shell described by {@code rfc-serverless-shell.md}. It constructs {@link IndicesService}
+ * <p>This is the serverless shell. It constructs {@link IndicesService}
  * and {@link SearchService} directly and drives them from a node-local {@link ClusterState} handed to
  * {@link ClusterApplier}, rather than from a consensus-published one. It contains no
  * {@code Coordinator}, no {@code AllocationService}, no {@code GatewayMetaState} and no {@code Node} —
  * a property asserted by test, not by inspection.
  *
- * <p>What is proven about this construction, and what is not, is recorded in {@code s0-findings.md} and
- * {@code s1-findings.md}. Two findings from those probes are load-bearing here and are commented at
- * their call sites: the applier requires a {@link NodeConnectionsService}, and the data plane refuses
- * to activate a primary at term 0.
- *
- * <p>Phase 1 scope: lifecycle and the data plane. No transport, no REST, no metadata plane.
+ * <p>Two properties of this construction are load-bearing and are commented at their call sites: the
+ * applier requires a {@link NodeConnectionsService}, and the data plane refuses to activate a primary
+ * at term 0.
  */
 public final class ServerlessNode implements Closeable {
 
@@ -818,7 +815,7 @@ public final class ServerlessNode implements Closeable {
         settings = this.settings;
 
         this.nodeName = settings.get("node.name", "serverless-node");
-        // §10.4: role is a runtime attribute a node advertises, not a topology decision baked into a
+        // Role is a runtime attribute a node advertises, not a topology decision baked into a
         // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
         // environment variable, and role switching under load stays a policy question.
         this.roles = Set.copyOf(settings.getAsList("serverless.roles", java.util.List.of(ROLE_INGEST, ROLE_SEARCH)));
@@ -919,10 +916,10 @@ public final class ServerlessNode implements Closeable {
             // has to close this one thing above all others: NodeEnvironment holds node.lock.
             openedEnvironment = new NodeEnvironment(settings, environment);
             this.nodeEnvironment = openedEnvironment;
-            // Roles from the lease's roles, never BUILT_IN_ROLES. §10.4 makes the role a lease attribute,
+            // Roles from the lease's roles, never BUILT_IN_ROLES. The role is a lease attribute,
             // and every DiscoveryNode this shell built used to say cluster_manager+data+ingest+warm
             // regardless -- a cluster-manager-role node that merely was not elected, which is exactly the
-            // latent arming of cluster-manager-only paths §10.5 warns about. Data always: this node opens
+            // latent arming of cluster-manager-only paths to avoid. Data always: this node opens
             // IndexShards whatever it serves. Ingest only when it accepts writer activation. Never
             // cluster_manager, never core's search role -- that one means "hosts search replicas" and may
             // not be combined with data, which is not what a serverless search node is.
@@ -1016,13 +1013,13 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * A real {@link ClusterService} with no coordinator behind it — {@code rfc-serverless-shell.md} §5.1.
+     * A real {@link ClusterService} with no coordinator behind it.
      */
     private ClusterService buildClusterService(ClusterSettings clusterSettings) {
         final ClusterService service = new ClusterService(settings, clusterSettings, threadPool);
 
-        // S0/F1: the applier refuses to start without this. In a later phase it holds real transport
-        // connections to the nodes named in the applied view; phase 1 has no transport.
+        // The applier refuses to start without this. Peer connections are not managed from the applied
+        // view, so this one connects to nothing.
         service.setNodeConnectionsService(new NodeConnectionsService(settings, threadPool, null) {
             @Override
             public void connectToNodes(DiscoveryNodes discoveryNodes, Runnable onCompletion) {
@@ -1031,12 +1028,12 @@ public final class ServerlessNode implements Closeable {
 
             @Override
             public void disconnectFromNodesExcept(DiscoveryNodes nodesToKeep) {
-                // no transport in phase 1
+                // peer connections are not driven by the applied view
             }
         });
 
-        // §10.5: clusterManagerNodeId is deliberately unset. There is no election, and S1 confirmed
-        // that nothing in the data plane needs one.
+        // clusterManagerNodeId is deliberately unset. There is no election, and nothing in the data
+        // plane needs one.
         service.getClusterApplierService()
             .setInitialState(
                 ClusterState.builder(ClusterName.CLUSTER_NAME_SETTING.get(settings))
@@ -1146,7 +1143,7 @@ public final class ServerlessNode implements Closeable {
             environment,
             this.plugins.filter(org.opensearch.plugins.AnalysisPlugin.class)
         ).getAnalysisRegistry();
-        // S0/F2: mandatory — DataFormatRegistry calls filterPlugins() during construction. It is now the
+        // Mandatory — DataFormatRegistry calls filterPlugins() during construction. It is now the
         // real one rather than an empty stub, so an installed plugin gets onIndexModule like it would on a
         // classic node.
         return new IndicesService(
@@ -1168,8 +1165,8 @@ public final class ServerlessNode implements Closeable {
             bigArrays(),
             scriptService(),
             clusterService,
-            null,                                   // Client — no node client in phase 1
-            // A no-op, as §6.2 instructs. The real one reads and writes on-disk index state under
+            null,                                   // Client — none at construction
+            // A no-op. The real one reads and writes on-disk index state under
             // gateway/, which is the persistence half of the control plane this shell does not build;
             // IndicesService wants an instance only to look up a deleted index's metadata on disk, and
             // "there is none" is the truthful answer here, because nothing ever wrote any.
@@ -1191,8 +1188,8 @@ public final class ServerlessNode implements Closeable {
             emptyMap(),                             // ingestion consumer factories
             org.opensearch.indices.pollingingest.IngestionPayloadDecoderRegistry.builder().build(),
             () -> null,                             // IngestService — streaming ingestion is not served here
-            // The S0 spike used DefaultRecoverySettings, which lives in test/framework and is not
-            // available to production code. A real shell builds these from settings.
+            // Built from settings: DefaultRecoverySettings lives in test/framework and is not
+            // available to production code.
             new org.opensearch.indices.recovery.RecoverySettings(settings, clusterSettings),
             new org.opensearch.common.cache.module.CacheModule(new ArrayList<>(), settings).getCacheService(),
             new org.opensearch.indices.RemoteStoreSettings(settings, clusterSettings),
@@ -1217,7 +1214,7 @@ public final class ServerlessNode implements Closeable {
      * behind it, and safety comes from the engine being incapable rather than from a convention.
      *
      * <p>Readers needing no coordination is the point, not a shortcut.
-     * {@code rfc-serverless-metadata-plane.md} §6: readers are interchangeable caches, so any search
+     * Readers are interchangeable caches, so any search
      * node can serve any shard by reading its manifest, and the directory tier just learns about it.
      */
     private
@@ -1544,7 +1541,7 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * The REST surface is an explicit allowlist (decision D2). Anything not registered here does not
+     * The REST surface is an explicit allowlist. Anything not registered here does not
      * exist, and returns 404/501 rather than an empty success.
      */
     private RestController buildRestController(ClusterSettings clusterSettings) {
@@ -1587,10 +1584,10 @@ public final class ServerlessNode implements Closeable {
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PointInTimeHandler(() -> this, () -> metadataPlane)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DeleteByQueryHandler(() -> this, () -> metadataPlane)));
         // Snapshot/restore, backed by this deployment's own object store rather than a distinct
-        // repository backend -- R7's "out of scope" closed, not worked around. See m45-snapshot-notes.md.
+        // repository backend.
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.RepositoryHandler(() -> metadataPlane, () -> this)));
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SnapshotHandler(() -> metadataPlane, () -> this)));
-        // The one piece of /_cluster/* not refused below: §9.3's /cluster/config is one register, exactly
+        // The one piece of /_cluster/* not refused below: cluster/config is one register, exactly
         // like an index descriptor, and this node can answer for it the same honest way it answers for an
         // index -- unlike health, state or stats, which are genuinely cluster-wide and would mislead
         // coming from one node.
@@ -1636,12 +1633,12 @@ public final class ServerlessNode implements Closeable {
             )
         );
 
-        // D2: these exist in classic OpenSearch and are absent here by design. Registering an explicit
+        // These exist in classic OpenSearch and are absent here by design. Registering an explicit
         // refusal turns "no handler for uri" — which reads like a typo — into a statement.
         final String noGlobalState = "there is no cluster-wide state in a serverless cluster; "
             + "no node can answer this, and a node-local answer would be misleading";
 
-        // D2 and the enumeration rule together: listing a deployment's indices is an inventory
+        // The allowlist and the enumeration rule together: listing a deployment's indices is an inventory
         // operation, not a serving one. Offering it here -- even paginated -- invites a caller to walk
         // a hundred million indices through a request path, so the request path does not offer it.
         controller.registerHandler(
@@ -1663,8 +1660,8 @@ public final class ServerlessNode implements Closeable {
         // it. A caller reading that a listing is unavailable because there is no cluster state would
         // reasonably conclude the data does not exist -- when in fact it exists, is readable one index at a
         // time, and is refused because reading all of it at once is unbounded. Three of these are refused
-        // because there is no allocator, which is a different thing again. This is the same stale-reason
-        // shape M50 found in _bulk and M51 found in the node endpoints, in its third place.
+        // because there is no allocator, which is a different thing again. A refusal must give the
+        // reason that is actually true.
         final String noClosedState = "an index here is being served or it does not exist: there is no closed state "
             + "for it to be opened from or closed into";
         final String noClusterManager = "there is no cluster manager, so there is no node to name as one";
@@ -1732,8 +1729,9 @@ public final class ServerlessNode implements Closeable {
             )
         );
 
-        // D2 said unimplemented endpoints return 501 with a reason. Ten paths did; everything else a normal
-        // client reaches for fell through to core's default handler and came back as
+        // Unimplemented endpoints return 501 with a reason. Without this list only explicitly refused
+        // paths did; everything else a normal client reaches for fell through to core's default handler
+        // and came back as
         // 400 {"error":"no handler found for uri ..."} -- a bare string, the wrong status, and
         // indistinguishable from a typo. These are the endpoints a client actually tries, each refused with
         // the reason it is refused for rather than with a generic one, because "not here" and "not here
@@ -1816,7 +1814,7 @@ public final class ServerlessNode implements Closeable {
             { "/_component_template/_simulate", simulate },
             // Found by comparing this surface against AWS OpenSearch Serverless and Elastic Cloud
             // Serverless: every one of these is an endpoint a real client reaches for, and every one of them
-            // fell through to core's default 400 rather than the 501 D2 promises. Being absent is a
+            // fell through to core's default 400 rather than the promised 501. Being absent is a
             // decision; looking like a typo is not.
             {
                 "/_field_caps",
@@ -2494,7 +2492,7 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * Starts the node. S0/F3: {@link IndicesService} and {@link SearchService} reject work until started.
+     * Starts the node. {@link IndicesService} and {@link SearchService} reject work until started.
      */
     public void start() {
         // Before anything can be sent to this node. A plugin's action is reachable over the transport
@@ -2803,7 +2801,6 @@ public final class ServerlessNode implements Closeable {
      * owns. Idempotent.
      *
      * <p>This is the whole shell loop in one call: descriptors and shard-heads in, serving shards out.
-     * Phase 3 replaces the arguments with reads from the object store; the shape does not change.
      *
      * @param descriptors the indices this node should know about
      * @param owned the shards this node owns, per shard-heads
@@ -2834,8 +2831,8 @@ public final class ServerlessNode implements Closeable {
      * Reads this node's truth from the metadata plane and applies it.
      *
      * <p>This is the whole steady-state loop, and it replaces cluster-state publication: no node tells
-     * this one what to serve, it reads the object store and works it out. Phase 8 puts this on a timer
-     * and wakes it early on a gossip epoch; phase 3 calls it explicitly.
+     * this one what to serve, it reads the object store and works it out. The background reconciler runs
+     * this on a timer; tests call it explicitly.
      *
      * @param plane the metadata plane to read from
      * @return the shards opened by this call
@@ -2855,20 +2852,19 @@ public final class ServerlessNode implements Closeable {
         reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
         final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId(), localNode.getEphemeralId());
 
-        // Phase 4 has only writer shards, and a node that does not accept writer activation must not
-        // open one. Phase 5 adds reader shards, at which point a search-only node opens those instead of
-        // opening nothing -- so this gate is on the role, not on "has any role".
+        // A node that does not accept writer activation must not open a writer shard. A search-only
+        // node opens reader shards instead -- so this gate is on the role, not on "has any role".
         final java.util.Collection<ShardAssignment> assignable = roles.contains(ROLE_INGEST) ? truth.assignments() : java.util.List.of();
         final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyTruth(truth.descriptors(), assignable);
 
-        // Closing here is NOT the rule §5.2 forbids, but only because of what the close is keyed on --
-        // and it used to be keyed on the wrong thing. Truth's assignment list is derived from a listing
-        // of this node's claim blobs, and RegisterMap says of that listing what the RFC says of every
+        // Closing here does NOT treat absence from a view as removal, but only because of what the close
+        // is keyed on -- and it used to be keyed on the wrong thing. Truth's assignment list is derived
+        // from a listing of this node's claim blobs, and RegisterMap says of that listing what holds for every
         // listing: a hint, not truth. A claim blob whose write failed after the head was won, or a
         // listing that lagged, made truth omit a shard whose head still named this node, and the old
         // loop released it on that evidence alone. So a shard the listing does not vouch for is judged
         // by its head, read directly: only "the head no longer names this node" closes it. That is the
-        // §5.2 rule as written. Readers are skipped outright -- they hold no head and no claim, and on a
+        // rule as written. Readers are skipped outright -- they hold no head and no claim, and on a
         // dual-role node every writer activation used to evict every warm reader through this loop.
         final java.util.Set<String> stillOwned = new java.util.HashSet<>();
         for (ShardAssignment assignment : assignable) {
@@ -3091,7 +3087,7 @@ public final class ServerlessNode implements Closeable {
      * that is not serving it once the lease is live again. A give-back the store refused is retried on the
      * next renewal.
      *
-     * <p>Always, not only under §7's batching. Under batching this is what keeps the node's shards
+     * <p>Always, not only under lease batching. Under batching this is what keeps the node's shards
      * alive; in either mode it is what keeps the node addressable, since peers resolve a forwarding
      * target from its lease. One write per renewal per node.
      *
@@ -3989,8 +3985,8 @@ public final class ServerlessNode implements Closeable {
     /**
      * Indexes a document durably: the write reaches the object store's log before it is acknowledged.
      *
-     * <p>This is the ordering that closes M10's window — the record is in the log before this method
-     * returns, and returning is what acknowledges the write. What changed is <em>where</em> in the method
+     * <p>This is the ordering that closes the unpublished-write window — the record is in the log before
+     * this method returns, and returning is what acknowledges the write. What changed is <em>where</em> in the method
      * the append happens: it used to come first, and now it comes after the engine has run, because the
      * sequence number the record carries does not exist until then. See {@link #appendOrRelease} for what
      * happens when the append is the thing that fails.
@@ -4075,7 +4071,7 @@ public final class ServerlessNode implements Closeable {
      * complete mapping could not accept a single document, and every write of an undeclared field answered
      * with a 500. Every test in this repository happened to declare its mappings, which is why it went unseen.
      *
-     * <p>The equivalent here is the one M52 already built: merge the addition into the descriptor under a
+     * <p>The equivalent here is the one the mapping update uses: merge the addition into the descriptor under a
      * compare-and-swap, apply it to the open shard, and retry once. Concurrent writers adding different
      * fields both win, because that is what the compare-and-swap is for.
      *
@@ -4169,7 +4165,7 @@ public final class ServerlessNode implements Closeable {
             return indexUnderFence(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, false);
         }
         if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
-            // s0-findings.md F5: this is a value, not a throw. A caller that ignores it indexes nothing
+            // This is a value, not a throw. A caller that ignores it indexes nothing
             // and reports no error.
             throw new java.io.IOException("indexing " + id + " returned " + result.getResultType(), result.getFailure());
         }
@@ -4219,7 +4215,7 @@ public final class ServerlessNode implements Closeable {
      *
      * <p><b>Fenced rather than released, which is a brownout decision.</b> This used to close the shard
      * on the spot, and a store that was merely slow for a moment took every writer shard on the node
-     * offline for reads too -- a fully cached copy answering "not open" to a get. §13's rule is that
+     * offline for reads too -- a fully cached copy answering "not open" to a get. The rule is that
      * reads degrade to staleness and writes to rejection. So the shard stays open and readable, refuses
      * every further write ({@link #refuseIfWriteFenced}), is skipped by publication, and is closed and
      * re-acquired from its log by the next heartbeat that reaches the store. Until then a read from this
@@ -4755,7 +4751,7 @@ public final class ServerlessNode implements Closeable {
             throw conflict;
         }
         if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
-            // A value, not a throw -- the same trap s0-findings.md F5 recorded for indexing.
+            // A value, not a throw -- the same trap as for indexing.
             throw new java.io.IOException("deleting " + id + " returned " + result.getResultType());
         }
         appendOrRelease(
@@ -4957,7 +4953,7 @@ public final class ServerlessNode implements Closeable {
                             item.ifPrimaryTerm()
                         );
                         if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
-                            // s0-findings.md F5 again: a failure here is a value, and a caller that reads
+                            // A failure here is a value, and a caller that reads
                             // only the exception channel reports success for an operation that did nothing.
                             outcomes[i] = conflicted(result)
                                 ? BulkOutcome.conflicted(operation.id(), describe("deleting", result))
@@ -5977,8 +5973,7 @@ public final class ServerlessNode implements Closeable {
      * Closes a shard this node has stopped owning.
      *
      * <p>Deliberately separate from {@link #applyTruth}: a shard is never closed because a view omitted
-     * it, only because truth says ownership is gone. See {@code ShardReconciler} and
-     * {@code s1-findings.md}.
+     * it, only because truth says ownership is gone. See {@code ShardReconciler}.
      *
      * @param shardId the shard to release
      * @param reason why, for the log
@@ -6171,7 +6166,7 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * Adds every live member of the fleet to the view's nodes, as §10.5 describes: {@code DiscoveryNodes}
+     * Adds every live member of the fleet to the view's nodes: {@code DiscoveryNodes}
      * built from the membership view, not the local node alone.
      *
      * <p>Nothing in the data plane looks a peer up by id today, so this is a description rather than a
@@ -6253,7 +6248,7 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * The on-disk index-state service §6.2 says this shell never builds, as a no-op that satisfies
+     * The on-disk index-state service this shell never builds, as a no-op that satisfies
      * {@link IndicesService}.
      *
      * <p>Every method answers "nothing is stored here", which is true: no path in this process ever
@@ -6574,9 +6569,8 @@ public final class ServerlessNode implements Closeable {
         // Stop accepting requests first, then close the plugins that were serving them, then the services
         // those plugins were given.
         //
-        // Nothing called this until now: M23 wrote ServerlessPlugins#closeAll and never invoked it, which
-        // was invisible while every plugin in existence was a test plugin holding nothing. The first plugin
-        // that owned a thread pool leaked it out of every node, and the leak detector said so.
+        // ServerlessPlugins#closeAll must be invoked here. Skipping it is invisible while every plugin is a
+        // test plugin holding nothing; a plugin that owns a thread pool leaks it out of every node.
         IOUtils.closeWhileHandlingException(httpServerTransport);
         ServerlessPlugins.closeAll(plugins.plugins());
         // After the plugins, because they were given these and may use them on the way out.

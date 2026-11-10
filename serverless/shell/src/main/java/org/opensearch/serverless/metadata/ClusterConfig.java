@@ -28,7 +28,7 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * §9.3's {@code /cluster/config}: settings an operator sets, one register, CAS on conflict.
+ * The {@code cluster/config} register: settings an operator sets, one register, CAS on conflict.
  *
  * <p><b>A store, not a settings service.</b> Core's {@code ClusterSettings} validates a key against a
  * registry of definitions plugins and modules contribute — types, defaults, validators, which are dynamic
@@ -97,7 +97,7 @@ public final class ClusterConfig {
      * leaves a null-valued tombstone in the map instead of dropping the key, and a register that only ever
      * merged would grow one dead entry per removal, forever.
      *
-     * <p><b>Retried under contention</b> rather than failing on the first lost race, because §9.3's whole
+     * <p><b>Retried under contention</b> rather than failing on the first lost race, because the whole
      * argument for this register is that the writer population is operators at human-scale — a retry here
      * costs one extra read-and-recompute, not a storm.
      *

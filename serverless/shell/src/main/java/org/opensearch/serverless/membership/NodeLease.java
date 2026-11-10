@@ -25,8 +25,8 @@ import java.util.Set;
 /**
  * One node's lease: the single object that says a node is alive and what it is willing to do.
  *
- * <p>{@code rfc-serverless-shell.md} §9.3 gives this a register per node, written only by that node, so
- * it has zero contention by construction. §10.4 puts roles here rather than in cluster topology, which
+ * <p>Each node has its own register, written only by that node, so it has zero contention by
+ * construction. Roles live here rather than in cluster topology, which
  * is what lets one binary serve as ingest or search without a deployment-level distinction.
  *
  * <p>Liveness is expressed as a writer-declared expiry. That trusts the writer's clock — see
@@ -53,7 +53,7 @@ public final class NodeLease {
      * @param nodeId stable node identity
      * @param ephemeralId changes on every restart, so a restarted node is distinguishable
      * @param address transport address, as a hint for peers
-     * @param roles what this node currently accepts, per §10.4
+     * @param roles what this node currently accepts
      * @param expiresAtMillis wall-clock expiry declared by the writer
      */
     public NodeLease(String nodeId, String ephemeralId, String address, Set<String> roles, long expiresAtMillis) {
@@ -76,7 +76,7 @@ public final class NodeLease {
      * @param nodeId stable node identity
      * @param ephemeralId changes on every restart, so a restarted node is distinguishable
      * @param address transport address, as a hint for peers
-     * @param roles what this node currently accepts, per §10.4
+     * @param roles what this node currently accepts
      * @param expiresAtMillis wall-clock expiry declared by the writer
      * @param name the node's configured name, or null
      * @param version the node's build version, or null

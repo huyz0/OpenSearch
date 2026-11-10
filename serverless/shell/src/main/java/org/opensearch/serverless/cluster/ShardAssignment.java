@@ -16,7 +16,7 @@ import java.util.Objects;
  * <p>This is what a shard-head says after a successful compare-and-swap: who owns the shard, and the
  * term that ownership was acquired at. It is the <em>only</em> thing that may cause a shard to be
  * closed. A projected view that fails to mention a shard says nothing about ownership — see
- * {@code ShardReconciler} and {@code s1-findings.md}.
+ * {@code ShardReconciler}.
  */
 public final class ShardAssignment {
 
@@ -35,7 +35,9 @@ public final class ShardAssignment {
         this.indexName = Objects.requireNonNull(indexName);
         this.shardId = shardId;
         if (term < 1) {
-            throw new IllegalArgumentException("shard-head term must be positive, got " + term + " (see s0-findings.md F4)");
+            throw new IllegalArgumentException(
+                "shard-head term must be positive, got " + term + "; the data plane refuses to activate a primary at term 0"
+            );
         }
         this.term = term;
     }

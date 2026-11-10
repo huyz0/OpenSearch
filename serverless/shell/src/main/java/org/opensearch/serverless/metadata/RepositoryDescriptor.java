@@ -30,8 +30,8 @@ import java.util.Objects;
  * <p><b>A repository here is a namespace, not a storage backend.</b> Classic OpenSearch's repository
  * abstraction exists to let a snapshot land on storage distinct from the cluster's own data — a different
  * bucket, a different provider, a different account. This shell has exactly one configured object store
- * (D3: one register implementation, not a pluggable set of backends), and a snapshot's data already lives
- * in it — the same store, the same durability, the same R11 conformance question. {@code type} is accepted
+ * (one register implementation, not a pluggable set of backends), and a snapshot's data already lives
+ * in it — the same store, the same durability, the same conformance question. {@code type} is accepted
  * and stored for a client that sends it, but only the value meaning "this deployment's own store" is
  * functional; a genuinely distinct backend is refused at the REST layer rather than silently ignored (see
  * {@link org.opensearch.serverless.rest.RepositoryHandler}). A caller asking for real cross-store

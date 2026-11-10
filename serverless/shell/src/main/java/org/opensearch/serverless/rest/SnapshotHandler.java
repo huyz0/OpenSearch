@@ -64,7 +64,7 @@ import java.util.regex.Pattern;
  * shard, never touches this storage, because neither one lists it.
  *
  * <p><b>Restoring always creates a new index.</b> This shell's shard storage is keyed by an index's own
- * uuid, so a restore mints a fresh one — reusing one is the exact bug M32 closed — and copies whatever the
+ * uuid, so a restore mints a fresh one — reusing one would let two indices share storage — and copies whatever the
  * snapshot's mode requires: a shallow snapshot's source is the original index's own storage, a standard
  * snapshot's source is its own repository-scoped copy.
  *

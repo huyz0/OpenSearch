@@ -24,10 +24,10 @@ import java.util.List;
  * caller who can write could put a record of their own choosing under an existing account name and become
  * that account. Naming the index with a leading dot is decoration; refusing to route to it is the control.
  *
- * <p><b>Refused entirely, rather than refused to some callers.</b> The shell has no authorization layer
- * (&sect;6.3), so "only administrators may read this" is not a sentence it can enforce. What it can enforce
- * is that <em>no</em> REST request reaches a declared system index, whoever sent it. The owning plugin
- * still reaches it through the {@code Client}, which is the path it was always meant to use, so the rule
+ * <p><b>Refused entirely, rather than refused to some callers.</b> The shell has no authorization layer,
+ * so "only administrators may read this" is not a sentence it can enforce. What it can enforce is that
+ * <em>no</em> REST request reaches a declared system index, whoever sent it. The owning plugin still reaches
+ * it through the {@code Client}, which is the path it was always meant to use, so the rule
  * costs the plugin nothing and closes the hole completely rather than partially.
  *
  * <p><b>Declared by the plugin, through core's API.</b> {@code SystemIndexPlugin#getSystemIndexDescriptors}

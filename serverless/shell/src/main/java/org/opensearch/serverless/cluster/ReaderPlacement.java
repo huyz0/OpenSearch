@@ -31,9 +31,8 @@ import java.util.PriorityQueue;
  *
  * <p><b>Deliberately not the shard's owner.</b> The owner is the <em>writer</em>, established by
  * compare-and-swap on the shard-head. Routing searches there would couple search capacity to write
- * capacity and make per-index search scale-to-zero meaningless — goals 2 and 3 of
- * {@code rfc-serverless-opensearch.md} §2. Reader activation needs no coordination at all
- * ({@code rfc-serverless-metadata-plane.md} §6), so readers are chosen by hashing, not by ownership.
+ * capacity and make per-index search scale-to-zero meaningless. Reader activation needs no coordination
+ * at all, because readers are interchangeable caches, so readers are chosen by hashing, not by ownership.
  *
  * <p><b>Rendezvous hashing rather than modulo.</b> With {@code hash(shard) % n}, adding or losing one
  * node reshuffles almost every shard and throws away every cache. With highest-random-weight, it moves

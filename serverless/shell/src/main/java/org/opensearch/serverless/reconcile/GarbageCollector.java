@@ -52,8 +52,8 @@ import java.util.TreeSet;
  * a writer at an older term can no longer publish at all — that is what the fence in
  * {@link SegmentPublisher} guarantees.
  *
- * <p>Condition 2 exists because a failover <em>inherits</em> files rather than re-uploading them
- * (phase 4), so files a live commit depends on routinely live in older term containers. Collecting by
+ * <p>Condition 2 exists because a failover <em>inherits</em> files rather than re-uploading them,
+ * so files a live commit depends on routinely live in older term containers. Collecting by
  * term alone would delete exactly the data the current writer is serving. That is the mistake this
  * class is shaped to make impossible, and the one its tests are pointed at.
  *
@@ -439,9 +439,8 @@ public final class GarbageCollector {
      *
      * <p>This is the shape a sweep at target scale has to have, and {@link #collectAll} is a loop over
      * it kept for small deployments and tests. A real fleet runs many workers each taking a slice, which
-     * is what {@code rfc-serverless-metadata-plane.md} §6 means by control logic being many small
-     * idempotent loops: nothing here is privileged, and two workers collecting the same slice at once is
-     * wasteful rather than wrong.
+     * is the point of control logic being many small idempotent loops: nothing here is privileged, and
+     * two workers collecting the same slice at once is wasteful rather than wrong.
      *
      * @param plane the metadata plane
      * @param after resume point, or null to start
@@ -626,7 +625,7 @@ public final class GarbageCollector {
      * parse is a sweep that eventually deletes somebody else's bucket.
      *
      * <p><b>This visits every shard container in the deployment</b>, which is proportional to the population
-     * and is the thing §6.3 forbids on a request path. It is allowed here for the same reason
+     * and is the thing a request path must never do. It is allowed here for the same reason
      * {@link #collectAll} is: a sweep genuinely intends to visit everything, and nothing waits on it. It walks
      * the containers a thousand at a time, so its memory is a page; the background runs the resumable form,
      * {@link #collectOrphanedShards(MetadataPlane, int)}, a slice at a time.

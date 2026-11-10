@@ -27,8 +27,8 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * The loop that keeps a node's shards where they should be.
  *
- * <p>Phase 6 left this gap explicitly: leases could expire and a successor could take over, but nothing
- * <em>noticed</em>. A node had to be told to activate. This is the noticing — and it is deliberately not
+ * <p>Without it, leases could expire and a successor could take over, but nothing would
+ * <em>notice</em>. A node had to be told to activate. This is the noticing — and it is deliberately not
  * privileged. Every node runs the same loop, any number may run it at once, and a node that stops
  * running it harms nothing but its own shards, because every action it takes goes through the same
  * compare-and-swap as everyone else.
@@ -905,7 +905,7 @@ public final class BackgroundReconciler implements Closeable {
      * refusal rather than an eviction. "Scale to zero" was something an operator did by killing the
      * process, not something the system did.
      *
-     * <p><b>The trade is measured on both sides</b> ({@code m20-fanout-notes.md}). Holding an idle shard
+     * <p><b>The trade is measured on both sides.</b> Holding an idle shard
      * costs reads on every reconcile tick, in proportion to how many are held. Releasing one and opening
      * it again costs about 41 object-store requests, of which 12 are data. So releasing pays as soon as a
      * shard stays cold for longer than the re-open cost divided by the per-tick holding cost, and the

@@ -64,8 +64,8 @@ import java.util.function.UnaryOperator;
 /**
  * The shell's own authentication, written as a plugin against the shell's own plugin host.
  *
- * <p><b>Why the shell's authentication is a plugin at all.</b> M23 built a host: components, routes and a
- * request wrapper, with no injector. It was proved by a test plugin, which is a plugin whose behaviour was
+ * <p><b>Why the shell's authentication is a plugin at all.</b> The shell's plugin host supplies components,
+ * routes and a request wrapper, with no injector. A test plugin alone would prove it with behaviour
  * chosen to make the host look good. This is the same host carrying something the system genuinely needs,
  * on the critical path of every request, storing its state in an index through the client. If the host
  * cannot carry this, it cannot carry OpenSearch Security either, and it is better to find that out from
@@ -79,7 +79,7 @@ import java.util.function.UnaryOperator;
  *
  * <p><b>What this is not.</b> It authenticates and it does not authorize. Every authenticated caller can
  * do everything, because privilege evaluation in OpenSearch is keyed on action names at the
- * {@code ActionFilter} layer, and R4/&sect;6.3 leaves that layer unbuilt. The single exception is one
+ * {@code ActionFilter} layer, and the shell deliberately has no action layer. The single exception is one
  * hard-coded rule — only the configured account may manage accounts — which exists so that account
  * management is not self-service, and which is deliberately one rule rather than the beginnings of a role
  * model. Calling it "roles" when it is one {@code if} would be the kind of half-implemented security that
@@ -915,8 +915,8 @@ public final class ServerlessAuthPlugin extends Plugin implements org.opensearch
     }
 
     private static String unsupported(String what) {
-        // D2, one layer down: refuse and say why, rather than hand back something that looks like a token
-        // and authenticates nobody. Both of these delegate authority, and delegating authority is only
+        // The REST surface's rule, one layer down: refuse and say why, rather than hand back something that
+        // looks like a token and authenticates nobody. Both of these delegate authority, and delegating authority is only
         // meaningful where there is authorization to delegate.
         return "the serverless shell does not issue "
             + what

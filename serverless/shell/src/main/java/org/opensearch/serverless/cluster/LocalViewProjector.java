@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * Builds the {@link ClusterState} this node holds, from the descriptors and assignments it knows about.
  *
- * <p>This is the mechanism at the centre of {@code rfc-serverless-shell.md} §5. The state it produces is
+ * <p>This is the mechanism at the centre of the shell's design. The state it produces is
  * a <em>cache</em>, not a truth: it is never published, never diffed, never agreed. It contains only
  * what this node hosts, which is what makes its cost proportional to the working set rather than to the
  * number of indices in the world.
@@ -44,9 +44,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p><b>Versions are per-node and are not comparable across nodes.</b> The counter here exists only to
  * satisfy {@link ClusterState}'s own monotonicity. It must never be fed to
- * {@code IndexShard#updateShardState} as the applying version — S1 reproduced what happens if it is
- * (a silently ignored update), and the shard-head term is used there instead. See
- * {@code s1-findings.md} and §5.3.
+ * {@code IndexShard#updateShardState} as the applying version: if it is, the update can be silently
+ * ignored, so the shard-head term is used there instead.
  */
 public final class LocalViewProjector {
 

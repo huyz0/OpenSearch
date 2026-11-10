@@ -38,13 +38,13 @@ import java.util.function.Supplier;
  * <p><b>Why this is one class rather than an action layer.</b> Plugins do not call {@code TransportAction}
  * directly; they call {@code Client}. And {@code AbstractClient} funnels its entire surface — dozens of
  * methods, every builder — through a single abstract {@code doExecute}. So a working client for the shell
- * is a dispatch table, not the {@code action/} package §6.3 decided not to build. That decision is what
+ * is a dispatch table, not the {@code action/} package the shell deliberately does not build. That decision is what
  * keeps this project small, and this class is what makes it survivable: plugins get the interface they
  * expect without the machinery behind it coming back.
  *
  * <p><b>An allowlist, and it refuses out loud.</b> Supported actions are the ones a plugin needs to keep
  * state in an index: index, get, delete, search and create-index. Everything else throws, naming the action. That
- * is D2 applied one layer down — an unimplemented endpoint returns 501 with a reason rather than an empty
+ * is the REST allowlist rule applied one layer down — an unimplemented endpoint returns 501 with a reason rather than an empty
  * success, and an unimplemented action does the same rather than quietly returning a default-constructed
  * response, which for a search would be "no results" and for a delete would be "done".
  *

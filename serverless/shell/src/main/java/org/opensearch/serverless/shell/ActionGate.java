@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * <p><b>The gap this closes.</b> Authorization in OpenSearch is keyed on action names and enforced by
  * {@link ActionFilter}s, which classic {@code ActionModule} wraps around every {@code TransportAction}.
- * &sect;6.3 declined to build an action layer, so until now a plugin could authenticate a caller and had no
+ * The shell declines to build an action layer, so without this a plugin could authenticate a caller and had no
  * way whatsoever to restrict what that caller then did. The shell's own authentication plugin says as much
  * in its own documentation: it authenticates and does not authorize. This is the seam that changes.
  *

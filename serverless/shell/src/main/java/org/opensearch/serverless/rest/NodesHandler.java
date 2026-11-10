@@ -31,8 +31,8 @@ import java.util.function.Supplier;
  * and it stopped being true the moment leases became an address book. Every node publishes a lease to a
  * register in the object store and reads the others' to know where to forward a write; that registry
  * <em>is</em> the membership list. A refusal that says nobody can answer, from a node that answers this exact
- * question on every heartbeat in order to route traffic, is a stale refusal — the same kind M50 found in
- * {@code _bulk}, and worth naming as such rather than quietly fixing.
+ * question on every heartbeat in order to route traffic, is a stale refusal, and worth naming as such
+ * rather than quietly fixing.
  *
  * <p><b>What is honest about the answer, and what is not claimed.</b> This is the set of nodes holding an
  * unexpired lease, as observed by this node, now. It is not a consensus snapshot and nothing here pretends
