@@ -118,6 +118,7 @@ public class PublishSpacingTests extends OpenSearchTestCase {
                     cost.requests(),
                     cost.breakdown()
                 );
+                logger.info("publish spacing [{}]: where the requests went\n{}", label, store.byPlace());
                 return cost;
             }
         }

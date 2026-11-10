@@ -50,8 +50,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * it becomes searchable.</b> A reader serves a shard's published commit, and a writer serves what it has
  * refreshed. So:
  * <ul>
- *   <li>A publish widens the shard's digest here <em>before</em> it writes its manifest. A publish that fails in
- *   between leaves the entry wider than the commit, never narrower.</li>
+ *   <li>A publish widens the shard's digest here <em>before</em> it writes its manifest, unless a writer's mark
+ *   already keeps the shard from being ruled out. A publish that fails in between leaves the entry wider than the
+ *   commit, never narrower.</li>
+ *   <li>Clearing a writer's mark widens the digest to the published commit's in the same swap, so what was published
+ *   under the mark is covered from the moment the shard can be ruled out.</li>
  *   <li>A writer records its term here <em>before</em> it opens the shard, and a shard with a writer is never
  *   ruled out. Letting go clears the term only if it is still that writer's, so a predecessor's late clear
  *   cannot unmark its successor.</li>
@@ -226,6 +229,41 @@ public final class DigestRollups {
     }
 
     /**
+     * Widens a shard's digest for a publish, unless a writer at {@code term} or later already marks the shard.
+     *
+     * <p>A marked shard is never ruled out, so widening its digest while the mark stands changes no search: it is a
+     * register read and swap per publish, which on a shard whose fields move with every write (a counter, a sequence)
+     * is one of the larger parts of what a publish costs. The digest has to be right only from the moment the mark
+     * is cleared, and every clear widens it to the published commit's digest in the same swap -- see
+     * {@link #clearOwned(String, String, int, long, PruningDigest)}. So this skips the register when this node's copy
+     * shows the mark, and widens as {@link #widen} does when it does not.
+     *
+     * @param name the index
+     * @param uuid the incarnation publishing
+     * @param shards its shard count
+     * @param shard the shard
+     * @param term the publishing writer's term
+     * @param digest the commit's digest
+     * @throws IOException if the register cannot be updated; the caller must not publish
+     */
+    public void widenUnlessMarked(String name, String uuid, int shards, int shard, long term, PruningDigest digest) throws IOException {
+        if (term > 0L) {
+            final Map<String, Entry> remembered = known.get(group(name) + "/" + blob(bucket(name)));
+            final Entry entry = remembered == null ? null : remembered.get(name);
+            // This node's copy, which can be stale only towards less: a mark is cleared by its own writer, or on its
+            // behalf once its head is gone, and neither happens while this writer still publishes at this term.
+            if (entry != null
+                && entry.alias() == false
+                && entry.uuid().equals(uuid)
+                && shard < entry.states().size()
+                && entry.states().get(shard).ownerTerm() >= term) {
+                return;
+            }
+        }
+        widen(name, uuid, shards, shard, digest);
+    }
+
+    /**
      * Records that a writer holds a shard at a term. Called before the shard is opened.
      *
      * @param name the index
@@ -257,7 +295,23 @@ public final class DigestRollups {
      * @throws IOException if the register cannot be updated
      */
     public void clearOwned(String name, String uuid, int shard, long term) throws IOException {
-        clearOwned(name, uuid, shard, term, true);
+        clearOwned(name, uuid, shard, term, null, true);
+    }
+
+    /**
+     * Clears a writer's mark, if it is still that writer's, widening the shard's digest to the published commit's in
+     * the same swap. Publishes made under the mark skip the rollup ({@link #widenUnlessMarked}), so this is where the
+     * entry catches up with them, before the shard can be ruled out.
+     *
+     * @param name the index
+     * @param uuid the incarnation
+     * @param shard the shard
+     * @param term the term being given up
+     * @param published the digest of the shard's published commit, or null if it has none
+     * @throws IOException if the register cannot be updated
+     */
+    public void clearOwned(String name, String uuid, int shard, long term, PruningDigest published) throws IOException {
+        clearOwned(name, uuid, shard, term, published, true);
     }
 
     /**
@@ -273,10 +327,27 @@ public final class DigestRollups {
      * @throws IOException if the register cannot be updated
      */
     public void clearOwnedOf(String name, String uuid, int shard, long term) throws IOException {
-        clearOwned(name, uuid, shard, term, false);
+        clearOwned(name, uuid, shard, term, null, false);
     }
 
-    private void clearOwned(String name, String uuid, int shard, long term, boolean trustRemembered) throws IOException {
+    /**
+     * Clears a mark another node left, widening the digest to the published commit's in the same swap, and reading the
+     * register rather than trusting this node's copy.
+     *
+     * @param name the index
+     * @param uuid the incarnation
+     * @param shard the shard
+     * @param term the term the mark records
+     * @param published the digest of the shard's published commit, or null if it has none
+     * @throws IOException if the register cannot be updated
+     */
+    public void clearOwnedOf(String name, String uuid, int shard, long term, PruningDigest published) throws IOException {
+        clearOwned(name, uuid, shard, term, published, false);
+    }
+
+    private void clearOwned(String name, String uuid, int shard, long term, PruningDigest published, boolean trustRemembered)
+        throws IOException {
+        final PruningDigest coarse = published == null ? null : published.coarsened();
         update(name, trustRemembered, entry -> {
             if (entry == null || entry.alias() || entry.uuid().equals(uuid) == false || shard >= entry.states().size()) {
                 return null;
@@ -285,7 +356,8 @@ public final class DigestRollups {
             if (was.ownerTerm() != term) {
                 return null;
             }
-            return with(entry, shard, new ShardState(0L, was.digest()));
+            final PruningDigest digest = coarse == null ? was.digest() : was.digest() == null ? coarse : was.digest().union(coarse);
+            return with(entry, shard, new ShardState(0L, digest));
         });
     }
 

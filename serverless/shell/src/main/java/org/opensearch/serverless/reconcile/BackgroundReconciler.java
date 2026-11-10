@@ -1271,9 +1271,18 @@ public final class BackgroundReconciler implements Closeable {
         lastPublishedMaxSeqNo.remove(shardId);
         lastPublishedAtMillis.remove(shardId);
         // Unmarked only now, with the last publish recorded and no writer left: from here a coordinator may
-        // rule the shard out from its digest. A clear that fails leaves it marked, which costs a check.
+        // rule the shard out from its digest, so the clear also widens the entry to the published commit, which
+        // the publishes made under the mark did not. A clear that fails leaves it marked, which costs a check.
         try {
-            plane.rollups().clearOwned(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id(), head.get().term());
+            final var published = plane.segmentPublisher(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id()).readManifest();
+            plane.rollups()
+                .clearOwned(
+                    shardId.getIndexName(),
+                    shardId.getIndex().getUUID(),
+                    shardId.id(),
+                    head.get().term(),
+                    published.map(org.opensearch.serverless.store.CommitManifest::digest).orElse(null)
+                );
         } catch (Exception e) {
             logger.warn("could not clear the writer mark of " + shardId + " in its digest rollup; searches will not skip it", e);
         }

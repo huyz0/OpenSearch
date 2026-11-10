@@ -1569,7 +1569,7 @@ public final class MetadataPlane {
         if (unpublished(indexName, uuid, shard, log)) {
             return Settled.NEEDS_REPLAY;
         }
-        rollups().clearOwnedOf(indexName, uuid, shard, previous.term());
+        rollups().clearOwnedOf(indexName, uuid, shard, previous.term(), publishedDigest(indexName, uuid, shard));
         forgetAssignment(deadNodeId, indexName, shard);
         return Settled.RELEASED_CLEAN;
     }
@@ -1601,8 +1601,18 @@ public final class MetadataPlane {
             return Settled.NEEDS_REPLAY;
         }
         // A writer that takes the shard meanwhile marks it at a higher term first, which this clear leaves alone.
-        rollups().clearOwnedOf(indexName, uuid, shard, markedTerm);
+        rollups().clearOwnedOf(indexName, uuid, shard, markedTerm, publishedDigest(indexName, uuid, shard));
         return Settled.RELEASED_CLEAN;
+    }
+
+    /**
+     * The digest of a shard's published commit, which a cleared writer mark must leave its rollup entry covering: the
+     * writer's publishes skipped the rollup while its mark stood. Null when nothing is published.
+     */
+    private org.opensearch.serverless.store.PruningDigest publishedDigest(String indexName, String uuid, int shard) throws IOException {
+        return segmentPublisher(indexName, uuid, shard).readManifest()
+            .map(org.opensearch.serverless.store.CommitManifest::digest)
+            .orElse(null);
     }
 
     /**
