@@ -100,7 +100,11 @@ public final class GcsEmulatorBlobStores {
     public static void deleteBucket(String endpoint, String bucket) {
         try {
             final GoogleCloudStorageService service = service(endpoint);
-            final Storage client = service.client(CLIENT, "serverless-gcs-cleanup-" + bucket, new GoogleCloudStorageOperationsStats(bucket));
+            final Storage client = service.client(
+                CLIENT,
+                "serverless-gcs-cleanup-" + bucket,
+                new GoogleCloudStorageOperationsStats(bucket)
+            );
             for (Blob blob : client.list(bucket, Storage.BlobListOption.versions(true)).iterateAll()) {
                 client.delete(blob.getBlobId());
             }
