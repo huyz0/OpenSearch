@@ -70,6 +70,7 @@ public final class MetadataPlane {
      * @param leaseTtlMillis lease duration for shard-heads and node leases
      */
     public MetadataPlane(BlobStore blobStore, BlobPath base, LongSupplier clock, long leaseTtlMillis) {
+        this.routingCache = new RoutingCache(this::resolve, clock);
 
         this.descriptors = new DescriptorStore(
             blobStore.blobContainer(RegisterMap.indices(base)),
@@ -119,6 +120,7 @@ public final class MetadataPlane {
         this.base = base;
         this.leaseTtlMillis = leaseTtlMillis;
         this.clock = clock;
+        this.transportSecretStore = new TransportSecretStore(blobStore.blobContainer(RegisterMap.clusterConfig(base)), clock);
         this.pointInTimeStore = new PointInTimeStore(
             blobStore.blobContainer(RegisterMap.pointsInTime(base)),
             blobStore.blobContainer(RegisterMap.pointInTimeStates(base)),
@@ -830,135 +832,41 @@ public final class MetadataPlane {
         }
     }
 
-    /**
-     * How long a routing lookup may answer from a resolution it read earlier.
-     *
-     * <p>One second, which is the interval {@code SearchHandler} already probes membership on and is
-     * chosen to match it rather than independently. Both are the same trade: a fact that changes rarely,
-     * read on the critical path of every request, is worth serving from a snapshot that is at most this
-     * far behind.
-     */
-    public static final long DEFAULT_ROUTING_CACHE_MILLIS = 1_000L;
-
-    /** A resolution and when it was read. */
-    private record CachedResolution(DescriptorStore.Resolution resolution, long atMillis, long readStartedNanos, long weight) {
-    }
+    /** How long a routing lookup may answer from a resolution it read earlier, by default. See {@link RoutingCache}. */
+    public static final long DEFAULT_ROUTING_CACHE_MILLIS = RoutingCache.DEFAULT_ROUTING_CACHE_MILLIS;
 
     /** Approximate retained memory budget, including the lazily rendered routing metadata. */
-    public static final long DEFAULT_ROUTING_CACHE_MAXIMUM_WEIGHT = 64L * 1024 * 1024;
+    public static final long DEFAULT_ROUTING_CACHE_MAXIMUM_WEIGHT = RoutingCache.DEFAULT_ROUTING_CACHE_MAXIMUM_WEIGHT;
 
-    private final org.opensearch.common.cache.Cache<String, CachedResolution> routingCache = org.opensearch.common.cache.CacheBuilder.<
-        String,
-        CachedResolution>builder().setMaximumWeight(DEFAULT_ROUTING_CACHE_MAXIMUM_WEIGHT).weigher((name, value) -> value.weight()).build();
-    private final Object routingCacheMutation = new Object();
-    private long routingCacheEpoch;
-    private volatile long routingCacheMillis = DEFAULT_ROUTING_CACHE_MILLIS;
+    /** Past this many names, routing-cache entries older than the window are dropped. */
+    public static final int DEFAULT_ROUTING_CACHE_PRUNE_ABOVE = RoutingCache.DEFAULT_ROUTING_CACHE_PRUNE_ABOVE;
+
+    /** What routing lookups may answer from; the methods below forward to it. */
+    private final RoutingCache routingCache;
 
     /**
-     * Resolves a name for <em>routing</em>, which may be answered from a recent read.
-     *
-     * <p><b>Why this is separate from {@link #resolve} rather than replacing it.</b> A descriptor read was
-     * the whole object-store cost of a warm search and half the cost of a write -- one register GET per
-     * request per index named, for a fact that changes when an operator changes it. But most callers of
-     * {@code resolve} are <em>mutating</em>: they need the generation they read to hold a compare-and-swap
-     * together, and a generation from a second ago is a swap that will be refused or, worse, one that lands
-     * on a record it never saw. Those callers keep reading through. Only routing uses this.
-     *
-     * <p><b>What a stale answer can and cannot do.</b> A descriptor carries the index's uuid, and the uuid
-     * is checked again wherever the request lands: {@code place} matches an open shard on uuid as well as
-     * name, and a forwarded request is refused by {@code ShardRouter} when the uuid it carries is not the
-     * one the shard has. That catches a stale resolution only when the landing node no longer holds the old
-     * incarnation's shard. When it still does, the uuids match -- both are the old one -- and this cache
-     * alone acknowledged a write into a deleted index. What closes that is the landing node's own fence:
-     * it answers from a shard only within {@code ServerlessNode#INCARNATION_FENCE_MILLIS} of having read
-     * that the shard's incarnation still exists, and a delete answers only after that window has passed.
-     * So a request routed here can be refused and retried, and is never answered from an incarnation whose
-     * delete has returned. Search, get, multi-get and the shard operations behind them route through here
-     * on the same terms as writes.
-     *
-     * <p><b>A miss is never cached.</b> Create-then-write against a name this node has not seen reads
-     * through and finds it, so a new index is usable the instant it exists. What ages is only a name
-     * already in hand: a mapping or rollover reaching this node up to a second late, which is the window
-     * open shards already have for mapping changes, and a deleted index resolving for up to a second more.
+     * Resolves a name for <em>routing</em>, which may be answered from a recent read. See
+     * {@link RoutingCache#resolveForRouting} for why only routing may, and what a stale answer can do.
      *
      * @param name the index or alias name
      * @return what it names
      * @throws IOException if the register cannot be read or parsed
      */
     public DescriptorStore.Resolution resolveForRouting(String name) throws IOException {
-        if (routingCacheMillis <= 0L) {
-            return resolve(name);
-        }
-        final long now = clock.getAsLong();
-        final CachedResolution seen = routingCache.get(name);
-        if (seen != null && now - seen.atMillis() <= routingCacheMillis) {
-            return seen.resolution();
-        }
-        final long epoch;
-        synchronized (routingCacheMutation) {
-            epoch = routingCacheEpoch;
-        }
-        final long readStartedNanos = System.nanoTime();
-        final DescriptorStore.Resolution fresh = resolve(name);
-        synchronized (routingCacheMutation) {
-            // A read started before a local mutation must not republish the invalidated value.
-            if (epoch == routingCacheEpoch) {
-                if (fresh.absent()) {
-                    routingCache.invalidate(name);
-                } else {
-                    final long weight = routingCacheWeight(name, fresh);
-                    if (weight <= routingCache.getMaximumWeight()) {
-                        routingCache.put(name, new CachedResolution(fresh, now, readStartedNanos, weight));
-                    } else {
-                        // A one-off large mapping must not evict every useful small resolution.
-                        routingCache.invalidate(name);
-                    }
-                    pruneRoutingCache(now);
-                }
-            }
-        }
-        return fresh;
+        return routingCache.resolveForRouting(name);
     }
 
     /**
-     * When this node last read an index's descriptor from the store and found it at this uuid, by
-     * {@link System#nanoTime}, taken as the read began -- for the incarnation fence, which that read confirms as
-     * surely as one of its own. A read answered from the cache is not a read and does not move it.
+     * When this node last read an index's descriptor from the store and found it at this uuid, for the incarnation
+     * fence. See {@link RoutingCache#readConfirmingIncarnation}.
      *
      * @param indexName the index
      * @param uuid the incarnation
      * @return what the read found and when it began, or empty if no cached read found this index at this uuid
      */
     public java.util.Optional<ConfirmingRead> readConfirmingIncarnation(String indexName, String uuid) {
-        final CachedResolution seen = routingCache.get(indexName);
-        if (seen == null || seen.resolution().index() == null || uuid.equals(seen.resolution().index().uuid()) == false) {
-            return java.util.Optional.empty();
-        }
-        return java.util.Optional.of(new ConfirmingRead(seen.resolution().index(), seen.readStartedNanos()));
+        return routingCache.readConfirmingIncarnation(indexName, uuid);
     }
-
-    /**
-     * A descriptor read from the store, and when that read began by {@link System#nanoTime}.
-     *
-     * @param descriptor what was read
-     * @param readStartedNanos when the read began
-     */
-    public record ConfirmingRead(IndexDescriptor descriptor, long readStartedNanos) {
-    }
-
-    /**
-     * Past this many names, entries older than the window are dropped.
-     *
-     * <p>An entry past the window answers nothing -- the next lookup reads through and overwrites it -- so
-     * dropping one changes no answer. Without this the map kept every name this node ever wrote to or read,
-     * for the life of the process, each with its whole descriptor, mapping included: a coordinator that
-     * touched a million daily indices over a year held them all. With it, the map holds what was resolved
-     * in the last second, plus up to this many stragglers.
-     */
-    public static final int DEFAULT_ROUTING_CACHE_PRUNE_ABOVE = 10_000;
-
-    private volatile int routingCachePruneAbove = DEFAULT_ROUTING_CACHE_PRUNE_ABOVE;
-    private volatile long routingCachePrunedAt = Long.MIN_VALUE;
 
     /**
      * Sets how many names the routing cache may hold before expired ones are dropped.
@@ -967,24 +875,8 @@ public final class MetadataPlane {
      * @return this, for chaining
      */
     public MetadataPlane setRoutingCachePruneAbove(int entries) {
-        this.routingCachePruneAbove = Math.max(0, entries);
+        routingCache.setRoutingCachePruneAbove(entries);
         return this;
-    }
-
-    private void pruneRoutingCache(long now) {
-        // At most once per window: a walk per insert would make a busy coordinator pay for its own cache.
-        if (routingCache.count() <= routingCachePruneAbove
-            || (routingCachePrunedAt != Long.MIN_VALUE && now - routingCachePrunedAt < routingCacheMillis)) {
-            return;
-        }
-        routingCachePrunedAt = now;
-        final long window = routingCacheMillis;
-        for (String name : routingCache.keysSnapshot()) {
-            final CachedResolution seen = routingCache.get(name);
-            if (seen != null && now - seen.atMillis() > window) {
-                routingCache.invalidate(name, seen);
-            }
-        }
     }
 
     /**
@@ -993,24 +885,17 @@ public final class MetadataPlane {
      * @return the entry count
      */
     public int routingCacheSize() {
-        return routingCache.count();
+        return routingCache.routingCacheSize();
     }
 
     /**
-     * Drops a name from the routing cache, so a change this node just made is visible to its own next
+     * Drops a name from this node's routing cache, so a change this node just made is visible to its own next
      * request rather than a window later.
-     *
-     * <p>Only this node's cache: another node's ages out on its own. That asymmetry is deliberate and is
-     * what keeps read-your-writes true where a client is most likely to notice it, which is against the
-     * node it just wrote to.
      *
      * @param name the index or alias name
      */
     public void forgetRouting(String name) {
-        synchronized (routingCacheMutation) {
-            routingCacheEpoch++;
-            routingCache.invalidate(name);
-        }
+        routingCache.forgetRouting(name);
     }
 
     /**
@@ -1020,41 +905,8 @@ public final class MetadataPlane {
      * @return this plane
      */
     public MetadataPlane setRoutingCacheMaximumWeight(long bytes) {
-        synchronized (routingCacheMutation) {
-            routingCache.setMaximumWeight(bytes);
-            routingCache.refresh();
-        }
+        routingCache.setRoutingCacheMaximumWeight(bytes);
         return this;
-    }
-
-    private static long routingCacheWeight(String name, DescriptorStore.Resolution resolution) {
-        // Include a fixed object/entry allowance and headroom for parsed routing metadata. Counting
-        // only names would leave a handful of large mappings or aliases able to exhaust the heap.
-        long weight = 4096L + 2L * name.length();
-        final IndexDescriptor index = resolution.index();
-        if (index != null) {
-            weight += 256L * index.numberOfShards() + 2L * (index.name().length() + index.uuid().length());
-            if (index.mapping() != null) {
-                weight += 16L * index.mapping().length();
-            }
-            for (String key : index.extraSettings().keySet()) {
-                weight += 128L + 16L * (key.length() + index.extraSettings().get(key, "").length());
-            }
-            for (String alias : index.aliasedBy()) {
-                weight += 64L + 2L * alias.length();
-            }
-        }
-        final var alias = resolution.alias();
-        if (alias != null) {
-            weight += 2L * alias.name().length();
-            for (String member : alias.indices()) {
-                weight += 64L + 2L * member.length();
-            }
-            for (String member : alias.pendingAdditions()) {
-                weight += 64L + 2L * member.length();
-            }
-        }
-        return weight;
     }
 
     /**
@@ -1064,8 +916,17 @@ public final class MetadataPlane {
      * @return this, for chaining
      */
     public MetadataPlane setRoutingCacheMillis(long millis) {
-        this.routingCacheMillis = Math.max(0L, millis);
+        routingCache.setRoutingCacheMillis(millis);
         return this;
+    }
+
+    /**
+     * A descriptor read from the store, and when that read began by {@link System#nanoTime}.
+     *
+     * @param descriptor what was read
+     * @param readStartedNanos when the read began
+     */
+    public record ConfirmingRead(IndexDescriptor descriptor, long readStartedNanos) {
     }
 
     /**
@@ -1408,7 +1269,7 @@ public final class MetadataPlane {
      * @param nodeId the acquiring node
      * @param ephemeralId the acquiring node's ephemeral id
      * @return the outcome, carrying the winner's head either way
-     * @throws IOException if the register cannot be read or written
+     * @throws IOException if the register cannot be read or created
      */
     public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId) throws IOException {
         return activate(indexName, shardId, nodeId, ephemeralId, null);
@@ -1423,7 +1284,7 @@ public final class MetadataPlane {
      * @param ephemeralId the acquiring node's ephemeral id
      * @param indexUuid the uuid of the index being activated
      * @return the outcome, carrying the winner's head either way
-     * @throws IOException if the register cannot be read or written
+     * @throws IOException if the register cannot be read or created
      */
     public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid) throws IOException {
         final Acquisition acquisition = heads.acquire(indexName, shardId, nodeId, ephemeralId, indexUuid);
@@ -2243,6 +2104,9 @@ public final class MetadataPlane {
         }
     }
 
+    /** Reads, mints and rotates the transport secret; the methods below forward to it. */
+    private final TransportSecretStore transportSecretStore;
+
     /**
      * Reads the transport secrets, minting the first under put-if-absent when there are none.
      *
@@ -2250,69 +2114,19 @@ public final class MetadataPlane {
      * @throws IOException if the register cannot be read or created
      */
     public TransportSecrets transportSecrets() throws IOException {
-        final var container = blobStore.blobContainer(RegisterMap.clusterConfig(base));
-        final Optional<org.opensearch.common.blobstore.BlobRegister> existing = container.readRegister(TRANSPORT_SECRET_BLOB);
-        if (existing.isPresent()) {
-            return atGeneration(TransportSecrets.parse(existing.get().value().utf8ToString()), existing.get().generation());
-        }
-        final TransportSecrets minted = new TransportSecrets(1L, freshHex(), null, clock.getAsLong());
-        final var created = container.createRegisterIfAbsent(
-            TRANSPORT_SECRET_BLOB,
-            new org.opensearch.core.common.bytes.BytesArray(minted.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8))
-        );
-        if (created.applied()) {
-            return atGeneration(minted, created.currentGeneration());
-        }
-        final Optional<org.opensearch.common.blobstore.BlobRegister> raced = container.readRegister(TRANSPORT_SECRET_BLOB);
-        if (raced.isEmpty()) {
-            throw new IOException("transport secret vanished");
-        }
-        return atGeneration(TransportSecrets.parse(raced.get().value().utf8ToString()), raced.get().generation());
+        return transportSecretStore.transportSecrets();
     }
 
     /**
-     * Rotates the transport secret: the current one becomes the previous, a fresh one becomes current.
-     *
-     * <p>A compare-and-swap on the register, so two operators rotating at once produce one new
-     * generation rather than two secrets neither knows about. The previous secret stays accepted until
-     * the next rotation, which is the window every node has to re-read the register.
+     * Rotates the transport secret: the current one becomes the previous, a fresh one becomes current. See
+     * {@link TransportSecretStore#rotateTransportSecret}.
      *
      * @return the secrets as rotated
      * @throws IOException if the register cannot be read or the swap keeps losing
      */
     public TransportSecrets rotateTransportSecret() throws IOException {
-        final var container = blobStore.blobContainer(RegisterMap.clusterConfig(base));
-        for (int attempt = 0; attempt < 8; attempt++) {
-            final TransportSecrets old = transportSecrets();
-            final TransportSecrets next = new TransportSecrets(old.generation() + 1, freshHex(), old.current(), clock.getAsLong());
-            final var swapped = container.compareAndSwapRegister(
-                TRANSPORT_SECRET_BLOB,
-                old.generation(),
-                new org.opensearch.core.common.bytes.BytesArray(next.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8))
-            );
-            if (swapped.applied()) {
-                return atGeneration(next, swapped.currentGeneration());
-            }
-        }
-        throw new IOException("transport secret rotation lost the compare-and-swap eight times; something else is rotating it");
+        return transportSecretStore.rotateTransportSecret();
     }
-
-    /**
-     * The register's own generation is the one a node caches against, so the record carries it rather
-     * than the counter it was written with -- the two agree except for a register written before
-     * generations existed, whose stored counter is a placeholder.
-     */
-    private static TransportSecrets atGeneration(TransportSecrets secrets, long registerGeneration) {
-        return new TransportSecrets(registerGeneration, secrets.current(), secrets.previous(), secrets.rotatedAtMillis());
-    }
-
-    private static String freshHex() {
-        final byte[] fresh = new byte[32];
-        new java.security.SecureRandom().nextBytes(fresh);
-        return org.opensearch.common.hash.MessageDigests.toHexString(fresh);
-    }
-
-    private static final String TRANSPORT_SECRET_BLOB = "transport-secret";
 
     /**
      * Returns the deployment's cluster-settings register.
