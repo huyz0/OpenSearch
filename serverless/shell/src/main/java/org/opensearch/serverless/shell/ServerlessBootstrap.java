@@ -145,6 +145,19 @@ public final class ServerlessBootstrap implements Closeable {
      */
     public static final String PUBLISH_DEBOUNCE = "serverless.publish.debounce_millis";
 
+    /**
+     * The least time between two write-triggered publishes of one shard. Each publish of a small commit costs five or
+     * more PUTs, so this is the knob that decides how much a busy shard spends on publishing; zero publishes every
+     * debounce window. See {@link ReconcileScheduler#DEFAULT_PUBLISH_MIN_INTERVAL}.
+     */
+    public static final String PUBLISH_MIN_INTERVAL = "serverless.publish.min_interval_millis";
+
+    /**
+     * How many operations beyond its last publish make a shard due for a publish inside the minimum interval; zero
+     * for never early. Bounds what a successor replays.
+     */
+    public static final String PUBLISH_MAX_UNPUBLISHED_OPERATIONS = "serverless.publish.max_unpublished_operations";
+
     /** The first token of the readiness line, so the file is self-describing. */
     public static final String READY_MARKER = "SERVERLESS_READY";
 
@@ -324,6 +337,12 @@ public final class ServerlessBootstrap implements Closeable {
                     complete.getAsLong(PUBLISH_DEBOUNCE, ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis())
                 ),
                 ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
+            );
+            scheduler.setPublishSpacing(
+                org.opensearch.common.unit.TimeValue.timeValueMillis(
+                    complete.getAsLong(PUBLISH_MIN_INTERVAL, ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL.millis())
+                ),
+                complete.getAsLong(PUBLISH_MAX_UNPUBLISHED_OPERATIONS, ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS)
             );
             openedScheduler = scheduler;
             node.setSignals(scheduler);
