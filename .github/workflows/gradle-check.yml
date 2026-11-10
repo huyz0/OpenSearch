@@ -1,12 +1,11 @@
 name: Gradle Check (Jenkins)
 on:
+  # Fork: only build main; feature branches skip CI to stay within Actions limits.
   push:
-    branches-ignore:
-      - 'backport/**'
-      - 'create-pull-request/**'
-      - 'dependabot/**'
+    branches: [ main ]
   pull_request_target:
     types: [opened, synchronize, reopened]
+    branches: [ main ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
