@@ -779,6 +779,26 @@ canary -- two nodes racing for the same six cold shards leave exactly one owner 
 nothing**. `ServerlessSchedulerTests#testOnDemandActivationStopsAtTheCap` caught the first version of the
 reservation overshooting the cap.
 
+**Opening a commit fetches its blocks concurrently.** Lucene opens a commit with a chain of small reads, one
+after another: `segments_N`, then per segment its `.si` and `.cfe`, and the header and footer block of every
+file and every compound sub-file. On a cold cache each is a round trip, so a 20-segment shard waited for about
+a hundred of them in a row. Every one of those blocks is known from the manifest's file lengths and the `.cfe`,
+so `BlockCacheDirectory` now fetches them before handing the directory out: the head and tail of every file in
+one wave, the compound sub-files' in a second, 16 reads at a time with the opening thread reading too.
+Adjacent blocks of one file share a ranged read. The blocks are the ones the open reads anyway, so the request
+count stays about the same. A cache too small to keep them until they are read is not prefetched into, and a
+file held locally is not fetched. `serverless.block_cache.prefetch_on_open=false` turns it off.
+
+| measurement | before | after |
+| --- | --- | --- |
+| `ServerlessOpenPrefetchTests`: 12 segments (half compound), 10 ms per request, filesystem store | 2,218 ms, 175 requests | 147 ms, 169 requests |
+| `ServerlessColdActivationMeasurementTests`, RustFS, 20 ms: first search / first write (p50) | 302 / 665 ms | 235 / 595 ms |
+| same, 100 ms | 1,474 / 2,949 ms | 1,059 / 2,639 ms |
+
+The cold harness's shards hold one tiny segment, so it shows the floor of the gain; a shard with many segments
+gains with its segment count. What a cold search still waits for after the open is the reader check: the head,
+the manifest again, and three listings of the log, one after another.
+
 **Wide searches: a sliding window, a pruning digest, and an activation budget.**
 
 - The fan-out handed the pool a chunk of shards and waited for the whole chunk before the next, so every

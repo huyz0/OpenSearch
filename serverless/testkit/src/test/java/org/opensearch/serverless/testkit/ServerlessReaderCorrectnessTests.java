@@ -271,12 +271,14 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
         try (ServerlessNode b = new ServerlessNode(nodeSettings("rc-retry", "ingest"))) {
             b.start();
 
-            // The first read of the published commit fails, after the shard exists in core.
-            store.failNextSegmentsRead();
+            // Reads of the published commit fail, after the shard exists in core. Every read, not the first only: the
+            // open fetches its blocks ahead and lets a failed one be read again, so a single failure is absorbed.
+            store.failSegmentsReads();
             final Exception failed = expectThrows(Exception.class, () -> b.activateWriter(plane, "alpha", 0));
             assertTrue("the fixture must have failed the read it was armed for: " + failed, store.tripped());
             assertTrue("nothing is recorded open after a failed activation", b.reconciler().openShards().isEmpty());
 
+            store.recover();
             // The store is back. The same node, the same shard: this used to be "already exists", forever.
             final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals("and the retry serves the published data", 3L, hits(b, onB, "durable"));
@@ -394,8 +396,12 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             this.delegate = delegate;
         }
 
-        void failNextSegmentsRead() {
+        void failSegmentsReads() {
             armed.set(true);
+        }
+
+        void recover() {
+            armed.set(false);
         }
 
         boolean tripped() {
@@ -425,7 +431,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
 
             @Override
             public InputStream readBlob(String blobName, long position, long length) throws IOException {
-                if (blobName.startsWith("segments_") && armed.compareAndSet(true, false)) {
+                if (blobName.startsWith("segments_") && armed.get()) {
                     tripped.set(true);
                     throw new IOException("the object store answered 503 for " + blobName);
                 }
