@@ -349,11 +349,13 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
     }
 
     private static BlobContainer independentContainer(FsBlobStore store, Path directory) throws Exception {
+        // The container and its register locks are defined again, so the copy has its own in-process lock stripes.
         final String name = FsBlobContainer.class.getName();
+        final Set<String> reloaded = Set.of(name, FsBlobRegisters.class.getName());
         final ClassLoader loader = new ClassLoader(FsBlobContainer.class.getClassLoader()) {
             @Override
             protected Class<?> loadClass(String requested, boolean resolve) throws ClassNotFoundException {
-                if (requested.equals(name) == false) {
+                if (reloaded.contains(requested) == false) {
                     return super.loadClass(requested, resolve);
                 }
                 synchronized (getClassLoadingLock(requested)) {

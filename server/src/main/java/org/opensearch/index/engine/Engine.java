@@ -987,44 +987,35 @@ public abstract class Engine implements LifecycleAware, Closeable {
     }
 
     /**
-     * Additional operations, beyond local translog, this engine needs replayed to reconstruct its
-     * state -- called by {@code IndexShard#openEngineAndRecoverFromTranslog()} once local translog
-     * recovery has completed, through the same {@code applyTranslogOperation} path (so mapping
-     * updates and version/seqno bookkeeping are handled identically to local translog recovery),
-     * before the shard proceeds toward being started. Empty by default: an engine whose durability
-     * is entirely local translog (every {@code InternalEngine} today) has nothing extra to supply.
-     * An engine backed by a durability mechanism beyond local disk (e.g. a write-ahead log mirrored
-     * to remote storage) overrides this to return whatever operations were durably written but not
-     * yet reflected in this shard's local state. A real override carries a subtle correctness
-     * obligation: replayed operations must be fenced against a competing writer that has taken over
-     * the shard since the operations were written, or a naive implementation reintroduces a
-     * lost-write bug. The plugin supplying such an engine keeps a formal model of that fencing
-     * argument alongside its implementation.
+     * Operations beyond the local translog that this engine needs replayed to rebuild its state. {@code IndexShard}
+     * replays them right after local translog recovery, through the same {@code applyTranslogOperation} path, so
+     * mapping updates and version and sequence-number bookkeeping are handled exactly as for the translog.
+     *
+     * <p>Empty by default: an engine whose durability is the local translog alone has nothing to add. An engine with
+     * another durability mechanism, such as a write-ahead log in remote storage, returns the operations that were
+     * made durable there but are not yet in the shard's local state. Such an engine must fence the replayed
+     * operations against any writer that has taken over the shard since they were written.
+     *
+     * @return an ordered snapshot of the operations to replay; the caller closes it
      */
-    public List<Translog.Operation> engineRecoveryOperations() {
-        return List.of();
-    }
-
-    /** A closeable, ordered view of additional recovery operations; large histories can stream from disk. */
     public Translog.Snapshot engineRecoverySnapshot() throws IOException {
-        final List<Translog.Operation> operations = engineRecoveryOperations();
-        return new Translog.Snapshot() {
-            private int index;
-
-            @Override
-            public int totalOperations() {
-                return operations.size();
-            }
-
-            @Override
-            public Translog.Operation next() {
-                return index < operations.size() ? operations.get(index++) : null;
-            }
-
-            @Override
-            public void close() {}
-        };
+        return EMPTY_RECOVERY_SNAPSHOT;
     }
+
+    private static final Translog.Snapshot EMPTY_RECOVERY_SNAPSHOT = new Translog.Snapshot() {
+        @Override
+        public int totalOperations() {
+            return 0;
+        }
+
+        @Override
+        public Translog.Operation next() {
+            return null;
+        }
+
+        @Override
+        public void close() {}
+    };
 
     protected TranslogDeletionPolicy getTranslogDeletionPolicy(EngineConfig engineConfig) {
         TranslogDeletionPolicy customTranslogDeletionPolicy = null;

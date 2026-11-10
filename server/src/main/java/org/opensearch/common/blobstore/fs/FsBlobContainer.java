@@ -47,17 +47,13 @@ import org.opensearch.common.blobstore.support.AbstractBlobContainer;
 import org.opensearch.common.blobstore.support.PlainBlobMetadata;
 import org.opensearch.common.io.Streams;
 import org.opensearch.common.util.io.IOUtils;
-import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
-import java.nio.channels.FileChannel;
-import java.nio.channels.FileLock;
 import java.nio.channels.SeekableByteChannel;
 import java.nio.file.DirectoryStream;
 import java.nio.file.FileAlreadyExistsException;
@@ -81,7 +77,6 @@ import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.ReentrantLock;
 
 import static java.util.Collections.unmodifiableMap;
 
@@ -98,23 +93,9 @@ import static java.util.Collections.unmodifiableMap;
 public class FsBlobContainer extends AbstractBlobContainer {
 
     private static final String TEMP_FILE_PREFIX = "pending-";
-    /** Stable lock files, reserved for registers and excluded from container listings. */
-    private static final String REGISTER_LOCK_DIRECTORY = ".opensearch-register-locks#";
 
     protected final FsBlobStore blobStore;
     protected final Path path;
-
-    // FileChannel locks exclude other processes, but overlapping locks in one JVM throw rather than
-    // wait. Bounded mutex stripes provide that local exclusion without retaining one lock per key.
-    // Writers lock stable sidecar files; the data inode itself changes on every atomic replacement.
-    // Published register files are immutable, so readers need only open one consistent version.
-    private static final int REGISTER_LOCK_STRIPE_COUNT = 64;
-    private static final ReentrantLock[] REGISTER_LOCK_STRIPES = new ReentrantLock[REGISTER_LOCK_STRIPE_COUNT];
-    static {
-        for (int i = 0; i < REGISTER_LOCK_STRIPE_COUNT; i++) {
-            REGISTER_LOCK_STRIPES[i] = new ReentrantLock();
-        }
-    }
 
     public FsBlobContainer(FsBlobStore blobStore, BlobPath blobPath, Path path) {
         super(blobPath);
@@ -132,7 +113,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
         Map<String, BlobContainer> builder = new HashMap<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(path)) {
             for (Path file : stream) {
-                if (file.getFileName().toString().equals(REGISTER_LOCK_DIRECTORY) == false && Files.isDirectory(file)) {
+                if (file.getFileName().toString().equals(FsBlobRegisters.LOCK_DIRECTORY) == false && Files.isDirectory(file)) {
                     final String name = file.getFileName().toString();
                     builder.put(name, new FsBlobContainer(blobStore, path().add(name), file));
                 }
@@ -153,7 +134,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
             try (DirectoryStream<Path> stream = Files.newDirectoryStream(path)) {
                 for (Path file : stream) {
                     final String name = file.getFileName().toString();
-                    if (name.equals(REGISTER_LOCK_DIRECTORY)
+                    if (name.equals(FsBlobRegisters.LOCK_DIRECTORY)
                         || (startAfter != null && order.compare(name, startAfter) <= 0)
                         || (page.size() == limit && order.compare(name, page.peek()) >= 0)
                         || Files.isDirectory(file) == false) {
@@ -199,7 +180,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
                     throw e;
                 }
                 if (attrs.isRegularFile()) {
-                    if (file.getFileName().toString().equals(REGISTER_LOCK_DIRECTORY) == false) {
+                    if (file.getFileName().toString().equals(FsBlobRegisters.LOCK_DIRECTORY) == false) {
                         builder.put(file.getFileName().toString(), new PlainBlobMetadata(file.getFileName().toString(), attrs.size()));
                     }
                 }
@@ -229,7 +210,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(path)) {
             for (Path file : stream) {
                 final String name = file.getFileName().toString();
-                if (name.equals(REGISTER_LOCK_DIRECTORY)
+                if (name.equals(FsBlobRegisters.LOCK_DIRECTORY)
                     || name.startsWith(prefix) == false
                     || (startAfter != null && name.compareTo(startAfter) <= 0)) {
                     continue;
@@ -279,7 +260,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
                 Files.delete(file);
-                if (file.getParent().getFileName().toString().equals(REGISTER_LOCK_DIRECTORY) == false) {
+                if (file.getParent().getFileName().toString().equals(FsBlobRegisters.LOCK_DIRECTORY) == false) {
                     filesDeleted.incrementAndGet();
                     bytesDeleted.addAndGet(attrs.size());
                 }
@@ -305,7 +286,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     @Override
     public boolean blobExists(String blobName) {
-        return isRegisterCoordinationPath(path.resolve(blobName)) == false && Files.exists(path.resolve(blobName));
+        return FsBlobRegisters.isLockPath(path.resolve(blobName)) == false && Files.exists(path.resolve(blobName));
     }
 
     @Override
@@ -582,134 +563,26 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     @Override
     public Optional<BlobRegister> readRegister(String blobName) throws IOException {
-        // A published data inode is never modified. An open file therefore remains a consistent
-        // snapshot through replacement or unlink, without creating coordination files on read-only stores.
-        return readRegisterFile(resolveBlobPath(blobName));
+        return FsBlobRegisters.read(resolveBlobPath(blobName));
     }
 
     @Override
     public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
         throws IOException {
-        final Path registerPath = resolveBlobPath(blobName);
-        Files.createDirectories(registerPath.getParent());
-        return underRegisterLock(registerPath, () -> {
-            final Optional<BlobRegister> current = readRegisterFile(registerPath);
-            final long generation = current.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
-            if (generation != expectedGeneration) {
-                return BlobRegisterCasResult.conflict(generation);
-            }
-            final long next = generation == BlobRegister.ABSENT_GENERATION ? BlobRegister.initialGeneration() : generation + 1;
-            writeRegisterUnderLock(registerPath, next, newValue);
-            return BlobRegisterCasResult.applied(next);
-        });
+        return FsBlobRegisters.compareAndSwap(resolveBlobPath(blobName), expectedGeneration, newValue);
     }
 
-    /** Deletes only the expected version, while the stable coordination inode remains locked. */
     @Override
     public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
-        final Path registerPath = resolveBlobPath(blobName);
-        try {
-            Files.readAttributes(registerPath, BasicFileAttributes.class);
-            return underRegisterLock(registerPath, () -> {
-                final Optional<BlobRegister> current = readRegisterFile(registerPath);
-                if (current.isEmpty() || current.get().generation() != expectedGeneration) {
-                    return false;
-                }
-                Files.delete(registerPath);
-                IOUtils.fsync(registerPath.getParent(), true);
-                return true;
-            });
-        } catch (NoSuchFileException e) {
-            return false;
-        }
+        return FsBlobRegisters.deleteIfUnchanged(resolveBlobPath(blobName), expectedGeneration);
     }
 
+    /** Resolves a blob name, refusing names inside the reserved register lock directory. */
     private Path resolveBlobPath(String blobName) {
-        final Path registerPath = path.resolve(blobName);
-        if (isRegisterCoordinationPath(registerPath)) {
+        final Path resolved = path.resolve(blobName);
+        if (FsBlobRegisters.isLockPath(resolved)) {
             throw new IllegalArgumentException("reserved register coordination file: " + blobName);
         }
-        return registerPath;
-    }
-
-    private static boolean isRegisterCoordinationPath(Path path) {
-        for (Path part : path) {
-            if (part.toString().equals(REGISTER_LOCK_DIRECTORY)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Coordinates through a stable sidecar, never the data inode that a delete or atomic replacement removes.
-     * Every process sharing a filesystem register must use this protocol. Canonical parent paths also keep
-     * aliases of one directory on the same in-process stripe. There are at most 64 lock files per
-     * container, rather than one per register. Separate files are necessary: on some systems closing
-     * any channel on a file releases all locks this process holds on it, including other byte ranges.
-     * The coordination directory remains after a register is deleted.
-     */
-    private <T> T underRegisterLock(Path registerPath, org.opensearch.common.CheckedSupplier<T, IOException> work) throws IOException {
-        final Path parent = registerPath.getParent().toRealPath();
-        final int stripe = Math.floorMod(parent.resolve(registerPath.getFileName()).toString().hashCode(), REGISTER_LOCK_STRIPE_COUNT);
-        final Path lockDirectory = parent.resolve(REGISTER_LOCK_DIRECTORY);
-        Files.createDirectories(lockDirectory);
-        final ReentrantLock lock = REGISTER_LOCK_STRIPES[stripe];
-        lock.lock();
-        try (
-            FileChannel channel = FileChannel.open(
-                lockDirectory.resolve(Integer.toString(stripe)),
-                StandardOpenOption.CREATE,
-                StandardOpenOption.READ,
-                StandardOpenOption.WRITE
-            );
-            FileLock held = channel.lock()
-        ) {
-            assert held != null;
-            return work.get();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    private Optional<BlobRegister> readRegisterFile(Path registerPath) throws IOException {
-        try (FileChannel channel = FileChannel.open(registerPath, StandardOpenOption.READ)) {
-            final long size = channel.size();
-            if (size == 0L) {
-                return Optional.empty();
-            }
-            if (size < Long.BYTES || size > Integer.MAX_VALUE) {
-                throw new IOException("invalid register length " + size + " at " + registerPath);
-            }
-            final byte[] bytes = org.opensearch.common.io.Channels.readFromFileChannel(channel, 0, (int) size);
-            final ByteBuffer buffer = ByteBuffer.wrap(bytes);
-            final long generation = buffer.getLong();
-            final byte[] value = new byte[buffer.remaining()];
-            buffer.get(value);
-            return Optional.of(new BlobRegister(generation, new BytesArray(value)));
-        } catch (NoSuchFileException e) {
-            return Optional.empty();
-        }
-    }
-
-    private void writeRegisterUnderLock(Path registerPath, long newGeneration, BytesReference newValue) throws IOException {
-        final byte[] valueBytes = BytesReference.toBytes(newValue);
-        final ByteBuffer buffer = ByteBuffer.allocate(Long.BYTES + valueBytes.length);
-        buffer.putLong(newGeneration);
-        buffer.put(valueBytes);
-        // Independent of the register's name length, including names already at the filesystem's limit.
-        final Path staged = registerPath.getParent()
-            .resolve(REGISTER_LOCK_DIRECTORY)
-            .resolve(TEMP_FILE_PREFIX + "register-" + UUIDs.randomBase64UUID());
-        try {
-            try (FileChannel channel = FileChannel.open(staged, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)) {
-                org.opensearch.common.io.Channels.writeToChannel(buffer.array(), channel, 0);
-                channel.force(true);
-            }
-            Files.move(staged, registerPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            IOUtils.fsync(registerPath.getParent(), true);
-        } finally {
-            Files.deleteIfExists(staged);
-        }
+        return resolved;
     }
 }
