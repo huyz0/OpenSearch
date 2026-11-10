@@ -147,8 +147,8 @@ public final class ServerlessBootstrap implements Closeable {
 
     /**
      * The least time between two write-triggered publishes of one shard. Each publish of a small commit costs five or
-     * more PUTs, so this is the knob that decides how much a busy shard spends on publishing; zero publishes every
-     * debounce window. See {@link ReconcileScheduler#DEFAULT_PUBLISH_MIN_INTERVAL}.
+     * more PUTs, so this is the knob that decides how much a busy shard spends on publishing; zero or less publishes
+     * every debounce window. See {@link ReconcileScheduler#DEFAULT_PUBLISH_MIN_INTERVAL}.
      */
     public static final String PUBLISH_MIN_INTERVAL = "serverless.publish.min_interval_millis";
 
@@ -340,7 +340,7 @@ public final class ServerlessBootstrap implements Closeable {
             );
             scheduler.setPublishSpacing(
                 org.opensearch.common.unit.TimeValue.timeValueMillis(
-                    complete.getAsLong(PUBLISH_MIN_INTERVAL, ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL.millis())
+                    Math.max(0L, complete.getAsLong(PUBLISH_MIN_INTERVAL, ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL.millis()))
                 ),
                 complete.getAsLong(PUBLISH_MAX_UNPUBLISHED_OPERATIONS, ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS)
             );

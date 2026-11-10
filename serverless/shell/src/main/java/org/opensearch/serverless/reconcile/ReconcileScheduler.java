@@ -323,7 +323,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @return this, for chaining
      */
     public ReconcileScheduler setPublishSpacing(TimeValue minInterval, long maxUnpublishedOperations) {
-        this.publishMinInterval = minInterval;
+        this.publishMinInterval = java.util.Objects.requireNonNull(minInterval, "minInterval");
         this.publishMaxUnpublishedOperations = maxUnpublishedOperations;
         return this;
     }
@@ -720,6 +720,9 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 return java.util.Set.of();
             }
             publishPending.set(false);
+            // Read before the pass is claimed, so nothing between the claim and the finally that releases it can throw.
+            final long minIntervalMillis = publishMinInterval.millis();
+            final long maxUnpublished = publishMaxUnpublishedOperations;
             // One pass at a time. A pass used to take minutes on a node holding a thousand shards, and each write meanwhile
             // scheduled another: they piled up on GENERIC, blocked on the same shards' publish locks, until nothing else could
             // run there. A pass that finds another running leaves its marks to it; the running one goes round again while any
@@ -728,8 +731,6 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 return java.util.Set.of();
             }
             final java.util.Set<ShardId> all = new java.util.LinkedHashSet<>();
-            final long minIntervalMillis = publishMinInterval.millis();
-            final long maxUnpublished = publishMaxUnpublishedOperations;
             int rounds = 0;
             try {
                 if (loop.hasDirtyDue(clock.getAsLong(), minIntervalMillis, maxUnpublished) == false) {
@@ -756,7 +757,9 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             } finally {
                 publishRunning.set(false);
                 // A mark made between the last look and here would wait for the next write or the backstop. A shard
-                // left marked because it was not yet due is looked at again here too, which costs no store request.
+                // left marked because it was not yet due is looked at again here too, one debounce on: that costs no
+                // store request, and waking at its due time instead would hold back the first publish of any other
+                // shard written meanwhile, since a pass already scheduled absorbs the edges of new writes.
                 if (closed == false && loop.hasDirty() && publishPending.compareAndSet(false, true)) {
                     threadPool.schedule(this::publishNow, publishDebounce, ThreadPool.Names.GENERIC);
                 }

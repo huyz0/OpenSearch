@@ -2582,14 +2582,7 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> publishDirty() throws Exception {
-        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
-            if (work == null) {
-                return Set.of();
-            }
-            final Set<ShardId> drained = new LinkedHashSet<>(dirty);
-            dirty.removeAll(drained);
-            return publish(drained);
-        }
+        return publishDirty(0L, 0L, 0L);
     }
 
     /**
@@ -2622,11 +2615,12 @@ public final class BackgroundReconciler implements Closeable {
             }
             final Set<ShardId> due = new LinkedHashSet<>();
             for (ShardId shardId : dirty) {
-                if (publishDue(shardId, nowMillis, minIntervalMillis, maxUnpublishedOperations)) {
+                // Unmarked one at a time, as each is found due: a write that re-marks a shard after this point keeps
+                // its mark and gets its own pass, where removing them all at the end would erase it.
+                if (publishDue(shardId, nowMillis, minIntervalMillis, maxUnpublishedOperations) && dirty.remove(shardId)) {
                     due.add(shardId);
                 }
             }
-            dirty.removeAll(due);
             return publish(due);
         }
     }
@@ -2665,8 +2659,15 @@ public final class BackgroundReconciler implements Closeable {
             // Closed since it was marked; publishOne drops it without a store request.
             return true;
         }
-        final long unpublished = shard.seqNoStats().getMaxSeqNo() - lastPublishedMaxSeqNo.getOrDefault(shardId, -1L);
-        return unpublished >= maxUnpublishedOperations;
+        final long maxSeqNo;
+        try {
+            maxSeqNo = shard.seqNoStats().getMaxSeqNo();
+        } catch (RuntimeException e) {
+            // An engine closing or resetting. Due, so the publish finds out and re-marks it on its own, rather than
+            // this one shard failing the whole pass for every other.
+            return true;
+        }
+        return maxSeqNo - lastPublishedMaxSeqNo.getOrDefault(shardId, -1L) >= maxUnpublishedOperations;
     }
 
     /**
