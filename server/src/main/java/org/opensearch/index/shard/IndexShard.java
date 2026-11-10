@@ -3327,14 +3327,9 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     }
 
     /**
-     * Replays whatever {@link Engine#engineRecoverySnapshot()} returns -- empty for every engine
-     * whose durability is local translog alone (the default), non-empty only for an engine backed
-     * by an additional durability mechanism (e.g. a write-ahead log mirrored to remote storage)
-     * that overrides it. Runs through the identical {@link #runTranslogRecovery} /
-     * {@link #applyTranslogOperation} path local translog recovery just used immediately above, so
-     * mapping updates and version/seqno bookkeeping are handled exactly the same way -- this is the
-     * entire reason this runs here, in {@code IndexShard}, rather than inside the engine itself,
-     * which has no {@link org.opensearch.index.mapper.MapperService} access of its own.
+     * Replays {@link Engine#engineRecoverySnapshot()} through the same path as local translog recovery, so mapping
+     * updates and version bookkeeping match. It runs here rather than in the engine because only the shard has the
+     * {@link org.opensearch.index.mapper.MapperService}.
      */
     private void recoverAdditionalEngineOperations(RecoveryState.Translog translogRecoveryStats) throws IOException {
         Indexer indexer = getIndexer();
