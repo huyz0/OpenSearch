@@ -12,7 +12,7 @@ package org.opensearch.serverless.metadata;
  * The outcome of trying to acquire a shard.
  *
  * <p>A loser is told <em>who won</em>, not merely that it lost. That is deliberate and is the rule
- * section 6 of {@code rfc-serverless-metadata-plane.md} states: losers read the winning head and route
+ * the metadata plane requires: losers read the winning head and route
  * to the winner, and must not retry activation elsewhere, which would just steal the shard back. An API
  * that returned a bare boolean would make the correct behaviour harder to write than the wrong one.
  */

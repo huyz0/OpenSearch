@@ -48,15 +48,14 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 /**
  * Opens and closes shards on this node.
  *
- * <p><b>The invariant this class exists to hold</b>, established by measurement in
- * {@code s1-findings.md} rather than by argument:
+ * <p><b>The invariant this class exists to hold</b>, established by measurement rather than by argument:
  *
  * <blockquote>Absence from a projected view is never a removal signal. A shard closes when the
  * shard-head says this node no longer owns it, and never because a locally-computed view failed to
  * mention it.</blockquote>
  *
- * <p>S1 measured both halves of why that matters. Applying a view naming no indices at all left a shard
- * STARTED and still serving, so projection is harmless on its own. But the close-set a
+ * <p>A two-node probe measured both halves of why that matters. Applying a view naming no indices at
+ * all left a shard STARTED and still serving, so projection is harmless on its own. But the close-set a
  * <em>diff-based</em> reconciler would have computed was exactly the set of locally-open shards. The
  * hazard is entirely a property of the reconciler, which is this class.
  *
@@ -161,7 +160,7 @@ public final class ShardReconciler {
 
     /**
      * Supplies the object-store publisher for each shard. Without one, shards open from local disk only,
-     * which is the phase 2 behaviour and is what the projection tests still exercise.
+     * which is what the projection tests exercise.
      *
      * @param publishers index name and shard number to publisher
      */
@@ -170,8 +169,7 @@ public final class ShardReconciler {
     }
 
     /**
-     * Supplies the write-ahead log for each shard. Without one, writes are durable only once published,
-     * which is the pre-M10 behaviour.
+     * Supplies the write-ahead log for each shard. Without one, writes are durable only once published.
      *
      * <p>Keyed on the {@link ShardId} rather than on a name and a number, because a shard's storage is
      * located by the index's uuid and a {@code ShardId} carries it. Passing the name alone meant the plane
@@ -418,9 +416,9 @@ public final class ShardReconciler {
     }
 
     /**
-     * The four calls S0 measured, in order. Step two is the one that is easy to omit: createIndex does
+     * The four calls that open a shard, in order. Step two is the one that is easy to omit: createIndex does
      * not apply the mapping, and without it the first write returns MAPPING_UPDATE_REQUIRED as a
-     * <em>result value</em> rather than throwing (see {@code s0-findings.md} F5).
+     * <em>result value</em> rather than throwing.
      */
     /** When each open shard was last touched by a request. */
     private final java.util.concurrent.ConcurrentHashMap<ShardId, Long> lastUsed = new java.util.concurrent.ConcurrentHashMap<>();
@@ -715,9 +713,9 @@ public final class ShardReconciler {
                 lap.run();
 
                 final ShardRouting started = initializing.moveToStarted();
-                // The applying version is the SHARD-HEAD TERM, not the projected view's version. S1
-                // reproduced what happens when a per-node counter is used here: the update is silently
-                // ignored, because ReplicationTracker gates on > against a value that may have crossed a
+                // The applying version is the SHARD-HEAD TERM, not the projected view's version. When a per-node
+                // counter is used here, the update is silently ignored, because ReplicationTracker gates on >
+                // against a value that may have crossed a
                 // node boundary.
                 shard.updateShardState(
                     started,
@@ -900,14 +898,13 @@ public final class ShardReconciler {
     /**
      * Opens a shard as a reader: serving the published commit, owning nothing.
      *
-     * <p>No compare-and-swap, no term bump, no entry in the shard-head. That is deliberate and is what
-     * {@code rfc-serverless-metadata-plane.md} §6 means by readers being interchangeable caches — any
-     * search node can serve any shard by reading its manifest, and no coordination is involved because
+     * <p>No compare-and-swap, no term bump, no entry in the shard-head. That is deliberate: readers are
+     * interchangeable caches — any search node can serve any shard by reading its manifest, and no coordination is involved because
      * nothing can go wrong if two of them do it at once.
      *
      * <p>The term recorded on the shard is the manifest's — the term of the writer whose commit this is
      * serving. It is not a claim of ownership; the shard needs a positive term to start at all
-     * ({@code s0-findings.md} F4), and the commit's own term is the only honest number available.
+     * (the data plane refuses term 0), and the commit's own term is the only honest number available.
      *
      * @param view the node-local view, which must describe the index
      * @param indexName the index

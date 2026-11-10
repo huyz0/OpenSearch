@@ -30,13 +30,13 @@ import java.util.function.Predicate;
  * Core's resolver turns {@code logs-*} or a concrete name into indices by consulting the {@code Metadata}
  * of a {@link ClusterState}. On a serverless node that {@code ClusterState} is a node-local materialised
  * view holding the indices <em>this node happens to have open</em> — never the deployment's index set,
- * which lives in the metadata plane and is deliberately not enumerable (&sect;6.3 refuses
+ * which lives in the metadata plane and is deliberately not enumerable (the shell refuses
  * {@code /_serverless/indices} for the same reason: walking a hundred million indices through a request
  * path is not an operation this system offers).
  *
  * <p>So a real resolver here would answer a wildcard with a subset and a concrete name this node has not
  * opened with {@code IndexNotFoundException}. Both are wrong answers that look like right ones, which is
- * exactly what D2 exists to prevent — and for a plugin evaluating privileges over an index pattern, a
+ * exactly what the allowlist exists to prevent — and for a plugin evaluating privileges over an index pattern, a
  * subset is a security failure that fails open.
  *
  * <p><b>Passing {@code null} was worse.</b> Until now {@code createComponents} handed plugins a null here,

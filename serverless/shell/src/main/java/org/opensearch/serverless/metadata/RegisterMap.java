@@ -13,9 +13,9 @@ import org.opensearch.common.blobstore.BlobPath;
 /**
  * Where each register lives.
  *
- * <p>Section 9.3's map, and the trap it avoids. Making cluster state <em>one</em> register would
+ * <p>The register map, and the trap it avoids. Making cluster state <em>one</em> register would
  * serialize every mutation in the system through a single optimistic-concurrency point — retry storms
- * under load, and a quiet reinstatement of the O(all indices) cost section 5 exists to remove. So the
+ * under load, and a quiet reinstatement of the O(all indices) cost the node-local view exists to remove. So the
  * layout is partitioned by natural CAS granularity, and each register has a bounded, disjoint writer
  * population:
  *
@@ -152,7 +152,7 @@ public final class RegisterMap {
     /**
      * Returns the container path holding the cluster config register.
      *
-     * <p>§9.3's {@code /cluster/config}: one register, operator write rate, CAS on conflict. Siblings
+     * <p>The {@code cluster/config} register: one register, operator write rate, CAS on conflict. Siblings
      * {@link #members} under {@code cluster/} rather than sharing its container, because a container is
      * the unit a backend lists and nothing should ever need to list this one alongside node leases.
      *
@@ -366,7 +366,7 @@ public final class RegisterMap {
     /**
      * Returns the container path listing the shards one node owns.
      *
-     * <p>Added in phase 9, because measurement showed {@code truthFor} was reading every descriptor in
+     * <p>Exists because measurement showed {@code truthFor} was reading every descriptor in
      * the deployment to find the handful a node hosts: 401 object-store operations at 200 indices and
      * 2,001 at 1,000, on the steady-state path, on every node, forever. That is the O(population) sweep
      * this whole architecture exists to remove, reintroduced in its own code.

@@ -35,8 +35,8 @@ import java.util.function.Predicate;
  *
  * <p>Creation is a single put-if-absent, which is what makes name uniqueness free: there is no global
  * lock, no elected serializer and no sweep over the existing population. That last point is the whole
- * reason this design exists — {@code plan-area-h-metadata-off-cluster-state.md} measured index creation
- * at 7.4 ms with 200 indices present and 98.8 ms at 6,000, because
+ * reason this design exists — classic cluster state was measured creating an index
+ * in 7.4 ms with 200 indices present and 98.8 ms at 6,000, because
  * {@code Metadata.Builder.build()} rebuilds name lookups across every index on every create. A CAS on
  * one blob costs the same at zero indices and at a hundred million.
  *
@@ -45,7 +45,7 @@ import java.util.function.Predicate;
  * reads before it writes. Creation does not need to, and a factor of two matters on the one operation
  * this design expects to run at 10^8.
  *
- * <p>Per D5, exercised against {@code FsBlobContainer} only. See this package's documentation.
+ * <p>See this package's documentation for which object stores this has been verified against.
  */
 public final class DescriptorStore {
 
@@ -1072,8 +1072,8 @@ public final class DescriptorStore {
     /**
      * Returns the names beginning with a prefix, up to a cap.
      *
-     * <p><b>This is what makes an index pattern answerable without enumerating the deployment.</b> §6.3
-     * refuses enumeration on a request path, and that refusal was the reason {@code logs-*} was refused
+     * <p><b>This is what makes an index pattern answerable without enumerating the deployment.</b> A request path
+     * never enumerates the deployment, and that refusal was the reason {@code logs-*} was refused
      * too. It does not have to be: a prefix listing with a maximum key count costs one request per thousand
      * names up to the cap, each page resuming where the last stopped, so its cost is set by the cap rather
      * than by the population, and a deployment with a hundred million indices pays exactly what one with ten
@@ -1159,8 +1159,8 @@ public final class DescriptorStore {
     /**
      * Lists every descriptor.
      *
-     * <p><b>Do not put this on a request path.</b> It is O(population) by construction and phase 9
-     * measured what that costs: 2N+1 operations when it backed {@code truthFor}. It survives for offline
+     * <p><b>Do not put this on a request path.</b> It is O(population) by construction, and that
+     * was measured: 2N+1 operations when it backed {@code truthFor}. It survives for offline
      * work — a sweep that already intends to visit everything — and {@link #listPage} is what an API
      * uses. A caller that reaches for this to answer a user is answering the wrong question.
      *

@@ -29,9 +29,8 @@ import java.util.function.UnaryOperator;
 /**
  * The plugins a node is running, without an injector.
  *
- * <p><b>R4, answered.</b> The risk register says the shell "implements the plugin contract without an
- * {@code Injector}", and until now nothing implemented it at all: {@code PluginsService} was constructed
- * with an empty list because {@code IndicesService} demands one, and no plugin was ever loaded. This is
+ * <p><b>The plugin contract without an {@code Injector}.</b> {@code IndicesService} demands a
+ * {@code PluginsService}, and an empty one would mean no plugin is ever loaded. This is
  * the part that makes a plugin run.
  *
  * <p><b>Guice was never the hard part.</b> {@code createComponents} is a plain method returning a
@@ -46,7 +45,7 @@ import java.util.function.UnaryOperator;
  * authentication belongs and is exactly what the security plugin uses it for.
  *
  * <p><b>What is deliberately absent</b> is the action layer: no {@code TransportAction} registration, no
- * action-name routing, no {@code action/} package. That is §6.3's boundary, and honouring it is what keeps
+ * action-name routing, no {@code action/} package. That is the shell's boundary, and honouring it is what keeps
  * this a plugin host rather than a second copy of the node it replaced.
  *
  * <p><b>{@code ActionFilter}s are the exception, and not a retreat from that.</b> A filter needs two things
@@ -109,7 +108,7 @@ public final class ServerlessPlugins {
      * therefore explicit: see {@link RefusingIndexNameExpressionResolver}. Only the
      * {@code RepositoriesService} supplier still yields null: that class is the classic repository-plugin
      * API surface — registering a repository <em>type</em>, hooking snapshot lifecycle events — and this
-     * shell's own snapshot/restore surface (M45) does not use it, the same way {@code IndexShard} needs no
+     * shell's own snapshot/restore surface does not use it, the same way {@code IndexShard} needs no
      * {@code ClusterService} to run. A plugin that implements a custom repository type still finds nothing
      * here; a caller taking or restoring a snapshot does not go through this at all.
      *
@@ -130,7 +129,7 @@ public final class ServerlessPlugins {
                 node.nodeEnvironment(),
                 node.namedWriteableRegistry(),
                 node.indexNameExpressionResolver(),
-                () -> null                              // RepositoriesService: snapshots are out of scope (R7)
+                () -> null                              // RepositoriesService: snapshots use the shell's own store
             );
             components.addAll(built);
             componentsByPlugin.put(plugin, List.copyOf(built));
@@ -155,7 +154,7 @@ public final class ServerlessPlugins {
     /**
      * Collects the REST handlers the plugins want to serve.
      *
-     * <p><b>This widens D2's allowlist, and does so knowingly.</b> The allowlist exists so that a classic
+     * <p><b>This widens the REST allowlist, and does so knowingly.</b> The allowlist exists so that a classic
      * endpoint the shell has not implemented answers 501 rather than pretending; it is not a rule that the
      * surface may never grow. A plugin an operator chose to install adding its own routes is that operator
      * deciding, which is a different thing from the shell quietly accepting a request it cannot honour.

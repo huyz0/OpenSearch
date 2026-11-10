@@ -11,6 +11,6 @@
  *
  * <p>This package constructs the OpenSearch data plane without a control plane, and drives it from a
  * view each node computes for itself rather than from a consensus-published one. See
- * {@code rfc-serverless-shell.md}.
+ * {@code serverless/README.md}.
  */
 package org.opensearch.serverless.shell;

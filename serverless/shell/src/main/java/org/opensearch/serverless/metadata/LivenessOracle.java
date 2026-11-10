@@ -11,11 +11,10 @@ package org.opensearch.serverless.metadata;
 /**
  * Answers whether a node is still alive, without asking its shard-heads.
  *
- * <p>This is the seam that makes {@code rfc-serverless-metadata-plane.md} §7's batching possible:
- * <em>"batch to one lease object per node with shard-heads referencing the node lease"</em>. Phase 8
- * measured why it matters — a steady-state reconciliation tick cost 3 object-store operations per
- * shard, of which the single write was a per-shard lease renewal. A node holding a hundred shards paid
- * a hundred writes per TTL to say one thing: that it was still there.
+ * <p>This is the seam that makes lease batching possible: one lease object per node, with shard-heads
+ * referencing the node lease. Measurement showed why it matters — a steady-state reconciliation tick
+ * cost 3 object-store operations per shard, of which the single write was a per-shard lease renewal.
+ * A node holding a hundred shards paid a hundred writes per TTL to say one thing: that it was still there.
  *
  * <p>With an oracle, a shard-head stops carrying its own expiry and liveness becomes a property of its
  * owner. One lease renewal covers every shard the node holds.

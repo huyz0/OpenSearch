@@ -24,20 +24,19 @@ import java.util.Objects;
  * The register that says who owns a shard, and at what term.
  *
  * <p>This is the only object in the system that arbitrates ownership. Membership does not; a projected
- * view does not; gossip does not. Section 10.1 puts it plainly: a node existing is not a node owning
+ * view does not; gossip does not. Put plainly: a node existing is not a node owning
  * anything, and only this answers the second question.
  *
- * <p><b>The term is not decoration.</b> S0 found that the data plane refuses to activate a primary at
- * term 0, and S1 found that feeding a per-node counter where a term belongs causes updates to be
- * silently ignored. The generation of this register is the one monotonic number every node that touches
- * the shard agrees on, which is exactly what {@code updateShardState} needs and what a projection
+ * <p><b>The term is not decoration.</b> The data plane refuses to activate a primary at term 0, and
+ * feeding a per-node counter where a term belongs causes updates to be silently ignored. The generation of this
+ * register is the one monotonic number every node that touches the shard agrees on, which is exactly
+ * what {@code updateShardState} needs and what a projection
  * counter cannot be.
  *
  * <p><b>What this alone does not do</b> is fence a zombie. A writer whose JVM paused past its lease can
  * still hold a file handle and keep writing bytes; CAS here establishes who <em>should</em> own the
- * shard, not what a stale owner is physically able to do. That is R9, and the mechanism for it is
- * term-scoped key paths (section 9.6) — not implemented in this phase, and deliberately not implied by
- * this class.
+ * shard, not what a stale owner is physically able to do. Fencing a stale owner is the job of
+ * term-scoped key paths in the store package, and deliberately not implied by this class.
  */
 public final class ShardHead {
 
