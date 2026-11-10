@@ -48,7 +48,7 @@ import java.util.function.Supplier;
  * <p>Three are now real. The fourth cannot be, and is explicit about it: see
  * {@link RefusingIndexNameExpressionResolver} for why a resolver that answered would answer wrongly.
  *
- * <p><b>D5:</b> no object store is involved.
+ * <p>No object store is involved.
  */
 public class ServerlessPluginCollaboratorTests extends OpenSearchTestCase {
 
@@ -149,7 +149,7 @@ public class ServerlessPluginCollaboratorTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("collaborators-script"), List.of(new CapturingPlugin()))) {
             node.start();
             final ScriptService scripts = (ScriptService) CapturingPlugin.CAPTURED.get()[4];
-            // Since M57 the service a plugin is handed has a real engine in it: modules:lang-painless is a
+            // The service a plugin is handed has a real engine in it: modules:lang-painless is a
             // dependency and its engine is registered directly, the same way the transport is chosen. A
             // plugin that compiles a script gets a compiled script rather than an explanation.
             assertNotNull(

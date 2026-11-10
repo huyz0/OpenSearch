@@ -27,14 +27,14 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Closing the gaps phase 8 named for itself: §7's batched lease renewal, and a deployment-wide sweep.
+ * Batched lease renewal, and a deployment-wide sweep.
  *
- * <p>Phase 8 measured 3 object-store operations per reconciliation tick per shard and observed that the
+ * <p>Measurement found 3 object-store operations per reconciliation tick per shard and observed that the
  * single write was a per-shard lease renewal — a node holding a hundred shards paying a hundred writes
  * per TTL to say one thing, that it was still there. This is that measurement acted on, re-measured, and
  * finally made unconditional: per-head expiry is no longer a mode a deployment can be in.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
 
@@ -183,7 +183,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
             final var manifest = a.publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
 
             final Map<String, List<String>> swept = gc.collectAll(plane);
-            logger.info("phase 8 sweep: {} shards had orphans across 2 indices", swept.size());
+            logger.info("sweep: {} shards had orphans across 2 indices", swept.size());
             for (Map.Entry<String, String> file : manifest.files().entrySet()) {
                 assertTrue(
                     "the sweep deleted a file the live commit depends on",

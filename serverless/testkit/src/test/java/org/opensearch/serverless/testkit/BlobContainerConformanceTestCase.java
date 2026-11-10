@@ -24,14 +24,14 @@ import java.util.concurrent.atomic.AtomicInteger;
 /**
  * The properties the serverless design assumes of its object store, written down as tests.
  *
- * <p>This is R11. Every safety argument in {@code rfc-serverless-shell.md} rests on behaviour nobody has
+ * <p>Every safety argument in the shell rests on behaviour nobody has
  * verified outside a local filesystem: that a compare-and-swap admits exactly one winner, that a range
  * read returns exactly the bytes asked for, that a listing is complete. `FsBlobContainer` provides all
  * of that with real filesystem atomicity, which is why every phase so far has passed and why none of
  * those passes is evidence about S3.
  *
  * <p><b>Subclass this and bind a container to check a backend.</b> Running it against a filesystem
- * proves the suite works, and nothing else. The value is that R11's remaining cost is now "point it at
+ * proves the suite works, and nothing else. The value is that verifying a provider now costs "point it at
  * an endpoint" rather than "write the tests".
  *
  * <p>What each property is load-bearing for:

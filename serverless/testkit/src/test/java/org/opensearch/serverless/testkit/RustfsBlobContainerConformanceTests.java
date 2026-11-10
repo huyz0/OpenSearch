@@ -18,7 +18,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
  * conditional-delete path has had no S3-API store to run on. Validated against {@code rustfs/rustfs:1.0.0},
  * pinned by digest {@code sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff}.
  *
- * <p>Evidence for RustFS, not for AWS: R11 stays open for S3, GCS and Azure until it runs against them.
+ * <p>Evidence for RustFS, not for AWS: S3, GCS and Azure stay unverified until the suite runs against them.
  */
 @ThreadLeakScope(ThreadLeakScope.Scope.NONE)
 public class RustfsBlobContainerConformanceTests extends MinioBlobContainerConformanceTests {

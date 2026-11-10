@@ -23,12 +23,12 @@ import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Phase 3 end to end: create an index in the object store, and a node serves it.
+ * End to end: create an index in the object store, and a node serves it.
  *
  * <p>Nothing tells the node what to do. It reads descriptors and shard-heads and works it out — which
  * is the whole of what cluster-state publication was for.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only. No durability claim for S3 or GCS until R11 runs.
+ * <p>Runs against {@code FsBlobContainer} only, so it makes no durability claim for S3 or GCS.
  */
 public class ServerlessEndToEndTests extends OpenSearchTestCase {
 

@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * intent finishes whatever a writer that missed the delete leaves behind. These pin each of the conditions
  * that makes that safe, and the probe that keeps a store which ignores the condition on tombstones.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only, plus a wrapper that ignores the condition.
+ * <p>Runs against {@code FsBlobContainer} only, plus a wrapper that ignores the condition.
  */
 public class ServerlessConditionalDeleteTests extends OpenSearchTestCase {
 

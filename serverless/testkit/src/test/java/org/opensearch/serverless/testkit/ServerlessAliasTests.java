@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>It also makes resolution one read, which is what keeps searching through an alias the same cost as
  * searching the index directly.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessAliasTests extends OpenSearchTestCase {
 

@@ -19,7 +19,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 
 /**
- * M13: a node as a process.
+ * A node as a process.
  *
  * <p>The scheduler made a node <em>capable</em> of running unattended. Until the bootstrap existed
  * nothing ever built one outside a test method, so the claim was true of an arrangement that only
@@ -28,7 +28,7 @@ import java.time.Duration;
  * <p>Nothing here calls {@code tick}, {@code heartbeat}, {@code activateWriter}, {@code index} or
  * {@code publishShard}. Every effect below is the node acting on its own, reached over HTTP.
  *
- * <p><b>D5:</b> filesystem-backed store only.
+ * <p>Runs against a filesystem-backed store only.
  */
 public class ServerlessBootstrapTests extends OpenSearchTestCase {
 
@@ -108,7 +108,7 @@ public class ServerlessBootstrapTests extends OpenSearchTestCase {
     }
 
     /**
-     * The whole of M13 in one test: start a process, create an index over HTTP, write to it, search it
+     * A node as a process, in one test: start a process, create an index over HTTP, write to it, search it
      * back, and observe that the node took the shard, renewed its lease and published a commit without
      * anybody driving it.
      */

@@ -28,7 +28,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Snapshot and restore, backed by this deployment's own object store rather than a distinct repository
- * type, with request and response shapes matching real OpenSearch's own {@code _snapshot} API (M45, M46).
+ * type, with request and response shapes matching real OpenSearch's own {@code _snapshot} API.
  *
  * <p><b>Shallow or standard is a repository setting</b> ({@code remote_store_index_shallow_copy}), not a
  * per-request choice, matching real OpenSearch — every snapshot taken against one repository behaves the
@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * explicitly via {@link #shallowRepo}. A repository created with no settings at all is standard, and its
  * own tests below prove standard mode needs none of the shallow-only protections to keep its data safe.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessSnapshotTests extends OpenSearchTestCase {
 
@@ -402,8 +402,8 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
             assertEquals(200, shallowRepo(node, "backups").status());
             assertEquals(200, send(node, "PUT", "/_snapshot/backups/gen1", "{\"indices\":\"reused\"}").status());
 
-            // The first "reused" is deleted and a second, unrelated index takes the name -- a new uuid, per
-            // M32. The old snapshot's referencedBlobs must not be mistaken for anything this new index owns.
+            // The first "reused" is deleted and a second, unrelated index takes the name -- a new uuid, so
+            // storage is not shared. The old snapshot's referencedBlobs must not be mistaken for anything this new index owns.
             assertEquals(200, send(node, "DELETE", "/reused", null).status());
             plane.createIndex(new IndexDescriptor("reused", "uuid-reused-second-00", 1, MAPPING, null));
             final BackgroundReconciler secondLoop = hold(node, plane, clock, "reused", 1);

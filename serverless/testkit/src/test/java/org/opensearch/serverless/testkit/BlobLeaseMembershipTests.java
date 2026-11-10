@@ -25,7 +25,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 /**
- * Membership as a derived view over leases — {@code rfc-serverless-shell.md} §10.1, §10.2.
+ * Membership as a derived view over leases.
  *
  * <p>The clock is injected rather than slept on: a test that sleeps for a TTL is slow and flaky, and
  * these assertions are about ordering against a clock, not about real time.

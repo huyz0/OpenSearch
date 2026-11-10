@@ -20,7 +20,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 
 /**
- * Phase 1 completion: the shell binds transport and HTTP, and serves its allowlisted REST surface.
+ * The shell binds transport and HTTP, and serves its allowlisted REST surface.
  *
  * <p>These go over real HTTP to a really-bound port rather than calling the handlers directly. A
  * handler that returns the right object while the transport fails to bind is not a working node, and
@@ -83,10 +83,10 @@ public class ServerlessRestTests extends OpenSearchTestCase {
             node.start();
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
-            // D2: the surface is an allowlist. These exist in classic OpenSearch and must NOT answer
-            // here — an empty-but-successful cluster health is the exact failure HANDOFF.md records
-            // eight times, and it is worse than a 404.
-            // Since M51, health and the node list are answered rather than refused -- they need only the
+            // The surface is an allowlist. These exist in classic OpenSearch and must NOT answer
+            // here — an empty-but-successful cluster health is a confident wrong answer, and it
+            // is worse than a 404.
+            // Health and the node list are answered rather than refused -- they need only the
             // lease registry, which is the address book write forwarding already routes through. What is
             // still refused needs a snapshot across every index, an allocator, or a task queue.
             for (String path : new String[] { "/_cluster/state", "/_cluster/stats", "/_cluster/reroute" }) {
@@ -94,7 +94,7 @@ public class ServerlessRestTests extends OpenSearchTestCase {
                 final int code = Integer.parseInt(response.split(" ", 2)[0]);
                 assertNotEquals("unimplemented endpoint " + path + " answered with 200", 200, code);
                 assertEquals("unimplemented endpoint " + path + " should refuse explicitly: " + response, 501, code);
-                // A reason, not a particular reason. Since M53 each refusal carries the one that is true
+                // A reason, not a particular reason. Each refusal carries the one that is true
                 // of it -- enumeration cost, a missing allocator, a missing task queue -- so asserting the
                 // shared text here would pin the wrong thing. ServerlessDiscoveryTests checks each.
                 assertTrue("a 501 must say why: " + response, response.contains("is not available here:"));

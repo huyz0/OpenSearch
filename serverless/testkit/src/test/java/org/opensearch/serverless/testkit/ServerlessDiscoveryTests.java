@@ -24,7 +24,7 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M53: discovery — what indices exist, and what can be queried in them.
+ * Discovery — what indices exist, and what can be queried in them.
  *
  * <p><b>Both endpoints answer from descriptors alone, and that is the design.</b> Neither reads a shard, so
  * both work against an index whose shards are all dormant — the normal resting state here, and precisely when
@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * conclusion about its own {@code _cat} APIs and added {@code _list/indices}, whose contract <em>is</em> a
  * page at a time. Serving that contract involves no lying, so that is what is served.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessDiscoveryTests extends OpenSearchTestCase {
 

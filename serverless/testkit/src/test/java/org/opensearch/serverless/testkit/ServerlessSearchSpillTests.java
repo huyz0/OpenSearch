@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * burst; the preferred nodes filled, refused at their shard cap, and the searches failed outright while other nodes had
  * slots free.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessSearchSpillTests extends OpenSearchTestCase {
 

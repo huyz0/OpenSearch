@@ -39,7 +39,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * during the walk lost its new descriptor. These pin both halves of the replacement: cost set by what was
  * deleted, and a generation check that protects a recreated index when deletion is delayed.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
 

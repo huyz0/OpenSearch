@@ -49,7 +49,7 @@ import java.util.function.Supplier;
 /**
  * The shell's own authentication, running as a plugin on the shell's own plugin host.
  *
- * <p>M23 proved the host with a test plugin — one whose behaviour was chosen to make the host look good.
+ * <p>A test plugin alone proves the host — one whose behaviour was chosen to make the host look good.
  * This is the same host carrying something the deployment genuinely needs: on the critical path of every
  * request, keeping its accounts in an index, reached through the client, and depending on
  * {@code :server} rather than on the shell. If the host cannot carry this, it cannot carry OpenSearch
@@ -60,7 +60,7 @@ import java.util.function.Supplier;
  * day, when the object store is unreachable? And when I remove somebody, when do they actually stop
  * working?
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessAuthTests extends OpenSearchTestCase {
 
@@ -699,7 +699,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
     /**
      * The account index is not reachable through the request path, by anyone, by any route.
      *
-     * <p>This is the hole this milestone would otherwise have opened. Every authenticated caller can do
+     * <p>This is the hole an account index would otherwise open. Every authenticated caller can do
      * everything — there is no authorization layer — so an account index that behaved like an ordinary
      * index would let any account read the password records out of it with a search. Worse, it would let
      * any account <em>write</em> one: a record whose hash derives from a password of the attacker's

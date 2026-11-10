@@ -42,7 +42,7 @@ import java.util.regex.Pattern;
  * words the sender did not recognise. A client cannot see which node it reached, so it cannot code
  * against any of those.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessForwardingTests extends OpenSearchTestCase {
 

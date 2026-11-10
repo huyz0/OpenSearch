@@ -31,7 +31,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * them the collector deleted them, as it should, and the writer's next commit read a deleted file and failed its
  * engine. A fleet run lost the use of a shard that way, its acknowledged writes stranded in the log.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessCommitRetentionTests extends OpenSearchTestCase {
 

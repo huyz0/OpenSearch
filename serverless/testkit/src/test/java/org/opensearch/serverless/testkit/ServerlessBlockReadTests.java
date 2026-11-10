@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * optimisation. The assertions are all on <b>bytes fetched versus bytes published</b>, because a lazy
  * reader that quietly fetches everything is indistinguishable from an eager one unless someone counts.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessBlockReadTests extends OpenSearchTestCase {
 

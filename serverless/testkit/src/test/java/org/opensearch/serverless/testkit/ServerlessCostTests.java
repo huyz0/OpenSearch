@@ -196,7 +196,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
     }
 
     /**
-     * §7's claim, measured: batched leases make the per-tick <b>write</b> cost independent of how many
+     * Lease batching's claim, measured: batched leases make the per-tick <b>write</b> cost independent of how many
      * shards a node holds. One lease renewal covers all of them.
      *
      * <p><b>They do not make the tick flat, and the RFC should not be read as saying they do.</b> Each
@@ -205,7 +205,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
      * expensive half of it. Measured on a filesystem, at 8 shards: 34 requests per tick without batching,
      * 18 with — better by a constant, not by an order.
      *
-     * <p>The assertion is on the compare-and-swap count, because that is the number §7 is actually about
+     * <p>The assertion is on the compare-and-swap count, because that is the number batching is actually about
      * and the only one that is genuinely constant.
      */
     public void testBatchedLeasesMakeThePerTickWriteCostIndependentOfShardCount() throws Exception {
@@ -445,7 +445,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
      * makes it stop existing, so a reclaimed term is not there to be listed next time and the second publish
      * is exactly {@code deadTerms} listings cheaper. On a filesystem the emptied directories remain, are
      * re-listed on every publish forever, and the cost does not fall — which is a recurring toll, and
-     * tolerable only because the filesystem store is a test fixture (D5) and its listings are system calls
+     * tolerable only because the filesystem store is a test fixture and its listings are system calls
      * rather than billed requests. Pinned here so that if the fixture ever becomes something people run on,
      * this is a measured number rather than a surprise.
      *

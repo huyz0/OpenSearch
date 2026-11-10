@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * forwarded to it, every activation found the shard already held, and every request was answered "engine is closed".
  * A fleet run stranded acknowledged writes that way -- durable in the log, and readable by nobody.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessFailedEngineTests extends OpenSearchTestCase {
 

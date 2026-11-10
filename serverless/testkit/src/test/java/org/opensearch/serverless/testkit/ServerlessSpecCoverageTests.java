@@ -41,10 +41,10 @@ import java.util.stream.Stream;
 /**
  * Every path in the REST API spec is served, or refused with a reason. Never core's default.
  *
- * <p>D2 says an endpoint this design does not implement answers 501 with a reason. That was checked by
+ * <p>An endpoint this design does not implement answers 501 with a reason. That was checked by
  * hand, endpoint by endpoint, and each time a new one was checked another sibling of it turned up
  * answering core's own {@code 400 no handler found for uri} -- the index-less form, the {@code {name}}
- * form, the {@code {metric}} form. M50 found twenty-two by driving a node by hand; the audit after M60
+ * form, the {@code {metric}} form. Driving a node by hand found twenty-two; a later audit
  * found forty-one more the same way, and one of them ({@code POST /_index_template/_simulate}) was not
  * merely unrouted but misrouted onto a placeholder, storing a live template.
  *

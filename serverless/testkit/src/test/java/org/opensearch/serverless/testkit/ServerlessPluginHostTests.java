@@ -59,7 +59,7 @@ import java.util.function.UnaryOperator;
 /**
  * A plugin, actually loaded, actually running.
  *
- * <p>Everything before this was the interface a plugin <em>would</em> use. R4 says the shell "implements
+ * <p>Everything before this was the interface a plugin <em>would</em> use. The shell "implements
  * the plugin contract without an {@code Injector}" and nothing implemented it: {@code PluginsService} was
  * constructed with an empty list because {@code IndicesService} demands one, and no plugin had ever been
  * started.
@@ -69,7 +69,7 @@ import java.util.function.UnaryOperator;
  * a host. Writing it as a test plugin rather than pointing at the security plugin is deliberate: the point
  * is to prove the seams with something whose behaviour we control, before anything real is aimed at them.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessPluginHostTests extends OpenSearchTestCase {
 

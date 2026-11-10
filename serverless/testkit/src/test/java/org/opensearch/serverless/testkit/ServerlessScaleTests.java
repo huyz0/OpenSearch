@@ -22,11 +22,11 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Phase 9: the {@code plan-100m-index-implementation.md} targets, re-measured on this shell.
+ * The 100-million-index scale targets, measured on this shell.
  *
  * <p>The claim the whole architecture rests on is from
- * {@code plan-area-h-metadata-off-cluster-state.md}: <em>index creation costs the same at 100 million
- * indices as at zero</em>. Classic OpenSearch does not manage that — the same document measured 7.4 ms
+ * the metadata design: <em>index creation costs the same at 100 million
+ * indices as at zero</em>. Classic OpenSearch does not manage that — it was measured at 7.4 ms
  * per create with 200 indices present, 10.3 at 1,000, 34.6 at 3,000 and 98.8 at 6,000, because
  * {@code Metadata.Builder.build()} rebuilds six name arrays and a sorted lookup across every index on
  * every create. Creating the millionth index does a million units of work that have nothing to do with it.
@@ -35,7 +35,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * on absolute milliseconds: a wall-clock threshold would make the suite a flaky machine-speed detector
  * rather than an architecture check.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only. A local filesystem is not an object store, and these
+ * <p>Runs against {@code FsBlobContainer} only. A local filesystem is not an object store, and these
  * numbers say nothing about what S3 does at the same shapes.
  */
 public class ServerlessScaleTests extends OpenSearchTestCase {
@@ -83,7 +83,7 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
         }
 
         logger.info(
-            "phase 9 creation: population 0->{} in {} batches of {}; ops/create={}; micros/create={}",
+            "creation: population 0->{} in {} batches of {}; ops/create={}; micros/create={}",
             6 * batch,
             6,
             batch,
@@ -109,7 +109,7 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
     }
 
     /**
-     * §5's central claim: a node's residency tracks what it hosts, not how many indices exist.
+     * The node-local view's central claim: a node's residency tracks what it hosts, not how many indices exist.
      */
     public void testNodeResidencyTracksTheWorkingSetNotThePopulation() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -145,7 +145,7 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
         final long atSmall = truthOpsAtPopulation(200);
         final long atLarge = truthOpsAtPopulation(1_000);
 
-        logger.info("phase 9 truthFor: {} ops at population 200, {} ops at population 1000 (node hosts 1 shard in both)", atSmall, atLarge);
+        logger.info("truthFor: {} ops at population 200, {} ops at population 1000 (node hosts 1 shard in both)", atSmall, atLarge);
 
         assertEquals(
             "reading one node's truth must not cost more because other indices exist: "
@@ -215,7 +215,7 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
         final long atSmall = listPageOpsAtPopulation(200, 25);
         final long atLarge = listPageOpsAtPopulation(1_000, 25);
 
-        logger.info("phase 9 listPage: {} ops at population 200, {} ops at population 1000 (page size 25)", atSmall, atLarge);
+        logger.info("listPage: {} ops at population 200, {} ops at population 1000 (page size 25)", atSmall, atLarge);
         assertEquals("reading one page must not cost more because other indices exist: " + atSmall + " vs " + atLarge, atSmall, atLarge);
 
         // And the cost must scale with the page, not with anything else. Measuring the slope rather
@@ -236,7 +236,7 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
         final var page = plane.descriptors().listPage(null, pageSize);
         assertEquals(pageSize, page.descriptors().size());
         assertTrue("a page short of the population must report more to come", page.hasMore());
-        logger.info("phase 9 listPage split at population {}: {} reads, {} writes", population, counter.reads(), counter.writes());
+        logger.info("listPage split at population {}: {} reads, {} writes", population, counter.reads(), counter.writes());
         return counter.total();
     }
 

@@ -36,7 +36,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * search passes before it runs. These tests run with the production interval and never tick the reconciler,
  * so only the fence can make them pass.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessDescriptorPropagationTests extends OpenSearchTestCase {
 

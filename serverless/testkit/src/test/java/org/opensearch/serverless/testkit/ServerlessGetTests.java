@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * with no writer there is nothing newer than the commit. The interesting case is the third one — an owner
  * that exists and cannot be reached — where serving the commit would be a wrong answer that looks right.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessGetTests extends OpenSearchTestCase {
 

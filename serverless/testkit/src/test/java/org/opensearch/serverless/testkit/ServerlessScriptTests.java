@@ -25,7 +25,7 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M57: scripts, and the endpoints that used to look like typos.
+ * Scripts, and the endpoints that used to look like typos.
  *
  * <p><b>"No modules are loaded" was never "no module code is used."</b> The shell has always depended on
  * {@code modules:transport-netty4} directly — it picks its transport by name rather than discovering it from
@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * state here, so a stored script has nowhere to be looked up from — which is the same call AWS OpenSearch
  * Serverless makes, supporting inline scripts and refusing {@code /_scripts}.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessScriptTests extends OpenSearchTestCase {
 
@@ -375,7 +375,7 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         try (ServerlessNode node = running(plane(clock, createTempDir()), clock, "script-stored")) {
             assertNotNull(node);
-            // Served since M62: stored scripts live in a register of their own, and the script service
+            // Stored scripts live in a register of their own, and the script service
             // resolves an id from it rather than from cluster state.
             final Answer stored = call("PUT", "/_scripts/mine", "{\"script\":{\"lang\":\"painless\",\"source\":\"ctx._source.n = 5\"}}");
             assertEquals(stored.body(), 200, stored.status());
@@ -395,7 +395,7 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
      * <p><b>This is the class of bug, not one bug.</b> {@code GET /{index}} matches any single-segment path,
      * so every unrouted top-level API was answered "no such index: _stats" — a confident wrong answer about
      * something that was never an index, sending a caller to look for a missing index instead of a missing
-     * endpoint. M50 fixed it for {@code /_search} by routing {@code /_search}, which fixes one path and leaves
+     * endpoint. Routing each top-level path explicitly fixes one path and leaves
      * the next. The same shape existed for node ids and repository names.
      */
     public void testAnUnimplementedApiIsNotReportedAsAMissingIndex() throws Exception {

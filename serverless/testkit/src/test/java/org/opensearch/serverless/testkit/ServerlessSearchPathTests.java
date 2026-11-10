@@ -22,14 +22,14 @@ import java.nio.file.Path;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Phase 5: the search path. Reader shards over object-store segments, owning nothing.
+ * The search path. Reader shards over object-store segments, owning nothing.
  *
  * <p>Reader activation is the half of the design that needs no coordination at all — no
  * compare-and-swap, no shard-head entry, no agreement. Two search nodes serving the same shard cannot
  * conflict, because neither can write: a node that does not accept writer activation runs
  * {@code ReadOnlyEngine}, so the guarantee is structural rather than conventional.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only. No durability claim for S3 or GCS until R11 runs.
+ * <p>Runs against {@code FsBlobContainer} only, so it makes no durability claim for S3 or GCS.
  */
 public class ServerlessSearchPathTests extends OpenSearchTestCase {
 
@@ -223,7 +223,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
                 ShardOps.hits(reader.searchService(), shardId, "msg", "searchable")
             );
 
-            // Re-opening picks up the newer commit. Phase 8's notification is what makes this automatic.
+            // Re-opening picks up the newer commit. The background reconciler makes this automatic.
             reader.releaseShard(shardId, "reopening onto a newer commit");
             final ShardId reopened = reader.serveAsReader(plane, "alpha", 0);
             assertEquals(

@@ -30,12 +30,12 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 
 /**
- * Phase 3: descriptors and shard-heads as CAS registers.
+ * Descriptors and shard-heads as CAS registers.
  *
- * <p><b>D5 applies to every test here.</b> These run against {@code FsBlobContainer}, whose
+ * <p><b>Filesystem only.</b> These run against {@code FsBlobContainer}, whose
  * compare-and-swap is real local-filesystem atomicity. That says nothing about whether S3's
- * {@code If-Match} or GCS's generation preconditions behave the same way under contention, which is R11
- * and remains open. A green run here is not evidence about a cloud provider.
+ * {@code If-Match} or GCS's generation preconditions behave the same way under contention, which
+ * remains unverified. A green run here is not evidence about a cloud provider.
  */
 public class MetadataPlaneTests extends OpenSearchTestCase {
 
@@ -129,7 +129,7 @@ public class MetadataPlaneTests extends OpenSearchTestCase {
         final Acquisition contender = plane.activate("alpha", 0, "node-b", "eph-b");
         assertFalse("a live lease must not be stolen", contender.acquired());
         // The loser is told who won, so it routes there instead of retrying elsewhere and
-        // ping-ponging ownership -- the failure rfc-serverless-metadata-plane.md section 6 warns about.
+        // ping-ponging ownership.
         assertEquals("node-a", contender.head().ownerNodeId());
         assertEquals(1L, contender.head().term());
     }
@@ -232,7 +232,7 @@ public class MetadataPlaneTests extends OpenSearchTestCase {
 
         final List<ShardAssignment> owned = List.copyOf(plane.truthFor("node-a").assignments());
         assertEquals(1, owned.size());
-        assertEquals("the assignment must carry the head's term, which s1-findings.md showed is load-bearing", 3L, owned.get(0).term());
+        assertEquals("the assignment must carry the head's term, never a per-node counter", 3L, owned.get(0).term());
     }
 
     public void testDeleteIndexRemovesHeadsAndDescriptor() throws Exception {
