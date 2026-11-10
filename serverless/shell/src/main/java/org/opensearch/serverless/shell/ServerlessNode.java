@@ -54,7 +54,6 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * A serverless node: the OpenSearch data plane with no control plane.
@@ -653,6 +652,14 @@ public final class ServerlessNode implements Closeable {
         settings = this.settings;
 
         this.nodeName = settings.get("node.name", "serverless-node");
+        this.views = new LocalViewApplier(
+            nodeName,
+            () -> localNode.getId(),
+            this::clusterService,
+            () -> membershipSource,
+            () -> metadataPlane,
+            this::projectView
+        );
         // Role is a runtime attribute a node advertises, not a topology decision baked into a
         // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
         // environment variable, and role switching under load stays a policy question.
@@ -1311,46 +1318,24 @@ public final class ServerlessNode implements Closeable {
 
     private final java.util.Map<String, long[]> appliedDescriptorVersions = new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** A head as last read, with when: the heartbeat's reads, reused by the same pass rather than repeated. */
-    private record SeenHead(org.opensearch.serverless.metadata.ShardHead head, long atMillis) {
-    }
+    /**
+     * Past this many shards, head sightings older than a lease are dropped. See {@link ShardHeadSightings}.
+     */
+    public static final int DEFAULT_RECENT_HEADS_PRUNE_ABOVE = ShardHeadSightings.DEFAULT_RECENT_HEADS_PRUNE_ABOVE;
 
-    private final java.util.Map<String, SeenHead> recentHeads = new java.util.concurrent.ConcurrentHashMap<>();
+    /** The shard heads this node has read lately; the methods below forward to it. */
+    private final ShardHeadSightings sightings = new ShardHeadSightings(() -> metadataPlane);
 
     /**
      * Records a head this node has just read, for the other readers in the same pass and for routing.
-     *
-     * <p>The heartbeat, the hint rebuild and the publish each read the same register within a second of
-     * each other; a write to a shard this node does not hold read it again to learn the owner. One read
-     * feeds all of them now. A hint is a hint: every user of it survives its being wrong, because the
-     * owner refuses what it does not hold and the caller then reads the register.
      *
      * @param index the index
      * @param shard the shard
      * @param head what was read, or null if there was no head
      */
     public void noteHead(String index, int shard, org.opensearch.serverless.metadata.ShardHead head) {
-        final long now = metadataPlane == null ? System.currentTimeMillis() : metadataPlane.clock().getAsLong();
-        if (head == null) {
-            recentHeads.remove(index + "#" + shard);
-        } else {
-            recentHeads.put(index + "#" + shard, new SeenHead(head, now));
-            pruneRecentHeads(now);
-        }
+        sightings.noteHead(index, shard, head);
     }
-
-    /**
-     * Past this many shards, sightings older than a lease are dropped.
-     *
-     * <p>No reader believes one that old -- {@link #ownerHint} discards it and every {@link #recentHead}
-     * caller asks for less -- so dropping it changes no answer. Only the lookups that happened to find one
-     * used to remove it, so a shard routed to once and never asked about again stayed for the life of the
-     * process: a coordinator that routed to a million shards held a million sightings.
-     */
-    public static final int DEFAULT_RECENT_HEADS_PRUNE_ABOVE = 10_000;
-
-    private volatile int recentHeadsPruneAbove = DEFAULT_RECENT_HEADS_PRUNE_ABOVE;
-    private volatile long recentHeadsPrunedAt = Long.MIN_VALUE;
 
     /**
      * Sets how many head sightings this node may hold before those older than a lease are dropped.
@@ -1358,19 +1343,7 @@ public final class ServerlessNode implements Closeable {
      * @param entries the threshold
      */
     public void setRecentHeadsPruneAbove(int entries) {
-        this.recentHeadsPruneAbove = Math.max(0, entries);
-    }
-
-    private void pruneRecentHeads(long now) {
-        final org.opensearch.serverless.metadata.MetadataPlane plane = metadataPlane;
-        // The oldest any reader accepts: a lease, or a second where a test runs a shorter one.
-        final long ttl = Math.max(1_000L, plane == null ? 30_000L : plane.leaseTtlMillis());
-        // At most once per lease: a sighting cannot age out faster than that.
-        if (recentHeads.size() <= recentHeadsPruneAbove || (recentHeadsPrunedAt != Long.MIN_VALUE && now - recentHeadsPrunedAt < ttl)) {
-            return;
-        }
-        recentHeadsPrunedAt = now;
-        recentHeads.values().removeIf(seen -> now - seen.atMillis() > ttl);
+        sightings.setRecentHeadsPruneAbove(entries);
     }
 
     /**
@@ -1379,7 +1352,7 @@ public final class ServerlessNode implements Closeable {
      * @return the entry count
      */
     public int recentHeadCount() {
-        return recentHeads.size();
+        return sightings.recentHeadCount();
     }
 
     /**
@@ -1391,39 +1364,18 @@ public final class ServerlessNode implements Closeable {
      * @return the head, or empty if none that young was read
      */
     public java.util.Optional<org.opensearch.serverless.metadata.ShardHead> recentHead(String index, int shard, long maxAgeMillis) {
-        final SeenHead seen = recentHeads.get(index + "#" + shard);
-        if (seen == null) {
-            return java.util.Optional.empty();
-        }
-        final long now = metadataPlane == null ? System.currentTimeMillis() : metadataPlane.clock().getAsLong();
-        return now - seen.atMillis() <= maxAgeMillis ? java.util.Optional.of(seen.head()) : java.util.Optional.empty();
+        return sightings.recentHead(index, shard, maxAgeMillis);
     }
 
     /**
      * Returns the node last seen owning a shard, if the sighting is no older than one lease TTL.
-     *
-     * <p>Bounded, where it used to be unbounded: a hint is invalidated by a refusal from the node it
-     * names, and a node that is dead refuses nothing. A coordinator whose hint named a dead owner
-     * forwarded every write there until something else happened to re-read the head. A lease is the
-     * longest a node can be gone unnoticed, so a sighting older than one is not a hint any more; it is
-     * re-read, at the cost of one register read per TTL per shard this node routes to but does not hold.
      *
      * @param index the index
      * @param shard the shard
      * @return the owner's node id, or empty if no head young enough has been read here
      */
     public java.util.Optional<String> ownerHint(String index, int shard) {
-        final String key = index + "#" + shard;
-        final SeenHead seen = recentHeads.get(key);
-        if (seen == null) {
-            return java.util.Optional.empty();
-        }
-        final org.opensearch.serverless.metadata.MetadataPlane plane = metadataPlane;
-        if (plane != null && plane.clock().getAsLong() - seen.atMillis() > plane.leaseTtlMillis()) {
-            recentHeads.remove(key, seen);
-            return java.util.Optional.empty();
-        }
-        return java.util.Optional.ofNullable(seen.head().ownerNodeId());
+        return sightings.ownerHint(index, shard);
     }
 
     /**
@@ -1433,7 +1385,7 @@ public final class ServerlessNode implements Closeable {
      * @param shard the shard
      */
     public void forgetOwner(String index, int shard) {
-        recentHeads.remove(index + "#" + shard);
+        sightings.forgetOwner(index, shard);
     }
 
     /**
@@ -1596,108 +1548,22 @@ public final class ServerlessNode implements Closeable {
     private final Map<String, java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId>> readerOpens =
         new java.util.concurrent.ConcurrentHashMap<>();
 
-    /**
-     * Serialises projecting a view with applying it, so views are applied in the order they were computed
-     * and each one includes everything recorded before it -- two opens projecting at once could otherwise
-     * apply an older view last and take away an index the newer one had just added.
-     */
-    private final Object viewLock = new Object();
+    /** Applies the node-local view and counts its cost; see {@link LocalViewApplier}. */
+    private final LocalViewApplier views;
 
-    /** One caller's part of a batched view: what it adds, and the view that included it. */
-    private record PendingView(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening,
-        java.util.concurrent.CompletableFuture<ClusterState> applied) {
-    }
-
-    private final java.util.List<PendingView> pendingViews = new java.util.ArrayList<>();
-
-    /**
-     * Projects the local view with what a caller adds, and applies it -- for every caller waiting at once, in one projection.
-     *
-     * <p>A projection covers every index this node hosts or serves, and applying it is the same size again, so its cost
-     * grows with the shards held; and every activation made one, one at a time under this lock. At four hundred shards that
-     * was a fraction of a second; at twelve hundred an open averaged five seconds and a dead node's shards queued for
-     * minutes behind each other's projections. The callers waiting on the lock now hand in what they add, and whichever
-     * holds it projects and applies them all at once: a burst of N activations pays for a few projections, not N.
-     *
-     * <p>A projection that fails is retried for each caller alone, so one index whose view cannot be built fails only its
-     * own activation, as before.
-     */
     private ClusterState projectAndApply(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening)
         throws Exception {
-        final PendingView mine = new PendingView(extra, opening, new java.util.concurrent.CompletableFuture<>());
-        synchronized (pendingViews) {
-            pendingViews.add(mine);
-        }
-        synchronized (viewLock) {
-            if (mine.applied().isDone() == false) {
-                final java.util.List<PendingView> batch;
-                synchronized (pendingViews) {
-                    batch = new java.util.ArrayList<>(pendingViews);
-                    pendingViews.clear();
-                }
-                applyBatch(batch);
-            }
-        }
-        try {
-            return mine.applied().get();
-        } catch (java.util.concurrent.ExecutionException e) {
-            throw e.getCause() instanceof Exception cause ? cause : e;
-        }
-    }
-
-    private final java.util.concurrent.atomic.AtomicLong viewProjectNanos = new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong viewApplyNanos = new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong viewsApplied = new java.util.concurrent.atomic.AtomicLong();
-
-    private ClusterState timedProjectAndApply(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening)
-        throws Exception {
-        final long projectingAt = System.nanoTime();
-        final ClusterState view = projectView(extra, opening);
-        final long applyingAt = System.nanoTime();
-        viewProjectNanos.addAndGet(applyingAt - projectingAt);
-        applyLocalView(view, () -> 30_000L);
-        viewApplyNanos.addAndGet(System.nanoTime() - applyingAt);
-        viewsApplied.incrementAndGet();
-        return view;
+        return views.projectAndApply(extra, opening);
     }
 
     /**
      * The local views activations have projected and applied: milliseconds projecting, milliseconds applying, and how many
      * -- fewer than the activations when they were batched.
+     *
+     * @return projecting, applying, then the count
      */
     public long[] localViewMillis() {
-        return new long[] {
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(viewProjectNanos.get()),
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(viewApplyNanos.get()),
-            viewsApplied.get() };
-    }
-
-    private void applyBatch(java.util.List<PendingView> batch) {
-        if (batch.size() > 1) {
-            final java.util.List<IndexDescriptor> extra = new java.util.ArrayList<>();
-            final java.util.List<ShardAssignment> opening = new java.util.ArrayList<>();
-            for (PendingView each : batch) {
-                extra.addAll(each.extra());
-                opening.addAll(each.opening());
-            }
-            try {
-                final ClusterState view = timedProjectAndApply(extra, opening);
-                for (PendingView each : batch) {
-                    each.applied().complete(view);
-                }
-                return;
-            } catch (Exception e) {
-                logger.debug("a batched view of " + batch.size() + " activations failed; projecting each alone", e);
-            }
-        }
-        for (PendingView each : batch) {
-            try {
-                final ClusterState view = timedProjectAndApply(each.extra(), each.opening());
-                each.applied().complete(view);
-            } catch (Exception e) {
-                each.applied().completeExceptionally(e);
-            }
-        }
+        return views.localViewMillis();
     }
 
     /** Records that an incarnation was read and found live at {@code startedAtNanos}, for the incarnation fence. */
@@ -5065,7 +4931,7 @@ public final class ServerlessNode implements Closeable {
             return;
         }
         forgetReader(shardId);
-        recentHeads.remove(shardId.getIndexName() + "#" + shardId.id());
+        sightings.forgetOwner(shardId.getIndexName(), shardId.id());
         writerAssignments.remove(shardKey(shardId.getIndexName(), shardId.id()));
         if (reconciler.openShards().stream().noneMatch(open -> open.getIndexName().equals(shardId.getIndexName()))) {
             appliedDescriptorVersions.remove(shardId.getIndexName());
@@ -5212,84 +5078,7 @@ public final class ServerlessNode implements Closeable {
      * @throws Exception if application fails or times out
      */
     public void applyLocalView(ClusterState state, TimeValueLike timeout) throws Exception {
-        final ClusterState toApply = withPeers(state);
-        final CountDownLatch latch = new CountDownLatch(1);
-        final AtomicReference<Exception> failure = new AtomicReference<>();
-        clusterService.getClusterApplierService()
-            .onNewClusterState("serverless-projected-view", () -> toApply, new ClusterApplier.ClusterApplyListener() {
-                @Override
-                public void onSuccess(String source) {
-                    latch.countDown();
-                }
-
-                @Override
-                public void onFailure(String source, Exception e) {
-                    failure.set(e);
-                    latch.countDown();
-                }
-            });
-        if (latch.await(timeout.millis(), TimeUnit.MILLISECONDS) == false) {
-            throw new IllegalStateException("projected view was never applied on " + nodeName);
-        }
-        if (failure.get() != null) {
-            throw failure.get();
-        }
-    }
-
-    /**
-     * Adds every live member of the fleet to the view's nodes: {@code DiscoveryNodes}
-     * built from the membership view, not the local node alone.
-     *
-     * <p>Nothing in the data plane looks a peer up by id today, so this is a description rather than a
-     * dependency; it is what makes {@code IndexShard}'s node lookups safe should a path ever name a peer,
-     * and what lets a plugin reading the cluster state see the fleet. A lease whose address does not parse,
-     * or that collides with one already added -- a restarted node whose old lease has not yet expired --
-     * is skipped: membership is a hint, and a wrong hint here costs a missing entry, never a failed apply.
-     */
-    private ClusterState withPeers(ClusterState state) {
-        MembershipSource source = membershipSource;
-        if (source == null && metadataPlane != null) {
-            source = metadataPlane.membership();
-        }
-        if (source == null || source.current().isEmpty()) {
-            return state;
-        }
-        final DiscoveryNodes.Builder nodes = DiscoveryNodes.builder(state.nodes());
-        boolean changed = false;
-        for (org.opensearch.serverless.membership.NodeLease lease : source.current()) {
-            if (lease.nodeId().equals(localNode.getId()) || state.nodes().nodeExists(lease.nodeId())) {
-                continue;
-            }
-            try {
-                nodes.add(peerNode(lease));
-                changed = true;
-            } catch (Exception e) {
-                logger.debug("not describing {} in the local view: {}", lease.nodeId(), e.getMessage());
-            }
-        }
-        return changed ? ClusterState.builder(state).nodes(nodes).build() : state;
-    }
-
-    /** A peer as the data plane would see it, from its lease: id, ephemeral id, address and roles all from there. */
-    private static DiscoveryNode peerNode(org.opensearch.serverless.membership.NodeLease lease) throws Exception {
-        final String address = lease.address();
-        final int colon = address.lastIndexOf(':');
-        final String host = address.substring(0, colon).replace("[", "").replace("]", "");
-        final TransportAddress transportAddress = new TransportAddress(
-            InetAddress.getByName(host),
-            Integer.parseInt(address.substring(colon + 1))
-        );
-        return new DiscoveryNode(
-            lease.name(),
-            lease.nodeId(),
-            lease.ephemeralId(),
-            transportAddress.address().getHostString(),
-            transportAddress.getAddress(),
-            transportAddress,
-            discoveryAttributesFor(lease.roles()),
-            discoveryRolesFor(lease.roles()),
-            Version.CURRENT
-        );
+        views.applyLocalView(state, timeout);
     }
 
     /**
