@@ -16,5 +16,5 @@ tasks.named('forbiddenPatterns').configure {
   rule name: 'plan reference (milestone, decision, risk or probe id)', pattern: /\b(M[1-9][0-9]|D[1-9]|R(1[0-9]?|[3-9])|S[01]|F[0-9])\b/
   rule name: 'design-document section reference', pattern: /§|&sect;|\b[Pp]hase [0-9]+\b|\b[Mm]ilestone/
   rule name: 'reference to a planning document not in this repository',
-    pattern: /rfc-serverless-(shell|opensearch|metadata-plane)\.md|[a-z0-9]-(notes|findings)\.md|HANDOFF\.md|plan-area-/
+    pattern: /rfc-serverless-(shell|opensearch|metadata-plane)\.md|[a-z0-9]-(notes|findings)\.md|HANDOFF\.md|\bplan-[a-z0-9-]+\.md/
 }
