@@ -54,6 +54,7 @@ public final class CountingBlobStore implements BlobStore {
     private final AtomicLong blobWrites = new AtomicLong();
     private final AtomicLong listings = new AtomicLong();
     private final AtomicLong deletes = new AtomicLong();
+    private final Map<String, AtomicLong> places = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * Wraps a store.
@@ -74,6 +75,35 @@ public final class CountingBlobStore implements BlobStore {
         blobWrites.set(0);
         listings.set(0);
         deletes.set(0);
+        places.clear();
+    }
+
+    /**
+     * Returns where the operations went: one line per kind of request and place in the store, most frequent first.
+     *
+     * <p>A place is the container path and blob name with every run of digits, and every Lucene segment or commit
+     * generation, replaced by {@code #}, so the thousand log blobs of one shard, or one kind of segment file across
+     * commits, count as one place. This is what turns
+     * "a publish costs seven requests" into which seven they are.
+     *
+     * @return the breakdown, one {@code count kind place} per line
+     */
+    public String byPlace() {
+        final StringBuilder out = new StringBuilder();
+        places.entrySet()
+            .stream()
+            .sorted((a, b) -> Long.compare(b.getValue().get(), a.getValue().get()))
+            .forEach(e -> out.append(e.getValue().get()).append(' ').append(e.getKey()).append('\n'));
+        return out.toString();
+    }
+
+    private void note(String kind, BlobPath path, String blobName) {
+        final String place = (path.buildAsString() + (blobName == null ? "" : blobName))
+            // Lucene names segments and commits in base 36, so their letters vary too.
+            .replaceAll("(^|/)_[a-z0-9]+\\.", "$1_#.")
+            .replaceAll("segments_[a-z0-9]+", "segments_#")
+            .replaceAll("[0-9]+", "#");
+        places.computeIfAbsent(kind + " " + place, k -> new AtomicLong()).incrementAndGet();
     }
 
     /**
@@ -232,6 +262,7 @@ public final class CountingBlobStore implements BlobStore {
         public InputStream readBlob(String blobName) throws IOException {
             reads.incrementAndGet();
             blobReads.incrementAndGet();
+            note("GET", inner.path(), blobName);
             return inner.readBlob(blobName);
         }
 
@@ -239,6 +270,7 @@ public final class CountingBlobStore implements BlobStore {
         public InputStream readBlob(String blobName, long position, long length) throws IOException {
             reads.incrementAndGet();
             blobReads.incrementAndGet();
+            note("GET", inner.path(), blobName);
             return inner.readBlob(blobName, position, length);
         }
 
@@ -246,6 +278,7 @@ public final class CountingBlobStore implements BlobStore {
         public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
             writes.incrementAndGet();
             blobWrites.incrementAndGet();
+            note("PUT", inner.path(), blobName);
             inner.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
         }
 
@@ -254,6 +287,7 @@ public final class CountingBlobStore implements BlobStore {
             throws IOException {
             writes.incrementAndGet();
             blobWrites.incrementAndGet();
+            note("PUT", inner.path(), blobName);
             inner.writeBlobAtomic(blobName, inputStream, blobSize, failIfAlreadyExists);
         }
 
@@ -261,6 +295,7 @@ public final class CountingBlobStore implements BlobStore {
         public DeleteResult delete() throws IOException {
             writes.incrementAndGet();
             deletes.incrementAndGet();
+            note("DELETE", inner.path(), null);
             return inner.delete();
         }
 
@@ -268,6 +303,7 @@ public final class CountingBlobStore implements BlobStore {
         public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws IOException {
             writes.incrementAndGet();
             deletes.incrementAndGet();
+            note("DELETE", inner.path(), null);
             inner.deleteBlobsIgnoringIfNotExists(blobNames);
         }
 
@@ -275,6 +311,7 @@ public final class CountingBlobStore implements BlobStore {
         public Map<String, BlobMetadata> listBlobs() throws IOException {
             reads.incrementAndGet();
             listings.incrementAndGet();
+            note("LIST", inner.path(), null);
             return inner.listBlobs();
         }
 
@@ -288,6 +325,7 @@ public final class CountingBlobStore implements BlobStore {
         public Map<String, BlobMetadata> listBlobsByPrefix(String blobNamePrefix) throws IOException {
             reads.incrementAndGet();
             listings.incrementAndGet();
+            note("LIST", inner.path(), blobNamePrefix);
             return inner.listBlobsByPrefix(blobNamePrefix);
         }
 
@@ -296,6 +334,7 @@ public final class CountingBlobStore implements BlobStore {
             reads.incrementAndGet();
             // One request per thousand names, as S3 pages.
             listings.addAndGet(Math.max(1, (limit + 999) / 1000));
+            note("LIST", inner.path(), blobNamePrefix);
             return inner.listBlobsByPrefix(blobNamePrefix, startAfter, limit);
         }
 
@@ -303,6 +342,7 @@ public final class CountingBlobStore implements BlobStore {
         public Map<String, BlobContainer> children(String startAfter, int limit) throws IOException {
             reads.incrementAndGet();
             listings.addAndGet(Math.max(1, (limit + 999) / 1000));
+            note("LIST", inner.path(), null);
             final Map<String, BlobContainer> counted = new java.util.LinkedHashMap<>();
             for (Map.Entry<String, BlobContainer> child : inner.children(startAfter, limit).entrySet()) {
                 counted.put(child.getKey(), new Counting(child.getValue()));
@@ -315,6 +355,7 @@ public final class CountingBlobStore implements BlobStore {
             throws IOException {
             reads.incrementAndGet();
             listings.addAndGet(Math.max(1, (limit + 999) / 1000));
+            note("LIST", inner.path(), blobNamePrefix);
             return inner.listBlobsByPrefixInSortedOrder(blobNamePrefix, limit, order);
         }
 
@@ -322,6 +363,7 @@ public final class CountingBlobStore implements BlobStore {
         public Optional<BlobRegister> readRegister(String blobName) throws IOException {
             reads.incrementAndGet();
             registerReads.incrementAndGet();
+            note("REGISTER_GET", inner.path(), blobName);
             return inner.readRegister(blobName);
         }
 
@@ -329,6 +371,7 @@ public final class CountingBlobStore implements BlobStore {
         public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
             writes.incrementAndGet();
             deletes.incrementAndGet();
+            note("DELETE", inner.path(), blobName);
             return inner.deleteRegisterIfUnchanged(blobName, expectedGeneration);
         }
 
@@ -337,6 +380,7 @@ public final class CountingBlobStore implements BlobStore {
             throws IOException {
             writes.incrementAndGet();
             registerWrites.incrementAndGet();
+            note("REGISTER_CAS", inner.path(), blobName);
             return inner.compareAndSwapRegister(blobName, expectedGeneration, newValue);
         }
 
@@ -344,6 +388,7 @@ public final class CountingBlobStore implements BlobStore {
         public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
             writes.incrementAndGet();
             registerWrites.incrementAndGet();
+            note("REGISTER_CAS", inner.path(), blobName);
             return inner.createRegisterIfAbsent(blobName, value);
         }
     }
