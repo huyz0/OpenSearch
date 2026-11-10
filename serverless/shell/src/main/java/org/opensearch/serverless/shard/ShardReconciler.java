@@ -793,14 +793,36 @@ public final class ShardReconciler {
                     // this call carries is the terms. Handing core different settings at an unchanged
                     // version is an assertion failure in IndexService#updateMetadata, and the store type
                     // set on open is exactly such a difference once a settings refresh has been applied.
-                    final IndexMetadata refreshed = current.getSettingsVersion() == indexMetadata.getSettingsVersion()
-                        ? IndexMetadata.builder(indexMetadata).settings(current.getSettings()).build()
-                        : indexMetadata;
-                    existing.updateMetadata(current, refreshed);
+                    final IndexMetadata.Builder refreshed = current.getSettingsVersion() == indexMetadata.getSettingsVersion()
+                        ? IndexMetadata.builder(indexMetadata).settings(current.getSettings())
+                        : IndexMetadata.builder(indexMetadata);
+                    existing.updateMetadata(current, keepingHigherTerms(current, refreshed));
                 }
                 return existing;
             }
         }
+    }
+
+    /**
+     * Builds the metadata to hand an index's service, keeping each shard's term at least where the service has it.
+     *
+     * <p>A caller knows the term of the shard it is opening and fills the others with a default, and a settings
+     * refresh knows none of them. Applied as given, an update pushes the terms of the index's other shards back
+     * down: two shards opening at once each lowered the other's before it was created, so it started at the old
+     * term and was refused when promoted to the one it won. Terms only ever rise within one incarnation of an
+     * index, so the higher of the two is the right one.
+     */
+    private static IndexMetadata keepingHigherTerms(IndexMetadata current, IndexMetadata.Builder incoming) {
+        final IndexMetadata built = incoming.build();
+        final int shards = Math.min(current.getNumberOfShards(), built.getNumberOfShards());
+        boolean raised = false;
+        for (int shard = 0; shard < shards; shard++) {
+            if (current.primaryTerm(shard) > built.primaryTerm(shard)) {
+                incoming.primaryTerm(shard, current.primaryTerm(shard));
+                raised = true;
+            }
+        }
+        return raised ? incoming.build() : built;
     }
 
     /** Takes a shard that never became ours back out of its IndexService, keeping the cause's own report. */
@@ -1550,7 +1572,21 @@ public final class ShardReconciler {
         }
         // The store type is how this node serves the index, not a property of the index; it travels with
         // the refreshed settings so the service's settings keep saying what its directory is.
-        indexService.updateMetadata(indexService.getMetadata(), onBlockCache(descriptor.toIndexMetadata(java.util.Map.of())));
+        final IndexMetadata incoming = onBlockCache(descriptor.toIndexMetadata(java.util.Map.of()));
+        // Under the index's monitor, the one a shard's open refreshes the terms under, so a term raised by an open
+        // between reading the service's metadata and updating it is not lowered again here.
+        final Index index = indexService.index();
+        while (true) {
+            final Object lock = indexLocks.computeIfAbsent(index, ignored -> new Object());
+            synchronized (lock) {
+                if (indexLocks.get(index) != lock) {
+                    continue;
+                }
+                final IndexMetadata current = indexService.getMetadata();
+                indexService.updateMetadata(current, keepingHigherTerms(current, IndexMetadata.builder(incoming)));
+                return;
+            }
+        }
     }
 
     /**
