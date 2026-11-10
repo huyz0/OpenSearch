@@ -382,7 +382,7 @@ public final class ServerlessNode implements Closeable {
     }
 
     /** The share of a node's cap a fleet sized by {@link #fleetSize} aims to use. */
-    public static final double TARGET_UTILISATION = 0.8;
+    public static final double TARGET_UTILISATION = FleetPlacement.TARGET_UTILISATION;
 
     /**
      * How many writer nodes the fleet has and how many its demand wants: the number to scale on.
@@ -396,40 +396,13 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * Sizes the writer fleet from the load every member renews into its lease: shards used in the last minute, and shards
-     * turned away at a cap, over the average cap at {@link #TARGET_UTILISATION}. Shards merely held do not count -- a
-     * node's cap is a cache that fills whatever the load -- so a fleet full but turning nothing away does not ask for more,
-     * and one turning shards away asks for as many more nodes as would have taken them.
+     * Sizes the writer fleet from the load every member renews into its lease. See {@link FleetPlacement#fleetSize}.
      *
      * @param plane the metadata plane
      * @return the members counted and the nodes wanted
      */
     public FleetSize fleetSize(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        final long now = plane.clock().getAsLong();
-        int members = 0;
-        long demand = 0;
-        long caps = 0;
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            // A member's lease as this node last read it, which is re-read only once it has run out: up to a TTL past its
-            // expiry it is a live member whose renewal this node has not fetched yet, not a departed one. Counting only
-            // unexpired copies dropped a varying share of the fleet, and nodes asked at the same moment answered 1 and 7.
-            if (lease.revoked()
-                || now >= lease.expiresAtMillis() + plane.leaseTtlMillis()
-                || lease.roles().contains(ROLE_INGEST) == false
-                || lease.inUse() < 0
-                || lease.cap() <= 0) {
-                continue;
-            }
-            members++;
-            demand += lease.inUse() + Math.max(0, lease.refused());
-            caps += lease.cap();
-        }
-        if (members == 0) {
-            // Nobody reports a load yet -- a fleet starting, or a view from before leases carried it. Not "none wanted".
-            return new FleetSize(0, -1, 0);
-        }
-        final double perNode = (double) caps / members * TARGET_UTILISATION;
-        return new FleetSize(members, (int) Math.max(1, Math.ceil(demand / perNode)), demand);
+        return placement.fleetSize(plane);
     }
 
     /**
@@ -458,9 +431,22 @@ public final class ServerlessNode implements Closeable {
     }
 
     /** Above this share of its cap a node looks for a member to hand work to. */
-    public static final double HAND_OFF_ABOVE = 0.9;
+    public static final double HAND_OFF_ABOVE = FleetPlacement.HAND_OFF_ABOVE;
     /** At or below this share of its cap a member can take work handed to it. */
-    public static final double ROOM_AT_OR_BELOW = 0.75;
+    public static final double ROOM_AT_OR_BELOW = FleetPlacement.ROOM_AT_OR_BELOW;
+    /** Above this multiple of the fleet's mean held shards a node hands work off, however far it is from its cap. */
+    public static final double HAND_OFF_ABOVE_MEAN = FleetPlacement.HAND_OFF_ABOVE_MEAN;
+    /** A node handing off for being above the mean hands off down to this multiple of it. */
+    public static final double HAND_OFF_DOWN_TO_MEAN = FleetPlacement.HAND_OFF_DOWN_TO_MEAN;
+    /** Below this share of its cap a node is never too busy for the mean to matter: a small fleet's few shards stay. */
+    public static final double MEAN_MATTERS_FROM = FleetPlacement.MEAN_MATTERS_FROM;
+
+    /** Decides where this node's work belongs across the fleet; the methods below forward to it. */
+    private final FleetPlacement placement = new FleetPlacement(
+        () -> localNode.getId(),
+        () -> admission.maxShardsHeld(),
+        () -> this.reconciler == null ? 0 : this.reconciler.heldShards().size()
+    );
 
     /**
      * Whether this node holds more than {@link #HAND_OFF_ABOVE} of its cap.
@@ -468,50 +454,26 @@ public final class ServerlessNode implements Closeable {
      * @return true when nearly full
      */
     public boolean nearlyFull() {
-        final int cap = admission.maxShardsHeld();
-        return cap > 0 && reconciler != null && reconciler.heldShards().size() >= cap * HAND_OFF_ABOVE;
+        return placement.nearlyFull();
     }
 
     /**
-     * The live writer member with the most room, if any has {@link #ROOM_AT_OR_BELOW} of its cap or less: where a full
-     * node sends work. From the leases every member renews with its load, so it costs no request.
+     * The live writer member with the most room, if any. See {@link FleetPlacement#memberWithRoom}.
      *
      * @param plane the metadata plane
      * @return the member's id
      */
     public java.util.Optional<String> memberWithRoom(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        final long now = plane.clock().getAsLong();
-        String best = null;
-        double bestShare = ROOM_AT_OR_BELOW;
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            if (lease.nodeId().equals(localNode.getId())
-                || lease.isExpiredAt(now)
-                || lease.roles().contains(ROLE_INGEST) == false
-                || lease.held() < 0
-                || lease.cap() <= 0) {
-                continue;
-            }
-            final double share = (double) lease.held() / lease.cap();
-            if (share <= bestShare) {
-                best = lease.nodeId();
-                bestShare = share;
-            }
-        }
-        return java.util.Optional.ofNullable(best);
+        return placement.memberWithRoom(plane);
     }
 
-    private volatile double takeoverOvercommit = 0.0;
-
-    private volatile boolean routeTakeovers = true;
-
     /**
-     * Sets whether requests for a dead member's shard go to the one survivor named for it: on by default; off only to
-     * measure what it saves.
+     * Sets whether requests for a dead member's shard go to the one survivor named for it.
      *
      * @param route whether to
      */
     public void setRouteTakeovers(boolean route) {
-        this.routeTakeovers = route;
+        placement.setRouteTakeovers(route);
     }
 
     /**
@@ -520,30 +482,26 @@ public final class ServerlessNode implements Closeable {
      * @return true if they do
      */
     public boolean routesTakeovers() {
-        return routeTakeovers;
+        return placement.routesTakeovers();
     }
 
     /**
-     * Sets how far past its cap a member may take a dead member's shards, as BackgroundReconciler does: the ceiling a
-     * member's room is judged against when choosing who takes over a shard.
+     * Sets how far past its cap a member may take a dead member's shards. See {@link FleetPlacement#setTakeoverOvercommit}.
      *
      * @param fraction of the cap
      */
     public void setTakeoverOvercommit(double fraction) {
-        this.takeoverOvercommit = Math.max(0.0, fraction);
+        placement.setTakeoverOvercommit(fraction);
     }
-
-    private final java.util.concurrent.atomic.AtomicLong takeoverWritesRouted = new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong takeoverDoubtsLeft = new java.util.concurrent.atomic.AtomicLong();
 
     /** Counts a write for a dead member's shard sent to the member that takes it over. */
     public void noteTakeoverWriteRouted() {
-        takeoverWritesRouted.incrementAndGet();
+        placement.noteTakeoverWriteRouted();
     }
 
     /** Counts a doubt about a dead member's shard this node left to the member that takes it over. */
     public void noteTakeoverDoubtLeft() {
-        takeoverDoubtsLeft.incrementAndGet();
+        placement.noteTakeoverDoubtLeft();
     }
 
     /**
@@ -552,18 +510,11 @@ public final class ServerlessNode implements Closeable {
      * @return routed, then left
      */
     public long[] takeoverRouting() {
-        return new long[] { takeoverWritesRouted.get(), takeoverDoubtsLeft.get() };
+        return placement.takeoverRouting();
     }
 
     /**
-     * The member that takes over a shard whose owner's lease has run out: of the live writer members other than that
-     * owner, in name order, the first from the shard's hash with room under its overcommit ceiling -- or, if none has
-     * room, the one the hash names. Every member computes the same answer from the same leases, so a dead node's shards
-     * are each taken by one survivor rather than queued by every survivor a request for them happens to reach: a fleet
-     * run had every survivor queueing ~300 of a dead node's shards, and requests waited 30-60 s in those queues.
-     *
-     * <p>Routing only. The head's compare-and-swap still decides who owns the shard; two members with different views
-     * cost a wasted activation, never a second owner.
+     * The member that takes over a shard whose owner's lease has run out. See {@link FleetPlacement#takeoverWinner}.
      *
      * @param plane the metadata plane
      * @param indexName the index
@@ -577,31 +528,12 @@ public final class ServerlessNode implements Closeable {
         int shard,
         String deadOwner
     ) {
-        final long now = plane.clock().getAsLong();
-        final java.util.TreeMap<String, org.opensearch.serverless.membership.NodeLease> live = new java.util.TreeMap<>();
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            if (lease.nodeId().equals(deadOwner) == false && lease.isExpiredAt(now) == false && lease.roles().contains(ROLE_INGEST)) {
-                live.put(lease.nodeId(), lease);
-            }
-        }
-        if (live.isEmpty()) {
-            return java.util.Optional.empty();
-        }
-        final java.util.List<String> order = new java.util.ArrayList<>(live.keySet());
-        final int first = Math.floorMod((indexName + "#" + shard).hashCode(), order.size());
-        for (int i = 0; i < order.size(); i++) {
-            final String candidate = order.get((first + i) % order.size());
-            if (hasTakeoverRoom(candidate, live.get(candidate))) {
-                return java.util.Optional.of(candidate);
-            }
-        }
-        return java.util.Optional.of(order.get(first));
+        return placement.takeoverWinner(plane, indexName, shard, deadOwner);
     }
 
     /**
-     * Whether a shard is a dead member's that another live member is to take over, so this node should leave it: the head
-     * names an owner with no live lease, and the member named for it is not this one. False when anything is unknown, and
-     * when routing is off: routing must never become nobody taking it.
+     * Whether a shard is a dead member's that another live member is to take over. See
+     * {@link FleetPlacement#takeoverBelongsElsewhere}.
      *
      * @param plane the metadata plane
      * @param indexName the index
@@ -609,127 +541,47 @@ public final class ServerlessNode implements Closeable {
      * @return true to leave it to the member named
      */
     public boolean takeoverBelongsElsewhere(org.opensearch.serverless.metadata.MetadataPlane plane, String indexName, int shard) {
-        if (routeTakeovers == false) {
-            return false;
-        }
-        try {
-            final var head = plane.heads().read(indexName, shard);
-            if (head.isEmpty()
-                || head.get().ownerNodeId() == null
-                || head.get().ownerNodeId().equals(localNode.getId())
-                || plane.heads().isHeld(head.get(), plane.clock().getAsLong())) {
-                return false;
-            }
-            final java.util.Optional<String> winner = takeoverWinner(plane, indexName, shard, head.get().ownerNodeId());
-            return winner.isPresent() && winner.get().equals(localNode.getId()) == false;
-        } catch (Exception e) {
-            return false;
-        }
+        return placement.takeoverBelongsElsewhere(plane, indexName, shard);
     }
-
-    private boolean hasTakeoverRoom(String nodeId, org.opensearch.serverless.membership.NodeLease lease) {
-        if (nodeId.equals(localNode.getId())) {
-            final int cap = admission.maxShardsHeld();
-            final int held = reconciler == null ? 0 : reconciler.heldShards().size();
-            return cap <= 0 || held < cap + Math.floor(cap * takeoverOvercommit);
-        }
-        if (lease.held() < 0 || lease.cap() <= 0) {
-            return true;
-        }
-        return lease.held() < lease.cap() + Math.floor(lease.cap() * takeoverOvercommit);
-    }
-
-    /** Above this multiple of the fleet's mean held shards a node hands work off, however far it is from its cap. */
-    public static final double HAND_OFF_ABOVE_MEAN = 1.5;
-    /** A node handing off for being above the mean hands off down to this multiple of it. */
-    public static final double HAND_OFF_DOWN_TO_MEAN = 1.25;
-    /** Below this share of its cap a node is never too busy for the mean to matter: a small fleet's few shards stay. */
-    public static final double MEAN_MATTERS_FROM = 0.25;
 
     /**
-     * The mean of held shards over the live writer members, this node counted from its own count rather than its lease.
+     * The mean of held shards over the live writer members. See {@link FleetPlacement#fleetMeanHeld}.
      *
      * @param plane the metadata plane
      * @return the mean, or -1 if no member says
      */
     public double fleetMeanHeld(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        final long now = plane.clock().getAsLong();
-        long sum = reconciler == null ? 0 : reconciler.heldShards().size();
-        int members = 1;
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            if (lease.nodeId().equals(localNode.getId())
-                || lease.isExpiredAt(now)
-                || lease.roles().contains(ROLE_INGEST) == false
-                || lease.held() < 0) {
-                continue;
-            }
-            sum += lease.held();
-            members++;
-        }
-        return members < 2 ? -1 : (double) sum / members;
+        return placement.fleetMeanHeld(plane);
     }
 
     /**
-     * Whether this node holds far more than its share: more than {@link #HAND_OFF_ABOVE_MEAN} of the fleet's mean, and at
-     * least {@link #MEAN_MATTERS_FROM} of its cap. Hand-off near the cap left load uneven everywhere below it: the node a
-     * fleet run killed held anywhere from 103 to 847 shards, and how long recovery took followed that.
+     * Whether this node holds far more than its share of the fleet. See {@link FleetPlacement#aboveFleetShare}.
      *
      * @param plane the metadata plane
      * @return true when above its share
      */
     public boolean aboveFleetShare(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        final int cap = admission.maxShardsHeld();
-        final int held = reconciler == null ? 0 : reconciler.heldShards().size();
-        final double mean = fleetMeanHeld(plane);
-        return cap > 0 && mean > 0 && held >= cap * MEAN_MATTERS_FROM && held > mean * HAND_OFF_ABOVE_MEAN;
+        return placement.aboveFleetShare(plane);
     }
 
     /**
-     * The live writer member holding the fewest shards, if it holds fewer than the fleet's mean: where a node above its
-     * share sends work.
+     * The live writer member holding the fewest shards, if below the fleet's mean. See {@link FleetPlacement#memberBelowMean}.
      *
      * @param plane the metadata plane
      * @return the member's id
      */
     public java.util.Optional<String> memberBelowMean(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        final double mean = fleetMeanHeld(plane);
-        if (mean <= 0) {
-            return java.util.Optional.empty();
-        }
-        final long now = plane.clock().getAsLong();
-        String best = null;
-        long fewest = Long.MAX_VALUE;
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            if (lease.nodeId().equals(localNode.getId())
-                || lease.isExpiredAt(now)
-                || lease.roles().contains(ROLE_INGEST) == false
-                || lease.held() < 0
-                || lease.held() >= mean) {
-                continue;
-            }
-            if (lease.held() < fewest) {
-                best = lease.nodeId();
-                fewest = lease.held();
-            }
-        }
-        return java.util.Optional.ofNullable(best);
+        return placement.memberBelowMean(plane);
     }
 
     /**
-     * Where this node should send work it would otherwise take, if anywhere: to a member with room when this one is nearly
-     * full, or to a member below the mean when this one holds far more than its share.
+     * Where this node should send work it would otherwise take, if anywhere. See {@link FleetPlacement#handOffTarget}.
      *
      * @param plane the metadata plane
      * @return the member's id
      */
     public java.util.Optional<String> handOffTarget(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        if (nearlyFull()) {
-            final java.util.Optional<String> roomy = memberWithRoom(plane);
-            if (roomy.isPresent()) {
-                return roomy;
-            }
-        }
-        return aboveFleetShare(plane) ? memberBelowMean(plane) : java.util.Optional.empty();
+        return placement.handOffTarget(plane);
     }
 
     /**
