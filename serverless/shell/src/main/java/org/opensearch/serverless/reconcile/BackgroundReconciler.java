@@ -1250,7 +1250,7 @@ public final class BackgroundReconciler implements Closeable {
         final boolean unchanged = maxSeqNo < 0 || maxSeqNo <= lastPublishedMaxSeqNo.getOrDefault(shardId, -1L);
         if (unchanged == false && node.isWriteFenced(shardId) == false) {
             synchronized (publishLock(shardId)) {
-                node.publishShard(shardId, head.get().term());
+                lastManifests.put(shardId, node.publishShard(shardId, head.get().term()));
             }
         }
         if (plane.heads()
@@ -1274,7 +1274,11 @@ public final class BackgroundReconciler implements Closeable {
         // rule the shard out from its digest, so the clear also widens the entry to the published commit, which
         // the publishes made under the mark did not. A clear that fails leaves it marked, which costs a check.
         try {
-            final var published = plane.segmentPublisher(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id()).readManifest();
+            // This writer's last publish is the published commit while it held the head; read only if it never published.
+            final org.opensearch.serverless.store.CommitManifest mine = lastManifests.get(shardId);
+            final Optional<org.opensearch.serverless.store.CommitManifest> published = mine != null && mine.term() == head.get().term()
+                ? Optional.of(mine)
+                : plane.segmentPublisher(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id()).readManifest();
             plane.rollups()
                 .clearOwned(
                     shardId.getIndexName(),

@@ -19,6 +19,7 @@ import org.opensearch.serverless.metadata.DigestRollups;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.store.PruningDigest;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
@@ -101,6 +102,48 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
             "a search outside every published value is ruled out: " + entry,
             entry.rulesOut(QueryBuilders.rangeQuery("n").gte(1_000_000), nowMillis)
         );
+    }
+
+    private static PruningDigest n(long min, long max) {
+        return new PruningDigest(Map.of("n", new PruningDigest.FieldRange("long", min, max, null, null)));
+    }
+
+    /** Only the publishing writer's own mark lets it skip the rollup: a successor's higher mark does not. */
+    public void testOnlyTheWritersOwnMarkSkipsTheRollup() throws Exception {
+        try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
+            final DigestRollups rollups = new DigestRollups(store, BlobPath.cleanPath().add("rollups"));
+            rollups.markOwned("logs-a", "uuid-a", 1, 0, 3L);
+
+            store.reset();
+            rollups.widenUnlessMarked("logs-a", "uuid-a", 1, 0, 3L, n(100, 200));
+            assertEquals("under its own mark a writer's publish makes no request", 0L, store.total());
+
+            // A successor marks the shard at a higher term. The writer at 3 is now stale, and its publish must widen.
+            rollups.markOwned("logs-a", "uuid-a", 1, 0, 4L);
+            store.reset();
+            rollups.widenUnlessMarked("logs-a", "uuid-a", 1, 0, 3L, n(100, 200));
+            assertTrue("a writer whose mark was superseded widens the entry", store.registerWrites() > 0L);
+
+            // And a clear by the successor keeps what the stale writer published.
+            rollups.clearOwned("logs-a", "uuid-a", 0, 4L, n(300, 400));
+            final DigestRollups.Entry entry = rollups.readGroup(DigestRollups.group("logs-a"), new DescriptorStore.Reads() {
+                @Override
+                public <T> List<T> runAll(List<Callable<T>> tasks) throws InterruptedException {
+                    final List<T> out = new ArrayList<>();
+                    for (Callable<T> task : tasks) {
+                        try {
+                            out.add(task.call());
+                        } catch (Exception e) {
+                            out.add(null);
+                        }
+                    }
+                    return out;
+                }
+            }).get("logs-a");
+            assertFalse(entry.rulesOut(QueryBuilders.rangeQuery("n").gte(150).lte(150), 0L));
+            assertFalse(entry.rulesOut(QueryBuilders.rangeQuery("n").gte(350).lte(350), 0L));
+            assertTrue(entry.rulesOut(QueryBuilders.rangeQuery("n").gte(1_000_000), 0L));
+        }
     }
 
     public void testPublishesUnderAWritersMarkSkipTheRollupUntilItLetsGo() throws Exception {

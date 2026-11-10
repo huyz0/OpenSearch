@@ -1803,6 +1803,15 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * What a publish does to the plane's digest rollups before its manifest is written: widen the shard's entry, unless
+     * the publishing writer's own mark already keeps the shard from being ruled out.
+     */
+    private static ShardReconciler.BeforePublish widensRollupsOf(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        return (id, shards, term, digest) -> plane.rollups()
+            .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest);
+    }
+
+    /**
      * Brings this node's open shards of an index up to a descriptor just read.
      *
      * <p>From the per-pass refresh and from the incarnation fence, which reads the same register for an
@@ -2313,10 +2322,7 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
-        reconciler.setBeforePublish(
-            (id, shards, term, digest) -> plane.rollups()
-                .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest)
-        );
+        reconciler.setBeforePublish(widensRollupsOf(plane));
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
         );
@@ -2390,10 +2396,7 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
-        reconciler.setBeforePublish(
-            (id, shards, term, digest) -> plane.rollups()
-                .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest)
-        );
+        reconciler.setBeforePublish(widensRollupsOf(plane));
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
         );
@@ -2459,10 +2462,7 @@ public final class ServerlessNode implements Closeable {
         }
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
-        reconciler.setBeforePublish(
-            (id, shards, term, digest) -> plane.rollups()
-                .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest)
-        );
+        reconciler.setBeforePublish(widensRollupsOf(plane));
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
         );
@@ -3138,10 +3138,7 @@ public final class ServerlessNode implements Closeable {
         ensureStarted();
         adopt(plane);
         reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
-        reconciler.setBeforePublish(
-            (id, shards, term, digest) -> plane.rollups()
-                .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest)
-        );
+        reconciler.setBeforePublish(widensRollupsOf(plane));
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
         );

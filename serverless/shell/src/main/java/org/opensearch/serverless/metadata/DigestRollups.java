@@ -248,15 +248,20 @@ public final class DigestRollups {
      */
     public void widenUnlessMarked(String name, String uuid, int shards, int shard, long term, PruningDigest digest) throws IOException {
         if (term > 0L) {
-            final Map<String, Entry> remembered = known.get(group(name) + "/" + blob(bucket(name)));
+            final Map<String, Entry> remembered = known.get(key(name));
             final Entry entry = remembered == null ? null : remembered.get(name);
-            // This node's copy, which can be stale only towards less: a mark is cleared by its own writer, or on its
-            // behalf once its head is gone, and neither happens while this writer still publishes at this term.
+            // This writer's own mark, exactly: a higher one is a successor's, which says nothing about this writer.
+            //
+            // Trusted from this node's copy because nothing else clears it while this writer can still publish
+            // something new. The writer clears it itself, after its last publish. A survivor clears it only after
+            // giving the head back on the writer's behalf and fencing the writer's log, and only when every record
+            // that landed is in the published commit -- so a writer that was not as dead as it looked can publish
+            // again only what that commit already holds, and the entry the survivor widened to it covers that.
             if (entry != null
                 && entry.alias() == false
                 && entry.uuid().equals(uuid)
                 && shard < entry.states().size()
-                && entry.states().get(shard).ownerTerm() >= term) {
+                && entry.states().get(shard).ownerTerm() == term) {
                 return;
             }
         }
@@ -285,23 +290,14 @@ public final class DigestRollups {
     }
 
     /**
-     * Clears a writer's mark, if it is still that writer's. Called after the last publish and the head's release;
-     * a clear that fails leaves the shard marked, which only stops it being ruled out.
-     *
-     * @param name the index
-     * @param uuid the incarnation
-     * @param shard the shard
-     * @param term the term being given up
-     * @throws IOException if the register cannot be updated
-     */
-    public void clearOwned(String name, String uuid, int shard, long term) throws IOException {
-        clearOwned(name, uuid, shard, term, null, true);
-    }
-
-    /**
      * Clears a writer's mark, if it is still that writer's, widening the shard's digest to the published commit's in
      * the same swap. Publishes made under the mark skip the rollup ({@link #widenUnlessMarked}), so this is where the
      * entry catches up with them, before the shard can be ruled out.
+     *
+     * <p>What the entry then covers is everything before the mark and the commit published last, not every commit in
+     * between: a document changed or deleted by the last commit is no longer covered at its old value. A reader still
+     * serving an earlier commit can hold it for a moment longer, and a wide search then answers as the last commit
+     * would.
      *
      * @param name the index
      * @param uuid the incarnation
@@ -315,24 +311,11 @@ public final class DigestRollups {
     }
 
     /**
-     * Clears a mark another node left, reading the register rather than trusting this node's copy.
+     * Clears a mark another node left, widening the digest to the published commit's in the same swap, and reading the
+     * register rather than trusting this node's copy.
      *
      * <p>An owner clearing its own mark can trust its copy: its own mark is in it. A node cleaning up after a dead one
      * cannot -- its copy may predate the mark, and a clear skipped on that copy left the shard marked for good.
-     *
-     * @param name the index
-     * @param uuid the incarnation
-     * @param shard the shard
-     * @param term the term the mark records
-     * @throws IOException if the register cannot be updated
-     */
-    public void clearOwnedOf(String name, String uuid, int shard, long term) throws IOException {
-        clearOwned(name, uuid, shard, term, null, false);
-    }
-
-    /**
-     * Clears a mark another node left, widening the digest to the published commit's in the same swap, and reading the
-     * register rather than trusting this node's copy.
      *
      * @param name the index
      * @param uuid the incarnation
@@ -520,10 +503,15 @@ public final class DigestRollups {
         update(name, true, change);
     }
 
+    /** The key of the register a name lives in, as {@link #known} holds it. */
+    private static String key(String name) {
+        return group(name) + "/" + blob(bucket(name));
+    }
+
     private void update(String name, boolean trustRemembered, Change change) throws IOException {
         final String group = group(name);
         final int bucket = bucket(name);
-        final String key = group + "/" + blob(bucket);
+        final String key = key(name);
         final BlobContainer container = container(group);
         final Map<String, Entry> remembered = known.get(key);
         if (trustRemembered && remembered != null && change.apply(remembered.get(name)) == null) {

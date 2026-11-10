@@ -1566,10 +1566,18 @@ public final class MetadataPlane {
         }
         final org.opensearch.serverless.store.WalStore log = walStore(indexName, uuid, shard);
         log.fenceOlderTerms(abandoned.get().released().term());
-        if (unpublished(indexName, uuid, shard, log)) {
+        final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
+        if (unpublished(indexName, uuid, shard, commit, log)) {
             return Settled.NEEDS_REPLAY;
         }
-        rollups().clearOwnedOf(indexName, uuid, shard, previous.term(), publishedDigest(indexName, uuid, shard));
+        // Widened to the published commit as the mark goes: the dead writer's publishes skipped the rollup under it.
+        rollups().clearOwnedOf(
+            indexName,
+            uuid,
+            shard,
+            previous.term(),
+            commit.map(org.opensearch.serverless.store.CommitManifest::digest).orElse(null)
+        );
         forgetAssignment(deadNodeId, indexName, shard);
         return Settled.RELEASED_CLEAN;
     }
@@ -1597,22 +1605,20 @@ public final class MetadataPlane {
             return Settled.NOT_ABANDONED;
         }
         final String uuid = descriptor.get().uuid();
-        if (unpublished(indexName, uuid, shard, walStore(indexName, uuid, shard))) {
+        final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
+        if (unpublished(indexName, uuid, shard, commit, walStore(indexName, uuid, shard))) {
             return Settled.NEEDS_REPLAY;
         }
-        // A writer that takes the shard meanwhile marks it at a higher term first, which this clear leaves alone.
-        rollups().clearOwnedOf(indexName, uuid, shard, markedTerm, publishedDigest(indexName, uuid, shard));
+        // A writer that takes the shard meanwhile marks it at a higher term first, which this clear leaves alone. Widened
+        // to the published commit as the mark goes, as in settleAbandoned.
+        rollups().clearOwnedOf(
+            indexName,
+            uuid,
+            shard,
+            markedTerm,
+            commit.map(org.opensearch.serverless.store.CommitManifest::digest).orElse(null)
+        );
         return Settled.RELEASED_CLEAN;
-    }
-
-    /**
-     * The digest of a shard's published commit, which a cleared writer mark must leave its rollup entry covering: the
-     * writer's publishes skipped the rollup while its mark stood. Null when nothing is published.
-     */
-    private org.opensearch.serverless.store.PruningDigest publishedDigest(String indexName, String uuid, int shard) throws IOException {
-        return segmentPublisher(indexName, uuid, shard).readManifest()
-            .map(org.opensearch.serverless.store.CommitManifest::digest)
-            .orElse(null);
     }
 
     /**
@@ -1621,8 +1627,18 @@ public final class MetadataPlane {
      * the log's, as a reader judges it; one that records neither counts as behind.
      */
     private boolean unpublished(String indexName, String uuid, int shard, org.opensearch.serverless.store.WalStore log) throws IOException {
+        return unpublished(indexName, uuid, shard, segmentPublisher(indexName, uuid, shard).readManifest(), log);
+    }
+
+    /** The same, judged against a manifest the caller has already read. */
+    private boolean unpublished(
+        String indexName,
+        String uuid,
+        int shard,
+        Optional<org.opensearch.serverless.store.CommitManifest> commit,
+        org.opensearch.serverless.store.WalStore log
+    ) throws IOException {
         final org.opensearch.serverless.store.SegmentPublisher publisher = segmentPublisher(indexName, uuid, shard);
-        final Optional<org.opensearch.serverless.store.CommitManifest> commit = publisher.readManifest();
         if (commit.isEmpty()) {
             return log.landedPast(0L, -1L);
         }
@@ -1687,7 +1703,7 @@ public final class MetadataPlane {
         for (int shard = 0; shard < shards; shard++) {
             final Optional<ShardHead> head = heads.read(indexName, shard);
             if (head.isPresent() && head.get().ownerNodeId() != null) {
-                // Its writer publishes, and the publish widens the entry.
+                // Marked by its writer, so never ruled out; the writer's clear widens the entry when it lets go.
                 return List.of();
             }
             if (unpublished(indexName, uuid, shard, walStore(indexName, uuid, shard))) {
