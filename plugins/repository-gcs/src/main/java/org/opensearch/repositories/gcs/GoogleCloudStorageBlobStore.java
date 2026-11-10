@@ -549,13 +549,28 @@ class GoogleCloudStorageBlobStore implements BlobStore {
      */
     Optional<BlobRegister> readRegister(String blobName) throws IOException {
         final BlobId blobId = BlobId.of(bucketName, blobName);
-        final Blob blob = AccessController.doPrivilegedChecked(() -> client().get(blobId));
-        if (blob == null) {
-            return Optional.empty();
+        // The download is pinned to the generation the metadata named, so the value and generation always match.
+        // A swap landing between the two requests removes that generation (buckets without object versioning keep
+        // only the live one), and the download answers 404. The metadata is then read again: the register now holds
+        // a later generation, or is gone.
+        for (int attempt = 1;; attempt++) {
+            final Blob blob = AccessController.doPrivilegedChecked(() -> client().get(blobId));
+            if (blob == null) {
+                return Optional.empty();
+            }
+            try {
+                final byte[] content = AccessController.doPrivilegedChecked(() -> blob.getContent());
+                return Optional.of(new BlobRegister(blob.getGeneration(), new BytesArray(content)));
+            } catch (StorageException e) {
+                if (e.getCode() != HTTP_NOT_FOUND || attempt >= MAX_REGISTER_READ_ATTEMPTS) {
+                    throw e;
+                }
+            }
         }
-        final byte[] content = AccessController.doPrivilegedChecked(() -> blob.getContent());
-        return Optional.of(new BlobRegister(blob.getGeneration(), new BytesArray(content)));
     }
+
+    /** How many times a register read follows a generation replaced under it before giving up. */
+    static final int MAX_REGISTER_READ_ATTEMPTS = 16;
 
     /**
      * CASes the register at {@code blobName} using GCS's real conditional-write primitives
