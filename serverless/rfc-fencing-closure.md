@@ -75,7 +75,7 @@ the fence can exist.
   acknowledged**; the lease check after the PUT no longer decides acknowledgement. That is what closes (2):
   the refused-but-replayed case came from refusing writes that had in fact landed ahead of the cutoff.
 - Remaining assumptions: that the store's put-if-absent on one key is linearizable (the conformance suite
-  checks it; R11 is still open for real S3, GCS and Azure), and that an append's outcome is known -- an
+  checks it; real S3, GCS and Azure remain unverified), and that an append's outcome is known -- an
   ambiguous result (a timeout) is reported as a failure and poisons the writer, and such a record, if it
   landed, is replayed: the one case where a refused write can reappear, which is the ordinary meaning of
   "unknown outcome" and not a fencing hole.
