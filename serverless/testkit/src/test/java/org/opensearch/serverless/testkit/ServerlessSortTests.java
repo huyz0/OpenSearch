@@ -42,7 +42,7 @@ import java.util.regex.Pattern;
  * by score, or dropped the sort keys on the way back from a remote shard, produces a visibly different
  * answer. A single-shard fixture would pass with the merge deleted.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessSortTests extends OpenSearchTestCase {
 

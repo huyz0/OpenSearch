@@ -24,13 +24,13 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * {@code /_cluster/settings} — §9.3's {@code /cluster/config} register, at the surface a caller reaches.
+ * {@code /_cluster/settings} — the {@code cluster/config} register, at the surface a caller reaches.
  *
  * <p>The one endpoint under {@code /_cluster/*} not refused, because it is the one piece of that
  * namespace that genuinely is one register rather than genuinely cluster-wide state. See
  * {@link org.opensearch.serverless.metadata.ClusterConfig} for what is and is not validated.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessClusterSettingsTests extends OpenSearchTestCase {
 

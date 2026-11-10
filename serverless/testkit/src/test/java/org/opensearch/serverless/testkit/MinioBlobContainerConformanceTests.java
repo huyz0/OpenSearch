@@ -27,13 +27,12 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * R11 against a real S3 API.
+ * The blob-store conformance suite against a real S3 API.
  *
  * <p>Every claim this project makes about durability, fencing and ownership rests on properties of an
  * object store, and until now every one of them had only ever been checked against a local filesystem —
  * where they hold almost by construction, because {@code FsBlobContainer} implements compare-and-swap
- * with real filesystem atomicity and ranged reads with a file channel. §12.1 has carried "M12: suite
- * written, not run on a provider" ever since.
+ * with real filesystem atomicity and ranged reads with a file channel.
  *
  * <p>MinIO is not S3. It is an S3-compatible implementation, and the properties that matter most —
  * conditional-write linearizability under contention, listing bounds, read-after-write — are exactly the

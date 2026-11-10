@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * is what lets the scan run every five minutes instead of on every pass, and these pin both halves and the
  * cost it buys.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessLeaseRevocationTests extends OpenSearchTestCase {
 

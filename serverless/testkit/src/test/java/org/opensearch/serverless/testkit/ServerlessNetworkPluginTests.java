@@ -39,7 +39,7 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * A plugin that gets to see the wire.
  *
- * <p>M28's audit found the shell building its {@code NetworkModule} with netty4 and nothing else, so an
+ * <p>An audit found the shell building its {@code NetworkModule} with netty4 and nothing else, so an
  * installed {@code NetworkPlugin} was loaded and then never asked. Two things follow from that, and they
  * are the two the audit named as the reason this host cannot yet carry the whole of OpenSearch Security:
  * the plugin cannot substitute its TLS transport, and it cannot install a transport interceptor — which is
@@ -55,7 +55,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * plugin's {@code additionalSettings} now reaches the node, and loses to an operator's explicit setting
  * rather than to the shell's default.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
 
@@ -259,7 +259,7 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
     /**
      * A plugin can supply the node's transport, and the node uses it.
      *
-     * <p>M29 wired {@code NetworkPlugin}s into the network module and could not show this: proving it needs
+     * <p>Wiring {@code NetworkPlugin}s into the network module could not show this: proving it needs
      * a transport to substitute, and writing one is a project rather than a fixture. Delegating to netty4
      * under a different name proves the part that was in question — that {@code additionalSettings} selects
      * an implementation and {@code getTransports} provides it — without pretending to have written a TLS

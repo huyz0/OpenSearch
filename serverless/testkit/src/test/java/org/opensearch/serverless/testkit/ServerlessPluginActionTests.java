@@ -54,14 +54,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * OpenSearch security plugin's configuration-update API is one. The shell's client implemented an
  * allowlist of core's actions and refused everything else by name, so a plugin calling
  * {@code client.execute(itsOwnAction, request)} was told the shell does not implement it. Core builds
- * these with Guice, which R4 says plugins do not get here, so the shell builds them by resolving each
+ * these with Guice, which plugins do not get here, so the shell builds them by resolving each
  * constructor against what this node can supply.
  *
  * <p><b>The action does real work through the client</b> rather than returning a constant. An action that
  * could be constructed and could not reach the shell's data plane would be a mechanism that proves
  * nothing.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessPluginActionTests extends OpenSearchTestCase {
 

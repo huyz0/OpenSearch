@@ -30,7 +30,7 @@ import java.util.concurrent.TimeUnit;
 /**
  * The shell itself, on an object store.
  *
- * <p>R11 established what an object store must provide and that MinIO provides it. That is a statement
+ * <p>The conformance suite established what an object store must provide and that MinIO provides it. That is a statement
  * about the store, not about the shell: every node this project has ever run has read and written a local
  * directory, so "the design works on object storage" rested on the two halves never having been put
  * together. Segments, the write-ahead log, shard-heads, node leases and index descriptors all move over
@@ -79,7 +79,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
 
     private String freshBucket() throws Exception {
         final String bucket = "shell-" + randomAlphaOfLength(12).toLowerCase(Locale.ROOT);
-        // Created through the same helper R11 uses, because creating a bucket is not something the shell
+        // Created through the same helper the conformance suite uses, because creating a bucket is not something the shell
         // does or should do -- a serverless node is handed one.
         org.opensearch.repositories.s3.MinioBlobStores.create(endpoint(), "minioadmin", "minioadmin", bucket, createTempDir());
         return bucket;
@@ -321,7 +321,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
     /**
      * Fencing, on the transport where the fence is an HTTP conditional write.
      *
-     * <p>Both halves of §9.6 have only ever been demonstrated on a filesystem, where a compare-and-swap is
+     * <p>Both halves of term fencing had only ever been demonstrated on a filesystem, where a compare-and-swap is
      * a rename and a segment upload is a memcpy. The claim the project actually makes is about an object
      * store: that a writer which lost its shard cannot make anyone believe its commit. That rests on
      * {@code compareAndSwapRegister} being linearizable over HTTP, which a filesystem cannot demonstrate —

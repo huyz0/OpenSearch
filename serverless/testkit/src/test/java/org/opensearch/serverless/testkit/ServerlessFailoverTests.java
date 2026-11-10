@@ -23,14 +23,14 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Phase 6: activation, lease expiry, and what a zombie can and cannot do.
+ * Activation, lease expiry, and what a zombie can and cannot do.
  *
  * <p>Failure detection here runs on the node that might be failing, not on one watching it. A node that
  * is paused, partitioned or dead simply stops heartbeating; its lease lapses and someone else acquires
  * by compare-and-swap. Nothing has to agree that it died, which is why there is no failure detector and
  * no quorum anywhere in this.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only. No durability claim for S3 or GCS until R11 runs.
+ * <p>Runs against {@code FsBlobContainer} only, so it makes no durability claim for S3 or GCS.
  */
 public class ServerlessFailoverTests extends OpenSearchTestCase {
 
@@ -154,7 +154,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
     }
 
     /**
-     * The zombie. R9's actual scenario, which kill -9 cannot produce: a writer that is not dead, only
+     * The zombie. The real fencing scenario, which kill -9 cannot produce: a writer that is not dead, only
      * paused past its lease, and that wakes up still believing it owns the shard.
      */
     public void testAZombieWriterCannotCorruptTheShardItLost() throws Exception {
@@ -198,7 +198,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             assertEquals(successorTerm, plane.segmentPublisher("alpha", 0).readManifest().orElseThrow().term());
 
             // And on its next heartbeat the zombie discovers the truth and lets go. Its unpublished
-            // document goes with it -- lost, not corrupting, which is phase 4's WAL gap and not a fence
+            // document goes with it -- lost, not corrupting, which is a durability gap and not a fence
             // failure. Distinguishing those two is the whole point of the test.
             assertEquals(java.util.Set.of(onZombie), zombie.heartbeat(plane));
             assertTrue(zombie.reconciler().openShards().isEmpty());
@@ -233,7 +233,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
      * test — the code was there and the evidence was not. {@link PausingBlobStore} holds it open on
      * demand instead of racing and hoping.
      *
-     * <p>The stakes are the whole of §9.6: without the swap, the loser's manifest replaces the winner's,
+     * <p>The stakes are the whole of term fencing: without the swap, the loser's manifest replaces the winner's,
      * and every document the winner wrote stops existing as far as any future reader is concerned.
      */
     public void testAWriterThatReadTheManifestBeforeItsSuccessorPublishedIsStillFenced() throws Exception {

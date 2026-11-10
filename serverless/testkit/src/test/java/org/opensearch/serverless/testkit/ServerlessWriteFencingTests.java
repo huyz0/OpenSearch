@@ -30,9 +30,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M49: fencing a writer that has lost its shard but has not yet noticed.
+ * Fencing a writer that has lost its shard but has not yet noticed.
  *
- * <p><b>The hole this closes.</b> M48 disclosed it precisely: a writer at term T appends to
+ * <p><b>The hole this closes.</b> Precisely: a writer at term T appends to
  * {@code wal/t=T}, and a successor replays every term it finds, so records the old writer appends
  * <em>after</em> ownership moved are replayed as though they had been acknowledged before it. The
  * term-scoped key path separates the two writers' blobs; it never stopped anyone from reading the older
@@ -45,7 +45,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * other side — a successor seals the log at takeover and nothing appended after the seal is ever replayed,
  * by it or by any node after it. The first test here covers the bound, the second the fence.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessWriteFencingTests extends OpenSearchTestCase {
 
@@ -279,7 +279,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
      * the other half, and is acknowledged and replayed: see
      * {@link #testAZombieAppendingBetweenTheSwapAndTheFenceIsAcknowledgedAndReplayed}.
      *
-     * <p><b>D5:</b> {@code FsBlobContainer} only.
+     * <p>Runs against {@code FsBlobContainer} only.
      */
     public void testAZombieAppendingBetweenTheSwapAndTheOpenIsFenced() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -346,7 +346,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
      * before the successor's fence. Its record lands ahead of the fence, so its append returns -- it is
      * acknowledged -- and the successor replays it. It used to be replayed while its writer refused it.
      *
-     * <p><b>D5:</b> {@code FsBlobContainer} only.
+     * <p>Runs against {@code FsBlobContainer} only.
      */
     public void testAZombieAppendingBetweenTheSwapAndTheFenceIsAcknowledgedAndReplayed() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -400,7 +400,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
      * acknowledges the write when it resumes -- and the successor has it. The record is ahead of the fence, so
      * it is durable; refusing it, as this used to, is what made a write "refused" and later replayed.
      *
-     * <p><b>D5:</b> {@code FsBlobContainer} only.
+     * <p>Runs against {@code FsBlobContainer} only.
      */
     public void testAWriteThatLandedBeforeATakeoverIsAcknowledgedAndKept() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

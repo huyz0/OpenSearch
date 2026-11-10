@@ -41,7 +41,7 @@ import java.util.regex.Pattern;
  * ordered by shard number. That is not a page of a relevance-ranked search, and no test noticed, because
  * every existing search test either fits on one shard or only counts totals.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessQueryTests extends OpenSearchTestCase {
 
@@ -201,7 +201,7 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
      *
      * <p>An aggregation parses and runs perfectly well on a single shard. Returning one shard's buckets,
      * or three shards' buckets concatenated, as if either were the index's answer would be a number that
-     * is wrong and looks right — which is the failure mode D2's 501s exist to prevent.
+     * is wrong and looks right — which is the failure mode the allowlist's 501s exist to prevent.
      */
     public void testWhatCannotBeMergedIsRefusedRatherThanIgnored() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

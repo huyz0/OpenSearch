@@ -55,7 +55,7 @@ import java.util.zip.ZipInputStream;
  * in this build, and an assertion that depends on optional data is an assertion that fails for reasons
  * that have nothing to do with the shell. Folding is table-driven and unconditional.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 /*
  * ExtrasFS, the test framework's mock filesystem, plants a stray entry in every directory it creates --

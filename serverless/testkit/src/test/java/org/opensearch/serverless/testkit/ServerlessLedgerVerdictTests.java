@@ -37,7 +37,7 @@ import java.util.stream.Stream;
  * day the loss is real. {@link DurabilityCheck} reads the commit and the log from the store, needs no owner, and answers
  * in three: verified, lost with its evidence, or unreached.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessLedgerVerdictTests extends OpenSearchTestCase {
 

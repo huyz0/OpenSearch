@@ -37,7 +37,7 @@ import java.util.stream.Collectors;
  * finished. At object-store latency, a node holding enough shards lapsed its own lease under no fault but
  * arithmetic, and every peer then stole its shards. The numbers here are the ones that were wrong.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
 

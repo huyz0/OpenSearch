@@ -36,7 +36,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * blob writes, and the rest exist because batching is only worth having if it does not quietly weaken
  * ordering, durability, or the refusal to reinterpret a request.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only. The cost claim is re-measured on a bucket in
+ * <p>Runs against {@code FsBlobContainer} only. The cost claim is re-measured on a bucket in
  * {@link ServerlessCostTests}, where an operation is a billed request rather than a system call.
  */
 public class ServerlessBulkTests extends OpenSearchTestCase {
@@ -247,7 +247,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
      *
      * <p>Both mean something this system cannot do — fail-if-exists and a partial merge, each needing
      * version-conditional writes. Accepting them as ordinary writes would be a request that succeeds and
-     * means something other than what it said, which is exactly what D2's 501s exist to prevent. Refusing
+     * means something other than what it said, which is exactly what the allowlist's 501s exist to prevent. Refusing
      * them per item rather than per request is what keeps the surrounding documents useful.
      */
     public void testUnsupportedActionsAreRefusedPerItemAndTheRestOfTheBatchLands() throws Exception {
@@ -263,7 +263,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
 
             // "update" is still refused -- it is a partial merge, which has to read the current document
             // before writing one, and this path applies a batch without reading it. "create" is no longer
-            // here: since M50 it is an ordinary index operation at MATCH_DELETED and works.
+            // here: it is an ordinary index operation at MATCH_DELETED and works.
             final String body = indexLine("ok-1", 1)
                 + "{\"update\":{\"_id\":\"nope-2\"}}\n{\"doc\":{\"n\":9}}\n"
                 + "{\"index\":{\"_id\":\"nope-3\",\"_version\":7}}\n{\"msg\":\"bulk\",\"n\":9}\n"

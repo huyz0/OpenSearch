@@ -25,19 +25,19 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M55: {@code _analyze} and {@code _msearch} — the last two endpoints both compared products ship.
+ * {@code _analyze} and {@code _msearch} — the last two endpoints both compared products ship.
  *
  * <p><b>{@code _analyze} replaces a refusal that was wrong about itself.</b> It used to say "analysis runs
  * inside a shard's mapping, and a node that does not hold a shard of this index cannot answer for it". Analysis
- * needs the mapping, and any node can read one — the same observation that made {@code _field_caps} shard-free
- * in M53. A fourth stale reason, found the same way as the others.
+ * needs the mapping, and any node can read one — the same observation that makes {@code _field_caps}
+ * shard-free. A fourth stale reason, found the same way as the others.
  *
  * <p><b>{@code _msearch} saves round trips, not shard work.</b> Each search still fans out to the shards it
  * names, so ten searches in one request cost one HTTP round trip and exactly the same object-store traffic as
  * ten requests. The endpoint's name suggests a bulk discount it does not give, and the tests say so rather
  * than implying otherwise.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessAnalyzeAndMsearchTests extends OpenSearchTestCase {
 

@@ -58,7 +58,7 @@ import java.util.function.Predicate;
  * <p>The rest: settings travel through a snapshot (the analyzers a mapping names live there), and a plugin's
  * own index can be neither captured nor restored onto.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
 

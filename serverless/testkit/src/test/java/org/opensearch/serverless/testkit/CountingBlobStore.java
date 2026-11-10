@@ -28,7 +28,7 @@ import java.util.stream.Collectors;
 /**
  * Counts object-store operations, so the cost of polling can be measured rather than argued.
  *
- * <p>{@code rfc-serverless-shell.md} §10.3 gates gossip on measurement: it is built only if polling
+ * <p>Gossip is gated on measurement: it is built only if polling
  * plus a Kubernetes informer turns out to be insufficient. That gate needs a number — how many requests
  * one reconciliation pass costs — and this is where it comes from.
  *

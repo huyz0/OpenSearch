@@ -15,7 +15,7 @@ dependencies {
   runtimeOnly project(':libs:opensearch-plugin-classloader')
   implementation project(':modules:transport-netty4')
   testImplementation project(':test:framework')
-  // R11 against a real S3 API: the conformance suite needs the container production would use.
+  // Conformance against a real S3 API: the suite needs the container production would use.
   testImplementation project(':plugins:repository-s3')
 }
 
@@ -78,7 +78,7 @@ tasks.register('pluginTest', Test) {
   systemProperty 'tests.security.manager', 'false'
 }
 
-// R11 against a real S3 API. Its own task because it needs a running endpoint and because the AWS SDK v2
+// Conformance against a real S3 API. Its own task because it needs a running endpoint and because the AWS SDK v2
 // insists on a config path -- S3Service hands System.getProperty("opensearch.path.conf") straight to
 // System.setProperty, which throws NPE when it is unset. The rest of the module should not carry either.
 tasks.register('s3Test', Test) {

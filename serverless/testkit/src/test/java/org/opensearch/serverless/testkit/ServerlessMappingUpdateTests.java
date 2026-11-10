@@ -25,9 +25,9 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M52: changing an index after it exists, and the endpoints a comparison said were missing.
+ * Changing an index after it exists, and the endpoints a comparison said were missing.
  *
- * <p><b>Where this milestone came from.</b> Comparing this shell's surface against AWS OpenSearch Serverless
+ * <p><b>Where this came from.</b> Comparing this shell's surface against AWS OpenSearch Serverless
  * and Elastic Cloud Serverless turned up one capability both of them ship and this did not: a mutable
  * mapping. An index whose mapping is fixed at creation cannot have a field added to it, and with no
  * {@code _reindex} to escape through, the only remedy was to delete the index and its data. Two independent
@@ -39,7 +39,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * shape as {@code if_seq_no}, where the compare-and-swap is the engine's and this shell only carries the
  * question to it.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
 
@@ -377,10 +377,10 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
             assertNotNull(node);
             for (String[] expected : new String[][] {
                 { "/_reindex", "search_after" },
-                // The list keeps shrinking, which is the point of it: four went in M59 and _explain went in
-                // M60, whose refusal -- "the fan-out here merges hits rather than exposing per-shard scoring
-                // internals" -- turned out to describe no part of an explain; and _rank_eval, served since
-                // M62. Templates exist since M56; only their table rendering is unrouted.
+                // The list keeps shrinking, which is the point of it. _explain's old refusal -- "the fan-out
+                // here merges hits rather than exposing per-shard scoring
+                // internals" -- turned out to describe no part of an explain; and _rank_eval is served
+                // too. Templates exist; only their table rendering is unrouted.
                 { "/_cat/templates", "GET /_index_template returns them all" } }) {
                 final Answer refused = call("GET", expected[0], null);
                 assertEquals(expected[0] + " must refuse explicitly: " + refused.body(), 501, refused.status());

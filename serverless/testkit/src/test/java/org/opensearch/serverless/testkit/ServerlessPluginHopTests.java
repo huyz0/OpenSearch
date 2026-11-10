@@ -73,7 +73,7 @@ import java.util.concurrent.atomic.AtomicReference;
  * {@code org.opensearch.serverless}. A plugin written for OpenSearch forwards its own action here without
  * being rewritten, and the shell authenticates underneath it.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessPluginHopTests extends OpenSearchTestCase {
 

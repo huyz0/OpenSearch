@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * writer for it, what happens to the bytes it wrote, and what happens to somebody who creates an index of
  * the same name afterwards.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
 

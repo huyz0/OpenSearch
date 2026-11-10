@@ -26,9 +26,9 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M54: changing an index's settings after it exists — the other half of M52.
+ * Changing an index's settings after it exists — the counterpart of the mapping update.
  *
- * <p>M52 made mappings mutable and left settings write-once, which both compared serverless products ship. The
+ * <p>Mappings are mutable, and settings must be too: both compared serverless products ship both. The
  * shape of the work is the same — compare-and-swap the descriptor, apply to shards already open — and the
  * difference is a validity question mappings do not have: core divides index settings into dynamic ones,
  * changeable on a live index, and static ones, which classic OpenSearch changes only on a <em>closed</em>
@@ -38,7 +38,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Nothing here keeps its own list of which settings are which. {@code IndexScopedSettings} answers that,
  * and a second account of a registry that grows every release is one that would drift from it.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessSettingsUpdateTests extends OpenSearchTestCase {
 

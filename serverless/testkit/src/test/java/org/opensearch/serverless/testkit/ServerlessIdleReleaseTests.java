@@ -37,7 +37,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * predicate away from being an availability bug, so "a shard in use is not released" carries more weight
  * here than "an idle one is".
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
 

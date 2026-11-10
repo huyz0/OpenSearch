@@ -37,7 +37,7 @@ import java.util.Map;
  * blocks; random reading must cost exactly what it did before, because over-fetching for a term dictionary
  * lookup would trade a cheap problem for an expensive one.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only. The count is what transfers.
+ * <p>Runs against {@code FsBlobContainer} only. The count is what transfers.
  */
 public class ServerlessReadAheadTests extends OpenSearchTestCase {
 

@@ -50,7 +50,7 @@ import java.util.stream.Collectors;
  * open: a store that parks a specific operation on demand is what turns "this could interleave" into
  * "this did".
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessFenceTests extends OpenSearchTestCase {
 
@@ -254,7 +254,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
      * <p>Truth's assignment list comes from a listing of this node's claim blobs, and a listing is a hint.
      * A claim whose write failed after the head was won, or a listing that lagged, made the sync omit a
      * shard the head still assigned here, and the old close loop released it on that evidence -- a
-     * shard given up because a hint said nothing about it, which is the exact rule §5.2 forbids.
+     * shard given up because a hint said nothing about it, which absence from a view must never cause.
      */
     public void testASyncKeepsAShardWhoseHeadStillNamesThisNodeWhenTheClaimIsMissing() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -517,7 +517,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
      * that reaches the store reopens it from its log, without the operation the caller was told failed.
      *
      * <p>The shard used to be closed on the spot, so a store that hiccuped once took a fully cached copy
-     * offline for reads too. §13 says reads degrade to staleness and writes to rejection.
+     * offline for reads too. Reads should degrade to staleness and writes to rejection.
      */
     public void testAFailedAppendFencesWritesKeepsReadsAndReopensFromTheLog() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);

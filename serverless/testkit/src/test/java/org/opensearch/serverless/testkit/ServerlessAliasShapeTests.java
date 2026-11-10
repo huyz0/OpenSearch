@@ -24,12 +24,11 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M59: the classic alias spellings, and two questions that never needed a cluster.
+ * The classic alias spellings, and two questions that never needed a cluster.
  *
  * <p><b>The alias API was the last invented shape on this surface.</b> Standard OpenSearch and AWS both use
  * {@code PUT /{index}/_alias/{name}} and {@code POST /_aliases}; this shell served a name-scoped API of its
- * own and refused those — the category M47 cleared out everywhere else, surviving because M47's audit
- * predated noticing it.
+ * own and refused those, a difference from classic with no architectural reason.
  *
  * <p><b>{@code POST /_aliases} is served for the case it exists to serve.</b> Its purpose is the atomic move:
  * remove an alias from yesterday's index, add it to today's, so a caller searching it sees one or the other
@@ -37,7 +36,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * compare-and-swap and is genuinely atomic. Actions spanning several aliases are several registers with no
  * transaction over them, and serving that would be a different operation wearing the same name.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessAliasShapeTests extends OpenSearchTestCase {
 
@@ -247,7 +246,7 @@ public class ServerlessAliasShapeTests extends OpenSearchTestCase {
         try (ServerlessNode node = running(plane(clock, createTempDir()), "alias-refused")) {
             assertNotNull(node);
 
-            // Served since M62: a body-less evaluation is a bad request, not a refusal and not a missing index.
+            // A body-less evaluation is a bad request, not a refusal and not a missing index.
             final Answer rankEval = call("GET", "/logs-a/_rank_eval", null);
             assertEquals(rankEval.body(), 400, rankEval.status());
             assertTrue(rankEval.body(), rankEval.has("could not parse the evaluation"));

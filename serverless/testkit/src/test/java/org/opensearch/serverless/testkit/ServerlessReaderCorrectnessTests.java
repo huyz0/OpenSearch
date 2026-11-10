@@ -43,7 +43,7 @@ import java.util.stream.Collectors;
  * next segment it publishes. The tests here are the ones a directory that "prefers local" fails: not with
  * an error, but with a confident answer from the wrong incarnation.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
 

@@ -40,7 +40,7 @@ import java.util.regex.Pattern;
  * <p>What must not happen is an item quietly disappearing, so every fixture here asks for more documents
  * than exist and asserts the answer has one entry per request, in order.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessMultiGetTests extends OpenSearchTestCase {
 

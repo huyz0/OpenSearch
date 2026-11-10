@@ -28,9 +28,9 @@ import java.util.concurrent.Executors;
  *
  * <p><b>This class lives in {@code org.opensearch.repositories.s3} on purpose.</b> {@code S3BlobStore}'s
  * constructor and {@code S3Service}'s are package-private, and that was recorded as the blocker for
- * M12/R11 — "blocked on a 17-argument package-private constructor rather than on credentials". It was
+ * running the conformance suite on S3 — "blocked on a 17-argument package-private constructor rather than on credentials". It was
  * never really a blocker: a test helper in the same package reaches them, and the alternative (writing a
- * second S3 client just for tests) would have measured the wrong thing. What R11 needs to exercise is
+ * second S3 client just for tests) would have measured the wrong thing. What the conformance suite needs to exercise is
  * the container the shell would actually run on, not a lookalike.
  *
  * <p>The async client is built as well, and it has to be: {@code deleteBlobsIgnoringIfNotExists} looks
@@ -39,7 +39,7 @@ import java.util.concurrent.Executors;
  * Deletion is not incidental here; it is how tombstones, garbage collection and lease release work.
  *
  * <p>Multipart upload stays off. The transfer manager it needs is a much larger construction and nothing
- * R11 asserts goes near it, so it is left null deliberately — a test that strayed into that path would
+ * the conformance suite asserts goes near it, so it is left null deliberately — a test that strayed into that path would
  * get a NullPointerException rather than a wrong answer, which is the failure mode to prefer.
  */
 public final class MinioBlobStores {

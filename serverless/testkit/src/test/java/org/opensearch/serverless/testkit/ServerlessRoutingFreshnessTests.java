@@ -29,7 +29,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * below are about what that window can and cannot do — a cost test can only show the saving, and the
  * saving is the easy half.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
 

@@ -52,7 +52,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * than the lease is waiting for a node whose ownership has already lapsed, and waiting less would fail
  * writes that a briefly slow owner would have completed.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessForwardBoundTests extends OpenSearchTestCase {
 

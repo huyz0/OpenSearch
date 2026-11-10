@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * deleting is not, and why it walks one shard at a time by {@code _doc} order rather than through the
  * cross-shard {@code search_after} merge {@code _search} uses.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
 

@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * that correction did not happen -- the hinted node was dead rather than refusing, or the index behind the
  * name had been replaced -- and the coordinator either failed forever or, worse, was told its write landed.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessRoutingHintTests extends OpenSearchTestCase {
 

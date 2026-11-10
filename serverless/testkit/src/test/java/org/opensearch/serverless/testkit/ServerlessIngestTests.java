@@ -25,11 +25,11 @@ import java.time.Duration;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * M58: ingest pipelines, and the dynamic mapping that turned out to be missing underneath them.
+ * Ingest pipelines, and the dynamic mapping that turned out to be missing underneath them.
  *
- * <p><b>Pipelines are the last item from the vendor comparison.</b> M56 refused them because every processor
+ * <p><b>Pipelines are the last item from the vendor comparison.</b> They were refused because every processor
  * lives in the {@code ingest-common} module and this shell loads none, and recorded that enabling them was
- * "a decision about loading modules, not about adding an endpoint". M57 made that decision by choosing
+ * "a decision about loading modules, not about adding an endpoint". The shell made that decision by choosing
  * {@code lang-painless} the way the transport had always been chosen. This is that decision applied a third
  * time.
  *
@@ -38,9 +38,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * {@code MAPPING_UPDATE_REQUIRED} with the mapping addition a write needs; a classic node sends that to the
  * cluster manager and retries, and nothing here was doing the equivalent — so every write of an undeclared
  * field answered 500. <b>Every test in this repository happened to declare its mappings</b>, which is why it
- * survived fifty-seven milestones unseen.
+ * survived so long unseen.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessIngestTests extends OpenSearchTestCase {
 

@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * descriptors are deliberately left unhashed: a pattern like {@code logs-*} is answered by a prefix listing of
  * them, which a hash would break.
  *
- * <p><b>D5:</b> {@code FsBlobContainer} only.
+ * <p>Runs against {@code FsBlobContainer} only.
  */
 public class ServerlessKeyLayoutTests extends OpenSearchTestCase {
 

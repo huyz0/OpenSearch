@@ -21,8 +21,8 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * Phase 2: a shard is opened from a descriptor and serves a search, and the reconciler holds the
- * invariant S1 established.
+ * A shard is opened from a descriptor and serves a search, and the reconciler holds the
+ * invariant that absence from a view never closes a shard.
  */
 public class ServerlessShardTests extends OpenSearchTestCase {
 
@@ -43,7 +43,7 @@ public class ServerlessShardTests extends OpenSearchTestCase {
         return new IndexDescriptor(name, uuid, 1, MAPPING, null);
     }
 
-    /** S0 made durable: the same proof, now through production code and a descriptor. */
+    /** A shard opens through production code from a descriptor and serves a search. */
     public void testShardOpensFromADescriptorAndServesASearch() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p2-a"))) {
             node.start();
@@ -69,7 +69,7 @@ public class ServerlessShardTests extends OpenSearchTestCase {
     /**
      * The invariant, through the production API: a view that omits a hosted index must not close it.
      *
-     * <p>S1 measured this against test code modelling a diff rule. This asserts it of
+     * <p>The two-node probe measured this against test code modelling a diff rule. This asserts it of
      * {@code ShardReconciler}, which is the thing that will actually be in the path.
      */
     public void testAViewOmittingAHostedIndexDoesNotCloseIt() throws Exception {
