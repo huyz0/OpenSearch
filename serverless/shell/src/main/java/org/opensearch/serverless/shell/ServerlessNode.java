@@ -47,7 +47,6 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.cluster.LocalViewProjector;
 import org.opensearch.serverless.cluster.ShardAssignment;
 import org.opensearch.serverless.membership.MembershipSource;
-import org.opensearch.serverless.rest.NotImplementedHandler;
 import org.opensearch.serverless.rest.ServerlessHealthHandler;
 import org.opensearch.serverless.rest.ServerlessRootHandler;
 import org.opensearch.serverless.shard.ShardReconciler;
@@ -382,7 +381,7 @@ public final class ServerlessNode implements Closeable {
     }
 
     /** The share of a node's cap a fleet sized by {@link #fleetSize} aims to use. */
-    public static final double TARGET_UTILISATION = 0.8;
+    public static final double TARGET_UTILISATION = FleetPlacement.TARGET_UTILISATION;
 
     /**
      * How many writer nodes the fleet has and how many its demand wants: the number to scale on.
@@ -396,40 +395,13 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * Sizes the writer fleet from the load every member renews into its lease: shards used in the last minute, and shards
-     * turned away at a cap, over the average cap at {@link #TARGET_UTILISATION}. Shards merely held do not count -- a
-     * node's cap is a cache that fills whatever the load -- so a fleet full but turning nothing away does not ask for more,
-     * and one turning shards away asks for as many more nodes as would have taken them.
+     * Sizes the writer fleet from the load every member renews into its lease. See {@link FleetPlacement#fleetSize}.
      *
      * @param plane the metadata plane
      * @return the members counted and the nodes wanted
      */
     public FleetSize fleetSize(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        final long now = plane.clock().getAsLong();
-        int members = 0;
-        long demand = 0;
-        long caps = 0;
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            // A member's lease as this node last read it, which is re-read only once it has run out: up to a TTL past its
-            // expiry it is a live member whose renewal this node has not fetched yet, not a departed one. Counting only
-            // unexpired copies dropped a varying share of the fleet, and nodes asked at the same moment answered 1 and 7.
-            if (lease.revoked()
-                || now >= lease.expiresAtMillis() + plane.leaseTtlMillis()
-                || lease.roles().contains(ROLE_INGEST) == false
-                || lease.inUse() < 0
-                || lease.cap() <= 0) {
-                continue;
-            }
-            members++;
-            demand += lease.inUse() + Math.max(0, lease.refused());
-            caps += lease.cap();
-        }
-        if (members == 0) {
-            // Nobody reports a load yet -- a fleet starting, or a view from before leases carried it. Not "none wanted".
-            return new FleetSize(0, -1, 0);
-        }
-        final double perNode = (double) caps / members * TARGET_UTILISATION;
-        return new FleetSize(members, (int) Math.max(1, Math.ceil(demand / perNode)), demand);
+        return placement.fleetSize(plane);
     }
 
     /**
@@ -458,9 +430,22 @@ public final class ServerlessNode implements Closeable {
     }
 
     /** Above this share of its cap a node looks for a member to hand work to. */
-    public static final double HAND_OFF_ABOVE = 0.9;
+    public static final double HAND_OFF_ABOVE = FleetPlacement.HAND_OFF_ABOVE;
     /** At or below this share of its cap a member can take work handed to it. */
-    public static final double ROOM_AT_OR_BELOW = 0.75;
+    public static final double ROOM_AT_OR_BELOW = FleetPlacement.ROOM_AT_OR_BELOW;
+    /** Above this multiple of the fleet's mean held shards a node hands work off, however far it is from its cap. */
+    public static final double HAND_OFF_ABOVE_MEAN = FleetPlacement.HAND_OFF_ABOVE_MEAN;
+    /** A node handing off for being above the mean hands off down to this multiple of it. */
+    public static final double HAND_OFF_DOWN_TO_MEAN = FleetPlacement.HAND_OFF_DOWN_TO_MEAN;
+    /** Below this share of its cap a node is never too busy for the mean to matter: a small fleet's few shards stay. */
+    public static final double MEAN_MATTERS_FROM = FleetPlacement.MEAN_MATTERS_FROM;
+
+    /** Decides where this node's work belongs across the fleet; the methods below forward to it. */
+    private final FleetPlacement placement = new FleetPlacement(
+        () -> localNode.getId(),
+        () -> admission.maxShardsHeld(),
+        () -> this.reconciler == null ? 0 : this.reconciler.heldShards().size()
+    );
 
     /**
      * Whether this node holds more than {@link #HAND_OFF_ABOVE} of its cap.
@@ -468,50 +453,26 @@ public final class ServerlessNode implements Closeable {
      * @return true when nearly full
      */
     public boolean nearlyFull() {
-        final int cap = admission.maxShardsHeld();
-        return cap > 0 && reconciler != null && reconciler.heldShards().size() >= cap * HAND_OFF_ABOVE;
+        return placement.nearlyFull();
     }
 
     /**
-     * The live writer member with the most room, if any has {@link #ROOM_AT_OR_BELOW} of its cap or less: where a full
-     * node sends work. From the leases every member renews with its load, so it costs no request.
+     * The live writer member with the most room, if any. See {@link FleetPlacement#memberWithRoom}.
      *
      * @param plane the metadata plane
      * @return the member's id
      */
     public java.util.Optional<String> memberWithRoom(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        final long now = plane.clock().getAsLong();
-        String best = null;
-        double bestShare = ROOM_AT_OR_BELOW;
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            if (lease.nodeId().equals(localNode.getId())
-                || lease.isExpiredAt(now)
-                || lease.roles().contains(ROLE_INGEST) == false
-                || lease.held() < 0
-                || lease.cap() <= 0) {
-                continue;
-            }
-            final double share = (double) lease.held() / lease.cap();
-            if (share <= bestShare) {
-                best = lease.nodeId();
-                bestShare = share;
-            }
-        }
-        return java.util.Optional.ofNullable(best);
+        return placement.memberWithRoom(plane);
     }
 
-    private volatile double takeoverOvercommit = 0.0;
-
-    private volatile boolean routeTakeovers = true;
-
     /**
-     * Sets whether requests for a dead member's shard go to the one survivor named for it: on by default; off only to
-     * measure what it saves.
+     * Sets whether requests for a dead member's shard go to the one survivor named for it.
      *
      * @param route whether to
      */
     public void setRouteTakeovers(boolean route) {
-        this.routeTakeovers = route;
+        placement.setRouteTakeovers(route);
     }
 
     /**
@@ -520,30 +481,26 @@ public final class ServerlessNode implements Closeable {
      * @return true if they do
      */
     public boolean routesTakeovers() {
-        return routeTakeovers;
+        return placement.routesTakeovers();
     }
 
     /**
-     * Sets how far past its cap a member may take a dead member's shards, as BackgroundReconciler does: the ceiling a
-     * member's room is judged against when choosing who takes over a shard.
+     * Sets how far past its cap a member may take a dead member's shards. See {@link FleetPlacement#setTakeoverOvercommit}.
      *
      * @param fraction of the cap
      */
     public void setTakeoverOvercommit(double fraction) {
-        this.takeoverOvercommit = Math.max(0.0, fraction);
+        placement.setTakeoverOvercommit(fraction);
     }
-
-    private final java.util.concurrent.atomic.AtomicLong takeoverWritesRouted = new java.util.concurrent.atomic.AtomicLong();
-    private final java.util.concurrent.atomic.AtomicLong takeoverDoubtsLeft = new java.util.concurrent.atomic.AtomicLong();
 
     /** Counts a write for a dead member's shard sent to the member that takes it over. */
     public void noteTakeoverWriteRouted() {
-        takeoverWritesRouted.incrementAndGet();
+        placement.noteTakeoverWriteRouted();
     }
 
     /** Counts a doubt about a dead member's shard this node left to the member that takes it over. */
     public void noteTakeoverDoubtLeft() {
-        takeoverDoubtsLeft.incrementAndGet();
+        placement.noteTakeoverDoubtLeft();
     }
 
     /**
@@ -552,18 +509,11 @@ public final class ServerlessNode implements Closeable {
      * @return routed, then left
      */
     public long[] takeoverRouting() {
-        return new long[] { takeoverWritesRouted.get(), takeoverDoubtsLeft.get() };
+        return placement.takeoverRouting();
     }
 
     /**
-     * The member that takes over a shard whose owner's lease has run out: of the live writer members other than that
-     * owner, in name order, the first from the shard's hash with room under its overcommit ceiling -- or, if none has
-     * room, the one the hash names. Every member computes the same answer from the same leases, so a dead node's shards
-     * are each taken by one survivor rather than queued by every survivor a request for them happens to reach: a fleet
-     * run had every survivor queueing ~300 of a dead node's shards, and requests waited 30-60 s in those queues.
-     *
-     * <p>Routing only. The head's compare-and-swap still decides who owns the shard; two members with different views
-     * cost a wasted activation, never a second owner.
+     * The member that takes over a shard whose owner's lease has run out. See {@link FleetPlacement#takeoverWinner}.
      *
      * @param plane the metadata plane
      * @param indexName the index
@@ -577,31 +527,12 @@ public final class ServerlessNode implements Closeable {
         int shard,
         String deadOwner
     ) {
-        final long now = plane.clock().getAsLong();
-        final java.util.TreeMap<String, org.opensearch.serverless.membership.NodeLease> live = new java.util.TreeMap<>();
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            if (lease.nodeId().equals(deadOwner) == false && lease.isExpiredAt(now) == false && lease.roles().contains(ROLE_INGEST)) {
-                live.put(lease.nodeId(), lease);
-            }
-        }
-        if (live.isEmpty()) {
-            return java.util.Optional.empty();
-        }
-        final java.util.List<String> order = new java.util.ArrayList<>(live.keySet());
-        final int first = Math.floorMod((indexName + "#" + shard).hashCode(), order.size());
-        for (int i = 0; i < order.size(); i++) {
-            final String candidate = order.get((first + i) % order.size());
-            if (hasTakeoverRoom(candidate, live.get(candidate))) {
-                return java.util.Optional.of(candidate);
-            }
-        }
-        return java.util.Optional.of(order.get(first));
+        return placement.takeoverWinner(plane, indexName, shard, deadOwner);
     }
 
     /**
-     * Whether a shard is a dead member's that another live member is to take over, so this node should leave it: the head
-     * names an owner with no live lease, and the member named for it is not this one. False when anything is unknown, and
-     * when routing is off: routing must never become nobody taking it.
+     * Whether a shard is a dead member's that another live member is to take over. See
+     * {@link FleetPlacement#takeoverBelongsElsewhere}.
      *
      * @param plane the metadata plane
      * @param indexName the index
@@ -609,127 +540,47 @@ public final class ServerlessNode implements Closeable {
      * @return true to leave it to the member named
      */
     public boolean takeoverBelongsElsewhere(org.opensearch.serverless.metadata.MetadataPlane plane, String indexName, int shard) {
-        if (routeTakeovers == false) {
-            return false;
-        }
-        try {
-            final var head = plane.heads().read(indexName, shard);
-            if (head.isEmpty()
-                || head.get().ownerNodeId() == null
-                || head.get().ownerNodeId().equals(localNode.getId())
-                || plane.heads().isHeld(head.get(), plane.clock().getAsLong())) {
-                return false;
-            }
-            final java.util.Optional<String> winner = takeoverWinner(plane, indexName, shard, head.get().ownerNodeId());
-            return winner.isPresent() && winner.get().equals(localNode.getId()) == false;
-        } catch (Exception e) {
-            return false;
-        }
+        return placement.takeoverBelongsElsewhere(plane, indexName, shard);
     }
-
-    private boolean hasTakeoverRoom(String nodeId, org.opensearch.serverless.membership.NodeLease lease) {
-        if (nodeId.equals(localNode.getId())) {
-            final int cap = admission.maxShardsHeld();
-            final int held = reconciler == null ? 0 : reconciler.heldShards().size();
-            return cap <= 0 || held < cap + Math.floor(cap * takeoverOvercommit);
-        }
-        if (lease.held() < 0 || lease.cap() <= 0) {
-            return true;
-        }
-        return lease.held() < lease.cap() + Math.floor(lease.cap() * takeoverOvercommit);
-    }
-
-    /** Above this multiple of the fleet's mean held shards a node hands work off, however far it is from its cap. */
-    public static final double HAND_OFF_ABOVE_MEAN = 1.5;
-    /** A node handing off for being above the mean hands off down to this multiple of it. */
-    public static final double HAND_OFF_DOWN_TO_MEAN = 1.25;
-    /** Below this share of its cap a node is never too busy for the mean to matter: a small fleet's few shards stay. */
-    public static final double MEAN_MATTERS_FROM = 0.25;
 
     /**
-     * The mean of held shards over the live writer members, this node counted from its own count rather than its lease.
+     * The mean of held shards over the live writer members. See {@link FleetPlacement#fleetMeanHeld}.
      *
      * @param plane the metadata plane
      * @return the mean, or -1 if no member says
      */
     public double fleetMeanHeld(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        final long now = plane.clock().getAsLong();
-        long sum = reconciler == null ? 0 : reconciler.heldShards().size();
-        int members = 1;
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            if (lease.nodeId().equals(localNode.getId())
-                || lease.isExpiredAt(now)
-                || lease.roles().contains(ROLE_INGEST) == false
-                || lease.held() < 0) {
-                continue;
-            }
-            sum += lease.held();
-            members++;
-        }
-        return members < 2 ? -1 : (double) sum / members;
+        return placement.fleetMeanHeld(plane);
     }
 
     /**
-     * Whether this node holds far more than its share: more than {@link #HAND_OFF_ABOVE_MEAN} of the fleet's mean, and at
-     * least {@link #MEAN_MATTERS_FROM} of its cap. Hand-off near the cap left load uneven everywhere below it: the node a
-     * fleet run killed held anywhere from 103 to 847 shards, and how long recovery took followed that.
+     * Whether this node holds far more than its share of the fleet. See {@link FleetPlacement#aboveFleetShare}.
      *
      * @param plane the metadata plane
      * @return true when above its share
      */
     public boolean aboveFleetShare(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        final int cap = admission.maxShardsHeld();
-        final int held = reconciler == null ? 0 : reconciler.heldShards().size();
-        final double mean = fleetMeanHeld(plane);
-        return cap > 0 && mean > 0 && held >= cap * MEAN_MATTERS_FROM && held > mean * HAND_OFF_ABOVE_MEAN;
+        return placement.aboveFleetShare(plane);
     }
 
     /**
-     * The live writer member holding the fewest shards, if it holds fewer than the fleet's mean: where a node above its
-     * share sends work.
+     * The live writer member holding the fewest shards, if below the fleet's mean. See {@link FleetPlacement#memberBelowMean}.
      *
      * @param plane the metadata plane
      * @return the member's id
      */
     public java.util.Optional<String> memberBelowMean(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        final double mean = fleetMeanHeld(plane);
-        if (mean <= 0) {
-            return java.util.Optional.empty();
-        }
-        final long now = plane.clock().getAsLong();
-        String best = null;
-        long fewest = Long.MAX_VALUE;
-        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
-            if (lease.nodeId().equals(localNode.getId())
-                || lease.isExpiredAt(now)
-                || lease.roles().contains(ROLE_INGEST) == false
-                || lease.held() < 0
-                || lease.held() >= mean) {
-                continue;
-            }
-            if (lease.held() < fewest) {
-                best = lease.nodeId();
-                fewest = lease.held();
-            }
-        }
-        return java.util.Optional.ofNullable(best);
+        return placement.memberBelowMean(plane);
     }
 
     /**
-     * Where this node should send work it would otherwise take, if anywhere: to a member with room when this one is nearly
-     * full, or to a member below the mean when this one holds far more than its share.
+     * Where this node should send work it would otherwise take, if anywhere. See {@link FleetPlacement#handOffTarget}.
      *
      * @param plane the metadata plane
      * @return the member's id
      */
     public java.util.Optional<String> handOffTarget(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        if (nearlyFull()) {
-            final java.util.Optional<String> roomy = memberWithRoom(plane);
-            if (roomy.isPresent()) {
-                return roomy;
-            }
-        }
-        return aboveFleetShare(plane) ? memberBelowMean(plane) : java.util.Optional.empty();
+        return placement.handOffTarget(plane);
     }
 
     /**
@@ -1633,313 +1484,8 @@ public final class ServerlessNode implements Closeable {
             )
         );
 
-        // These exist in classic OpenSearch and are absent here by design. Registering an explicit
-        // refusal turns "no handler for uri" — which reads like a typo — into a statement.
-        final String noGlobalState = "there is no cluster-wide state in a serverless cluster; "
-            + "no node can answer this, and a node-local answer would be misleading";
-
-        // The allowlist and the enumeration rule together: listing a deployment's indices is an inventory
-        // operation, not a serving one. Offering it here -- even paginated -- invites a caller to walk
-        // a hundred million indices through a request path, so the request path does not offer it.
-        controller.registerHandler(
-            new NotImplementedHandler(
-                "/_serverless/indices",
-                "enumerating indices is a maintenance operation, not a serving one; "
-                    + "look an index up by name, or run an offline inventory"
-            )
-        );
-        // What is left after the answerable ones moved out. Each of these needs a snapshot across every
-        // index, or an allocator, or a cluster-manager task queue -- three things this design does not have
-        // and is not going to grow. The endpoints that only needed the lease registry or one index's shard
-        // heads are served instead, above.
-        for (String path : new String[] { "/_cluster/state", "/_cluster/stats", "/_cat" }) {
-            controller.registerHandler(new NotImplementedHandler(path, noGlobalState));
-        }
-
-        // Refusals that used to share the "no cluster-wide state" reason and are not actually refused for
-        // it. A caller reading that a listing is unavailable because there is no cluster state would
-        // reasonably conclude the data does not exist -- when in fact it exists, is readable one index at a
-        // time, and is refused because reading all of it at once is unbounded. Three of these are refused
-        // because there is no allocator, which is a different thing again. A refusal must give the
-        // reason that is actually true.
-        final String noClosedState = "an index here is being served or it does not exist: there is no closed state "
-            + "for it to be opened from or closed into";
-        final String noClusterManager = "there is no cluster manager, so there is no node to name as one";
-        final String reshaping = "reshaping an index means rewriting every document into a different shard count, "
-            + "and there is no _reindex here to do it with. An index that needs a different shard count is a new "
-            + "index, written by the caller";
-        final String simulate = "simulating template resolution is not routed; create the index and read back "
-            + "GET /{index}, which reports exactly what it inherited";
-        final String indexEnumeration = "aggregating across every index in the deployment is unbounded, and this "
-            + "design refuses an answer it would have to truncate";
-        final String noAllocator = "there is no allocator here: a shard is activated by the write that needs it, "
-            + "not by a placement decision, so there is nothing to explain, retry or rebalance";
-        final String enumeration = "listing every index in the deployment is unbounded, and this design refuses "
-            + "an answer it would have to truncate. Use GET /_list/indices/{prefix}*, which resolves through "
-            + "one bounded listing and refuses a prefix that matches more than the cap rather than cutting it "
-            + "off -- OpenSearch added _list for this reason and left _cat alone";
-        for (String[] refusal : new String[][] {
-            {
-                "/_cat/shards",
-                "the same unbounded listing as _cat/indices, one row per shard. GET "
-                    + "/_cluster/health/{index}?level=shards reports one index's shards, bounded" },
-            { "/_cat/aliases", "aliases are found by name here, not enumerated; GET /_alias/{name} answers for one" },
-            {
-                "/_cat/count",
-                "counting every document in the deployment means visiting every index; GET "
-                    + "/{index}/_count answers for one, and takes a prefix pattern" },
-            {
-                "/_cat/segments",
-                "per-shard Lucene detail across every index, which is both unbounded and not " + "exposed for a single index either" },
-            { "/_cluster/reroute", noAllocator },
-            { "/_cluster/allocation/explain", noAllocator },
-            { "/_cat/allocation", noAllocator },
-            { "/_cat/recovery", noAllocator },
-            { "/_cat/pending_tasks", "there is no cluster manager and no task queue, so there is nothing pending" },
-            {
-                "/_cat/thread_pool",
-                "this reports per-node thread pools, which are not among the numbers this shell reports "
-                    + "about itself; GET /_serverless/stats answers for the node it is sent to, and "
-                    + "?nodes=_all for the fleet" },
-            { "/_list/shards", "the same unbounded listing as _cat/shards" } }) {
-            controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
-        }
-
-        // Refused for a reason of its own, and the reason has changed. The fan-out this used to be waiting
-        // for exists: GET /_serverless/stats?nodes=_all asks every live node and reports which ones did not
-        // answer. What is still missing is not the reach, it is the schema -- this endpoint means indices,
-        // os, jvm, fs, transport and thread_pool, and none of those numbers are produced here. Serving the
-        // shell's own document under this name would hand a client that parses core's schema something that
-        // looks right and answers nothing, which is worse than a refusal that points at the real endpoint.
-        controller.registerHandler(
-            new NotImplementedHandler(
-                "/_nodes/stats",
-                "this endpoint's body is core's node-statistics schema -- indices, os, jvm, fs, transport, "
-                    + "thread_pool -- and this shell does not produce those numbers, so there is nothing "
-                    + "honest to put under this name. GET /_serverless/stats answers for the node it is sent "
-                    + "to, and GET /_serverless/stats?nodes=_all asks every live node and names the ones that "
-                    + "did not answer"
-            )
-        );
-        controller.registerHandler(
-            new NotImplementedHandler(
-                "/_tasks",
-                "there is no cluster-wide task registry: work here belongs to the node doing it and does not "
-                    + "outlive it, so there is no task to look up by id from anywhere else"
-            )
-        );
-
-        // Unimplemented endpoints return 501 with a reason. Without this list only explicitly refused
-        // paths did; everything else a normal client reaches for fell through to core's default handler
-        // and came back as
-        // 400 {"error":"no handler found for uri ..."} -- a bare string, the wrong status, and
-        // indistinguishable from a typo. These are the endpoints a client actually tries, each refused with
-        // the reason it is refused for rather than with a generic one, because "not here" and "not here
-        // *because*" are different answers and only the second is useful.
-        final String noReindex = "bulk reindexing runs for hours and needs a task that survives the node "
-            + "that started it; there is no cluster-wide task registry here. Read with search_after and "
-            + "write with _bulk, which is the same work under the caller's own control";
-        for (String[] refusal : new String[][] {
-            {
-                "/{index}/_refresh",
-                "refresh is per-write here: pass refresh=true on the write that must be visible. A "
-                    + "deployment-wide refresh would have to reach every node holding a shard of this index" },
-            {
-                "/{index}/_flush",
-                "there is no flush to ask for: durability is the write-ahead log, which a write is in "
-                    + "before it is acknowledged, and publication is the background reconciler's job" },
-            {
-                "/{index}/_forcemerge",
-                "merging is the shard writer's own decision; there is no cluster-wide operation to trigger "
-                    + "it, and forcing one on a shard this node may not own is not something this node can do" },
-            { "/{index}/_termvectors/{id}", "term vectors are a per-shard Lucene detail this surface does not expose" },
-            { "/_reindex", noReindex },
-            { "/{index}/_update_by_query", noReindex },
-            {
-                "/_search/scroll",
-                "scroll holds a search context open on a node; use a point in time (POST /{index}/_pit) with "
-                    + "search_after, which is held in the object store and is not tied to one node" },
-            { "/_ilm/policy/{name}", "index lifecycle management is not part of this surface" },
-            // Found by driving a running node rather than by reading this list: twenty-two endpoints a real
-            // client reaches for were answering core's default 400 "no handler found for uri", which reads
-            // as a typo. Each has a reason under one of the four the rest of this list already gives -- no
-            // allocator, no cluster-wide state, no modules, no closed index -- and none of them said so.
-            { "/_alias", "aliases are found by name here, not enumerated; GET /_alias/{name} answers for one" },
-            { "/_stats", indexEnumeration },
-            {
-                "/{index}/_stats",
-                "per-shard statistics are not exposed; GET /_serverless/stats answers for the node "
-                    + "it is sent to, and GET /_cluster/health/{index}?level=shards reports one index's shards" },
-            { "/{index}/_segments", "per-shard Lucene detail is not exposed" },
-            { "/{index}/_recovery", noAllocator },
-            { "/{index}/_shard_stores", noAllocator },
-            {
-                "/{index}/_cache/clear",
-                "there is no cluster-wide operation to clear a cache, and clearing one on a "
-                    + "shard this node may not own is not something this node can do" },
-            { "/{index}/_open", noClosedState },
-            { "/{index}/_close", noClosedState },
-            { "/{index}/_shrink/{target}", reshaping },
-            { "/{index}/_split/{target}", reshaping },
-            { "/{index}/_clone/{target}", reshaping },
-            { "/_cluster/pending_tasks", "there is no cluster manager and no task queue, so there is nothing pending" },
-            { "/_cat/master", noClusterManager },
-            { "/_cat/cluster_manager", noClusterManager },
-            {
-                "/_cat/plugins",
-                "plugins are per node; GET /_nodes lists the fleet and GET /_serverless/stats answers " + "for the node it is sent to" },
-            {
-                "/_cat/nodeattrs",
-                "node attributes are not part of this deployment's node model; GET /_nodes reports " + "the roles a node does have" },
-            {
-                "/_cat/repositories",
-                "a repository here is a namespace in this deployment's own object store; " + "GET /_snapshot lists them" },
-            { "/_cat/snapshots", "GET /_snapshot/{repo} lists a repository's snapshots" },
-            { "/_cat/tasks", "there is no cluster-wide task registry" },
-            { "/_cat/fielddata", "fielddata is per-shard memory this surface does not report" },
-            { "/_remote/info", "there are no remote clusters: cross-cluster search and replication are not part of " + "this design" },
-            {
-                "/_dangling",
-                "a dangling index is one whose data outlived the cluster state naming it. There is no "
-                    + "cluster state here, so an index exists exactly when its descriptor does" },
-            {
-                "/_scripts/painless/_execute",
-                "the script-execution sandbox endpoint is not routed; inline scripts run " + "in a query, an aggregation or an update" },
-            { "/_index_template/_simulate_index/{name}", simulate },
-            { "/_index_template/_simulate/{name}", simulate },
-            // The nameless form is the one in the spec, and it used to match POST /_index_template/{name}
-            // and store a live template called "_simulate".
-            { "/_index_template/_simulate", simulate },
-            { "/_component_template/_simulate/{name}", simulate },
-            { "/_component_template/_simulate", simulate },
-            // Found by comparing this surface against AWS OpenSearch Serverless and Elastic Cloud
-            // Serverless: every one of these is an endpoint a real client reaches for, and every one of them
-            // fell through to core's default 400 rather than the promised 501. Being absent is a
-            // decision; looking like a typo is not.
-            {
-                "/_field_caps",
-                "name an index or a prefix: GET /{index}/_field_caps answers for what it can reach, and "
-                    + "asking every index in the deployment what fields it has is the inventory operation "
-                    + "this design refuses" },
-            {
-                "/_cat/templates",
-                "listing templates as a table is not routed; GET /_index_template returns them all, and "
-                    + "GET /_index_template/{prefix}* narrows by name" },
-            // Found by walking every path in rest-api-spec against a running node (ServerlessSpecCoverageTests)
-            // rather than by hand: each of these is a sibling of a path already refused above -- the
-            // index-less form, the {name} form, the {metric} form -- that the refusal did not cover, so it
-            // fell through to core's default 400 "no handler found for uri" while its sibling answered 501
-            // with a reason. Same reason, same answer, every spelling.
-            { "/_cat/templates/{name}", "GET /_index_template/{name} answers for one template" },
-            { "/_cat/aliases/{name}", "aliases are found by name here, not enumerated; GET /_alias/{name} answers for one" },
-            { "/_cat/allocation/{nodeId}", noAllocator },
-            { "/_cat/count/{index}", "GET /{index}/_count answers for one index, and takes a prefix pattern" },
-            { "/_cat/fielddata/{fields}", "fielddata is per-shard memory this surface does not report" },
-            { "/_cat/recovery/{index}", noAllocator },
-            { "/_cat/segments/{index}", "per-shard Lucene detail is not exposed" },
-            { "/_cat/shards/{index}", "GET /_cluster/health/{index}?level=shards reports one index's shards, bounded" },
-            { "/_cat/snapshots/{repo}", "GET /_snapshot/{repo}/_all lists a repository's snapshots" },
-            { "/_cat/thread_pool/{thread_pool_patterns}", "GET /_serverless/stats answers for the node it is sent to" },
-            { "/_cat/segment_replication", "there is no segment replication here: a shard's redundancy is the object store" },
-            { "/_cat/segment_replication/{index}", "there is no segment replication here: a shard's redundancy is the object store" },
-            { "/_cluster/state/{metric}", noGlobalState },
-            { "/_cluster/state/{metric}/{index}", noGlobalState },
-            { "/_cluster/stats/nodes/{nodeId}", noGlobalState },
-            { "/_cluster/decommission/awareness", noAllocator },
-            { "/_cluster/decommission/awareness/{name}/_status", noAllocator },
-            { "/_cluster/decommission/awareness/{name}/{value}", noAllocator },
-            { "/_cluster/voting_config_exclusions", noClusterManager },
-            { "/_cluster/routing/awareness/weights", noAllocator },
-            { "/_cluster/routing/awareness/{attribute}/weights", noAllocator },
-            { "/_dangling/{index_uuid}", "there is no cluster state here, so an index exists exactly when its descriptor does" },
-            { "/_script_context", "the context catalogue is not served; PUT /_scripts/{id}/{context} checks a script against one" },
-            { "/_script_language", "the language catalogue is not served; painless and mustache are the languages here" },
-            { "/{index}/_block/{block}", noClosedState },
-            { "/_cache/clear", "there is no cluster-wide operation to clear a cache" },
-            {
-                "/_data_stream",
-                "listing every data stream is the enumeration this design refuses; GET /_data_stream/{name} answers for "
-                    + "one, and takes a prefix pattern" },
-            {
-                "/_data_stream/_modify",
-                "a data stream here is an alias with a generation, so its backing indices are the alias's members "
-                    + "and are changed by rolling it over, not by reassigning them underneath it" },
-            { "/_data_stream/_stats", "store sizes are not reported here; GET /_data_stream/{name} lists a stream's backing indices" },
-            {
-                "/_data_stream/{name}/_stats",
-                "store sizes are not reported here; GET /_data_stream/{name} lists a stream's backing indices" },
-            { "/_template", "legacy templates are not served; composable templates are, at /_index_template" },
-            { "/_template/{name}", "legacy templates are not served; composable templates are, at /_index_template/{name}" },
-            { "/_flush", "there is no flush to ask for: durability is the write-ahead log" },
-            { "/_refresh", "refresh is per-write here: pass refresh=true on the write that must be visible" },
-            { "/_forcemerge", "merging is the shard writer's own decision" },
-            { "/_recovery", noAllocator },
-            { "/_segments", "per-shard Lucene detail is not exposed" },
-            { "/_shard_stores", noAllocator },
-            { "/_upgrade", "there is no upgrade to run: an index is served by whatever version serves it" },
-            { "/{index}/_upgrade", "there is no upgrade to run: an index is served by whatever version serves it" },
-            { "/_mapping", enumeration },
-            { "/_mapping/field/{fields}", enumeration },
-            { "/_settings", enumeration },
-            { "/_settings/{name}", enumeration },
-            { "/_stats/{metric}", indexEnumeration },
-            {
-                "/{index}/_stats/{metric}",
-                "per-shard statistics are not exposed; GET /_serverless/stats answers for the node it is sent to" },
-            { "/_validate/query", "name an index: GET /{index}/_validate/query answers for what it can reach" },
-            {
-                "/_ingest/processor/grok",
-                "the grok pattern catalogue is not served; a pipeline naming a grok processor is compiled at PUT" },
-            { "/_mtermvectors", "term vectors are a per-shard Lucene detail this surface does not expose" },
-            { "/{index}/_mtermvectors", "term vectors are a per-shard Lucene detail this surface does not expose" },
-            { "/{index}/_termvectors", "term vectors are a per-shard Lucene detail this surface does not expose" },
-            { "/_nodes/hot_threads", "per-node diagnostics are not served; GET /_serverless/stats answers for the node it is sent to" },
-            {
-                "/_nodes/{nodeId}/hot_threads",
-                "per-node diagnostics are not served; GET /_serverless/stats answers for the node it is sent to" },
-            { "/_nodes/reload_secure_settings", "secure settings are read at start; there is no reload" },
-            { "/_nodes/{nodeId}/reload_secure_settings", "secure settings are read at start; there is no reload" },
-            { "/_nodes/usage", "feature usage is not counted here" },
-            { "/_nodes/{nodeId}/usage", "feature usage is not counted here" },
-            { "/_nodes/usage/{metric}", "feature usage is not counted here" },
-            { "/_nodes/{nodeId}/usage/{metric}", "feature usage is not counted here" },
-            { "/_nodes/{nodeId}/stats", "GET /_serverless/stats answers for the node it is sent to" },
-            { "/_nodes/stats/{metric}", "GET /_serverless/stats answers for the node it is sent to" },
-            { "/_nodes/{nodeId}/stats/{metric}", "GET /_serverless/stats answers for the node it is sent to" },
-            { "/_nodes/stats/{metric}/{index_metric}", "GET /_serverless/stats answers for the node it is sent to" },
-            { "/_nodes/{nodeId}/stats/{metric}/{index_metric}", "GET /_serverless/stats answers for the node it is sent to" },
-            { "/_rank_eval", "name an index: ranking evaluation belongs in the harness doing the evaluating" },
-            { "/_reindex/{task_id}/_rethrottle", noReindex },
-            { "/_update_by_query/{task_id}/_rethrottle", noReindex },
-            { "/_delete_by_query/{task_id}/_rethrottle", "delete_by_query runs inline here and is not throttled" },
-            { "/_remotestore/_restore", "the object store is the store; there is no separate remote store to restore from" },
-            { "/_remotestore/stats/{index}", "the object store is the store; there is no separate remote store to report on" },
-            { "/_remotestore/stats/{index}/{shard_id}", "the object store is the store; there is no separate remote store to report on" },
-            { "/_search_shards", "shards here are placed by id and served by whichever node holds them; there is no allocation to report" },
-            {
-                "/{index}/_search_shards",
-                "shards here are placed by id and served by whichever node holds them; there is no allocation to report" },
-            {
-                "/_snapshot/{repo}/_cleanup",
-                "a repository here is a namespace in this deployment's own object store, swept by its own collector" },
-            { "/_snapshot/{repo}/{snapshot}/_clone/{target}", "cloning a snapshot is not served; take a new one" },
-            { "/_snapshot/_status", "every snapshot here is taken synchronously, so there is no in-progress status to report" },
-            { "/_snapshot/{repo}/_status", "every snapshot here is taken synchronously, so there is no in-progress status to report" },
-            {
-                "/_snapshot/{repo}/{snapshot}/_status",
-                "every snapshot here is taken synchronously, so there is no in-progress status to report" },
-            {
-                "/_snapshot/{repo}/{snapshot}/{index}/_status",
-                "every snapshot here is taken synchronously, so there is no in-progress status to report" },
-            { "/_tasks/_cancel", "there is no cluster-wide task registry" },
-            { "/_tasks/{task_id}", "there is no cluster-wide task registry" },
-            { "/_tasks/{task_id}/_cancel", "there is no cluster-wide task registry" },
-            { "/_list/wlm_stats", "workload management is not part of this surface" },
-            {
-                "/{index}/_mapping/field/{fields}",
-                "GET /{index}/_mapping returns the whole mapping, which is one register read either way" } }) {
-            controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
-        }
+        // Then every endpoint a classic node serves and this one refuses, each with its reason.
+        RefusedEndpoints.register(controller);
         return controller;
     }
 
