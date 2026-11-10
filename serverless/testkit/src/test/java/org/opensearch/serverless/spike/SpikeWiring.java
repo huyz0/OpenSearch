@@ -52,27 +52,26 @@ import java.util.concurrent.atomic.AtomicReference;
 import static java.util.Collections.emptyMap;
 
 /**
- * Hand-rolled construction of the data plane for {@link S0ShellSpikeTests}. Disposable, like its caller.
+ * Hand-rolled construction of the data plane for {@link NoControlPlaneShardSpikeTests}. Disposable, like its caller.
  *
- * <p>Kept separate from the assertions so that the spike's answer to RFC §11 Q3 — "what is the actual
- * constructor closure" — is a single readable file rather than something inferred from a stack trace.
+ * <p>Kept separate from the assertions so that the spike's answer to "what is the actual
+ * constructor closure" is a single readable file rather than something inferred from a stack trace.
  */
-final class S0Wiring {
+final class SpikeWiring {
 
-    private S0Wiring() {}
+    private SpikeWiring() {}
 
     /**
-     * RFC §5.1 in production form: a real {@link ClusterService} whose state is set locally.
+     * A real {@link ClusterService} whose state is set locally.
      *
      * <p>The publisher applies to the local applier and completes — there are no peers. That is the
      * whole of {@code LocalOnlyPublisher}.
      */
     static ClusterService clusterService(Settings settings, ClusterSettings clusterSettings, ThreadPool threadPool, DiscoveryNode local) {
         final ClusterService clusterService = new ClusterService(settings, clusterSettings, threadPool);
-        // FINDING (S0): ClusterApplierService.doStart() requires a NodeConnectionsService as well as the
-        // publisher/supplier pair on ClusterManagerService. RFC §2.3 recorded two required collaborators;
-        // there are three. In the shell this is a real service driven by the membership view (§10) —
-        // its job is to hold transport connections to the nodes named in the applied state. S0 has no
+        // FINDING: ClusterApplierService.doStart() requires a NodeConnectionsService as well as the
+        // publisher/supplier pair on ClusterManagerService: three required collaborators, not two. Its
+        // job is to hold transport connections to the nodes named in the applied state. The spike has no
         // transport, so it is a no-op here.
         clusterService.setNodeConnectionsService(new NodeConnectionsService(Settings.EMPTY, null, null) {
             @Override
@@ -83,15 +82,15 @@ final class S0Wiring {
             @Override
             public void disconnectFromNodesExcept(DiscoveryNodes nodesToKeep) {}
         });
-        // §10.5: clusterManagerNodeId is deliberately NOT set. There is no election.
-        final ClusterState initial = ClusterState.builder(new ClusterName(settings.get("cluster.name", "s0-cluster")))
+        // clusterManagerNodeId is deliberately NOT set. There is no election.
+        final ClusterState initial = ClusterState.builder(new ClusterName(settings.get("cluster.name", "spike-cluster")))
             .nodes(DiscoveryNodes.builder().add(local).localNodeId(local.getId()).build())
             .blocks(ClusterBlocks.EMPTY_CLUSTER_BLOCK)
             .build();
         clusterService.getClusterApplierService().setInitialState(initial);
         clusterService.getClusterManagerService().setClusterStatePublisher((event, publishListener, ackListener) -> {
             clusterService.getClusterApplierService()
-                .onNewClusterState("s0-local-publish", event::state, new ClusterApplier.ClusterApplyListener() {
+                .onNewClusterState("spike-local-publish", event::state, new ClusterApplier.ClusterApplyListener() {
                     @Override
                     public void onSuccess(String source) {
                         publishListener.onResponse(null);
@@ -113,7 +112,7 @@ final class S0Wiring {
         final CountDownLatch latch = new CountDownLatch(1);
         final AtomicReference<Exception> failure = new AtomicReference<>();
         clusterService.getClusterApplierService()
-            .onNewClusterState("s0-projected-view", () -> state, new ClusterApplier.ClusterApplyListener() {
+            .onNewClusterState("spike-projected-view", () -> state, new ClusterApplier.ClusterApplyListener() {
                 @Override
                 public void onSuccess(String source) {
                     latch.countDown();
@@ -155,7 +154,7 @@ final class S0Wiring {
             emptyMap(),
             emptyMap()
         );
-        // FINDING (S0): PluginsService is genuinely required — DataFormatRegistry calls filterPlugins()
+        // FINDING: PluginsService is genuinely required — DataFormatRegistry calls filterPlugins()
         // during IndicesService construction. A real one with no plugins is what the shell will hold.
         final org.opensearch.plugins.PluginsService pluginsService = new org.opensearch.plugins.PluginsService(
             settings,
@@ -234,7 +233,7 @@ final class S0Wiring {
         );
     }
 
-    /** RFC §2.2: the shard lifecycle takes value objects, so a shell-owned reconciler can drive it. */
+    /** The shard lifecycle takes value objects, so a shell-owned reconciler can drive it. */
     static IndexShard openShard(IndexService indexService, ShardRouting routing, DiscoveryNode local, ClusterService clusterService)
         throws Exception {
         return indexService.createShard(
