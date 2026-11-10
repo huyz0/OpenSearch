@@ -1,12 +1,10 @@
 # The serverless shell: where it actually is
 
-Per-milestone notes (`m10`…`m64`) recorded what was true when each was written. They live on
-`feature/serverlessnode`, which this branch supersedes. **This document supersedes all of them.**
-If a milestone note and this disagree, this is right.
+This is the current account of what the shell does and does not do. Earlier per-change notes lived
+on a predecessor branch that no longer exists; where they and this document disagree, this is right.
 
-**Ported from `feature/serverlessnode`, where it was `serverless-status.md`.** That branch was
-built on a fork of OpenSearch; this one is built directly on `opensearch-project/OpenSearch`
-`main`. Three kinds of claim below were re-checked against that move and corrected: what core
+**Carried over from that predecessor branch.** It was built on a fork of OpenSearch; this one is built
+directly on `opensearch-project/OpenSearch` `main`. Three kinds of claim below were re-checked against that move and corrected: what core
 costs, what the tests are, and the alias-option gap. Everything else is carried over as it was
 written and was **not** re-verified line by line -- treat an unfamiliar claim here as a lead, not
 as a warranty.
@@ -18,13 +16,13 @@ OpenSearch client actually calls: `PUT|POST /{index}/_doc/{id}`, `POST /{index}/
 `PUT|POST /{index}/_create/{id}` for create-if-absent — which is one constant on the write path's own engine
 call (`MATCH_DELETED`), so the comparison happens under the per-document lock the engine already holds rather
 than as a read followed by a write. `_bulk` does `create` and per-item `if_seq_no`/`if_primary_term` too, and
-reports a lost condition as a 409 (`m50-api-compatibility-notes.md` (on `feature/serverlessnode`)). Every write, get
+reports a lost condition as a 409. Every write, get
 and bulk item reports `_seq_no`, `_primary_term` and `_version`, and **conditional writes work**:
 `if_seq_no`/`if_primary_term` on a write, a delete or an `_update` are passed to the engine, which performs
 the compare-and-swap against its own live version map; a lost race is a 409. The numbers survive a
 failover — the write-ahead log records each operation's sequence identity and a successor replays it as
 that operation rather than as a new one, so a token minted before a writer died is still honoured by its
-successor (`m48-sequence-numbers-notes.md` (on `feature/serverlessnode`)). `version` (external
+successor. `version` (external
 versioning) stays refused: it asks this system to order writes by a number the caller maintains and this
 system does not keep, which is a different thing from comparing against one the engine assigned. `_update` does a
 partial-document merge (core's own recursive merge, so a nested object is not silently overwritten), with
@@ -46,8 +44,7 @@ against MinIO where one writer pays 96. Nothing is acknowledged before the blob 
 durability contract is the one it was. **A writer that has lost its shard but not yet noticed is fenced
 out of that log**: it refuses to write past the lease deadline it last published for itself, which needs no
 I/O and so is checked on every write; and a successor seals the log at takeover, durably, so nothing
-appended after ownership moved is ever replayed — by that successor or by any node after it
-(`m49-fencing-notes.md` (on `feature/serverlessnode`)). A get is routed to the shard's owner so it sees writes a search
+appended after ownership moved is ever replayed — by that successor or by any node after it. A get is routed to the shard's owner so it sees writes a search
 cannot yet; an unowned shard is served from its published commit, so a get works against an index that has
 scaled to zero.
 
@@ -64,7 +61,7 @@ shards than `serverless.search.max_activations_per_query` (1,024) is refused unl
 rather than an empty result. `ignore_unavailable` turns a named index that cannot be reached into a
 `skipped` entry rather than a failure, and only when the caller asked for that.
 
-**API compatibility.** Measured below the route table, not just at it (`m61-api-compatibility-notes.md` (on `feature/serverlessnode`)).
+**API compatibility.** Measured below the route table, not just at it.
 The official Java client and OpenSearch Dashboards can search this shell: search parameters go through core's
 own `parseSearchRequest`, the response is a real `SearchResponse` rendered by core, so `typed_keys`,
 `rest_total_hits_as_int`, `highlight`, `_explanation`, `_shards.failures`, `timed_out` and `pit_id` are what
@@ -74,8 +71,7 @@ parameters into honoured, consumed-as-a-hint, or refused-with-a-reason, and noth
 dropped: alias options, restore fields, bulk action-line fields and template blocks that cannot be kept are
 refused, not acknowledged. `refresh=wait_for`, `op_type`, `retry_on_conflict`, a body `pit` block, the
 standard point-in-time delete and list, `_ingest/pipeline/_simulate`, `_analyze` without an index and
-`_cat/indices/{prefix}*` are served. M62 (`m62-remaining-compatibility-notes.md` (on `feature/serverlessnode`))
-took what M61 left: an index records when and by what it was created; `GET /_alias/{name}` is core's shape
+`_cat/indices/{prefix}*` are served. Beyond those: an index records when and by what it was created; `GET /_alias/{name}` is core's shape
 and `GET /{index}/_alias` answers the reverse question from a hint each descriptor carries, verified against
 the alias records it names; **stored scripts** live in a register with a change marker and resolve through
 one overridden `ScriptService` method; **search templates** (`lang-mustache`), **ranking evaluation**
@@ -103,7 +99,7 @@ alias.
 cannot inherit the previous index's data. Deletion reclaims the bytes, and a sweep collects shard
 containers no index owns.
 
-**Cluster config.** `GET/PUT /_cluster/settings` — §9.3's `/cluster/config` register, the one piece of
+**Cluster config.** `GET/PUT /_cluster/settings` — the `cluster/config` register, the one piece of
 `/_cluster/*` that is not refused, because it genuinely is one CAS register rather than genuinely
 cluster-wide state. Persistent settings only (`transient` is refused if non-empty — no cluster manager
 means no restart to reset one on), scalar values only (a list cannot be told apart from an explicit
@@ -153,7 +149,7 @@ burst of arrivals needs, rather than one slot per arrival, so the O(open shards)
 per burst rather than once per arrival — and a **per-index pin**, exempting an index's shards from both
 cap-pressure eviction and idle release on the node that pins it. Pinning is a node-local runtime setting,
 the same shape as the shard cap or the idle timeout, not a durable deployment-wide record; nothing has
-asked for the durable version yet. See `m13-hysteresis-notes.md` (on `feature/serverlessnode`).
+asked for the durable version yet.
 
 **Identity across a hop.** A thread-context header a plugin sets travels with a forwarded write and
 arrives on the node that owns the shard — core's own mechanism, the one the security plugin uses to move an
@@ -204,7 +200,7 @@ field's own analyzer, a named one, or the index default — read from the mappin
 answers. A custom tokenizer chain is refused rather than substituted: a caller debugging analysis must not be
 shown the analysis of something else. `_msearch` runs several searches in one request, each answered in the
 body `_search` would have produced, with one search's failure kept to its own slot. The saving is round trips,
-not shard work (`m55-analyze-msearch-notes.md` (on `feature/serverlessnode`)).
+not shard work.
 
 **Discovery.** `GET /{index}/_field_caps` reports what a client can query — field types, and whether each is
 searchable and aggregatable — read from the mapping rather than from a shard, so it answers for an index whose
@@ -213,8 +209,7 @@ indices using it. `GET /_list/indices/{prefix}*` (and the bare form, meaning eve
 core's `size` (500 by default, 5,000 at most) and `next_token`; each page resumes in the store's own listing,
 so page two hundred costs what page one did. `_cat/indices`, whose contract is the whole answer, still
 **refuses a prefix matching more than the cap rather than truncating** -- which is why the walk is `_list`
-and not `_cat`: OpenSearch added `_list` for exactly this reason (`m53-discovery-notes.md` (on
-`feature/serverlessnode`)).
+and not `_cat`: OpenSearch added `_list` for exactly this reason.
 
 **Ingest pipelines, and dynamic mapping.** `_ingest/pipeline/{id}` stores a pipeline in a register and
 compiles it at `PUT`, so one naming a processor this deployment does not have is refused where the operator is
@@ -224,15 +219,14 @@ are honoured too, with core's precedence: a pipeline named on the request displa
 never its final, `_none` opts out of the default alone, and the default runs before the final. They are
 resolved against the index actually written to, so a data stream write uses its backing index's settings.
 Separately: a document carrying a field the mapping
-does not describe now grows the mapping and is indexed — before M58 an index created without an explicit
-mapping could not accept a single document (`m58-ingest-notes.md` (on `feature/serverlessnode`)).
+does not describe now grows the mapping and is indexed. Without that, an index created without an explicit
+mapping could not accept a single document.
 
 **Scripts.** Painless runs here: script queries, `script_score`, `script_fields`, scripted aggregations and
 scripted updates including `ctx.op` for noop and delete. The engine is chosen by name and registered directly,
 the same way this shell has always chosen its transport — "no modules are loaded" was about discovery from
-disk, not about the code in `modules/`. Stored scripts were refused at M57 because `ScriptService` reads them
-out of cluster metadata; M62 overrode the one method that does so, and they live in a register now (see
-above and `m62-remaining-compatibility-notes.md` (on `feature/serverlessnode`)).
+disk, not about the code in `modules/`. `ScriptService` reads stored scripts
+out of cluster metadata; the shell overrides the one method that does so, and they live in a register.
 
 **Why a document scored what it did.** `GET|POST /{index}/_explain/{id}` accounts for one document's score
 against one query, in Lucene's own words. It is served because it is not a fan-out: an explain names a
@@ -240,31 +234,28 @@ document, a named document lives on one shard, so it is one term lookup and one 
 than the search whose score it explains**, which has to ask every shard. A document that exists and does not
 match is a 200 saying why, not a 404; that is the half a get cannot answer. The response says which copy
 scored it, because a score is a function of the whole shard's term and document frequencies and a published
-commit's are not a live writer's (`m60-explain-notes.md` (on `feature/serverlessnode`)).
+commit's are not a live writer's.
 
 **Aliases, in OpenSearch's own spellings.** `PUT|GET|HEAD|DELETE /{index}/_alias/{name}` alongside the
 name-scoped form this shell shipped with. `POST /_aliases` serves the atomic move it exists for — actions on
 one alias are one register, so the whole move is one compare-and-swap — and refuses actions spanning several,
 which would be several registers with no transaction over them. `_validate/query` parses a query and says that
-is all it did; `_resolve/index` reports which names are indices and which are aliases
-(`m59-alias-shapes-notes.md` (on `feature/serverlessnode`)).
+is all it did; `_resolve/index` reports which names are indices and which are aliases.
 
 **Templates.** `_index_template` and `_component_template` store in registers like every index descriptor, and
 a new index inherits from the highest-priority template whose patterns match — its components merged in order,
 its own block on top, and whatever the request said on top of that. A missing component fails the create
 rather than being skipped, because an index quietly missing the settings a component was meant to contribute
-shows up much later as a query matching nothing
-(`m56-templates-notes.md` (on `feature/serverlessnode`)).
+shows up much later as a query matching nothing.
 
 **Indices are mutable.** `PUT|POST /{index}/_settings` changes any *dynamic* setting on a live index and
 refuses a static one, because classic changes those only on a closed index and there is no closed state here —
 storing one would leave a value nothing acts on. `IndexScopedSettings` decides which is which, so there is no
-second list to drift (`m54-mutable-settings-notes.md` (on `feature/serverlessnode`)).
+second list to drift.
 `PUT|POST /{index}/_mapping` adds fields to an index that already exists — the merge
 is core's own `MapperService`, so adding a field succeeds and changing a field's type is refused in core's own
 words, and a shard already open and serving traffic picks the change up. The write is a compare-and-swap on
-the descriptor, so two clients adding different fields both win
-(`m52-mutable-mappings-notes.md` (on `feature/serverlessnode`)). `PUT /{index}` reads OpenSearch's own create envelope — `settings.number_of_shards` is honoured,
+the descriptor, so two clients adding different fields both win. `PUT /{index}` reads OpenSearch's own create envelope — `settings.number_of_shards` is honoured,
 `mappings` is the mapping, and any other setting is carried into the descriptor and layered into
 `IndexMetadata`, because the data plane under this shell is core's and understands them. The older bare-mapping
 body with `?shards=` still works. `GET /{index}`, `/_mapping` and `/_settings` answer OpenSearch's shape, so
@@ -279,15 +270,14 @@ every shard asked about can be served. A shard nobody owns is *dormant*, not una
 resting state, and reporting it as a fault would make `wait_for_status=green` block forever in a system where
 shards activate on demand. `dormant_shards` carries the real information, `replication: "object-store"` says on
 every answer that green does not mean copies exist, and the unscoped form reports `complete: false` rather than
-counting shards it did not examine (`m51-cluster-endpoints-notes.md` (on `feature/serverlessnode`)).
+counting shards it did not examine.
 
 **Nothing looks like a typo.** Every endpoint a client reaches for either answers or refuses with the reason
 it is refused for. An index name beginning with an underscore is an API this shell does not implement and says
 so, rather than being reported as a missing index — and the same backstop covers node selectors and repository
 names. A genuinely missing index is still a 404.
 
-M63 (`m63-review-fixes-notes.md` (on `feature/serverlessnode`)) took every finding of the September review
-([`serverless-index-review-2026-09.md`](serverless-index-review-2026-09.md)): names are validated before they
+A September 2026 review's findings are all fixed: names are validated before they
 become paths, the system-index guard checks the written target, transport is authenticated with a deployment
 secret, generations never restart, shards and heads are identified by uuid, the WAL ordinal is seeded and a
 write is acknowledged only if the lease was valid on both sides of the append, the action gate covers the
@@ -299,9 +289,7 @@ is a `members` register maintained only on join and leave, the WAL is truncated 
 ordinals, a sweep runs only when a manifest lost a file, and the manifest records every file's length so a
 reader opens without listing. Register reads followed: one head read per shard per pass shared by the
 heartbeat, the hints and the publish; writes and gets route by the owner last seen and read the head only
-when that node refuses; a publish swaps over the generation it remembers. M64
-(`m64-deep-review-fixes-notes.md` (on `feature/serverlessnode`)) took every finding of the deep review
-([`serverless-deep-review-2026-09.md`](serverless-deep-review-2026-09.md)): the acknowledgement fence is
+when that node refuses; a publish swaps over the generation it remembers. A later deep review's findings are all fixed too: the acknowledgement fence is
 explicit — a lapsed lease suspends every shard until the heads are re-verified, a per-shard fence spans
 apply→append→acknowledge and publish→release→close, the holder treats its lease as lapsed a margin early,
 a forwarded write is accepted only for a shard whose recent head names the owner, and a failed append fences
@@ -371,7 +359,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
   already holds at an older term now reopens it at the new term -- before, its later writes landed behind
   the seal and were never replayed, acknowledged and lost. **What remains is assumption, not window**: that
   the store's put-if-absent on one key is linearizable (conformance checks it on the filesystem, MinIO and
-  RustFS 1.0.0; R11 is open for real S3, GCS and Azure), and that an append whose outcome is unknown -- a
+  RustFS 1.0.0; real S3, GCS and Azure remain unverified), and that an append whose outcome is unknown -- a
   timeout -- may or may not be in the log, which is what "unknown" means. The log's cutoff no longer rests on
   clocks; lease expiry still decides when a takeover may begin. Pinned by `FsLogFencingTests` and
   `S3LogFencingTests` (the same history on MinIO and on RustFS single-node and erasure: an append before the
@@ -389,7 +377,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
   design decision rather than plumbing. `POST /{index}/_update/{id}` does the merge.
 - Static index settings cannot be changed at all, by any route. Classic OpenSearch offers close-change-open
   and there is no close here, so the only way to change one is to create a new index. Dynamic settings change
-  freely (M54).
+  freely.
 - A walk over indices is not a snapshot. `GET /_list/indices` by `next_token` returns every index that
   exists for the whole walk exactly once, in name order; one created or deleted behind the cursor is not
   seen, one ahead of it is seen or not depending on when its page is read. Core sorts `_list/indices` by
@@ -411,7 +399,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
   uuid in the path means the new index writes somewhere else. A reader whose node cannot reach the object store for longer than the grace can lose
   the commit it is reading — it fails with an error rather than answering wrongly, but it is a real limit.
 
-**Open under D4 (each needs a narrow shared interface in `server/`, which D4 permits and nobody has built):**
+**Open, each needing a narrow shared interface in `server/` (permitted, and not yet built):**
 
 - `onIndexModule` fires only for plugins loaded from disk. Firing it for a plugin passed in as an instance
   needs `PluginsService` to accept instances.
@@ -419,7 +407,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 **Blocked on something I do not have:**
 
-- **R11 — provider CAS linearizability — remains the top risk and is unclosed.** The whole safety argument
+- **Provider CAS linearizability remains the top risk and is unverified.** The whole safety argument
   rests on `compareAndSwapRegister` being genuinely linearizable. What exists now: a linearizability
   checker that records a concurrent history and asks whether any sequential order explains it — the
   question itself rather than a proxy for it — canaried against stores that really misbehave, and passing
@@ -438,7 +426,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
   object-store compare-and-swap register, and the pair of engine hooks that replay the write-ahead
   log during recovery. See [`README.md`](README.md) for the file-by-file account. The direction rule
   still holds and is still a build task: no file under `server/` may reference
-  `org.opensearch.serverless`. D4 permits narrow shared interfaces, and these are them.
+  `org.opensearch.serverless`. Narrow shared interfaces in `server/` are permitted, and these are them.
 - **One build-tooling file is touched too, and it is not part of that count.** `doc-tools/missing-doclet`
   reported every record's accessors and canonical constructor as undocumented, which no amount of writing
   could satisfy: a record's `@param` tags are the only place those can be documented, and the doclet never
@@ -448,20 +436,19 @@ These are decisions, not gaps. Each answers 501 with a reason.
   strictest level, and above core's own `server/`, which sits at `class`.
 - The REST surface is an allowlist. Anything not registered answers 404 or an explicit 501, never an empty
   success.
-- Storage layout changed in M32 (uuid in the path); an existing deployment's data is not found by a node
+- Storage layout changed to put the index uuid in the path; an existing deployment's data is not found by a node
   running this build. Pre-release.
 - The authentication plugin authenticates and ships no policy beyond one rule: only the configured account
   may manage accounts. It is one `if`, and is named as one.
-- **Response shapes match real OpenSearch wherever matching costs nothing architecturally** (M47) — field
+- **Response shapes match real OpenSearch wherever matching costs nothing architecturally** — field
   names, envelopes, defaults that were shell-specific inventions with no reason to differ. Every deliberate
   refusal, not just uncaught exceptions, now renders the real `{"error": {"root_cause": [...], "type": ...,
   "reason": ...}}` object; search responses carry `took`, `timed_out`, real `_shards` field names,
   `hits.total.relation`; writes carry `_shards`; index creation carries `shards_acknowledged`. What did
-  **not** change: the endpoints and request shapes D2 and §6.3 refuse on purpose — conditional writes (no
+  **not** change: the endpoints and request shapes the REST allowlist and the no-enumeration rule refuse on purpose — conditional writes (no
   version model), non-prefix wildcards (no listing on a request path), a cluster-wide surface (no
   cluster-wide state) — and `_version`/`_seq_no`/`_primary_term` and "created vs. updated," both deferred
-  because closing them needs a real feature (a version model), not a response-shape change. See
-  `m47-api-compatibility-notes.md` (on `feature/serverlessnode`).
+  because closing them needs a real feature (a version model), not a response-shape change.
 
 ## What a correctness review found
 
@@ -637,7 +624,7 @@ to histories mixing concurrent reads, swaps, create-if-absent and conditional de
 times over per layout, 100 rounds of four contenders each — with a planted store that deletes despite a stale
 generation to show the check fails when it should. Nothing reported against earlier RustFS builds (a
 conditional delete checking `If-Match` on arrival and then deleting whatever was current) reproduced on 1.0.0.
-**That is evidence for RustFS 1.0.0, not for AWS, GCS or Azure**: R11 stays open for all three, since this
+**That is evidence for RustFS 1.0.0, not for AWS, GCS or Azure**: all three stay unverified, since this
 work had no account on any of them.
 
 The extended check also found two defects in the filesystem store, fixed: a register read racing a delete
