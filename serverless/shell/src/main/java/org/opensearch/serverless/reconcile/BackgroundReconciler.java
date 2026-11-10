@@ -98,6 +98,7 @@ public final class BackgroundReconciler implements Closeable {
     private final RoutingHints hints = new RoutingHints();
     private final Set<Map.Entry<String, Integer>> wanted = ConcurrentHashMap.newKeySet();
     private final Map<ShardId, Long> lastPublishedMaxSeqNo = new ConcurrentHashMap<>();
+    private final Map<ShardId, Long> lastPublishedAtMillis = new ConcurrentHashMap<>();
     private final Set<ShardId> dirty = ConcurrentHashMap.newKeySet();
     private final Set<ShardId> fenced = ConcurrentHashMap.newKeySet();
     private final Set<String> pinnedIndices = ConcurrentHashMap.newKeySet();
@@ -1268,6 +1269,7 @@ public final class BackgroundReconciler implements Closeable {
         }
         node.reconciler().releaseShard(shardId, reason);
         lastPublishedMaxSeqNo.remove(shardId);
+        lastPublishedAtMillis.remove(shardId);
         // Unmarked only now, with the last publish recorded and no writer left: from here a coordinator may
         // rule the shard out from its digest. A clear that fails leaves it marked, which costs a check.
         try {
@@ -2580,14 +2582,92 @@ public final class BackgroundReconciler implements Closeable {
      * @throws Exception if the metadata plane cannot be reached
      */
     public Set<ShardId> publishDirty() throws Exception {
+        return publishDirty(0L, 0L, 0L);
+    }
+
+    /**
+     * Publishes the shards written to since their last publish that are due for another one.
+     *
+     * <p>A publish is a flush plus one upload per new segment file plus a manifest swap: five or more PUTs for
+     * a commit that adds one small segment. On a shard taking a write every second or so, publishing on every
+     * debounce window costs those five PUTs per write, several times the one log append the write itself paid.
+     * Durability does not need it, because an acknowledged write is already in the log. What a publish buys is
+     * reader freshness and a shorter log to replay on takeover, and both are well served by publishing a busy
+     * shard every few seconds rather than every few hundred milliseconds.
+     *
+     * <p>So a shard is due when it has never been published by this node, when {@code minIntervalMillis} has
+     * passed since its last publish, or when it holds at least {@code maxUnpublishedOperations} operations its
+     * last publish did not cover, which bounds the replay a successor inherits whatever the write rate. A shard
+     * that is not yet due keeps its mark and is looked at again on the next pass.
+     *
+     * @param nowMillis the plane's clock, now
+     * @param minIntervalMillis the least time between two publishes of one shard; zero or less publishes every
+     *     marked shard, as {@link #publishDirty()} does
+     * @param maxUnpublishedOperations how many unpublished operations make a shard due early; zero or less to
+     *     never publish early
+     * @return the shards published
+     * @throws Exception if the metadata plane cannot be reached
+     */
+    public Set<ShardId> publishDirty(long nowMillis, long minIntervalMillis, long maxUnpublishedOperations) throws Exception {
         try (org.opensearch.common.lease.Releasable work = activity.enter()) {
             if (work == null) {
                 return Set.of();
             }
-            final Set<ShardId> drained = new LinkedHashSet<>(dirty);
-            dirty.removeAll(drained);
-            return publish(drained);
+            final Set<ShardId> due = new LinkedHashSet<>();
+            for (ShardId shardId : dirty) {
+                // Unmarked one at a time, as each is found due: a write that re-marks a shard after this point keeps
+                // its mark and gets its own pass, where removing them all at the end would erase it.
+                if (publishDue(shardId, nowMillis, minIntervalMillis, maxUnpublishedOperations) && dirty.remove(shardId)) {
+                    due.add(shardId);
+                }
+            }
+            return publish(due);
         }
+    }
+
+    /**
+     * Whether any marked shard is due for a publish now, by the rule {@link #publishDirty(long, long, long)}
+     * applies.
+     *
+     * @param nowMillis the plane's clock, now
+     * @param minIntervalMillis the least time between two publishes of one shard
+     * @param maxUnpublishedOperations how many unpublished operations make a shard due early
+     * @return true if a pass now would publish something
+     */
+    public boolean hasDirtyDue(long nowMillis, long minIntervalMillis, long maxUnpublishedOperations) {
+        for (ShardId shardId : dirty) {
+            if (publishDue(shardId, nowMillis, minIntervalMillis, maxUnpublishedOperations)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean publishDue(ShardId shardId, long nowMillis, long minIntervalMillis, long maxUnpublishedOperations) {
+        if (minIntervalMillis <= 0) {
+            return true;
+        }
+        final Long lastAt = lastPublishedAtMillis.get(shardId);
+        if (lastAt == null || nowMillis - lastAt >= minIntervalMillis) {
+            return true;
+        }
+        if (maxUnpublishedOperations <= 0) {
+            return false;
+        }
+        final var shard = node.reconciler().shard(shardId);
+        if (shard == null) {
+            // Closed since it was marked; publishOne drops it without a store request.
+            return true;
+        }
+        final long maxSeqNo;
+        try {
+            maxSeqNo = shard.seqNoStats().getMaxSeqNo();
+        } catch (RuntimeException e) {
+            // An engine closing or resetting. Due, so the publish finds out and re-marks it on its own, rather than
+            // this one shard failing the whole pass for every other.
+            return true;
+        }
+        return maxSeqNo - lastPublishedMaxSeqNo.getOrDefault(shardId, -1L) >= maxUnpublishedOperations;
     }
 
     /**
@@ -2701,6 +2781,7 @@ public final class BackgroundReconciler implements Closeable {
                 logger.warn("could not release " + shardId + " after a fenced publish", releaseFailure);
             }
             lastPublishedMaxSeqNo.remove(shardId);
+            lastPublishedAtMillis.remove(shardId);
             fenced.add(shardId);
             return false;
         } catch (Exception e) {
@@ -2713,6 +2794,7 @@ public final class BackgroundReconciler implements Closeable {
             return false;
         }
         lastPublishedMaxSeqNo.put(shardId, covered);
+        lastPublishedAtMillis.put(shardId, plane.clock().getAsLong());
         return true;
     }
 
@@ -2814,6 +2896,7 @@ public final class BackgroundReconciler implements Closeable {
         reclaiming.set(false);
         wanted.clear();
         dirty.clear();
+        lastPublishedAtMillis.clear();
         fenced.clear();
         pendingSweeps.clear();
     }
