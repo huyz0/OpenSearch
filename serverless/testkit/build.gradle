@@ -17,6 +17,23 @@ dependencies {
   testImplementation project(':test:framework')
   // Conformance against a real S3 API: the suite needs the container production would use.
   testImplementation project(':plugins:repository-s3')
+  // The same suite against GCS and Azure emulators, through each plugin's production blob store.
+  testImplementation project(':plugins:repository-gcs')
+  testImplementation project(':plugins:repository-azure')
+  // The GCS plugin declares its client libraries as implementation, so they reach this module at runtime only.
+  // The emulator helper names a few of their types; compile against the versions the plugin pins.
+  ['com.google.cloud:google-cloud-storage:2.60.0', 'com.google.cloud:google-cloud-core:2.60.0',
+   'com.google.cloud:google-cloud-core-http:2.60.0', 'com.google.api:gax:2.72.1', 'com.google.api:api-common:2.55.1',
+   'com.google.auth:google-auth-library-credentials:1.41.0', 'com.google.auth:google-auth-library-oauth2-http:1.41.0',
+   'org.checkerframework:checker-qual:4.2.3'].each {
+    testCompileOnly(it) { transitive = false }
+  }
+}
+
+// The GCS plugin pins a newer guava than the one the Azure plugin takes from the version catalog, and the build
+// fails on any version conflict. Both only need it at runtime; the newer one serves both.
+configurations.named('testRuntimeClasspath').configure {
+  resolutionStrategy.force 'com.google.guava:guava:33.4.0-jre'
 }
 
 // Spikes (package org.opensearch.serverless.spike) live here. They are disposable probes, not a
@@ -47,6 +64,8 @@ tasks.named('test').configure {
   exclude '**/ServerlessFleetScaleTests.class'
   exclude '**/ServerlessRealPluginTests.class'
   exclude '**/ServerlessTlsTests.class'
+  exclude '**/GcsEmulator*Tests.class'
+  exclude '**/Azurite*Tests.class'
 }
 
 /*
@@ -165,6 +184,30 @@ tasks.register('fleetTest', Test) {
     }
   }
   outputs.upToDateWhen { false }
+}
+
+/*
+ * The conformance and WAL fencing suites against GCS and Azure emulators (fake-gcs-server and Azurite), through
+ * the production GCS and Azure blob stores. Not part of check: it needs both emulators running, and each test
+ * skips when its emulator is not reachable. Start them with:
+ *
+ *   docker run -d -p 4443:4443 fsouza/fake-gcs-server:1.56.1 -scheme http -port 4443 -public-host 127.0.0.1:4443
+ *   docker run -d -p 10000:10000 mcr.microsoft.com/azure-storage/azurite:3.35.0 azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck --loose
+ *
+ *   ./gradlew :serverless:testkit:emulatorTest [-Dtests.serverless.gcs.endpoint=...] [-Dtests.serverless.azure.endpoint=...]
+ */
+tasks.register('emulatorTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/GcsEmulator*Tests.class'
+  include '**/Azurite*Tests.class'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'opensearch.set.netty.runtime.available.processors', 'false'
+  ['tests.serverless.gcs.endpoint', 'tests.serverless.azure.endpoint'].each { key ->
+    if (System.getProperty(key) != null) {
+      systemProperty key, System.getProperty(key)
+    }
+  }
 }
 
 tasks.named('check').configure {
