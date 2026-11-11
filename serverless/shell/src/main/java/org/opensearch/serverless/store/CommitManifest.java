@@ -115,6 +115,11 @@ public final class CommitManifest {
         PruningDigest digest,
         long walOrdinal
     ) {
+        try {
+            checkLocations(files);
+        } catch (IOException e) {
+            throw new IllegalArgumentException(e.getMessage(), e);
+        }
         this.term = term;
         this.files = Map.copyOf(files);
         this.writer = writer;
@@ -164,7 +169,12 @@ public final class CommitManifest {
      * @return the length, or null if this manifest does not record it
      */
     public Long lengthOf(String fileName) {
-        return lengths.get(fileName);
+        final Long recorded = lengths.get(fileName);
+        if (recorded != null) {
+            return recorded;
+        }
+        final FileLocation location = location(fileName);
+        return location != null && location.isPacked() ? Long.valueOf(location.length()) : null;
     }
 
     /**
@@ -195,12 +205,38 @@ public final class CommitManifest {
     }
 
     /**
-     * Returns segment file name to blob name.
+     * Returns segment file name to where it is, as recorded: see {@link FileLocation} for the forms.
      *
      * @return the file map
      */
     public Map<String, String> files() {
         return files;
+    }
+
+    /**
+     * Returns where one file's bytes are.
+     *
+     * @param fileName the file
+     * @return its location, or null if this commit does not name it
+     */
+    public FileLocation location(String fileName) {
+        final String recorded = files.get(fileName);
+        if (recorded == null) {
+            return null;
+        }
+        try {
+            return FileLocation.parse(fileName, recorded);
+        } catch (IOException e) {
+            // Every manifest is checked when it is read or built, so a recorded location is well formed.
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /** Refuses a file map that records a location no reader could follow. */
+    private static void checkLocations(Map<String, String> files) throws IOException {
+        for (Map.Entry<String, String> file : files.entrySet()) {
+            FileLocation.parse(file.getKey(), file.getValue());
+        }
     }
 
     /**
@@ -337,6 +373,7 @@ public final class CommitManifest {
             if (parser.nextToken() != null) {
                 throw new IOException("malformed commit manifest: trailing content");
             }
+            checkLocations(files);
             return new CommitManifest(term, files, writer, lengths, digest, walOrdinal);
         }
     }
@@ -360,6 +397,7 @@ public final class CommitManifest {
         for (int i = 0; i < count; i++) {
             read.put(in.readString(), in.readString());
         }
+        checkLocations(read);
         this.files = Map.copyOf(read);
         final int known = in.readVInt();
         final Map<String, Long> readLengths = new LinkedHashMap<>(known);

@@ -39,6 +39,8 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
     private final String blobName;
     private final String cacheKeyPrefix;
     private final long length;
+    /** Where the file starts in its blob: zero for a file of its own, its offset in a pack. */
+    private final long blobOffset;
     private long position;
 
     /**
@@ -59,7 +61,8 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
         BlockCache cache,
         String blobName,
         String cacheKeyPrefix,
-        long length
+        long length,
+        long blobOffset
     ) {
         super(resourceDescription, context);
         this.container = container;
@@ -67,6 +70,7 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
         this.blobName = blobName;
         this.cacheKeyPrefix = cacheKeyPrefix;
         this.length = length;
+        this.blobOffset = blobOffset;
     }
 
     @Override
@@ -112,7 +116,7 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
             final byte[] span = new byte[size];
             // The one range request, and the whole point of the ramp: a cold scan of a large segment used
             // to pay one of these per 64 KB, which on an object store is one billed round trip per 64 KB.
-            try (InputStream in = container.readBlob(blobName, start, size)) {
+            try (InputStream in = container.readBlob(blobName, blobOffset + start, size)) {
                 int read = 0;
                 while (read < size) {
                     final int n = in.read(span, read, size - read);
