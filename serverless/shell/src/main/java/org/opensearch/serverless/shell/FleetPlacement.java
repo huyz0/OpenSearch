@@ -186,7 +186,8 @@ final class FleetPlacement {
 
     /**
      * The member that takes over a shard whose owner's lease has run out: of the live writer members other than that
-     * owner, in name order, the first from the shard's hash with room under its overcommit ceiling -- or, if none has
+     * owner, those in the owner's zone first, in name order, the first from the shard's hash with room under its
+     * overcommit ceiling; then of all of them the same way -- or, if none has
      * room, the one the hash names. Every member computes the same answer from the same leases, so a dead node's shards
      * are each taken by one survivor rather than queued by every survivor a request for them happens to reach: a fleet
      * run had every survivor queueing ~300 of a dead node's shards, and requests waited 30-60 s in those queues.
@@ -203,7 +204,11 @@ final class FleetPlacement {
     public Optional<String> takeoverWinner(MetadataPlane plane, String indexName, int shard, String deadOwner) {
         final long now = plane.clock().getAsLong();
         final TreeMap<String, NodeLease> live = new TreeMap<>();
+        String deadZone = null;
         for (NodeLease lease : plane.membership().current()) {
+            if (lease.nodeId().equals(deadOwner)) {
+                deadZone = lease.zone();
+            }
             if (lease.nodeId().equals(deadOwner) == false
                 && lease.isExpiredAt(now) == false
                 && lease.roles().contains(ServerlessNode.ROLE_INGEST)) {
@@ -212,6 +217,26 @@ final class FleetPlacement {
         }
         if (live.isEmpty()) {
             return Optional.empty();
+        }
+        if (deadZone == null) {
+            deadZone = zoneOfDeparted(plane, deadOwner);
+        }
+        // A member in the dead owner's zone first, with room: the shard's writes were arriving in that zone, and a
+        // survivor there keeps them from crossing to another. Any member otherwise, exactly as before.
+        final List<String> inZone = new ArrayList<>();
+        for (NodeLease lease : live.values()) {
+            if (org.opensearch.serverless.cluster.Zones.same(deadZone, lease.zone())) {
+                inZone.add(lease.nodeId());
+            }
+        }
+        if (inZone.isEmpty() == false) {
+            final int firstInZone = Math.floorMod((indexName + "#" + shard).hashCode(), inZone.size());
+            for (int i = 0; i < inZone.size(); i++) {
+                final String candidate = inZone.get((firstInZone + i) % inZone.size());
+                if (hasTakeoverRoom(candidate, live.get(candidate))) {
+                    return Optional.of(candidate);
+                }
+            }
         }
         final List<String> order = new ArrayList<>(live.keySet());
         final int first = Math.floorMod((indexName + "#" + shard).hashCode(), order.size());
@@ -250,6 +275,31 @@ final class FleetPlacement {
             return winner.isPresent() && winner.get().equals(localNodeId.get()) == false;
         } catch (Exception e) {
             return false;
+        }
+    }
+
+    /** Zones of owners whose leases have run out, "" when the lease says none; read once each, then remembered. */
+    private final java.util.Map<String, String> departedZones = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * The zone of a member no longer in the live view, from its lease, which outlives it until the sweep: one read per
+     * departed member, not one per shard it owned, and nothing at all once its zone is known.
+     */
+    private String zoneOfDeparted(MetadataPlane plane, String nodeId) {
+        final String known = departedZones.get(nodeId);
+        if (known != null) {
+            return known.isEmpty() ? null : known;
+        }
+        try {
+            final String zone = plane.membership().read(nodeId).map(NodeLease::zone).orElse(null);
+            if (departedZones.size() >= 4096) {
+                departedZones.clear();
+            }
+            departedZones.put(nodeId, zone == null ? "" : zone);
+            return zone;
+        } catch (Exception e) {
+            // Unknown this time; asked again on the next takeover. Any member takes it meanwhile.
+            return null;
         }
     }
 
