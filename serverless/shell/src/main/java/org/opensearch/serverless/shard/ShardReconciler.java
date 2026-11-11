@@ -431,10 +431,42 @@ public final class ShardReconciler {
                     nodeLogReplayed.merge(shardId, hooks.replay(shardId, writer, fromNodeLog.term(), counting), Long::sum);
                 }
             }
+            // Last: records a caller handed in for this open, newer than anything the shard's logs hold.
+            final java.util.List<org.opensearch.serverless.store.WalRecord> preloaded = preloadedReplay.remove(shardId);
+            if (preloaded != null) {
+                for (org.opensearch.serverless.store.WalRecord record : preloaded) {
+                    consumer.accept(record);
+                }
+                // Counted as node-log replay, so the open publishes them before it serves: no log of this shard holds them.
+                nodeLogReplayed.merge(shardId, (long) preloaded.size(), Long::sum);
+            }
         } finally {
             writerOpenNanos[WRITER_OPEN_PHASES.indexOf("log_read")].addAndGet(System.nanoTime() - readingAt);
         }
     }
+
+    /**
+     * Hands the next writer open of a shard records to replay with their own sequence numbers, after whatever the shard's
+     * logs hold: for a caller that builds a shard from part of another, such as a shard split, whose records are in the
+     * other shard's log and not in this one's. Nothing calls it by default.
+     *
+     * <p>Replayed as recovery replays a log, so each record keeps its sequence number, and the sequence numbers missing
+     * between them are filled with no-ops once recovery ends. A shard that replayed any is published before the open
+     * returns, so no later open depends on the other shard's log for them. The records are dropped, unused, by an open
+     * that replays no log, such as a reader's, and by an open that fails.
+     *
+     * @param shardId the shard about to be opened as a writer on this node
+     * @param records the records, oldest first, each past the local checkpoint of the commit the shard opens from
+     * @throws IllegalStateException if records are already waiting for the shard's next open
+     */
+    public void preloadReplay(ShardId shardId, java.util.List<org.opensearch.serverless.store.WalRecord> records) {
+        if (preloadedReplay.putIfAbsent(shardId, java.util.List.copyOf(records)) != null) {
+            throw new IllegalStateException("records are already waiting for the next open of " + shardId);
+        }
+    }
+
+    final java.util.concurrent.ConcurrentHashMap<ShardId, java.util.List<org.opensearch.serverless.store.WalRecord>> preloadedReplay =
+        new java.util.concurrent.ConcurrentHashMap<>();
 
     public boolean retainReplay(ShardId shardId, org.opensearch.serverless.engine.ReplaySpool spool) throws IOException {
         if (replayedRecords.putIfAbsent(shardId, spool) != null) {
