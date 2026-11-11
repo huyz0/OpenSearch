@@ -11,6 +11,7 @@ package org.opensearch.serverless.reconcile;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.shell.ShardAdmission;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -187,7 +188,7 @@ public final class BackgroundReconciler implements Closeable {
         this.plane = plane;
         this.collector = new GarbageCollector(plane.blobStore(), plane.basePath());
         // Readers and frozen views are admitted under this loop's cap and eviction, not a constant.
-        node.setShardAdmission(new ServerlessNode.ShardAdmission() {
+        node.setShardAdmission(new ShardAdmission() {
             @Override
             public int maxShardsHeld() {
                 return BackgroundReconciler.this.maxShardsHeld;
