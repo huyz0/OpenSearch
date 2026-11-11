@@ -75,7 +75,11 @@ final class IndexDescriptorRendering {
     static void renderSettings(XContentBuilder builder, IndexDescriptor descriptor, String only) throws IOException {
         final java.util.Map<String, String> settings = new java.util.LinkedHashMap<>();
         // Strings, not numbers, because that is what OpenSearch returns: settings are a string map there.
-        settings.put("number_of_shards", Integer.toString(descriptor.numberOfShards()));
+        // The declared count: an adaptive index reports what the user asked for, not how many units hold it.
+        settings.put("number_of_shards", Integer.toString(descriptor.declaredShards()));
+        if (descriptor.layout() != null) {
+            settings.put("serverless.shard_mode", descriptor.layout().mode().settingValue());
+        }
         // Zero, and true: a shard here has exactly one writer, and its redundancy is the object store
         // rather than a second copy. Reporting it is more honest than omitting it, because a client
         // reading a replica count gets the real one.

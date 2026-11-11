@@ -40,12 +40,35 @@ final class SnapshotBlobs {
             builder.startObject();
             descriptor.extraSettings().toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
             builder.endObject();
-            return org.opensearch.common.xcontent.XContentHelper.convertToMap(
-                BytesReference.bytes(builder),
-                false,
-                org.opensearch.common.xcontent.XContentType.JSON
-            ).v2();
+            final Map<String, Object> settings = new java.util.HashMap<>(
+                org.opensearch.common.xcontent.XContentHelper.convertToMap(
+                    BytesReference.bytes(builder),
+                    false,
+                    org.opensearch.common.xcontent.XContentType.JSON
+                ).v2()
+            );
+            // An index created with a shard mode routes by its unit layout, so a restore without it would
+            // look for documents in the wrong units. Carried beside the settings, not as one.
+            if (descriptor.layout() != null) {
+                settings.put(UNIT_LAYOUT_KEY, org.opensearch.serverless.routing.UnitLayoutFormat.toJson(descriptor.layout()));
+            }
+            return settings;
         }
+    }
+
+    /** Where a captured index's unit layout travels in its snapshot settings. */
+    static final String UNIT_LAYOUT_KEY = "serverless_unit_layout";
+
+    /**
+     * The unit layout a captured index was routed by, or null for an index without a shard mode.
+     *
+     * @param captured the settings the snapshot recorded
+     * @return the layout, or null
+     * @throws IOException if the recorded layout is malformed
+     */
+    static org.opensearch.serverless.routing.UnitLayout layoutOf(Map<String, Object> captured) throws IOException {
+        final Object layout = captured.get(UNIT_LAYOUT_KEY);
+        return layout == null ? null : org.opensearch.serverless.routing.UnitLayoutFormat.fromJson(layout.toString());
     }
 
     /**
@@ -60,8 +83,10 @@ final class SnapshotBlobs {
         if (captured.isEmpty()) {
             return org.opensearch.common.settings.Settings.EMPTY;
         }
+        final Map<String, Object> withoutLayout = new java.util.HashMap<>(captured);
+        withoutLayout.remove(UNIT_LAYOUT_KEY);
         final org.opensearch.common.settings.Settings.Builder settings = org.opensearch.common.settings.Settings.builder()
-            .loadFromMap(captured)
+            .loadFromMap(withoutLayout)
             .normalizePrefix(org.opensearch.cluster.metadata.IndexMetadata.INDEX_SETTING_PREFIX);
         for (String key : new String[] {
             org.opensearch.cluster.metadata.IndexMetadata.SETTING_INDEX_UUID,

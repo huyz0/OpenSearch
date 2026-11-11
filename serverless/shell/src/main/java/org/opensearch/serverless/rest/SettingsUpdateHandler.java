@@ -199,7 +199,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
         final IndexScopedSettings scoped = IndexScopedSettings.DEFAULT_SCOPED_SETTINGS;
         final TreeSet<String> unknown = new TreeSet<>();
         for (String key : requested.keySet()) {
-            if (scoped.get(key) == null) {
+            if (scoped.get(key) == null && org.opensearch.serverless.routing.ShardMode.SETTING.equals(key) == false) {
                 unknown.add(key);
             }
         }
@@ -207,6 +207,11 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
     }
 
     private static String refuse(Settings requested) {
+        if (requested.get(org.opensearch.serverless.routing.ShardMode.SETTING) != null) {
+            return org.opensearch.serverless.routing.ShardMode.SETTING
+                + " is chosen when an index is created and cannot be changed: it decides how the index's units "
+                + "start, and the units an index already has stay as they are";
+        }
         if (requested.hasValue(IndexMetadata.SETTING_NUMBER_OF_SHARDS)) {
             return "number_of_shards cannot be changed after an index is created: the shard list lives in the "
                 + "index descriptor and routing is a function of it, so changing the count would re-route every "

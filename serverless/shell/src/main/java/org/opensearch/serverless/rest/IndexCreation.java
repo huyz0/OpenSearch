@@ -183,18 +183,31 @@ final class IndexCreation {
         IndexCreateRequest create,
         org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited
     ) throws IOException, IndexAdminHandler.RefusedException {
-        final Settings settings = IndexCreateRequest.settingsWith(create.settings, inherited);
+        final Settings requested = IndexCreateRequest.settingsWith(create.settings, inherited);
+        // The shard mode is the descriptor's own field, not a setting core knows, so it is taken out
+        // before core validates the rest. Absent, the index has no unit layout and routes as it always has.
+        final org.opensearch.serverless.routing.ShardMode mode;
+        try {
+            mode = org.opensearch.serverless.routing.ShardMode.requested(requested);
+        } catch (IllegalArgumentException e) {
+            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+        }
+        final Settings settings = org.opensearch.serverless.routing.ShardMode.without(requested);
         // Parsed and validated before the descriptor exists, not by the first shard to open it. A value
         // core cannot parse used to land in the register and fail every node that later built
         // IndexSettings from it, with a 400 to the caller that read like a refusal.
         validateIndexSettings(settings == null ? Settings.EMPTY : settings, true);
-        final IndexDescriptor descriptor = new IndexDescriptor(
+        final int declaredShards = IndexCreateRequest.shardsWith(create.shards, create.explicitShards, inherited);
+        IndexDescriptor descriptor = new IndexDescriptor(
             index,
             UUID.randomUUID().toString(),
-            IndexCreateRequest.shardsWith(create.shards, create.explicitShards, inherited),
+            declaredShards,
             IndexCreateRequest.mappingWith(create.mapping, inherited),
             settings
         ).createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id);
+        if (mode != null) {
+            descriptor = descriptor.withLayout(org.opensearch.serverless.routing.UnitLayout.initial(mode, declaredShards));
+        }
         if (serving == null) {
             throw new IndexAdminHandler.RefusedException(
                 RestStatus.SERVICE_UNAVAILABLE,
@@ -280,12 +293,19 @@ final class IndexCreation {
     /**
      * Refuses settings core would not accept, or this design cannot honour, before anything is written.
      *
-     * @param settings normalised ({@code index.}-prefixed) settings
+     * @param given normalised ({@code index.}-prefixed) settings
      * @param atCreation whether this is a create, where dependencies between settings are checked as
      *     core checks them; an update validates each value on its own, as core's update does
      * @throws IndexAdminHandler.RefusedException with the status and words the caller should see
      */
-    static void validateIndexSettings(Settings settings, boolean atCreation) throws IndexAdminHandler.RefusedException {
+    static void validateIndexSettings(Settings given, boolean atCreation) throws IndexAdminHandler.RefusedException {
+        // The shard mode is the shell's, not core's: checked here, and left out of what core validates.
+        try {
+            org.opensearch.serverless.routing.ShardMode.requested(given);
+        } catch (IllegalArgumentException e) {
+            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+        }
+        final Settings settings = org.opensearch.serverless.routing.ShardMode.without(given);
         final String unsupported = unsupportedIndexSetting(settings);
         if (unsupported != null) {
             throw new IndexAdminHandler.RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_setting", unsupported);
