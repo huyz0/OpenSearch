@@ -13,6 +13,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 
 import java.io.ByteArrayInputStream;
@@ -74,7 +75,7 @@ public final class DescriptorStore {
      */
     public static final long TOMBSTONE_REAP_HANDOFF_MILLIS = 60_000L;
 
-    private final BlobContainer container;
+    private final ConditionalBlobContainer container;
     private final DescriptorListing listing;
     private final BlobStore blobStore;
     private final BlobPath tombstonesPath;
@@ -99,7 +100,7 @@ public final class DescriptorStore {
      * @param clock the clock tombstones are stamped with and a sweep's claim is timed by
      */
     public DescriptorStore(BlobContainer container, BlobStore blobStore, BlobPath tombstonesPath, LongSupplier clock) {
-        this.container = container;
+        this.container = ConditionalBlobContainer.of(container);
         this.listing = new DescriptorListing(container);
         this.blobStore = blobStore;
         this.tombstonesPath = tombstonesPath;

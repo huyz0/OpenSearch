@@ -14,6 +14,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.core.common.bytes.BytesReference;
 
@@ -283,7 +284,7 @@ public final class CountingBlobStore implements BlobStore {
         delegate.close();
     }
 
-    private final class Counting implements BlobContainer {
+    private final class Counting implements ConditionalBlobContainer {
 
         private final BlobContainer inner;
 
@@ -408,7 +409,7 @@ public final class CountingBlobStore implements BlobStore {
             reads.incrementAndGet();
             registerReads.incrementAndGet();
             note("REGISTER_GET", inner.path(), blobName);
-            return inner.readRegister(blobName);
+            return ConditionalBlobContainer.of(inner).readRegister(blobName);
         }
 
         @Override
@@ -416,7 +417,7 @@ public final class CountingBlobStore implements BlobStore {
             writes.incrementAndGet();
             deletes.incrementAndGet();
             note("DELETE", inner.path(), blobName);
-            return inner.deleteRegisterIfUnchanged(blobName, expectedGeneration);
+            return ConditionalBlobContainer.of(inner).deleteRegisterIfUnchanged(blobName, expectedGeneration);
         }
 
         @Override
@@ -425,7 +426,7 @@ public final class CountingBlobStore implements BlobStore {
             writes.incrementAndGet();
             registerWrites.incrementAndGet();
             note("REGISTER_CAS", inner.path(), blobName);
-            return inner.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+            return ConditionalBlobContainer.of(inner).compareAndSwapRegister(blobName, expectedGeneration, newValue);
         }
 
         @Override
@@ -433,7 +434,7 @@ public final class CountingBlobStore implements BlobStore {
             writes.incrementAndGet();
             registerWrites.incrementAndGet();
             note("REGISTER_CAS", inner.path(), blobName);
-            return inner.createRegisterIfAbsent(blobName, value);
+            return ConditionalBlobContainer.of(inner).createRegisterIfAbsent(blobName, value);
         }
     }
 }

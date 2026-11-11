@@ -10,9 +10,9 @@ package org.opensearch.serverless.testkit;
 
 import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
-import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.DescriptorStore;
@@ -76,7 +76,7 @@ public class ServerlessDeleteCostTests extends OpenSearchTestCase {
     public void testASwapOnAKnownVersionIsOneRequest() throws Exception {
         final BlobStore store = bucket();
         final BlobPath path = BlobPath.cleanPath().add("cas");
-        final BlobContainer container = store.blobContainer(path);
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(path));
         container.createRegisterIfAbsent("head", value("v0"));
         final long generation = container.readRegister("head").orElseThrow().generation();
 
@@ -85,7 +85,7 @@ public class ServerlessDeleteCostTests extends OpenSearchTestCase {
         final Map<String, Long> warm = delta(before, org.opensearch.repositories.s3.MinioBlobStores.requestCounts(store));
 
         before = org.opensearch.repositories.s3.MinioBlobStores.requestCounts(store);
-        assertTrue(store.blobContainer(path).compareAndSwapRegister("head", next, value("v2")).applied());
+        assertTrue(ConditionalBlobContainer.of(store.blobContainer(path)).compareAndSwapRegister("head", next, value("v2")).applied());
         final Map<String, Long> cold = delta(before, org.opensearch.repositories.s3.MinioBlobStores.requestCounts(store));
 
         logger.info("delete cost: a swap on a known version cost {}; from a fresh container {}", warm, cold);
@@ -166,7 +166,9 @@ public class ServerlessDeleteCostTests extends OpenSearchTestCase {
         final Map<String, Long> deferred = delta(before, org.opensearch.repositories.s3.MinioBlobStores.requestCounts(store));
         assertTrue(
             "conditional deletes remove the register; the fallback keeps its generation",
-            store.blobContainer(RegisterMap.indices(BlobPath.cleanPath())).readRegister("doomed").isEmpty() == conditional
+            ConditionalBlobContainer.of(store.blobContainer(RegisterMap.indices(BlobPath.cleanPath())))
+                .readRegister("doomed")
+                .isEmpty() == conditional
         );
         return new Phases(atDelete, deferred);
     }

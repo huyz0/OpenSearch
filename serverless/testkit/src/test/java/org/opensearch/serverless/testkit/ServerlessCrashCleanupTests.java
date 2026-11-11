@@ -10,6 +10,7 @@ package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
@@ -217,13 +218,13 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         final var container = store.blobContainer(
             org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), index, descriptor(index).uuid(), 0)
         );
-        final var register = container.readRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST).orElseThrow();
+        final var register = ConditionalBlobContainer.of(container)
+            .readRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST)
+            .orElseThrow();
         assertTrue(
-            container.compareAndSwapRegister(
-                org.opensearch.serverless.store.SegmentPublisher.MANIFEST,
-                register.generation(),
-                bare.toBytes()
-            ).applied()
+            ConditionalBlobContainer.of(container)
+                .compareAndSwapRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST, register.generation(), bare.toBytes())
+                .applied()
         );
     }
 
@@ -397,13 +398,13 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         final var container = store.blobContainer(
             org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), index, descriptor(index).uuid(), 0)
         );
-        final var register = container.readRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST).orElseThrow();
+        final var register = ConditionalBlobContainer.of(container)
+            .readRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST)
+            .orElseThrow();
         assertTrue(
-            container.compareAndSwapRegister(
-                org.opensearch.serverless.store.SegmentPublisher.MANIFEST,
-                register.generation(),
-                legacy.toBytes()
-            ).applied()
+            ConditionalBlobContainer.of(container)
+                .compareAndSwapRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST, register.generation(), legacy.toBytes())
+                .applied()
         );
     }
 

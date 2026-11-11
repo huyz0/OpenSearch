@@ -214,7 +214,7 @@ public class AzureBlobContainerRetriesTests extends OpenSearchTestCase {
                 exchange.close();
             }
         });
-        final var result = createBlobContainer(1).compareAndSwapRegister(
+        final var result = ((AzureBlobContainer) createBlobContainer(1)).compareAndSwapRegister(
             "register-conflict",
             0L,
             new org.opensearch.core.common.bytes.BytesArray("next")

@@ -14,6 +14,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.core.common.bytes.BytesReference;
 
@@ -196,26 +197,26 @@ final class LatencyInjectingBlobStore implements BlobStore {
         @Override
         public Optional<BlobRegister> readRegister(String blobName) throws IOException {
             pay("GET-reg", path(), blobName);
-            return delegate.readRegister(blobName);
+            return ConditionalBlobContainer.of(delegate).readRegister(blobName);
         }
 
         @Override
         public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
             pay("DELETE-reg", path(), blobName);
-            return delegate.deleteRegisterIfUnchanged(blobName, expectedGeneration);
+            return ConditionalBlobContainer.of(delegate).deleteRegisterIfUnchanged(blobName, expectedGeneration);
         }
 
         @Override
         public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
             throws IOException {
             pay("CAS-reg", path(), blobName);
-            return delegate.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+            return ConditionalBlobContainer.of(delegate).compareAndSwapRegister(blobName, expectedGeneration, newValue);
         }
 
         @Override
         public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
             pay("CREATE-reg", path(), blobName);
-            return delegate.createRegisterIfAbsent(blobName, value);
+            return ConditionalBlobContainer.of(delegate).createRegisterIfAbsent(blobName, value);
         }
     }
 }

@@ -9,6 +9,7 @@ package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.serverless.metadata.TemplateStore;
@@ -32,7 +33,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class TemplateMigrationPublicationTests extends OpenSearchTestCase {
     public void testAcknowledgedMigrationNeverExposesAnotherUploadsPartialBytes() throws Exception {
         try (var store = new FsBlobStore(1024, createTempDir(), false); var executor = Executors.newFixedThreadPool(2)) {
-            final var raw = store.blobContainer(BlobPath.cleanPath().add("templates"));
+            final ConditionalBlobContainer raw = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath().add("templates")));
             final String legacy = "{\"index_patterns\":[\"legacy-*\"],\"priority\":7}";
             final byte[] bytes = legacy.getBytes(StandardCharsets.UTF_8);
             raw.writeBlob("template-legacy", new ByteArrayInputStream(bytes), bytes.length, true);
@@ -98,7 +99,7 @@ public class TemplateMigrationPublicationTests extends OpenSearchTestCase {
             final String legacy = "{\"index_patterns\":[\"legacy-*\"]}";
             final byte[] bytes = legacy.getBytes(StandardCharsets.UTF_8);
             container.writeBlob("template-legacy", new ByteArrayInputStream(bytes), bytes.length, true);
-            container.createRegisterIfAbsent("_version", new BytesArray("1"));
+            ConditionalBlobContainer.of(container).createRegisterIfAbsent("_version", new BytesArray("1"));
             final String key = "blob-" + HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes));
             container.writeBlob(key, new ByteArrayInputStream(new byte[0]), 0, true);
             new TemplateStore(container).put("new", "{}");
@@ -113,7 +114,7 @@ public class TemplateMigrationPublicationTests extends OpenSearchTestCase {
             for (String name : java.util.List.of("first", "second")) {
                 container.writeBlob("template-" + name, new ByteArrayInputStream(bytes), bytes.length, true);
             }
-            container.createRegisterIfAbsent("_version", new BytesArray("1"));
+            ConditionalBlobContainer.of(container).createRegisterIfAbsent("_version", new BytesArray("1"));
             store.reset();
             new TemplateStore(container).put("new", "{}");
             assertEquals("one shared adopted body plus the new revision", 2L, store.blobWrites());

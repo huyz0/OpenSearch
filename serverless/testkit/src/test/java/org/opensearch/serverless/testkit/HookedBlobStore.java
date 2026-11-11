@@ -14,6 +14,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.core.common.bytes.BytesReference;
 
@@ -203,7 +204,7 @@ public final class HookedBlobStore implements BlobStore {
         delegate.close();
     }
 
-    private final class Hooked implements BlobContainer {
+    private final class Hooked implements ConditionalBlobContainer {
 
         private final BlobContainer inner;
 
@@ -342,7 +343,7 @@ public final class HookedBlobStore implements BlobStore {
             if (failing != null && inner.path().buildAsString().contains(failing)) {
                 throw new IOException("injected: register reads under [" + failing + "] fail");
             }
-            final Optional<BlobRegister> read = inner.readRegister(blobName);
+            final Optional<BlobRegister> read = ConditionalBlobContainer.of(inner).readRegister(blobName);
             final Hook hook = armed.get();
             if (hook != null
                 && hook.blobName().equals(blobName)
@@ -356,7 +357,7 @@ public final class HookedBlobStore implements BlobStore {
 
         @Override
         public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
-            final boolean deleted = inner.deleteRegisterIfUnchanged(blobName, expectedGeneration);
+            final boolean deleted = ConditionalBlobContainer.of(inner).deleteRegisterIfUnchanged(blobName, expectedGeneration);
             final Hook after = afterRegisterDeleteHook.get();
             if (deleted
                 && after != null
@@ -381,7 +382,8 @@ public final class HookedBlobStore implements BlobStore {
                 hook.action().run();
                 fired = true;
             }
-            final BlobRegisterCasResult result = inner.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+            final BlobRegisterCasResult result = ConditionalBlobContainer.of(inner)
+                .compareAndSwapRegister(blobName, expectedGeneration, newValue);
             final Hook after = afterSwapHook.get();
             if (result.applied()
                 && after != null
