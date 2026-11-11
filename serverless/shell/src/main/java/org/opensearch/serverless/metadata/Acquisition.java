@@ -21,40 +21,28 @@ public final class Acquisition {
     private final boolean acquired;
     private final ShardHead head;
     private final String previousOwner;
-    private final boolean previousLetGo;
 
-    private Acquisition(boolean acquired, ShardHead head, String previousOwner, boolean previousLetGo) {
+    private Acquisition(boolean acquired, ShardHead head, String previousOwner) {
         this.acquired = acquired;
         this.head = head;
         this.previousOwner = previousOwner;
-        this.previousLetGo = previousLetGo;
     }
 
     /**
      * The caller now owns the shard, taken over from a head that named another owner, or this node's earlier process.
      *
-     * @param head the head as written
-     * @param previousOwner the node the replaced head named, or its last writer if it had no owner; null for neither
-     * @param previousLetGo whether that node had let go of the shard, so its log needs no fence against further writes
+     * @param head the head as written; its {@link ShardHead#writers} name every log the new owner replays
+     * @param previousOwner the node the replaced head named, or null if it had none
      * @return the outcome
      */
-    public static Acquisition won(ShardHead head, String previousOwner, boolean previousLetGo) {
-        return new Acquisition(true, head, previousOwner, previousLetGo);
+    public static Acquisition won(ShardHead head, String previousOwner) {
+        return new Acquisition(true, head, previousOwner);
     }
 
     /**
-     * Returns whether {@link #previousOwner} had let go of the shard rather than been taken from.
+     * Returns the node the replaced head named as its owner.
      *
-     * @return true for a head that had been given back
-     */
-    public boolean previousLetGo() {
-        return previousLetGo;
-    }
-
-    /**
-     * Returns the node the replaced head named: the writer whose log may hold this shard's unpublished records.
-     *
-     * @return its id, or for a head that had been given back the last writer it recorded; null if neither, or for a loss
+     * @return its id, or null if the head had no owner, or for a loss
      */
     public String previousOwner() {
         return previousOwner;
@@ -67,7 +55,7 @@ public final class Acquisition {
      * @return the outcome
      */
     public static Acquisition won(ShardHead head) {
-        return new Acquisition(true, head, null, false);
+        return new Acquisition(true, head, null);
     }
 
     /**
@@ -77,7 +65,7 @@ public final class Acquisition {
      * @return the outcome
      */
     public static Acquisition heldByAnother(ShardHead head) {
-        return new Acquisition(false, head, null, false);
+        return new Acquisition(false, head, null);
     }
 
     /**

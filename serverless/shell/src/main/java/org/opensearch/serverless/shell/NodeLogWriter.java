@@ -286,16 +286,15 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
      * Streams the records a shard being opened must replay from the node logs, oldest first.
      *
      * @param shardId the shard
-     * @param predecessor the node the head named before this node took it; null or this node's id for a shard this node
-     *     reopens itself
-     * @param letGo whether the predecessor had given the shard back, so its log is read with no fence
+     * @param predecessor a node the head named as holding the shard's unpublished records in its log; null or this
+     *     node's id for this node's own
      * @param term the term this node opens it at
      * @param consumer what takes each record
      * @return how many records were streamed
      * @throws IOException if a fence or a read fails
      */
     @Override
-    public long replay(ShardId shardId, String predecessor, boolean letGo, long term, CheckedConsumer<WalRecord, IOException> consumer)
+    public long replay(ShardId shardId, String predecessor, long term, CheckedConsumer<WalRecord, IOException> consumer)
         throws IOException {
         final ShardKey key = keyOf(shardId);
         final long[] count = { 0 };
@@ -322,14 +321,27 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
         }
         final NodeLogStore theirs = new NodeLogStore(plane.blobStore(), plane.basePath(), predecessor);
         final NodeLogTakeover.LeaseReader reread = () -> plane.membership().read(predecessor).map(NodeLease::nodeLog).orElse(List.of());
-        if (letGo && plane.isLive(lease.get())) {
-            // It gave the shard back and writes no more of it; fencing would fail the writes of every shard it still holds.
-            // One that is not live may have been given back for, and may still be writing, so it is fenced below.
+        if (plane.isLive(lease.get())) {
+            // Live, so it gave the shard back itself and writes no more of it: a node taken from has its lease revoked
+            // first. Fencing would fail the writes of every shard it still holds. One that is not live may still be
+            // writing an epoch it opened while it held the shard, so it is fenced below.
             NodeLogTakeover.unfenced(theirs, epochs, reread).forEachRecord(key, counting);
             return count[0];
         }
         takeoverOf(predecessor, theirs, epochs, term, reread).forEachRecord(key, counting);
         return count[0];
+    }
+
+    /**
+     * Stops the shard's head naming the logs the open replayed, now that what they held of it is published.
+     *
+     * @param shardId the shard
+     * @param term the term it opened at
+     * @throws IOException if the head cannot be read or written
+     */
+    @Override
+    public void replayedAndPublished(ShardId shardId, long term) throws IOException {
+        plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
     }
 
     private NodeLogTakeover takeoverOf(

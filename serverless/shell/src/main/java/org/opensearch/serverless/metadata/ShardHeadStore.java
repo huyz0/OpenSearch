@@ -179,17 +179,16 @@ public final class ShardHeadStore {
             return Acquisition.heldByAnother(current);
         }
 
-        final ShardHead next = new ShardHead(indexName, shardId, current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid);
+        // The logs the shard's unpublished records may be in travel with it until its new owner has replayed and published
+        // them: a head given back names them, and the owner it is taken from is the newest. Not across incarnations.
+        final ShardHead next = otherIncarnation
+            ? new ShardHead(indexName, shardId, current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid)
+            : new ShardHead(indexName, shardId, current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid).withWriters(
+                current.writers()
+            ).withWriter(current.ownerNodeId());
         final BlobRegisterCasResult result = container.compareAndSwapRegister(name, existing.get().generation(), next.toBytes());
         if (result.applied()) {
-            if (otherIncarnation) {
-                return Acquisition.won(next, null, false);
-            }
-            // A head with an owner names whose log to read; one given back names its last writer, which let go of the
-            // shard, or was given back for when it died. A reader fences that log only if the writer is not live.
-            return current.ownerNodeId() != null
-                ? Acquisition.won(next, current.ownerNodeId(), false)
-                : Acquisition.won(next, current.lastWriter(), true);
+            return Acquisition.won(next, otherIncarnation ? null : current.ownerNodeId());
         }
         // Someone swapped it between our read and our write. They won; route to them.
         return read(indexName, shardId).map(Acquisition::heldByAnother)
@@ -232,9 +231,42 @@ public final class ShardHeadStore {
             current.ownerEphemeralId(),
             clock.getAsLong() + leaseTtlMillis,
             current.indexUuid()
-        );
+        ).withWriters(current.writers());
         final BlobRegisterCasResult result = container.compareAndSwapRegister(name, existing.get().generation(), renewed.toBytes());
         return result.applied() ? Optional.of(renewed) : Optional.empty();
+    }
+
+    /**
+     * Stops naming other nodes' write logs once this owner has replayed what they held of the shard and published it.
+     *
+     * <p>Until then a successor of this owner reads them too: an owner that dies between taking a shard and publishing
+     * what it replayed would otherwise leave records only in a log nobody names. A lost swap changes nothing: the head
+     * moved on, and whoever holds it now names what it needs.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param nodeId the owner
+     * @param expectedTerm the term the owner holds
+     * @return true if the head named no other log afterwards
+     * @throws IOException if the register cannot be read or written
+     */
+    public boolean clearWriters(String indexName, int shardId, String nodeId, long expectedTerm) throws IOException {
+        final String name = RegisterMap.shardHeadBlob(indexName, shardId);
+        final Optional<BlobRegister> existing = container.readRegister(name);
+        if (existing.isEmpty()) {
+            return false;
+        }
+        final ShardHead current;
+        try (InputStream in = existing.get().value().streamInput()) {
+            current = ShardHead.fromStream(in);
+        }
+        if (nodeId.equals(current.ownerNodeId()) == false || current.term() != expectedTerm) {
+            return false;
+        }
+        if (current.writers().isEmpty()) {
+            return true;
+        }
+        return container.compareAndSwapRegister(name, existing.get().generation(), current.withWriters(List.of()).toBytes()).applied();
     }
 
     /**
@@ -345,9 +377,9 @@ public final class ShardHeadStore {
         }
         // Unowned, but still this incarnation's: the uuid is kept so the next acquirer of a recreated
         // index sees a head from the previous one and overwrites it, exactly as it would an owned one.
-        final ShardHead released = new ShardHead(indexName, shardId, current.term(), null, null, 0L, current.indexUuid()).withLastWriter(
-            lastWriter
-        );
+        final ShardHead released = new ShardHead(indexName, shardId, current.term(), null, null, 0L, current.indexUuid()).withWriters(
+            current.writers()
+        ).withWriter(lastWriter);
         return container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied();
     }
 
@@ -387,8 +419,9 @@ public final class ShardHeadStore {
             return Optional.empty();
         }
         // The dead owner's log may hold what it never published: whoever takes the shard next reads it.
-        final ShardHead released = new ShardHead(indexName, shardId, current.term() + 1, null, null, 0L, current.indexUuid())
-            .withLastWriter(deadNodeId);
+        final ShardHead released = new ShardHead(indexName, shardId, current.term() + 1, null, null, 0L, current.indexUuid()).withWriters(
+            current.writers()
+        ).withWriter(deadNodeId);
         if (container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied() == false) {
             return Optional.empty();
         }

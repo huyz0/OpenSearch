@@ -39,6 +39,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -549,11 +550,17 @@ public final class ShardReconciler {
             final NodeLogReplay fromNodeLog = pendingNodeLogReplay.get(shardId);
             final NodeLogHooks hooks = nodeLog;
             if (fromNodeLog != null && hooks != null) {
-                final long streamed = hooks.replay(shardId, fromNodeLog.predecessor(), fromNodeLog.letGo(), fromNodeLog.term(), record -> {
+                final org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> counting = record -> {
                     consumer.accept(record);
                     logRecordsRead.incrementAndGet();
-                });
-                nodeLogReplayed.merge(shardId, streamed, Long::sum);
+                };
+                // Oldest writer first, so a record a later writer replayed and wrote again comes after the original.
+                final java.util.List<String> writers = fromNodeLog.writers().isEmpty()
+                    ? java.util.Collections.singletonList(null)
+                    : fromNodeLog.writers();
+                for (String writer : writers) {
+                    nodeLogReplayed.merge(shardId, hooks.replay(shardId, writer, fromNodeLog.term(), counting), Long::sum);
+                }
             }
         } finally {
             writerOpenNanos[WRITER_OPEN_PHASES.indexOf("log_read")].addAndGet(System.nanoTime() - readingAt);
@@ -595,8 +602,7 @@ public final class ShardReconciler {
          * Streams the records a shard being opened must replay from the node logs.
          *
          * @param shardId the shard
-         * @param predecessor the node the head named before this one took it, or null for this node's own reopen
-         * @param letGo whether the predecessor had given the shard back, so its log needs no fence
+         * @param writer a node whose log may hold the shard's unpublished records, or null for this node's own reopen
          * @param term the term the shard opens at
          * @param consumer what takes each record
          * @return how many records were streamed
@@ -604,11 +610,20 @@ public final class ShardReconciler {
          */
         long replay(
             ShardId shardId,
-            String predecessor,
-            boolean letGo,
+            String writer,
             long term,
             org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> consumer
         ) throws IOException;
+
+        /**
+         * Records that a shard opened at a term has replayed every log its head named and published what they held, so
+         * the head need name them no longer.
+         *
+         * @param shardId the shard
+         * @param term the term it opened at
+         * @throws IOException if the head cannot be read or written
+         */
+        void replayedAndPublished(ShardId shardId, long term) throws IOException;
     }
 
     private volatile NodeLogHooks nodeLog;
@@ -623,22 +638,12 @@ public final class ShardReconciler {
         this.nodeLog = nodeLog;
     }
 
-    /** Per index and shard, the node a takeover replaced in the head: whose node log the open replays. */
-    private final java.util.concurrent.ConcurrentHashMap<String, Predecessor> nodeLogPredecessors =
+    /** Per index and shard, the nodes the head named when it was taken: whose node logs the open replays. */
+    private final java.util.concurrent.ConcurrentHashMap<String, List<String>> nodeLogWriters =
         new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** Whose node log a takeover replays, and whether that node had let go of the shard. */
-    private record Predecessor(String nodeId, boolean letGo) {
-    }
-
-    /** A writer open in progress: whose node log it replays, whether to fence it, and at what term. */
-    private record NodeLogReplay(String predecessor, boolean letGo, long term) {
-    }
-
-    private static NodeLogReplay nodeLogReplayOf(Predecessor predecessor, long term) {
-        return predecessor == null
-            ? new NodeLogReplay(null, false, term)
-            : new NodeLogReplay(predecessor.nodeId(), predecessor.letGo(), term);
+    /** A writer open in progress: whose node logs it replays, oldest first, and at what term. */
+    private record NodeLogReplay(List<String> writers, long term) {
     }
 
     private final java.util.concurrent.ConcurrentHashMap<ShardId, NodeLogReplay> pendingNodeLogReplay =
@@ -648,19 +653,18 @@ public final class ShardReconciler {
     private final java.util.concurrent.ConcurrentHashMap<ShardId, Long> nodeLogReplayed = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
-     * Records the node a takeover replaced in a shard's head, so the open that follows replays that node's write log. One
-     * use: the open consumes it. An open with none noted is this node reopening its own shard.
+     * Records the nodes a shard's head named when this node took it, so the open that follows replays their write logs.
+     * One use: the open consumes it. An open with none noted is this node reopening its own shard.
      *
      * @param indexName the index
      * @param shard the shard
-     * @param predecessor the node the replaced head named, or its last writer; null for neither
-     * @param letGo whether that node had given the shard back rather than been taken from
+     * @param writers the nodes whose logs may hold the shard's unpublished records, oldest first; empty for none
      */
-    public void noteNodeLogPredecessor(String indexName, int shard, String predecessor, boolean letGo) {
-        if (predecessor == null) {
-            nodeLogPredecessors.remove(indexName + "#" + shard);
+    public void noteNodeLogWriters(String indexName, int shard, List<String> writers) {
+        if (writers.isEmpty()) {
+            nodeLogWriters.remove(indexName + "#" + shard);
         } else {
-            nodeLogPredecessors.put(indexName + "#" + shard, new Predecessor(predecessor, letGo));
+            nodeLogWriters.put(indexName + "#" + shard, List.copyOf(writers));
         }
     }
 
@@ -811,6 +815,7 @@ public final class ShardReconciler {
                 }
                 lap.run();
 
+                List<String> armedWriters = null;
                 if (replayWal && walStores != null) {
                     // Armed for exactly the window in which the engine is built and recovery runs, which is
                     // the only window in which core will accept operations carrying their own sequence
@@ -818,9 +823,10 @@ public final class ShardReconciler {
                     final org.opensearch.serverless.store.WalStore log = wal(shardId);
                     pendingReplay.put(shardId, log);
                     if (nodeLog != null) {
+                        armedWriters = nodeLogWriters.remove(shardId.getIndexName() + "#" + shardId.id());
                         pendingNodeLogReplay.put(
                             shardId,
-                            nodeLogReplayOf(nodeLogPredecessors.remove(shardId.getIndexName() + "#" + shardId.id()), shardHeadTerm)
+                            new NodeLogReplay(armedWriters == null ? List.of() : armedWriters, shardHeadTerm)
                         );
                     }
                     // Fence the log before recovery reads anything: every older term, so a predecessor that has
@@ -904,6 +910,16 @@ public final class ShardReconciler {
                     } catch (IOException | RuntimeException e) {
                         open.remove(shardId);
                         throw e;
+                    }
+                }
+                final NodeLogHooks hooks = nodeLog;
+                if (armedWriters != null && hooks != null) {
+                    try {
+                        hooks.replayedAndPublished(shardId, shardHeadTerm);
+                    } catch (IOException | RuntimeException e) {
+                        // The head goes on naming logs that hold nothing more of this shard: a successor reads them for
+                        // nothing, which costs reads, never records.
+                        logger.debug("could not stop " + shardId + "'s head naming the logs it replayed", e);
                     }
                 }
                 return shard;
