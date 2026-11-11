@@ -47,6 +47,7 @@ public final class ShardHead {
     private final String ownerNodeId;
     private final String ownerEphemeralId;
     private final long leaseExpiresAtMillis;
+    private final String lastWriter;
 
     /**
      * Creates a head.
@@ -97,6 +98,38 @@ public final class ShardHead {
         this.ownerNodeId = ownerNodeId;
         this.ownerEphemeralId = ownerEphemeralId;
         this.leaseExpiresAtMillis = leaseExpiresAtMillis;
+        this.lastWriter = null;
+    }
+
+    private ShardHead(ShardHead head, String lastWriter) {
+        this.indexName = head.indexName;
+        this.indexUuid = head.indexUuid;
+        this.shardId = head.shardId;
+        this.term = head.term;
+        this.ownerNodeId = head.ownerNodeId;
+        this.ownerEphemeralId = head.ownerEphemeralId;
+        this.leaseExpiresAtMillis = head.leaseExpiresAtMillis;
+        this.lastWriter = lastWriter;
+    }
+
+    /**
+     * Returns this head naming the node whose write log may still hold the shard's unpublished records: for a head
+     * given back with no owner, so whoever takes it next knows whose log to read.
+     *
+     * @param lastWriter the node, or null
+     * @return the copy
+     */
+    public ShardHead withLastWriter(String lastWriter) {
+        return new ShardHead(this, lastWriter);
+    }
+
+    /**
+     * Returns the node whose write log may still hold this shard's unpublished records, for a head with no owner.
+     *
+     * @return the node, or null if none was recorded
+     */
+    public String lastWriter() {
+        return lastWriter;
     }
 
     /**
@@ -195,6 +228,9 @@ public final class ShardHead {
             if (indexUuid != null) {
                 builder.field("index_uuid", indexUuid);
             }
+            if (lastWriter != null) {
+                builder.field("last_writer", lastWriter);
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -219,6 +255,7 @@ public final class ShardHead {
             String uuid = null;
             String owner = null;
             String ephemeral = null;
+            String lastWriter = null;
             int shard = -1;
             long term = 0;
             long expiry = 0;
@@ -241,6 +278,7 @@ public final class ShardHead {
                         case "owner_node_id" -> owner = parser.textOrNull();
                         case "owner_ephemeral_id" -> ephemeral = parser.textOrNull();
                         case "lease_expires_at_millis" -> expiry = parser.longValue();
+                        case "last_writer" -> lastWriter = parser.textOrNull();
                         default -> {
                             // forward compatibility
                         }
@@ -250,7 +288,7 @@ public final class ShardHead {
             if (index == null || shard < 0 || term < 1) {
                 throw new IOException("malformed shard head: missing a required field");
             }
-            return new ShardHead(index, shard, term, owner, ephemeral, expiry, uuid);
+            return new ShardHead(index, shard, term, owner, ephemeral, expiry, uuid).withLastWriter(lastWriter);
         }
     }
 

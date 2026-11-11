@@ -2170,7 +2170,7 @@ public final class ServerlessNode implements Closeable {
         if (nodeLogEnabled) {
             // Whose node log the open replays: the node this takeover replaced in the head.
             nodeLog(plane);
-            reconciler.noteNodeLogPredecessor(indexName, shardNumber, acquisition.previousOwner());
+            reconciler.noteNodeLogPredecessor(indexName, shardNumber, acquisition.previousOwner(), acquisition.previousLetGo());
         }
         try {
             // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed
@@ -2197,6 +2197,8 @@ public final class ServerlessNode implements Closeable {
             writerAssignments.remove(shardKey(indexName, shardNumber));
             noteHead(indexName, shardNumber, null);
             try {
+                // Naming whose log still holds what was not published: the node it was being taken from, whose records an
+                // open that failed did not get to publish, or this node's own.
                 plane.heads()
                     .release(
                         indexName,
@@ -2204,7 +2206,8 @@ public final class ServerlessNode implements Closeable {
                         localNode.getId(),
                         assignment.term(),
                         described.get().uuid(),
-                        localNode.getEphemeralId()
+                        localNode.getEphemeralId(),
+                        acquisition.previousOwner() != null ? acquisition.previousOwner() : localNode.getId()
                     );
                 plane.forgetAssignment(localNode.getId(), indexName, shardNumber);
             } catch (Exception giveBack) {

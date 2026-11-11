@@ -549,7 +549,7 @@ public final class ShardReconciler {
             final NodeLogReplay fromNodeLog = pendingNodeLogReplay.get(shardId);
             final NodeLogHooks hooks = nodeLog;
             if (fromNodeLog != null && hooks != null) {
-                final long streamed = hooks.replay(shardId, fromNodeLog.predecessor(), fromNodeLog.term(), record -> {
+                final long streamed = hooks.replay(shardId, fromNodeLog.predecessor(), fromNodeLog.letGo(), fromNodeLog.term(), record -> {
                     consumer.accept(record);
                     logRecordsRead.incrementAndGet();
                 });
@@ -596,6 +596,7 @@ public final class ShardReconciler {
          *
          * @param shardId the shard
          * @param predecessor the node the head named before this one took it, or null for this node's own reopen
+         * @param letGo whether the predecessor had given the shard back, so its log needs no fence
          * @param term the term the shard opens at
          * @param consumer what takes each record
          * @return how many records were streamed
@@ -604,6 +605,7 @@ public final class ShardReconciler {
         long replay(
             ShardId shardId,
             String predecessor,
+            boolean letGo,
             long term,
             org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> consumer
         ) throws IOException;
@@ -622,11 +624,21 @@ public final class ShardReconciler {
     }
 
     /** Per index and shard, the node a takeover replaced in the head: whose node log the open replays. */
-    private final java.util.concurrent.ConcurrentHashMap<String, String> nodeLogPredecessors =
+    private final java.util.concurrent.ConcurrentHashMap<String, Predecessor> nodeLogPredecessors =
         new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** A writer open in progress: whose node log it replays, and at what term. */
-    private record NodeLogReplay(String predecessor, long term) {
+    /** Whose node log a takeover replays, and whether that node had let go of the shard. */
+    private record Predecessor(String nodeId, boolean letGo) {
+    }
+
+    /** A writer open in progress: whose node log it replays, whether to fence it, and at what term. */
+    private record NodeLogReplay(String predecessor, boolean letGo, long term) {
+    }
+
+    private static NodeLogReplay nodeLogReplayOf(Predecessor predecessor, long term) {
+        return predecessor == null
+            ? new NodeLogReplay(null, false, term)
+            : new NodeLogReplay(predecessor.nodeId(), predecessor.letGo(), term);
     }
 
     private final java.util.concurrent.ConcurrentHashMap<ShardId, NodeLogReplay> pendingNodeLogReplay =
@@ -641,13 +653,14 @@ public final class ShardReconciler {
      *
      * @param indexName the index
      * @param shard the shard
-     * @param predecessor the node the replaced head named, or null
+     * @param predecessor the node the replaced head named, or its last writer; null for neither
+     * @param letGo whether that node had given the shard back rather than been taken from
      */
-    public void noteNodeLogPredecessor(String indexName, int shard, String predecessor) {
+    public void noteNodeLogPredecessor(String indexName, int shard, String predecessor, boolean letGo) {
         if (predecessor == null) {
             nodeLogPredecessors.remove(indexName + "#" + shard);
         } else {
-            nodeLogPredecessors.put(indexName + "#" + shard, predecessor);
+            nodeLogPredecessors.put(indexName + "#" + shard, new Predecessor(predecessor, letGo));
         }
     }
 
@@ -807,7 +820,7 @@ public final class ShardReconciler {
                     if (nodeLog != null) {
                         pendingNodeLogReplay.put(
                             shardId,
-                            new NodeLogReplay(nodeLogPredecessors.remove(shardId.getIndexName() + "#" + shardId.id()), shardHeadTerm)
+                            nodeLogReplayOf(nodeLogPredecessors.remove(shardId.getIndexName() + "#" + shardId.id()), shardHeadTerm)
                         );
                     }
                     // Fence the log before recovery reads anything: every older term, so a predecessor that has
