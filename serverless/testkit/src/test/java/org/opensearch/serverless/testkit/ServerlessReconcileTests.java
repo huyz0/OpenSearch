@@ -172,12 +172,17 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             successor.reconciler().shard(onSuccessor).refresh("p8");
             final CommitManifest liveCommit = successor.publishShard(onSuccessor, term2);
 
-            final long inheritedFromTerm1 = liveCommit.files().values().stream().filter(t -> t.equals("t=" + term1)).count();
+            final long inheritedFromTerm1 = liveCommit.files()
+                .keySet()
+                .stream()
+                .filter(f -> ShardOps.termDirOf(liveCommit, f).equals("t=" + term1))
+                .count();
             assertTrue("this test is meaningless unless the live commit actually inherits from the old term", inheritedFromTerm1 > 0);
 
             // The zombie wakes and writes more. It cannot publish, so these files are orphans.
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
             zombie.reconciler().shard(onZombie).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
+            leaveAnUnfinishedPublish(d, term1);
             final int term1BlobsBefore = d.store.blobContainer(d.plane.shardData("alpha", 0).add("t=" + term1)).listBlobs().size();
 
             final List<String> deleted = gc.collectShard(d.plane, "alpha", 0);
@@ -186,7 +191,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             for (Map.Entry<String, String> file : liveCommit.files().entrySet()) {
                 assertTrue(
                     "GC deleted a file the live commit depends on: " + file.getValue() + "/" + file.getKey(),
-                    d.store.blobContainer(d.plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey())
+                    ShardOps.stored(d.store, d.plane.shardData("alpha", 0), liveCommit, file.getKey())
                 );
             }
             assertTrue("GC must not have deleted every term-1 blob", term1BlobsBefore > 0);
@@ -239,6 +244,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             // The zombie wakes and writes. It cannot publish, so these are orphans in a dead term.
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
             zombie.reconciler().shard(onZombie).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
+            leaveAnUnfinishedPublish(d, term1);
 
             try (BackgroundReconciler loop = new BackgroundReconciler(successor, d.plane)) {
                 assertEquals(
@@ -255,7 +261,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
                 for (Map.Entry<String, String> file : liveCommit.files().entrySet()) {
                     assertTrue(
                         "the sweep deleted a file the live commit depends on: " + file.getValue() + "/" + file.getKey(),
-                        d.store.blobContainer(d.plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey())
+                        ShardOps.stored(d.store, d.plane.shardData("alpha", 0), liveCommit, file.getKey())
                     );
                 }
                 assertEquals(
@@ -303,6 +309,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
 
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
             zombie.reconciler().shard(onZombie).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
+            leaveAnUnfinishedPublish(d, term1);
             final var deadTerm = d.store.blobContainer(d.plane.shardData("alpha", 0).add("t=" + term1));
             final int before = deadTerm.listBlobs().size();
 
@@ -321,7 +328,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             for (Map.Entry<String, String> file : liveCommit.files().entrySet()) {
                 assertTrue(
                     "the pass deleted a file the live commit depends on: " + file.getValue() + "/" + file.getKey(),
-                    d.store.blobContainer(d.plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey())
+                    ShardOps.stored(d.store, d.plane.shardData("alpha", 0), liveCommit, file.getKey())
                 );
             }
         }
@@ -353,11 +360,22 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             successor.publishShard(onSuccessor, term2);
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
             zombie.reconciler().shard(onZombie).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
+            leaveAnUnfinishedPublish(d, term1);
 
             try (BackgroundReconciler loop = new BackgroundReconciler(successor, d.plane).setSweepGracePasses(0)) {
                 assertFalse("with no grace the first sweep must delete", loop.sweepPublished(java.util.Set.of(onSuccessor)).isEmpty());
             }
         }
+    }
+
+    /**
+     * Leaves in a dead term what a zombie's publish leaves when its manifest swap loses: a segment blob no commit
+     * names. The zombie's flush alone no longer leaves one -- the old commit point that used to go unreferenced
+     * rides inside a segment blob the live commit still names.
+     */
+    private static void leaveAnUnfinishedPublish(Deployment d, long term) throws java.io.IOException {
+        d.store.blobContainer(d.plane.shardData("alpha", 0).add("t=" + term))
+            .writeBlob("_zz.seg", new java.io.ByteArrayInputStream(new byte[] { 1, 2, 3 }), 3L, true);
     }
 
     public void testGcLeavesTheLiveTermAloneAndNoOpsWithNothingPublished() throws Exception {
@@ -390,7 +408,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
                 d.store.blobContainer(d.plane.shardData("alpha", 0).add("t=" + term)).blobExists(inFlight)
             );
             for (Map.Entry<String, String> file : manifest.files().entrySet()) {
-                assertTrue(d.store.blobContainer(d.plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey()));
+                assertTrue(ShardOps.stored(d.store, d.plane.shardData("alpha", 0), manifest, file.getKey()));
             }
         }
     }
