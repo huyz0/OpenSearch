@@ -53,6 +53,12 @@ public final class SegmentPublisher {
     /** Whether a publish writes the files it adds as one pack rather than a blob each. */
     private volatile boolean packing;
 
+    /** Where small segment blobs go instead of the shard's term container, or null to keep them there (the default). */
+    private volatile NodePackWriter nodePacks;
+    private volatile String nodePackIndexUuid;
+    private volatile int nodePackShard = -1;
+    private volatile long nodePackMaxBlobBytes;
+
     /** This instance's own last publish: the register need not be read to swap over what this wrote. */
     private volatile long lastPublishedGeneration = BlobRegister.ABSENT_GENERATION;
     private volatile CommitManifest lastPublished;
@@ -83,6 +89,31 @@ public final class SegmentPublisher {
      */
     public SegmentPublisher packing(boolean packing) {
         this.packing = packing;
+        return this;
+    }
+
+    /**
+     * Sends segment blobs up to a size into this node's packs, shared with every other shard the node publishes at
+     * about the same time, instead of writing each into this shard's term container.
+     *
+     * <p>Opt-in: without it, each segment stays one blob of its own under the shard. Only applies while
+     * {@link #packing} is on, since a node pack holds segment blobs. Larger blobs, such as big merged segments, keep a
+     * blob of their own, so no shard's large files sit in a pack beside other shards' small ones.
+     *
+     * @param writer the node's pack writer, or null to turn node packs off
+     * @param indexUuid this shard's index, recorded in each pack's header
+     * @param shard this shard's number
+     * @param maxBlobBytes the largest segment blob that goes into a node pack
+     * @return this publisher
+     */
+    public SegmentPublisher nodePacks(NodePackWriter writer, String indexUuid, int shard, long maxBlobBytes) {
+        if (writer != null && (indexUuid == null || shard < 0 || maxBlobBytes <= 0L)) {
+            throw new IllegalArgumentException("node packs need the shard's index, number and a size limit");
+        }
+        this.nodePackIndexUuid = indexUuid;
+        this.nodePackShard = shard;
+        this.nodePackMaxBlobBytes = maxBlobBytes;
+        this.nodePacks = writer;
         return this;
     }
 
@@ -374,10 +405,22 @@ public final class SegmentPublisher {
             }
         }
         final String last = bySegment.lastKey();
+        final NodePackWriter packs = nodePacks;
+        final java.util.List<SegmentBlob> toNodePack = new java.util.ArrayList<>();
         for (Map.Entry<String, java.util.List<String>> segment : bySegment.entrySet()) {
             final java.util.List<String> files = new java.util.ArrayList<>(segment.getValue());
             if (segment.getKey().equals(last)) {
                 files.addAll(commitPoints);
+            }
+            if (packs != null) {
+                final String blobName = publishedSegments.contains(segment.getKey())
+                    ? uniqueSegmentBlob(segment.getKey())
+                    : segment.getKey() + ".seg";
+                final SegmentBlob prepared = prepareSegmentBlob(directory, blobName, files);
+                if (prepared.length() <= nodePackMaxBlobBytes) {
+                    toNodePack.add(prepared);
+                    continue;
+                }
             }
             if (publishedSegments.contains(segment.getKey()) == false) {
                 try {
@@ -388,6 +431,94 @@ public final class SegmentPublisher {
                 }
             }
             writeSegmentBlob(directory, termDir, uniqueSegmentBlob(segment.getKey()), files, published, lengths);
+        }
+        if (toNodePack.isEmpty() == false) {
+            writeToNodePack(packs, directory, toNodePack, published, lengths);
+        }
+    }
+
+    /** A segment blob laid out but not yet written: its name, header, files in blob order and their sizes. */
+    private record SegmentBlob(String name, byte[] header, java.util.List<String> files, Map<String, Long> sizes, long length) {
+    }
+
+    private static SegmentBlob prepareSegmentBlob(Directory directory, String blob, java.util.List<String> fileNames) throws IOException {
+        final Map<String, Long> sizes = new LinkedHashMap<>();
+        for (String fileName : fileNames) {
+            sizes.put(fileName, directory.fileLength(fileName));
+        }
+        final java.util.List<String> ordered = new java.util.ArrayList<>(fileNames);
+        ordered.sort(java.util.Comparator.<String>comparingLong(sizes::get).thenComparing(java.util.Comparator.naturalOrder()));
+        final byte[] header = segmentBlobHeader(ordered, sizes);
+        long length = header.length;
+        for (String fileName : ordered) {
+            length += sizes.get(fileName);
+        }
+        return new SegmentBlob(blob, header, java.util.List.copyOf(ordered), sizes, length);
+    }
+
+    /**
+     * Writes a publish's small segment blobs into the node's next pack, all into the same one, and records where each
+     * file landed. Each block is the segment blob exactly as it would be on its own, so a file's range is the block's
+     * offset plus the file's offset in the blob.
+     */
+    private void writeToNodePack(
+        NodePackWriter packs,
+        Directory directory,
+        java.util.List<SegmentBlob> blobs,
+        Map<String, String> published,
+        Map<String, Long> lengths
+    ) throws IOException {
+        final java.util.List<NodePackStore.Part> parts = new java.util.ArrayList<>(blobs.size());
+        for (SegmentBlob blob : blobs) {
+            parts.add(
+                new NodePackStore.Part(nodePackIndexUuid, nodePackShard, blob.name(), blob.length(), () -> openSegmentBlob(directory, blob))
+            );
+        }
+        final java.util.List<NodePackWriter.Landed> landed = packs.add(parts);
+        for (int i = 0; i < blobs.size(); i++) {
+            final SegmentBlob blob = blobs.get(i);
+            long offset = blob.header().length;
+            for (String fileName : blob.files()) {
+                final long size = blob.sizes().get(fileName);
+                published.put(fileName, landed.get(i).fileAt(offset, size).encode());
+                lengths.put(fileName, size);
+                offset += size;
+            }
+        }
+    }
+
+    /** Opens a laid-out segment blob's bytes from the first, holding its files open until the stream is closed. */
+    private static java.io.InputStream openSegmentBlob(Directory directory, SegmentBlob blob) throws IOException {
+        final java.util.List<IndexInput> opened = new java.util.ArrayList<>();
+        boolean success = false;
+        try {
+            final java.util.List<PackInputStream.Part> parts = new java.util.ArrayList<>();
+            long offset = blob.header().length;
+            for (String fileName : blob.files()) {
+                final IndexInput input = directory.openInput(fileName, IOContext.READONCE);
+                opened.add(input);
+                if (input.length() != blob.sizes().get(fileName)) {
+                    throw new IOException("[" + fileName + "] changed length while it was being published");
+                }
+                parts.add(new PackInputStream.Part(input, offset, input.length()));
+                offset += input.length();
+            }
+            final PackInputStream stream = new PackInputStream(blob.header(), parts);
+            success = true;
+            return new java.io.FilterInputStream(stream) {
+                @Override
+                public void close() throws IOException {
+                    try {
+                        super.close();
+                    } finally {
+                        org.opensearch.common.util.io.IOUtils.close(opened);
+                    }
+                }
+            };
+        } finally {
+            if (success == false) {
+                org.opensearch.common.util.io.IOUtils.closeWhileHandlingException(opened);
+            }
         }
     }
 
@@ -497,7 +628,7 @@ public final class SegmentPublisher {
         if (location == null) {
             throw new java.io.FileNotFoundException(fileName + " is not in the commit");
         }
-        final BlobContainer container = blobStore.blobContainer(shardBase.add(location.termDir()));
+        final BlobContainer container = blobStore.blobContainer(location.containerPath(shardBase));
         return location.isPacked()
             ? container.readBlob(location.blob(), location.offset(), location.length())
             : container.readBlob(location.blob());
