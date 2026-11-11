@@ -83,7 +83,7 @@ final class ShardPublishing {
             // that fails in between leaves the record wider than what is searchable, never narrower. The hook may
             // skip the record while the writer's own mark keeps the shard from being ruled out; clearing the mark
             // then widens it.
-            final ShardReconciler.BeforePublish hook = reconciler.beforePublish;
+            final BeforePublish hook = reconciler.beforePublish;
             // Even for an empty digest -- no digested fields, or one that could not be computed. Skipping it left an
             // entry holding an earlier, narrower digest while the commit grew past it; an empty one widens the entry
             // to rule nothing out.

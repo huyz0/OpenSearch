@@ -9,7 +9,7 @@ package org.opensearch.serverless.transport;
 
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.action.get.GetRequest;
-import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.TransportSecrets;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.LinkedHashMap;
@@ -17,7 +17,7 @@ import java.util.Map;
 
 public class TransportAuthenticationContextTests extends OpenSearchTestCase {
     private TransportAuthenticator authenticator(String node) {
-        final var secrets = new MetadataPlane.TransportSecrets(1L, "ab".repeat(32), null, 0L);
+        final var secrets = new TransportSecrets(1L, "ab".repeat(32), null, 0L);
         return new TransportAuthenticator(() -> secrets, () -> {}, () -> node, () -> 1_000L, () -> 30_000L);
     }
 

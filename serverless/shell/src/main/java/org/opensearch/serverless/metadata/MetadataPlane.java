@@ -198,22 +198,6 @@ public final class MetadataPlane {
         return lifecycle.deleteIndex(indexName, expectedUuid);
     }
 
-    /**
-     * An alias record together with the register generation it was read at.
-     *
-     * <p>The two come from one register read, and that is the whole point of the type: a generation read
-     * separately from the value it is meant to protect guards nothing. Read the value, then read the
-     * generation, and a writer that landed between the two hands the caller a fresh token for a stale
-     * value -- its compare-and-swap succeeds and the other writer's acknowledged change is gone. Worse, a
-     * delete between the two reads hands over a tombstone's generation and the alias is resurrected, and
-     * an index created under the name in that window is overwritten by an alias record.
-     *
-     * @param alias the record as read
-     * @param generation the generation to compare-and-swap against
-     */
-    public record AliasAtGeneration(org.opensearch.serverless.cluster.AliasRecord alias, long generation) {
-    }
-
     /** Reads an alias and its generation together, briefly waiting for a pending mutation. */
     public Optional<AliasAtGeneration> aliasWithGeneration(String name) throws IOException {
         return aliases.aliasWithGeneration(name);
@@ -249,15 +233,6 @@ public final class MetadataPlane {
     /** Answers which aliases name an index, verified. */
     public java.util.List<String> aliasesOf(IndexDescriptor descriptor) throws IOException {
         return aliases.aliasesOf(descriptor);
-    }
-
-    /**
-     * Where a write addressed to a name goes.
-     *
-     * @param index the index the write lands in
-     * @param dataStream the data stream the name resolved through, or null when the name was an index
-     */
-    public record WriteTarget(IndexDescriptor index, org.opensearch.serverless.cluster.AliasRecord dataStream) {
     }
 
     /**
@@ -402,15 +377,6 @@ public final class MetadataPlane {
     public MetadataPlane setRoutingCacheMillis(long millis) {
         routingCache.setRoutingCacheMillis(millis);
         return this;
-    }
-
-    /**
-     * A descriptor read from the store, and when that read began by {@link System#nanoTime}.
-     *
-     * @param descriptor what was read
-     * @param readStartedNanos when the read began
-     */
-    public record ConfirmingRead(IndexDescriptor descriptor, long readStartedNanos) {
     }
 
     /** Removes an alias. */
@@ -833,113 +799,6 @@ public final class MetadataPlane {
      */
     public String transportSecret() throws IOException {
         return transportSecrets().current();
-    }
-
-    /**
-     * The deployment's transport secrets: the current one, the one before it, and the register
-     * generation they were read at.
-     *
-     * <p>Two secrets rather than one is what makes rotation possible without partitioning the fleet: a
-     * receiver accepts a request authenticated under either until every node has re-read the register,
-     * and the generation is what a node caches against so a refusal can trigger one re-read rather than
-     * a read per request. Stored as JSON; a register written before generations existed holds a bare hex
-     * string, which parses as generation 1 with no previous secret, so a running deployment upgrades in
-     * place.
-     *
-     * @param generation the register generation, which rotation moves
-     * @param current the secret new requests are authenticated with
-     * @param previous the secret still accepted for one rotation window, or null
-     * @param rotatedAtMillis when the current secret became current, in the plane's clock
-     */
-    public record TransportSecrets(long generation, String current, String previous, long rotatedAtMillis) {
-
-        /**
-         * Parses a register value: the JSON form, or a bare hex secret from before rotation existed.
-         *
-         * @param stored the register's value
-         * @return the secrets
-         * @throws IOException if the JSON is malformed
-         */
-        public static TransportSecrets parse(String stored) throws IOException {
-            final String trimmed = stored.trim();
-            if (trimmed.isEmpty()) {
-                throw new IOException("malformed transport-secret register: blank secret");
-            }
-            if (trimmed.startsWith("{") == false) {
-                return new TransportSecrets(1L, trimmed, null, 0L);
-            }
-            final java.util.Map<String, Object> body;
-            try (
-                var parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
-                    .createParser(
-                        org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
-                        org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
-                        trimmed
-                    )
-            ) {
-                if (parser.nextToken() != org.opensearch.core.xcontent.XContentParser.Token.START_OBJECT) {
-                    throw new IOException("expected an object");
-                }
-                body = parser.map();
-                if (parser.nextToken() != null) {
-                    throw new IOException("trailing content");
-                }
-            } catch (IOException | RuntimeException malformed) {
-                // Parser messages and their causes can contain the register's secret bytes.
-                throw new IOException("malformed transport-secret register: invalid JSON");
-            }
-            final Object current = body.get("current");
-            final Object previous = body.get("previous");
-            if (current instanceof String == false || ((String) current).isBlank()) {
-                throw new IOException("malformed transport-secret register: current must be a nonblank string");
-            }
-            if (previous != null && (previous instanceof String == false || ((String) previous).isBlank())) {
-                throw new IOException("malformed transport-secret register: previous must be a nonblank string");
-            }
-            return new TransportSecrets(
-                body.get("generation") instanceof Number n ? n.longValue() : 1L,
-                (String) current,
-                (String) previous,
-                body.get("rotated_at") instanceof Number n ? n.longValue() : 0L
-            );
-        }
-
-        /**
-         * Renders the register value.
-         *
-         * @return the JSON
-         * @throws IOException if it cannot be written
-         */
-        public String toJson() throws IOException {
-            try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
-                builder.startObject();
-                builder.field("generation", generation);
-                builder.field("current", current);
-                builder.field("previous", previous);
-                builder.field("rotated_at", rotatedAtMillis);
-                builder.endObject();
-                return org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString();
-            }
-        }
-
-        /**
-         * Reports whether a secret is one this record accepts: the current, or the previous.
-         *
-         * @param secret the secret presented
-         * @return true if it is either
-         */
-        public boolean accepts(String secret) {
-            return secret != null
-                && (java.security.MessageDigest.isEqual(
-                    secret.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                    current.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                )
-                    || (previous != null
-                        && java.security.MessageDigest.isEqual(
-                            secret.getBytes(java.nio.charset.StandardCharsets.UTF_8),
-                            previous.getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                        )));
-        }
     }
 
     /** Reads, mints and rotates the transport secret; the methods below forward to it. */

@@ -34,6 +34,7 @@ import org.opensearch.plugins.NetworkPlugin;
 import org.opensearch.plugins.Plugin;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.TransportSecrets;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.transport.ForwardedIndexRequest;
 import org.opensearch.serverless.transport.ForwardedIndexResponse;
@@ -131,7 +132,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
                     return thread;
                 });
                 try {
-                    final var reads = new java.util.ArrayList<java.util.concurrent.Future<MetadataPlane.TransportSecrets>>();
+                    final var reads = new java.util.ArrayList<java.util.concurrent.Future<TransportSecrets>>();
                     for (int i = 0; i < 8; i++) {
                         reads.add(workers.submit(() -> node.secrets().transportSecrets(false)));
                     }
@@ -465,7 +466,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
 
             // Rotate; the sender re-reads and signs under generation 2. The receiver still holds
             // generation 1, meets a newer one, and re-reads the register rather than refusing.
-            final MetadataPlane.TransportSecrets second = plane.rotateTransportSecret();
+            final TransportSecrets second = plane.rotateTransportSecret();
             assertEquals(first + 1, second.generation());
             assertEquals("the old secret becomes the previous one", other.secrets().transportSecrets(false).current(), second.previous());
             other.secrets().transportSecrets(true);
@@ -478,7 +479,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
 
             // Rotate again; only the receiver re-reads. The sender signs under generation 2, which is
             // now the previous secret, and is accepted for the window.
-            final MetadataPlane.TransportSecrets third = plane.rotateTransportSecret();
+            final TransportSecrets third = plane.rotateTransportSecret();
             owner.secrets().transportSecrets(true);
             assertEquals(third.generation(), owner.secrets().transportSecrets(false).generation());
             assertEquals(second.generation(), other.secrets().transportSecrets(false).generation());
