@@ -16,6 +16,7 @@ import org.opensearch.serverless.store.NodeLogBlob.Slice;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -43,6 +44,9 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class NodeLogTakeover {
 
+    /** How many times a fence is searched for again after the predecessor's lease moved past it. */
+    static final int MAX_REFENCES = 8;
+
     private final NodeLogStore log;
     private final List<NodeLogEpoch> epochs;
     private final String fencedBy;
@@ -62,6 +66,41 @@ public final class NodeLogTakeover {
      * @param term the term this node has just won, recorded in each fence for diagnosis
      */
     public NodeLogTakeover(NodeLogStore log, List<NodeLogEpoch> epochs, String fencedBy, long term) {
+        this(log, epochs, fencedBy, term, null);
+    }
+
+    /** Reads the predecessor's lease again, for its epochs as they stand now. */
+    @FunctionalInterface
+    public interface LeaseReader {
+        /**
+         * Reads the lease.
+         *
+         * @return the epochs it names now; empty if it is gone
+         * @throws IOException if it cannot be read
+         */
+        List<NodeLogEpoch> epochs() throws IOException;
+    }
+
+    private final LeaseReader reread;
+
+    /**
+     * Creates a reader of one predecessor's log that checks each fence against the predecessor's lease as it stands after
+     * the fence.
+     *
+     * <p>The predecessor deletes behind a trim point only once a lease naming it has landed, but the lease this was built
+     * from may be older than that. Its landed hint can then point into what was deleted, and a fence searching from there
+     * lands in a hole below the writer's tail, which the writer never reaches. Any deletion that made such a hole followed
+     * a lease naming a trim point above it, so reading the lease after the fence finds a trim point above the fence
+     * exactly when the fence may be in a hole, and the fence is searched for again from that lease's hint.
+     *
+     * @param log the predecessor's log
+     * @param epochs the epochs its lease names
+     * @param fencedBy this node
+     * @param term the term this node has just won, recorded in each fence for diagnosis
+     * @param reread reads the predecessor's lease again; null to trust the epochs given, as for this node's own log
+     */
+    public NodeLogTakeover(NodeLogStore log, List<NodeLogEpoch> epochs, String fencedBy, long term, LeaseReader reread) {
+        this.reread = reread;
         this.log = Objects.requireNonNull(log, "log");
         this.epochs = List.copyOf(epochs);
         this.fencedBy = Objects.requireNonNull(fencedBy, "fencedBy");
@@ -95,10 +134,35 @@ public final class NodeLogTakeover {
         if (lastHeaders != null) {
             return;
         }
+        final Map<Long, Long> fences = new HashMap<>();
+        final Map<Long, Long> floors = new HashMap<>();
+        for (NodeLogEpoch epoch : epochs) {
+            floors.put(epoch.epoch(), epoch.trimPoint());
+            fences.put(epoch.epoch(), log.fence(epoch.epoch(), epoch.landed(), fencedBy, term));
+        }
+        if (reread != null) {
+            for (int attempt = 0; attempt < MAX_REFENCES; attempt++) {
+                boolean moved = false;
+                for (NodeLogEpoch now : reread.epochs()) {
+                    final Long fence = fences.get(now.epoch());
+                    if (fence != null) {
+                        // Nothing below a trim point the lease has recorded is needed, so the header search stops there.
+                        floors.merge(now.epoch(), now.trimPoint(), Math::max);
+                    }
+                    if (fence != null && now.trimPoint() > fence) {
+                        // Deleted past the fence after the lease this started from: the fence may be in a hole.
+                        fences.put(now.epoch(), log.fence(now.epoch(), now.landed(), fencedBy, term));
+                        moved = true;
+                    }
+                }
+                if (moved == false) {
+                    break;
+                }
+            }
+        }
         final Map<Long, Optional<Header>> found = new ConcurrentHashMap<>();
         for (NodeLogEpoch epoch : epochs) {
-            final long fence = log.fence(epoch.epoch(), epoch.landed(), fencedBy, term);
-            found.put(epoch.epoch(), log.lastHeaderBelow(epoch.epoch(), fence, epoch.trimPoint()));
+            found.put(epoch.epoch(), log.lastHeaderBelow(epoch.epoch(), fences.get(epoch.epoch()), floors.get(epoch.epoch())));
         }
         lastHeaders = found;
     }
