@@ -14,6 +14,8 @@ import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchShardTask;
 import org.opensearch.action.support.PlainActionFuture;
+import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.lucene.uid.Versions;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.action.ActionListener;
@@ -31,6 +33,7 @@ import org.opensearch.search.SearchService;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.search.internal.AliasFilter;
 import org.opensearch.search.internal.ShardSearchRequest;
+import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -40,6 +43,34 @@ import java.util.Collections;
 public final class ShardOps {
 
     private ShardOps() {}
+
+    /**
+     * Whether the blob a commit's file is read from is in the store: its own blob, or the segment blob it is a
+     * range of.
+     *
+     * @param store the object store
+     * @param shardBase the shard's data path
+     * @param manifest the commit naming the file
+     * @param file the file's name
+     * @return true if the blob exists
+     * @throws IOException if the store cannot be asked
+     */
+    public static boolean stored(BlobStore store, BlobPath shardBase, CommitManifest manifest, String file) throws IOException {
+        final String blob = manifest.location(file).referencedBlob();
+        final int slash = blob.indexOf('/');
+        return store.blobContainer(shardBase.add(blob.substring(0, slash))).blobExists(blob.substring(slash + 1));
+    }
+
+    /**
+     * The term container a commit's file is read from, such as {@code t=2}.
+     *
+     * @param manifest the commit naming the file
+     * @param file the file's name
+     * @return its term container
+     */
+    public static String termDirOf(CommitManifest manifest, String file) {
+        return manifest.location(file).termDir();
+    }
 
     /**
      * Indexes one document, failing loudly on a non-success result.
