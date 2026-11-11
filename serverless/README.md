@@ -136,6 +136,26 @@ Reading it was not merely reassuring. The same page documents two further outcom
 under concurrency, and `404` when a delete beats an `If-Match` write -- which the S3 register mapped to
 exceptions rather than to conflicts. See `STATUS.md`.
 
+## One write log per node
+
+`serverless.wal.node_log.enabled` (off by default) sends every write a node acknowledges to one log of its own,
+rather than one per shard: a window of `serverless.wal.node_log.window_millis` is one PUT however many shards it
+writes. Blobs are named `nodelog/<node>/e=<epoch>/<ordinal>`, and the last header before a fence says where every
+unpublished record of every shard is, so a successor reads it without a listing.
+
+- **Publishing.** A shard is published once its oldest unpublished write is
+  `serverless.wal.node_log.publish_max_age_millis` old (a minute by default), once it holds
+  `serverless.publish.max_unpublished_operations`, or the first time this node writes it. Searches read published
+  commits, so the age is also the longest a write takes to be searchable.
+- **Deleting.** A node deletes its own blobs behind the trim point its lease records: the oldest record any of its
+  shards has not published. A survivor deletes a dead node's log once every shard it names has published past it.
+  Neither lists.
+- **Lifecycle rule.** A delete that fails, or a fence above another, leaves a blob nothing names. Give the bucket a
+  lifecycle rule that expires objects under the `nodelog/` prefix after some days; seven is a reasonable choice.
+  It must exceed the longest any record can stay unpublished, which for a running fleet is the publish age plus a
+  takeover. A whole fleet down for longer than the rule loses what its logs held unpublished, so set it beyond any
+  outage the deployment means to recover from.
+
 ## Transport replay capacity
 
 `serverless.transport.replay_cache.capacity` limits the accepted, still-valid nonces

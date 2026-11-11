@@ -24,6 +24,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
 /** With one write log per node: a crashed writer's unpublished writes reach whoever takes its shards, and stay there. */
@@ -47,15 +48,16 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
             .build();
     }
 
-    private static void takeAll(ServerlessNode node, MetadataPlane plane, AtomicLong clock) throws Exception {
+    private static BackgroundReconciler.TickResult takeAll(ServerlessNode node, MetadataPlane plane, AtomicLong clock) throws Exception {
         node.renewLease(plane);
         plane.membership().refresh();
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
         for (int shard = 0; shard < SHARDS; shard++) {
             loop.want("alpha", shard);
         }
-        loop.tick(clock.get());
+        final BackgroundReconciler.TickResult pass = loop.tick(clock.get());
         assertEquals("one pass opens every shard it wants", SHARDS, node.reconciler().openShards().size());
+        return pass;
     }
 
     /** Opens every shard, writes to each, publishes, then writes one more to each that is never published. */
@@ -113,7 +115,11 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
             clock.addAndGet(2 * TTL);
             second.start();
             second.setMetadataPlane(plane);
-            takeAll(second, plane, clock);
+            assertEquals(
+                "what the open replayed it published before serving, and the pass that took it does not publish it again",
+                Set.of(),
+                takeAll(second, plane, clock).published()
+            );
             assertFound(second, fromFirst);
             for (ShardId shardId : second.reconciler().openShards()) {
                 second.index(shardId, "second-" + shardId.id(), "{\"msg\":\"s\",\"n\":" + shardId.id() + "}");
