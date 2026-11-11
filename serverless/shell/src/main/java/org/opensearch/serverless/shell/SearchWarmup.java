@@ -239,7 +239,7 @@ public final class SearchWarmup {
         return directory == null ? 0 : directory.fetchMissing(keys, node.threadPool().generic());
     }
 
-    private static BlockCacheDirectory blockDirectoryOf(ServerlessNode node, ShardId id) {
+    static BlockCacheDirectory blockDirectoryOf(ServerlessNode node, ShardId id) {
         final var service = node.indicesService().indexService(id.getIndex());
         if (service == null) {
             return null;
