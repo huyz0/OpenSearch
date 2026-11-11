@@ -46,7 +46,7 @@ public final class BlockCacheDirectory extends FilterDirectory {
     private final BlockCache cache;
     private final String cacheScope;
 
-    private record RemoteFile(BlobContainer container, String blobName, long length, String termDir) {
+    private record RemoteFile(BlobContainer container, String blobName, long length, String termDir, long blobOffset) {
     }
 
     private BlockCacheDirectory(Directory local, Map<String, RemoteFile> remote, BlockCache cache, String cacheScope) {
@@ -112,7 +112,8 @@ public final class BlockCacheDirectory extends FilterDirectory {
             // the length before it will read a byte, and an open used to list every term container.
             final Map<String, Map<String, Long>> lengthsByTerm = new LinkedHashMap<>();
             for (Map.Entry<String, String> entry : present.get().files().entrySet()) {
-                final String termDir = entry.getValue();
+                final FileLocation location = present.get().location(entry.getKey());
+                final String termDir = location.termDir();
                 Long length = present.get().lengthOf(entry.getKey());
                 if (length == null) {
                     final Map<String, Long> lengths = lengthsByTerm.computeIfAbsent(termDir, dir -> {
@@ -129,7 +130,15 @@ public final class BlockCacheDirectory extends FilterDirectory {
                 if (length != null) {
                     files.put(
                         entry.getKey(),
-                        new RemoteFile(blobStore.blobContainer(shardBase.add(termDir)), entry.getKey(), length, termDir)
+                        new RemoteFile(
+                            blobStore.blobContainer(shardBase.add(termDir)),
+                            location.blob(),
+                            length,
+                            // A pack's name, not only its term: a cache keyed on the term and the file's name alone
+                            // could serve another pack's bytes for a same-named file.
+                            location.isPacked() ? location.referencedBlob() : termDir,
+                            location.offset()
+                        )
                     );
                 }
             }
@@ -150,7 +159,8 @@ public final class BlockCacheDirectory extends FilterDirectory {
                         file.container(),
                         file.blobName(),
                         keyPrefix(cacheScope, file.termDir(), entry.getKey()),
-                        file.length()
+                        file.length(),
+                        file.blobOffset()
                     )
                 );
             }
@@ -206,7 +216,8 @@ public final class BlockCacheDirectory extends FilterDirectory {
                 cache,
                 file.blobName(),
                 keyPrefix(cacheScope, file.termDir(), name),
-                file.length()
+                file.length(),
+                file.blobOffset()
             );
         }
     }

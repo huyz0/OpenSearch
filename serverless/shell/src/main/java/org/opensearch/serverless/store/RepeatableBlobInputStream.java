@@ -23,6 +23,8 @@ public final class RepeatableBlobInputStream extends InputStream {
     private final BlobContainer container;
     private final String name;
     private final long length;
+    /** Where the bytes start in the blob: zero for a whole blob, a file's offset in a pack. */
+    private final long blobOffset;
     private InputStream input;
     private long position;
     private long mark;
@@ -37,13 +39,27 @@ public final class RepeatableBlobInputStream extends InputStream {
      * @throws IOException if the initial read cannot be opened
      */
     public RepeatableBlobInputStream(BlobContainer container, String name, long length) throws IOException {
+        this(container, name, -1L, length);
+    }
+
+    /**
+     * Opens one range of an immutable blob: a file packed with others.
+     *
+     * @param container its source container
+     * @param name the blob's name
+     * @param blobOffset where the range starts in the blob, or -1 for the whole blob
+     * @param length the range's length
+     * @throws IOException if the initial read cannot be opened
+     */
+    public RepeatableBlobInputStream(BlobContainer container, String name, long blobOffset, long length) throws IOException {
         if (length < 0) {
             throw new IllegalArgumentException("negative blob length");
         }
         this.container = Objects.requireNonNull(container);
         this.name = Objects.requireNonNull(name);
         this.length = length;
-        this.input = container.readBlob(name);
+        this.blobOffset = Math.max(0L, blobOffset);
+        this.input = blobOffset < 0L ? container.readBlob(name) : container.readBlob(name, blobOffset, length);
     }
 
     private void ensureOpen() throws IOException {
@@ -118,7 +134,7 @@ public final class RepeatableBlobInputStream extends InputStream {
         if (previous != null) {
             previous.close();
         }
-        input = offset == length ? InputStream.nullInputStream() : container.readBlob(name, offset, length - offset);
+        input = offset == length ? InputStream.nullInputStream() : container.readBlob(name, blobOffset + offset, length - offset);
         position = offset;
     }
 

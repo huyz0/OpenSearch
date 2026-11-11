@@ -289,6 +289,40 @@ public final class SegmentPublisher {
     }
 
     /**
+     * Opens one published file's bytes, whether it is a blob of its own or a range of a pack.
+     *
+     * @param manifest the commit naming it
+     * @param fileName the file
+     * @return its bytes, from the first
+     * @throws IOException if the commit does not name it or it cannot be read
+     */
+    public InputStream openFile(CommitManifest manifest, String fileName) throws IOException {
+        return openFile(blobStore, shardBase, manifest, fileName);
+    }
+
+    /**
+     * Opens one published file's bytes under a shard's base path.
+     *
+     * @param blobStore the store
+     * @param shardBase the shard's base path
+     * @param manifest the commit naming the file
+     * @param fileName the file
+     * @return its bytes, from the first
+     * @throws IOException if the commit does not name it or it cannot be read
+     */
+    public static InputStream openFile(BlobStore blobStore, BlobPath shardBase, CommitManifest manifest, String fileName)
+        throws IOException {
+        final FileLocation location = manifest.location(fileName);
+        if (location == null) {
+            throw new java.io.FileNotFoundException(fileName + " is not in the commit");
+        }
+        final BlobContainer container = blobStore.blobContainer(shardBase.add(location.termDir()));
+        return location.isPacked()
+            ? container.readBlob(location.blob(), location.offset(), location.length())
+            : container.readBlob(location.blob());
+    }
+
+    /**
      * The highest sequence number a published commit holds, read from its commit point.
      *
      * <p>For a commit published before manifests recorded how far into the log they reach: the log keeps each term's
@@ -332,8 +366,7 @@ public final class SegmentPublisher {
                 if (isCommit) {
                     commitFile = name;
                 }
-                final BlobContainer source = blobStore.blobContainer(shardBase.add(file.getValue()));
-                try (InputStream in = source.readBlob(name); IndexOutput out = scratch.createOutput(name, IOContext.DEFAULT)) {
+                try (InputStream in = openFile(manifest, name); IndexOutput out = scratch.createOutput(name, IOContext.DEFAULT)) {
                     final byte[] buffer = new byte[8192];
                     int read;
                     while ((read = in.read(buffer)) > 0) {
@@ -381,8 +414,10 @@ public final class SegmentPublisher {
             } catch (java.io.IOException ignored) {
                 // absent, which is the normal case on a cold node
             }
-            final BlobContainer source = blobStore.blobContainer(shardBase.add(file.getValue()));
-            try (InputStream in = source.readBlob(file.getKey()); IndexOutput out = target.createOutput(file.getKey(), IOContext.DEFAULT)) {
+            try (
+                InputStream in = openFile(manifest.get(), file.getKey());
+                IndexOutput out = target.createOutput(file.getKey(), IOContext.DEFAULT)
+            ) {
                 final byte[] buffer = new byte[8192];
                 int read;
                 while ((read = in.read(buffer)) > 0) {

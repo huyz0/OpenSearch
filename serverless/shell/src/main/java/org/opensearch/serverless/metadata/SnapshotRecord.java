@@ -318,7 +318,7 @@ public final class SnapshotRecord {
             }
             final List<String> referenced = new ArrayList<>(manifest.files().size());
             for (Map.Entry<String, String> file : manifest.files().entrySet()) {
-                referenced.add(file.getValue() + "/" + file.getKey());
+                referenced.add(manifest.location(file.getKey()).referencedBlob());
             }
             return referenced;
         }
