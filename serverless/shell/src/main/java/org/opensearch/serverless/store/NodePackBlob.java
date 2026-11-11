@@ -36,7 +36,7 @@ import java.util.Set;
  * <pre>
  * prefix:  magic "NPK1" (4) | version (1) | header length (4)
  * header:  node (UTF) | epoch (8) | ordinal (8) | block count (4)
- *          per block: index uuid (UTF) | shard (4) | name (UTF) | offset (8) | length (8)
+ *          per block: index uuid (UTF) | index name (UTF) | shard (4) | name (UTF) | offset (8) | length (8)
  * body:    the blocks, in header order, the first starting where the header ends
  * </pre>
  */
@@ -44,8 +44,10 @@ public final class NodePackBlob {
 
     /** {@code NPK1}. */
     static final int MAGIC = 0x4E504B31;
-    /** The one format version this node writes and reads. */
-    static final byte VERSION = 1;
+    /** The format version this node writes. */
+    static final byte VERSION = 2;
+    /** The first version, whose blocks name their index by uuid alone; still read. */
+    static final byte VERSION_UUID_ONLY = 1;
     /** Magic, version and header length. */
     static final int PREFIX_BYTES = 4 + 1 + 4;
 
@@ -59,8 +61,23 @@ public final class NodePackBlob {
      * @param name the segment blob's name, as the shard would have named it on its own ({@code _5.seg})
      * @param offset where the block starts in the pack
      * @param length the block's length
+     * @param indexName the index's name, which with the uuid locates the shard's manifest; empty in a pack of the first
+     *     version
      */
-    public record Block(String indexUuid, int shard, String name, long offset, long length) {
+    public record Block(String indexUuid, int shard, String name, long offset, long length, String indexName) {
+
+        /**
+         * A block whose index name is not recorded.
+         *
+         * @param indexUuid the index
+         * @param shard the shard
+         * @param name the block's name
+         * @param offset where it starts
+         * @param length how long it is
+         */
+        public Block(String indexUuid, int shard, String name, long offset, long length) {
+            this(indexUuid, shard, name, offset, length, "");
+        }
 
         /**
          * Validates a block.
@@ -70,10 +87,12 @@ public final class NodePackBlob {
          * @param name the block's name
          * @param offset where it starts
          * @param length how long it is
+         * @param indexName the index's name, or empty
          */
         public Block {
             Objects.requireNonNull(indexUuid, "indexUuid");
             Objects.requireNonNull(name, "name");
+            Objects.requireNonNull(indexName, "indexName");
             if (indexUuid.isEmpty() || name.isEmpty() || shard < 0 || offset < 0L || length < 0L) {
                 throw new IllegalArgumentException(
                     "invalid pack block [" + indexUuid + "][" + shard + "][" + name + "] at [" + offset + ":" + length + "]"
@@ -89,8 +108,9 @@ public final class NodePackBlob {
      * @param shard the shard
      * @param name the segment blob's name
      * @param length its length
+     * @param indexName the index's name
      */
-    public record Planned(String indexUuid, int shard, String name, long length) {
+    public record Planned(String indexUuid, int shard, String name, long length, String indexName) {
     }
 
     /**
@@ -98,8 +118,19 @@ public final class NodePackBlob {
      *
      * @param indexUuid the index
      * @param shard the shard number
+     * @param indexName the index's name, or empty in a pack of the first version
      */
-    public record ShardKey(String indexUuid, int shard) {
+    public record ShardKey(String indexUuid, int shard, String indexName) {
+
+        /**
+         * A shard named by uuid alone.
+         *
+         * @param indexUuid the index
+         * @param shard the shard number
+         */
+        public ShardKey(String indexUuid, int shard) {
+            this(indexUuid, shard, "");
+        }
     }
 
     /**
@@ -121,7 +152,7 @@ public final class NodePackBlob {
         public Set<ShardKey> shards() {
             final Set<ShardKey> shards = new LinkedHashSet<>();
             for (Block block : blocks) {
-                shards.add(new ShardKey(block.indexUuid(), block.shard()));
+                shards.add(new ShardKey(block.indexUuid(), block.shard(), block.indexName()));
             }
             return shards;
         }
@@ -175,7 +206,7 @@ public final class NodePackBlob {
         final List<Block> blocks = new ArrayList<>(planned.size());
         long offset = bodyStart;
         for (Planned block : planned) {
-            blocks.add(new Block(block.indexUuid(), block.shard(), block.name(), offset, block.length()));
+            blocks.add(new Block(block.indexUuid(), block.shard(), block.name(), offset, block.length(), block.indexName()));
             offset += block.length();
         }
         final byte[] header = headerBytes(nodeId, epoch, ordinal, blocks);
@@ -202,7 +233,7 @@ public final class NodePackBlob {
     private static List<Block> placeholders(List<Planned> planned) {
         final List<Block> blocks = new ArrayList<>(planned.size());
         for (Planned block : planned) {
-            blocks.add(new Block(block.indexUuid(), block.shard(), block.name(), 0L, block.length()));
+            blocks.add(new Block(block.indexUuid(), block.shard(), block.name(), 0L, block.length(), block.indexName()));
         }
         return blocks;
     }
@@ -216,6 +247,7 @@ public final class NodePackBlob {
             data.writeInt(blocks.size());
             for (Block block : blocks) {
                 data.writeUTF(block.indexUuid());
+                data.writeUTF(block.indexName());
                 data.writeInt(block.shard());
                 data.writeUTF(block.name());
                 data.writeLong(block.offset());
@@ -254,8 +286,8 @@ public final class NodePackBlob {
                 throw new IOException("not a node pack: magic " + Integer.toHexString(magic));
             }
             final byte version = in.readByte();
-            if (version != VERSION) {
-                throw new IOException("node pack of format version " + version + "; this node reads " + VERSION);
+            if (version != VERSION && version != VERSION_UUID_ONLY) {
+                throw new IOException("node pack of format version " + version + "; this node reads up to " + VERSION);
             }
             final int headerLength = in.readInt();
             if (headerLength < 0 || leading.length < PREFIX_BYTES + (long) headerLength) {
@@ -271,7 +303,9 @@ public final class NodePackBlob {
             final List<Block> blocks = new ArrayList<>(count);
             for (int i = 0; i < count; i++) {
                 try {
-                    blocks.add(new Block(in.readUTF(), in.readInt(), in.readUTF(), in.readLong(), in.readLong()));
+                    final String indexUuid = in.readUTF();
+                    final String indexName = version == VERSION_UUID_ONLY ? "" : in.readUTF();
+                    blocks.add(new Block(indexUuid, in.readInt(), in.readUTF(), in.readLong(), in.readLong(), indexName));
                 } catch (IllegalArgumentException e) {
                     throw new IOException("malformed node pack header", e);
                 }
