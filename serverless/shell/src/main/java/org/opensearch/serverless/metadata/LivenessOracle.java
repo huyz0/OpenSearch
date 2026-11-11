@@ -46,4 +46,16 @@ public interface LivenessOracle {
     default boolean revoke(String nodeId, String ephemeralId) {
         return true;
     }
+
+    /**
+     * Judges an owner and, if it is dead, revokes its lease: {@link #isLive} then {@link #revoke}, for an oracle that
+     * can answer both from one read of the lease.
+     *
+     * @param nodeId the owner's stable id
+     * @param ephemeralId the id it had when it took the shard, or null if unknown
+     * @return true if the owner is dead and can no longer renew; false if it is alive, which refuses the takeover
+     */
+    default boolean revokeUnlessLive(String nodeId, String ephemeralId) {
+        return isLive(nodeId, ephemeralId) == false && revoke(nodeId, ephemeralId);
+    }
 }
