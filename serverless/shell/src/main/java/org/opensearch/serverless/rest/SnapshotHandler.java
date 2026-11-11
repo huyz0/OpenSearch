@@ -722,10 +722,18 @@ public final class SnapshotHandler extends BaseRestHandler {
                 // The settings the index had when it was captured, restored with it: the analyzers a mapping
                 // names live there, and a restored index without them could neither index nor search.
                 final org.opensearch.common.settings.Settings settings = SnapshotBlobs.restorableSettings(capturedIndex.settings());
-                metadata.createIndex(
-                    new IndexDescriptor(restoring.getValue(), newUuid, capturedIndex.numberOfShards(), capturedIndex.mapping(), settings)
-                        .createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id)
-                );
+                IndexDescriptor restoredDescriptor = new IndexDescriptor(
+                    restoring.getValue(),
+                    newUuid,
+                    capturedIndex.numberOfShards(),
+                    capturedIndex.mapping(),
+                    settings
+                ).createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id);
+                final org.opensearch.serverless.routing.UnitLayout layout = SnapshotBlobs.layoutOf(capturedIndex.settings());
+                if (layout != null) {
+                    restoredDescriptor = restoredDescriptor.withLayout(layout);
+                }
+                metadata.createIndex(restoredDescriptor);
                 created.put(restoring.getValue(), newUuid);
                 for (Map.Entry<Integer, CommitManifest> shard : capturedIndex.shards().entrySet()) {
                     final BlobPath sourceBase = record.shallow()

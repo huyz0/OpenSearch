@@ -64,6 +64,7 @@ public final class IndexDescriptor {
     private final long createdAtMillis;
     private final int createdVersionId;
     private final List<String> aliasedBy;
+    private final org.opensearch.serverless.routing.UnitLayout layout;
 
     /**
      * This descriptor rendered for routing, built once on demand.
@@ -171,6 +172,54 @@ public final class IndexDescriptor {
         int createdVersionId,
         List<String> aliasedBy
     ) {
+        this(
+            name,
+            uuid,
+            numberOfShards,
+            mapping,
+            extraSettings,
+            mappingVersion,
+            settingsVersion,
+            createdAtMillis,
+            createdVersionId,
+            aliasedBy,
+            null
+        );
+    }
+
+    /**
+     * Creates a descriptor with a unit layout: an index created with a shard mode.
+     *
+     * <p>{@code numberOfShards} is then the number of <em>units</em>, the physical shards every caller
+     * enumerates, and the layout's declared count is what the user asked for. The two are equal in fixed
+     * mode; an adaptive index starts as one unit whatever it declared. Unit ids must be
+     * {@code 0..numberOfShards-1}, because callers derive a shard's identity from that range.
+     *
+     * @param name the index name
+     * @param uuid the index uuid
+     * @param numberOfShards the number of units, the physical shard count
+     * @param mapping the mapping, or null
+     * @param extraSettings the settings beyond the shard count
+     * @param mappingVersion how many times the mapping has changed
+     * @param settingsVersion how many times the settings have changed
+     * @param createdAtMillis when the index was created, or 0 when not recorded
+     * @param createdVersionId the id of the OpenSearch version that created it, or 0 when not recorded
+     * @param aliasedBy the aliases believed to name this index
+     * @param layout the range map from routing hashes to units, or null for an index without a shard mode
+     */
+    public IndexDescriptor(
+        String name,
+        String uuid,
+        int numberOfShards,
+        String mapping,
+        Settings extraSettings,
+        long mappingVersion,
+        long settingsVersion,
+        long createdAtMillis,
+        int createdVersionId,
+        List<String> aliasedBy,
+        org.opensearch.serverless.routing.UnitLayout layout
+    ) {
         this.name = Objects.requireNonNull(name);
         this.uuid = Objects.requireNonNull(uuid);
         if (numberOfShards < 1) {
@@ -194,6 +243,58 @@ public final class IndexDescriptor {
         this.createdAtMillis = createdAtMillis;
         this.createdVersionId = createdVersionId;
         this.aliasedBy = List.copyOf(aliasedBy);
+        if (layout != null) {
+            for (org.opensearch.serverless.routing.UnitLayout.Unit unit : layout.units()) {
+                if (unit.id() >= numberOfShards || layout.unitCount() != numberOfShards) {
+                    throw new IllegalArgumentException(
+                        "a layout's units must be shards 0.." + (numberOfShards - 1) + " of [" + name + "], got " + layout
+                    );
+                }
+            }
+        }
+        this.layout = layout;
+    }
+
+    /**
+     * Returns the range map from routing hashes to units, or null for an index created without a shard mode.
+     *
+     * @return the layout, or null
+     */
+    public org.opensearch.serverless.routing.UnitLayout layout() {
+        return layout;
+    }
+
+    /**
+     * Returns the shard count the user declared, which every user-facing shard count reports.
+     *
+     * <p>The same as {@link #numberOfShards()} for an index without a shard mode, and for a fixed one.
+     *
+     * @return the declared shard count
+     */
+    public int declaredShards() {
+        return layout == null ? numberOfShards : layout.declaredShards();
+    }
+
+    /**
+     * Returns this descriptor with a unit layout, its shard count set to the layout's unit count.
+     *
+     * @param newLayout the layout, or null to route as an index without a shard mode
+     * @return the new descriptor
+     */
+    public IndexDescriptor withLayout(org.opensearch.serverless.routing.UnitLayout newLayout) {
+        return new IndexDescriptor(
+            name,
+            uuid,
+            newLayout == null ? numberOfShards : newLayout.unitCount(),
+            mapping,
+            extraSettings,
+            mappingVersion,
+            settingsVersion,
+            createdAtMillis,
+            createdVersionId,
+            aliasedBy,
+            newLayout
+        );
     }
 
     /**
@@ -247,7 +348,8 @@ public final class IndexDescriptor {
             settingsVersion,
             createdAtMillis,
             createdVersionId,
-            aliasedBy
+            aliasedBy,
+            layout
         );
     }
 
@@ -268,7 +370,8 @@ public final class IndexDescriptor {
             settingsVersion,
             createdAtMillis,
             createdVersionId,
-            aliases
+            aliases,
+            layout
         );
     }
 
@@ -403,7 +506,8 @@ public final class IndexDescriptor {
             settingsVersion,
             createdAtMillis,
             createdVersionId,
-            aliasedBy
+            aliasedBy,
+            layout
         );
     }
 
@@ -433,7 +537,8 @@ public final class IndexDescriptor {
             settingsVersion + 1,
             createdAtMillis,
             createdVersionId,
-            aliasedBy
+            aliasedBy,
+            layout
         );
     }
 
@@ -474,6 +579,13 @@ public final class IndexDescriptor {
             }
             if (aliasedBy.isEmpty() == false) {
                 builder.field("aliased_by", aliasedBy);
+            }
+            // Only for an index created with a shard mode, so every other descriptor is byte-identical to
+            // what this class wrote before layouts existed.
+            if (layout != null) {
+                builder.startObject("unit_layout");
+                org.opensearch.serverless.routing.UnitLayoutFormat.toXContent(layout, builder);
+                builder.endObject();
             }
             // Core's own settings serialization, rather than a flat key-to-string loop.
             //
@@ -516,6 +628,7 @@ public final class IndexDescriptor {
             int createdVersionId = 0;
             final List<String> aliasedBy = new java.util.ArrayList<>();
             Settings parsedSettings = Settings.EMPTY;
+            org.opensearch.serverless.routing.UnitLayout layout = null;
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
@@ -523,6 +636,8 @@ public final class IndexDescriptor {
                     field = parser.currentName();
                 } else if (token == XContentParser.Token.START_OBJECT && "settings".equals(field)) {
                     parsedSettings = Settings.fromXContent(parser);
+                } else if (token == XContentParser.Token.START_OBJECT && "unit_layout".equals(field)) {
+                    layout = org.opensearch.serverless.routing.UnitLayoutFormat.fromXContent(parser);
                 } else if (token == XContentParser.Token.START_ARRAY && "aliased_by".equals(field)) {
                     while ((token = parser.nextToken()) != XContentParser.Token.END_ARRAY) {
                         aliasedBy.add(parser.text());
@@ -560,7 +675,8 @@ public final class IndexDescriptor {
                 settingsVersion,
                 createdAtMillis,
                 createdVersionId,
-                aliasedBy
+                aliasedBy,
+                layout
             );
         }
     }
@@ -577,14 +693,15 @@ public final class IndexDescriptor {
                 && Objects.equals(mapping, other.mapping)
                 && mappingVersion == other.mappingVersion
                 && settingsVersion == other.settingsVersion
-                && extraSettings.equals(other.extraSettings);
+                && extraSettings.equals(other.extraSettings)
+                && Objects.equals(layout, other.layout);
         }
         return false;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(name, uuid, numberOfShards, mapping, extraSettings, mappingVersion, settingsVersion);
+        return Objects.hash(name, uuid, numberOfShards, mapping, extraSettings, mappingVersion, settingsVersion, layout);
     }
 
     @Override

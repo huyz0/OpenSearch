@@ -18,7 +18,10 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
  * document in one shard and look for it in another, and the symptom would be a search that returns
  * nothing rather than an error.
  *
- * <p><b>Split indices are not supported here.</b> The real function consults
+ * <p>An index created with a shard mode routes through its unit layout instead: the 64-bit hash of the
+ * id, looked up in the layout's cut points. Its answer is a unit, which is the physical shard.
+ *
+ * <p><b>Core's split indices are not supported here.</b> The real function consults
  * {@code getSplitShardsMetadata()} after the modulo; this does not, because nothing in this shell
  * splits an index. If splitting ever lands, this is one of the places that has to learn about it, and
  * failing to would be silent.
@@ -32,9 +35,12 @@ public final class DocumentRouting {
      *
      * @param descriptor the index
      * @param id the document id, which is also the routing value
-     * @return the shard number
+     * @return the shard number; for an index with a unit layout, the unit id
      */
     public static int shardFor(IndexDescriptor descriptor, String id) {
+        if (descriptor.layout() != null) {
+            return descriptor.layout().unitForRouting(id).id();
+        }
         try {
             return org.opensearch.cluster.routing.OperationRouting.generateShardId(descriptor.routingMetadata(), id, null);
         } catch (java.io.IOException e) {
