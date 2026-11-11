@@ -199,7 +199,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 return;
             }
             janitorTask = threadPool.schedule(() -> {
-                final BackgroundReconciler.JanitorPass pass = janitorNow();
+                final JanitorPass pass = janitorNow();
                 scheduleJanitor(pass != null && pass.full() ? JANITOR_BACKLOG_DELAY : janitorInterval);
             }, delay, ThreadPool.Names.GENERIC);
         }
@@ -210,14 +210,14 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      *
      * @return what it did, or null if it failed
      */
-    public BackgroundReconciler.JanitorPass janitorNow() {
+    public JanitorPass janitorNow() {
         try (org.opensearch.common.lease.Releasable work = activity.enter()) {
             if (work == null) {
                 return null;
             }
             janitorPasses.incrementAndGet();
             try {
-                final BackgroundReconciler.JanitorPass pass = org.opensearch.serverless.store.ObjectStores.attributedTo(
+                final JanitorPass pass = org.opensearch.serverless.store.ObjectStores.attributedTo(
                     janitorRequests,
                     () -> loop.sweepAbandoned(BackgroundReconciler.DEFAULT_JANITOR_BUDGET, BackgroundReconciler.DEFAULT_JANITOR_REPLAYS)
                 );
@@ -542,7 +542,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      *
      * @return the figures
      */
-    public BackgroundReconciler.ActivationStats activationStats() {
+    public ActivationStats activationStats() {
         return loop.activationStats();
     }
 
@@ -799,7 +799,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      *
      * @return what the pass did, or null if it failed
      */
-    public BackgroundReconciler.TickResult backstopNow() {
+    public TickResult backstopNow() {
         try (org.opensearch.common.lease.Releasable work = activity.enter()) {
             if (work == null) {
                 return null;
