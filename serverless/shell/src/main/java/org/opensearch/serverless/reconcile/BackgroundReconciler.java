@@ -2530,6 +2530,14 @@ public final class BackgroundReconciler implements Closeable {
                 // Its idle clock starts here, so a shard just taken is not immediately a candidate for being
                 // given straight back -- whether it was wanted or taken on demand.
                 taken.ifPresent(shardId -> openedAt.put(shardId, plane.clock().getAsLong()));
+                // Opened from a commit that already holds everything it has: that commit is this node's last publish
+                // too, so neither the next pass nor an idle release publishes the same operations again.
+                taken.ifPresent(shardId -> node.reconciler().takePublishedThroughAtOpen(shardId).ifPresent(through -> {
+                    lastPublishedMaxSeqNo.put(shardId, through);
+                    // And spaced from now, as the publish it replaces would have been, so the first write
+                    // after the take does not publish at once.
+                    lastPublishedAtMillis.put(shardId, plane.clock().getAsLong());
+                }));
                 return taken;
             } finally {
                 if (reserved) {
