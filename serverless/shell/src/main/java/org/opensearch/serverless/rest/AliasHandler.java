@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.rest;
 
-import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
@@ -206,7 +205,7 @@ public final class AliasHandler extends BaseRestHandler {
                     if (selected.indices() == null || selected.indices().length != 1) {
                         throw new UnsupportedOperationException("a reverse alias lookup requires one concrete index");
                     }
-                    aliasesOf(buffered, reverse, selected.indices()[0], selected.aliases());
+                    AliasReads.aliasesOf(buffered, reverse, selected.indices()[0], selected.aliases());
                 }
             );
         }
@@ -345,7 +344,7 @@ public final class AliasHandler extends BaseRestHandler {
                     switch (method) {
                         case PUT, POST -> attach(channel, metadata, aliasName, indices, true);
                         case DELETE -> attach(channel, metadata, aliasName, indices, false);
-                        case GET, HEAD -> membership(channel, metadata, aliasName, indices, method == RestRequest.Method.HEAD);
+                        case GET, HEAD -> AliasReads.membership(channel, metadata, aliasName, indices, method == RestRequest.Method.HEAD);
                         default -> channel.sendResponse(
                             IndexAdminHandler.error(
                                 channel,
@@ -359,7 +358,7 @@ public final class AliasHandler extends BaseRestHandler {
                 }
                 switch (method) {
                     case PUT, POST -> create(channel, metadata, aliasName, indices);
-                    case GET -> read(channel, metadata, aliasName);
+                    case GET -> AliasReads.read(channel, metadata, aliasName);
                     case HEAD -> {
                         // An existence check on a name: the same one register read a GET does, and no body.
                         // A data stream is not an alias, so HEAD /_alias/{stream} is a 404 as it is in core.
@@ -481,7 +480,7 @@ public final class AliasHandler extends BaseRestHandler {
                 }
             }
         }
-        final Refusal failure = swap(metadata, name, indices, adding);
+        final AliasSwap.Refusal failure = AliasSwap.swap(metadata, name, indices, adding);
         if (failure != null) {
             channel.sendResponse(IndexAdminHandler.error(channel, failure.status(), failure.type(), failure.reason()));
             return;
@@ -490,134 +489,6 @@ public final class AliasHandler extends BaseRestHandler {
             builder.startObject();
             builder.field("acknowledged", true);
             builder.field("alias", name);
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
-    }
-
-    /** A refusal, with the status and type the caller should see rather than one status for everything. */
-    private record Refusal(RestStatus status, String type, String reason) {
-    }
-
-    /** Core's refusal when an alias operation names a data stream. */
-    private static String dataStreamNotAlias(String name) {
-        return "The provided expression [" + name + "] matches a data stream, specify the corresponding concrete indices instead";
-    }
-
-    /**
-     * Applies one add-or-remove to an alias under a compare-and-swap, retrying a lost race.
-     *
-     * <p>The record and the generation it is swapped under come from one read; see the class comment for
-     * why two reads are not a token at all.
-     *
-     * @param metadata the metadata plane
-     * @param name the alias
-     * @param indices the indices to add or remove
-     * @param adding whether to add or remove
-     * @return a refusal to report, or null on success
-     * @throws IOException if the store cannot be read or written
-     */
-    private Refusal swap(MetadataPlane metadata, String name, List<String> indices, boolean adding) throws IOException {
-        for (int attempt = 0; attempt < 4; attempt++) {
-            final var resolved = metadata.resolveForAliasMutation(name);
-            if (resolved.index() != null) {
-                return new Refusal(
-                    RestStatus.BAD_REQUEST,
-                    "invalid_alias_name_exception",
-                    "[" + name + "] is an index, not an alias; a name cannot be both"
-                );
-            }
-            final AliasRecord before = resolved.alias();
-            if (before != null && before.dataStream()) {
-                return new Refusal(RestStatus.BAD_REQUEST, "illegal_argument_exception", dataStreamNotAlias(name));
-            }
-            final List<String> now = new ArrayList<>(before == null ? List.of() : before.indices());
-            for (String index : indices) {
-                if (adding) {
-                    if (now.contains(index) == false) {
-                        now.add(index);
-                    }
-                } else {
-                    now.remove(index);
-                }
-            }
-            if (before == null) {
-                if (adding == false) {
-                    return new Refusal(RestStatus.NOT_FOUND, "aliases_not_found_exception", "aliases [" + name + "] missing");
-                }
-                try {
-                    metadata.createAlias(new AliasRecord(name, now));
-                    return null;
-                } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
-                    continue; // somebody created it between the read and the write; re-read and merge
-                }
-            }
-            if (now.equals(before.indices())) {
-                if (adding) {
-                    return null; // already named; nothing to swap
-                }
-                // Core's answer when a remove matched nothing: 404, not a silent 200 that reads as done.
-                return new Refusal(RestStatus.NOT_FOUND, "aliases_not_found_exception", "aliases [" + name + "] missing on " + indices);
-            }
-            if (now.isEmpty()) {
-                // The last index left. An alias over nothing is worse than no alias, so it goes -- under the
-                // generation this read saw, so a concurrent add is a lost swap here rather than a lost add.
-                if (metadata.deleteAlias(before, resolved.generation())) {
-                    return null;
-                }
-                continue;
-            }
-            if (metadata.updateAlias(before, MetadataPlane.withIndices(before, now), resolved.generation()).isPresent()) {
-                return null;
-            }
-        }
-        return new Refusal(RestStatus.CONFLICT, "version_conflict_engine_exception", "[" + name + "] is being changed concurrently; retry");
-    }
-
-    /**
-     * Whether an index is under an alias.
-     *
-     * @param channel the channel to answer on
-     * @param metadata the metadata plane
-     * @param name the alias
-     * @param indices the indices asked about
-     * @param bodyless whether this is a HEAD
-     * @throws IOException if the read fails
-     */
-    private void membership(
-        org.opensearch.rest.RestChannel channel,
-        MetadataPlane metadata,
-        String name,
-        List<String> indices,
-        boolean bodyless
-    ) throws IOException {
-        final var resolved = metadata.resolve(name);
-        // A data stream's backing indices are not "under an alias", so the answer for one is core's 404.
-        final boolean all = resolved.alias() != null
-            && resolved.alias().dataStream() == false
-            && resolved.alias().indices().containsAll(indices);
-        if (bodyless) {
-            channel.sendResponse(
-                new BytesRestResponse(all ? RestStatus.OK : RestStatus.NOT_FOUND, BytesRestResponse.TEXT_CONTENT_TYPE, "")
-            );
-            return;
-        }
-        if (all == false) {
-            channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "alias_not_found", "alias [" + name + "] does not cover " + indices)
-            );
-            return;
-        }
-        // OpenSearch's shape: keyed by index, each carrying the aliases it is under that were asked about.
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            for (String index : indices) {
-                builder.startObject(index);
-                builder.startObject("aliases");
-                writeAliasBody(builder, name, resolved.alias().writeIndex(), index);
-                builder.endObject();
-                builder.endObject();
-            }
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
@@ -770,7 +641,12 @@ public final class AliasHandler extends BaseRestHandler {
                 // Core's refusal, in core's words. Rebuilding the record here would have turned the stream
                 // into a plain alias: no generation, no timestamp field, no write index, and a 200.
                 channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", dataStreamNotAlias(alias))
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.BAD_REQUEST,
+                        "illegal_argument_exception",
+                        AliasSwap.dataStreamNotAlias(alias)
+                    )
                 );
                 return;
             }
@@ -958,71 +834,6 @@ public final class AliasHandler extends BaseRestHandler {
         }
     }
 
-    private void read(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name) throws IOException {
-        final var resolved = metadata.resolve(name);
-        if (resolved.alias() == null || resolved.alias().dataStream()) {
-            // A data stream is not an alias, and rendering it as one -- backing indices keyed as if a
-            // caller had aliased them -- would tell a client it can be managed through this API.
-            channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_FOUND,
-                    "alias_not_found",
-                    resolved.index() != null ? "[" + name + "] is an index, not an alias"
-                        : resolved.alias() != null ? "[" + name + "] is a data stream, not an alias; GET /_data_stream/" + name
-                        : "no such alias: " + name
-                )
-            );
-            return;
-        }
-        // Core's shape: keyed by index, each carrying the alias. This was {alias, indices[]} -- the last
-        // shell-specific shape on the alias surface, kept for the shell's own callers and now retired,
-        // since a client library's alias parser is written for this one and nothing else reads the other.
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            for (String index : resolved.alias().indices()) {
-                builder.startObject(index);
-                builder.startObject("aliases");
-                writeAliasBody(builder, name, resolved.alias().writeIndex(), index);
-                builder.endObject();
-                builder.endObject();
-            }
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
-    }
-
-    /** {@code GET /{index}/_alias}: every alias that names the index, verified against each alias record. */
-    private void aliasesOf(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String index, String[] wantedAliases)
-        throws IOException {
-        final var descriptor = metadata.describe(index);
-        if (descriptor.isEmpty()) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
-            return;
-        }
-        try (XContentBuilder builder = channel.newBuilder()) {
-            builder.startObject();
-            builder.startObject(index);
-            builder.startObject("aliases");
-            for (String alias : metadata.aliasesOf(descriptor.get())) {
-                if (wantedAliases != null
-                    && wantedAliases.length != 0
-                    && org.opensearch.common.regex.Regex.simpleMatch(wantedAliases, alias) == false) {
-                    continue;
-                }
-                final var record = metadata.aliasWithGeneration(alias);
-                if (record.isEmpty() || record.get().alias().dataStream() || record.get().alias().indices().contains(index) == false) {
-                    continue;
-                }
-                writeAliasBody(builder, alias, record.get().alias().writeIndex(), index);
-            }
-            builder.endObject();
-            builder.endObject();
-            builder.endObject();
-            channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
-    }
-
     private void delete(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name) throws IOException {
         final var found = metadata.aliasWithGeneration(name);
         if (found.isEmpty()) {
@@ -1060,29 +871,6 @@ public final class AliasHandler extends BaseRestHandler {
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
-    }
-
-    /**
-     * Writes one alias body the way core writes it.
-     *
-     * <p>This surface used to emit {@code {}} for every alias, which is right for an alias carrying
-     * nothing and silently wrong for one with an explicit write index: real OpenSearch reports
-     * {@code is_write_index} there, and a client that reads it to decide where to send a write saw
-     * nothing to read. Handing the job to {@link AliasMetadata.Builder#toXContent} fixes that and, more
-     * to the point, stops this shape being a thing someone has to keep in step by hand -- filter,
-     * routing and hidden come along the moment this shell has anything to put in them.
-     *
-     * @param builder the builder, positioned inside the {@code aliases} object
-     * @param alias the alias name
-     * @param writeIndex the index this alias writes to, or null when it names no particular one
-     * @param index the index this body is being written under
-     */
-    private static void writeAliasBody(XContentBuilder builder, String alias, String writeIndex, String index) throws IOException {
-        final AliasMetadata.Builder metadata = AliasMetadata.builder(alias);
-        if (writeIndex != null) {
-            metadata.writeIndex(writeIndex.equals(index));
-        }
-        AliasMetadata.Builder.toXContent(metadata.build(), builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
     }
 
 }
