@@ -129,7 +129,7 @@ public final class CatalogHandler extends BaseRestHandler {
             builder.startObject();
             builder.field("index", index);
             builder.startArray("shards");
-            for (int shard = 0; shard < descriptor.get().numberOfShards(); shard++) {
+            for (int shard : descriptor.get().unitIds()) {
                 final Optional<ShardHead> head = metadata.heads().read(index, shard);
                 builder.startObject();
                 builder.field("shard", shard);

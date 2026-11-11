@@ -65,6 +65,8 @@ public final class IndexDescriptor {
     private final int createdVersionId;
     private final List<String> aliasedBy;
     private final org.opensearch.serverless.routing.UnitLayout layout;
+    /** The live unit ids, sorted; null for an index without a layout, whose shards are all live. */
+    private final int[] unitIds;
 
     /**
      * This descriptor rendered for routing, built once on demand.
@@ -190,14 +192,16 @@ public final class IndexDescriptor {
     /**
      * Creates a descriptor with a unit layout: an index created with a shard mode.
      *
-     * <p>{@code numberOfShards} is then the number of <em>units</em>, the physical shards every caller
-     * enumerates, and the layout's declared count is what the user asked for. The two are equal in fixed
-     * mode; an adaptive index starts as one unit whatever it declared. Unit ids must be
-     * {@code 0..numberOfShards-1}, because callers derive a shard's identity from that range.
+     * <p>{@code numberOfShards} is then the number of physical shard <em>slots</em>: the layout's next
+     * unit id, so every unit the index has ever had, live or retired by a split, is a shard below it.
+     * Housekeeping that must reach every slot (purging, reclaiming, releasing) keeps enumerating
+     * {@code 0..numberOfShards-1}; serving (search fan-out, health, catalog, points in time) enumerates
+     * {@link #unitIds()}, the live units only. The layout's declared count is what the user asked for. In
+     * fixed mode all three are equal; an adaptive index starts as one unit whatever it declared.
      *
      * @param name the index name
      * @param uuid the index uuid
-     * @param numberOfShards the number of units, the physical shard count
+     * @param numberOfShards the physical shard slots; with a layout, its next unit id
      * @param mapping the mapping, or null
      * @param extraSettings the settings beyond the shard count
      * @param mappingVersion how many times the mapping has changed
@@ -243,16 +247,42 @@ public final class IndexDescriptor {
         this.createdAtMillis = createdAtMillis;
         this.createdVersionId = createdVersionId;
         this.aliasedBy = List.copyOf(aliasedBy);
-        if (layout != null) {
-            for (org.opensearch.serverless.routing.UnitLayout.Unit unit : layout.units()) {
-                if (unit.id() >= numberOfShards || layout.unitCount() != numberOfShards) {
-                    throw new IllegalArgumentException(
-                        "a layout's units must be shards 0.." + (numberOfShards - 1) + " of [" + name + "], got " + layout
-                    );
-                }
-            }
+        if (layout != null && layout.nextUnitId() != numberOfShards) {
+            // Every unit id is below the next one, so this also puts every unit inside the slots.
+            throw new IllegalArgumentException(
+                "[" + name + "] has " + numberOfShards + " shard slots but its layout's next unit id is " + layout.nextUnitId()
+            );
         }
         this.layout = layout;
+        if (layout == null) {
+            this.unitIds = null;
+        } else {
+            final int[] ids = new int[layout.unitCount()];
+            for (int i = 0; i < ids.length; i++) {
+                ids[i] = layout.units().get(i).id();
+            }
+            java.util.Arrays.sort(ids);
+            this.unitIds = ids;
+        }
+    }
+
+    /**
+     * Returns the shards that hold documents now, in ascending order: {@code 0..numberOfShards-1} for an
+     * index without a shard mode, the live unit ids otherwise. What a search fans out over, and what health,
+     * the catalog and a point in time cover. A unit retired by a split keeps its slot until its data is
+     * collected, but is not here.
+     *
+     * @return the live shard ids; a fresh array the caller may keep
+     */
+    public int[] unitIds() {
+        if (unitIds == null) {
+            final int[] all = new int[numberOfShards];
+            for (int i = 0; i < all.length; i++) {
+                all[i] = i;
+            }
+            return all;
+        }
+        return unitIds.clone();
     }
 
     /**
@@ -276,7 +306,7 @@ public final class IndexDescriptor {
     }
 
     /**
-     * Returns this descriptor with a unit layout, its shard count set to the layout's unit count.
+     * Returns this descriptor with a unit layout, its shard slots set to the layout's next unit id.
      *
      * @param newLayout the layout, or null to route as an index without a shard mode
      * @return the new descriptor
@@ -285,7 +315,7 @@ public final class IndexDescriptor {
         return new IndexDescriptor(
             name,
             uuid,
-            newLayout == null ? numberOfShards : newLayout.unitCount(),
+            newLayout == null ? numberOfShards : newLayout.nextUnitId(),
             mapping,
             extraSettings,
             mappingVersion,

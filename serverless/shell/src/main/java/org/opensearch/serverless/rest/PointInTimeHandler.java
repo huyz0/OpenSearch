@@ -305,7 +305,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
         metadata.beginPointInTime(new PointInTime(pitId, index, descriptor.get().uuid(), now + keepAlive, Map.of(), true));
 
         final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
-        for (int shard = 0; shard < descriptor.get().numberOfShards(); shard++) {
+        for (int shard : descriptor.get().unitIds()) {
             final var manifest = metadata.segmentPublisher(index, descriptor.get().uuid(), shard).readManifest();
             if (manifest.isEmpty()) {
                 // A shard with nothing published cannot be frozen, and freezing the rest would give a view

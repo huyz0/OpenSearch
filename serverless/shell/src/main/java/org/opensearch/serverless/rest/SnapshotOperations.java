@@ -193,7 +193,7 @@ final class SnapshotOperations {
                 final IndexDescriptor descriptor = index.getValue();
                 final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
                 boolean complete = true;
-                for (int shard = 0; shard < descriptor.numberOfShards(); shard++) {
+                for (int shard : descriptor.unitIds()) {
                     final Optional<CommitManifest> manifest = metadata.segmentPublisher(trimmed, descriptor.uuid(), shard).readManifest();
                     if (manifest.isEmpty()) {
                         if (partial) {

@@ -67,7 +67,7 @@ final class DeleteByQueryExecution {
         );
 
         final java.util.Map<Integer, org.opensearch.serverless.store.CommitManifest> shards = new java.util.LinkedHashMap<>();
-        for (int shard = 0; shard < descriptor.numberOfShards(); shard++) {
+        for (int shard : descriptor.unitIds()) {
             final var manifest = plane.segmentPublisher(index, descriptor.uuid(), shard).readManifest();
             if (manifest.isEmpty()) {
                 // Nothing published on this shard: nothing to match, and nothing silently skipped either

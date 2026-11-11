@@ -243,7 +243,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
                             org.opensearch.action.admin.indices.create.CreateIndexAction.NAME,
                             new org.opensearch.action.admin.indices.create.CreateIndexRequest(index),
                             () -> {
-                                resolvedShards.set(createIndex(node.get(), metadata, index, create).numberOfShards());
+                                resolvedShards.set(createIndex(node.get(), metadata, index, create).declaredShards());
                                 return null;
                             }
                         );

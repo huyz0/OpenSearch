@@ -412,8 +412,9 @@ public final class ClusterHealthHandler extends BaseRestHandler {
                 return health;
             }
             final IndexHealth each = new IndexHealth();
-            each.shards = descriptor.get().numberOfShards();
-            for (int shard = 0; shard < descriptor.get().numberOfShards(); shard++) {
+            final int[] live = descriptor.get().unitIds();
+            each.shards = live.length;
+            for (int shard : live) {
                 String state;
                 try {
                     final var head = metadata.heads().read(index, shard);
