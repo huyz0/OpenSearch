@@ -35,6 +35,9 @@ final class DescriptorRefresh {
         for (org.opensearch.core.index.shard.ShardId shardId : node.reconciler.openShards()) {
             indices.add(shardId.getIndexName());
         }
+        if (indices.isEmpty() == false) {
+            refreshClusterPlacement(plane, false);
+        }
         // What was read, for the caller: present, or definitely absent. An index whose read failed is
         // left out, so a transient error is never mistaken for a deletion.
         final java.util.Map<String, java.util.Optional<IndexDescriptor>> read = new java.util.LinkedHashMap<>();
@@ -63,6 +66,29 @@ final class DescriptorRefresh {
         }
         node.descriptorReadAtNanos.keySet().retainAll(indices);
         return read;
+    }
+
+    /**
+     * Reads the cluster's segment placement from its register, at most every few minutes unless forced: one read for
+     * every shard this node publishes, since a publish reads the copy kept here.
+     *
+     * @param plane the metadata plane
+     * @param force true to read now
+     */
+    void refreshClusterPlacement(org.opensearch.serverless.metadata.MetadataPlane plane, boolean force) {
+        final long now = System.nanoTime();
+        if (force == false
+            && node.clusterSegmentPlacementRead
+            && now - node.clusterSegmentPlacementReadAtNanos < SegmentPlacement.CLUSTER_REFRESH_NANOS) {
+            return;
+        }
+        try {
+            node.clusterSegmentPlacement = plane.clusterConfig().read().settings().get(SegmentPlacement.CLUSTER_SETTING);
+            node.clusterSegmentPlacementReadAtNanos = now;
+            node.clusterSegmentPlacementRead = true;
+        } catch (Exception e) {
+            ServerlessNode.logger.warn("could not read the cluster's segment placement; keeping [" + node.clusterSegmentPlacement + "]", e);
+        }
     }
 
     /**

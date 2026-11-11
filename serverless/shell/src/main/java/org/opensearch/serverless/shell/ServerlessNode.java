@@ -570,6 +570,16 @@ public final class ServerlessNode implements Closeable {
 
     volatile long descriptorRefreshIntervalMillis = 0L;
 
+    /** The cluster's segment placement as last read from its register, or null; see {@link SegmentPlacement}. */
+    volatile String clusterSegmentPlacement;
+    volatile long clusterSegmentPlacementReadAtNanos;
+    volatile boolean clusterSegmentPlacementRead;
+
+    /** The planes whose pack ledger this node has looked at for packs to collect; see {@link NodePackWiring}. */
+    final java.util.Set<org.opensearch.serverless.metadata.MetadataPlane> packLedgersChecked = java.util.Collections.newSetFromMap(
+        new java.util.IdentityHashMap<>()
+    );
+
     /**
      * Sets how long the descriptors of open indices go between re-reads when nothing else has read them;
      * zero re-reads them on every pass, which is the library default. See

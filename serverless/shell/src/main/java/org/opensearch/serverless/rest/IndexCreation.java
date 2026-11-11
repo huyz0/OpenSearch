@@ -305,7 +305,17 @@ final class IndexCreation {
         } catch (IllegalArgumentException e) {
             throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
         }
-        final Settings settings = org.opensearch.serverless.routing.ShardMode.without(given);
+        // So is the segment placement.
+        final String placement = given.get(org.opensearch.serverless.shell.SegmentPlacement.INDEX_SETTING);
+        if (placement != null) {
+            try {
+                org.opensearch.serverless.shell.SegmentPlacement.check(placement);
+            } catch (IllegalArgumentException e) {
+                throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+            }
+        }
+        final Settings settings = org.opensearch.serverless.routing.ShardMode.without(given)
+            .filter(key -> org.opensearch.serverless.shell.SegmentPlacement.INDEX_SETTING.equals(key) == false);
         final String unsupported = unsupportedIndexSetting(settings);
         if (unsupported != null) {
             throw new IndexAdminHandler.RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_setting", unsupported);

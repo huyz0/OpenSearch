@@ -282,6 +282,7 @@ final class NodeServiceBuilders {
                 org.opensearch.common.settings.Setting.Property.PrivateIndex
             )
         );
+        known.add(SegmentPlacement.INDEX);
         return new IndexScopedSettings(services.settings, known);
     }
 

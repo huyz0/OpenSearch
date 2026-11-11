@@ -116,6 +116,19 @@ public final class ShardReconciler {
     final Map<ShardId, java.util.concurrent.atomic.AtomicInteger> inFlight = new ConcurrentHashMap<>();
     final Set<ShardId> readers = ConcurrentHashMap.newKeySet();
     volatile java.util.function.Function<ShardId, SegmentPublisher> publishers;
+
+    /** Whether a shard's next publish puts its segments in node packs, or null to leave its publisher as built. */
+    volatile java.util.function.Predicate<IndexShard> nodePackPlacement;
+
+    /**
+     * Sets how a shard's segment placement is decided at each publish.
+     *
+     * @param placement true for node packs
+     */
+    public void setNodePackPlacement(java.util.function.Predicate<IndexShard> placement) {
+        this.nodePackPlacement = placement;
+    }
+
     volatile java.util.function.Function<ShardId, org.opensearch.serverless.store.WalStore> walStores;
 
     /** Whether this node still owns a shard at a term, asked by a writer after it fences its own term. */
