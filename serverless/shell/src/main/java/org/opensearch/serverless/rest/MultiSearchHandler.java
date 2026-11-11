@@ -346,7 +346,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
                         continue;
                     }
                     builder.startObject();
-                    SearchHandler.renderInto(builder, item.skipped(), item.response(), item.complete(), params);
+                    SearchRendering.renderInto(builder, item.skipped(), item.response(), item.complete(), params);
                     builder.field("status", item.response().status().getStatus());
                     builder.endObject();
                 }
