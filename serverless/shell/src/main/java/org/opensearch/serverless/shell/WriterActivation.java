@@ -237,6 +237,12 @@ public final class WriterActivation {
         if (described.isEmpty()) {
             return java.util.Optional.empty();
         }
+        if (described.get().writableSlot(shardNumber) == false) {
+            // A unit a split retired, reached by a coordinator still routing with the layout from before it: taking it
+            // back would let it take writes beside the halves that replaced it. The coordinator re-reads and retries.
+            ServerlessNode.logger.debug("not taking {}[{}]: it is not a live unit of the index", indexName, shardNumber);
+            return java.util.Optional.empty();
+        }
         final long acquiringAt = System.nanoTime();
         node.nodeCapacity().activationPhases[0].addAndGet(acquiringAt - describedAt);
         final org.opensearch.serverless.metadata.Acquisition acquisition = plane.activate(
