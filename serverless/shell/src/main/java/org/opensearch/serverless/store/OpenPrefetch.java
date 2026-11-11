@@ -118,6 +118,38 @@ final class OpenPrefetch {
         }
     }
 
+    /**
+     * Fetches named blocks of some files that are not already held, consecutive ones coalesced into ranged reads of at
+     * most {@value #MAX_WARM_RANGE_BLOCKS} blocks.
+     *
+     * <p>For a joining search node: the blocks its peers named as hot but could not hand over. Wider ranges than an
+     * open's, since these are known to be wanted and the request count is what a warm join is trying to keep down.
+     *
+     * @param wanted the blocks wanted, by file
+     * @param cache the cache the blocks go into
+     * @param executor where the helper reads run
+     * @return how many ranged reads were needed
+     */
+    static int fetchBlocks(Map<Target, TreeSet<Long>> wanted, BlockCache cache, Executor executor) {
+        final List<Range> ranges = new ArrayList<>();
+        for (Map.Entry<Target, TreeSet<Long>> file : wanted.entrySet()) {
+            final TreeSet<Long> missing = new TreeSet<>();
+            for (long block : file.getValue()) {
+                if (cache.peek(file.getKey().key(block)) == null) {
+                    missing.add(block);
+                }
+            }
+            ranges.addAll(ranges(file.getKey(), missing, MAX_WARM_RANGE_BLOCKS));
+        }
+        if (ranges.isEmpty() == false) {
+            fetchAll(ranges, cache, executor);
+        }
+        return ranges.size();
+    }
+
+    /** The widest ranged read a warm join makes: 8 MB of 64 KB blocks. */
+    static final int MAX_WARM_RANGE_BLOCKS = 128;
+
     /** The blocks a reader of the byte span {@code [offset, offset + length)} touches first: its head and tail. */
     private static void addFile(TreeSet<Long> wanted, long offset, long length, int blockSize) {
         if (length <= 0) {
@@ -136,11 +168,15 @@ final class OpenPrefetch {
     }
 
     private static List<Range> ranges(Target file, TreeSet<Long> blocks) {
+        return ranges(file, blocks, MAX_RANGE_BLOCKS);
+    }
+
+    private static List<Range> ranges(Target file, TreeSet<Long> blocks, int maxBlocks) {
         final List<Range> ranges = new ArrayList<>();
         long start = -1;
         long end = -1;
         for (long block : blocks) {
-            if (start >= 0 && block == end + 1 && block - start < MAX_RANGE_BLOCKS) {
+            if (start >= 0 && block == end + 1 && block - start < maxBlocks) {
                 end = block;
                 continue;
             }
