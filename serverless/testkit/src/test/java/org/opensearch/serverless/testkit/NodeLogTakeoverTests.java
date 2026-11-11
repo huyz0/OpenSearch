@@ -100,6 +100,31 @@ public class NodeLogTakeoverTests extends OpenSearchTestCase {
         }
     }
 
+    public void testAFenceFromAStaleLeaseIsSearchedForAgainAboveWhatTheWriterDeleted() throws Exception {
+        try (FsBlobStore store = new FsBlobStore(8192, createTempDir(), false)) {
+            final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
+            final NodeLogCommitter writer = committer(log);
+            writer.commit(A, 1L, one("old-0", 0));
+            writer.commit(A, 1L, one("old-1", 1));
+            // A successor reads the lease here, with a landed hint of 2...
+            final List<NodeLogEpoch> stale = writer.positions();
+            for (int i = 2; i < 6; i++) {
+                writer.commit(A, 1L, one("old-" + i, i));
+            }
+            // ...and before it fences, A publishes, the writer records the new trim point, deletes behind it, and writes on.
+            writer.onPublished(A, writer.lastPosition(A));
+            final List<NodeLogEpoch> recorded = writer.positions();
+            log.deleteRange(0L, 0L, recorded.get(0).trimPoint());
+            writer.commit(B, 1L, one("b-after", 0));
+            final List<NodeLogEpoch> now = writer.positions();
+
+            assertEquals("the fence alone would land in the hole", 2L, stale.get(0).landed());
+            final NodeLogTakeover takeover = new NodeLogTakeover(log, stale, "node-2", 2L, () -> now);
+            assertEquals("found above the hole the deletion left", List.of("b-after"), ids(takeover.records(B)));
+            expectThrows(IOException.class, () -> writer.commit(B, 1L, one("after-the-fence", 1)));
+        }
+    }
+
     public void testAnEpochWithNothingAboveItsTrimPointReadsNoRecords() throws Exception {
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
