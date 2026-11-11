@@ -153,7 +153,7 @@ public final class WriterActivation {
             }
             final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = plane.heads()
                 .read(held.getIndexName(), held.id());
-            node.noteHead(held.getIndexName(), held.id(), head.orElse(null));
+            node.sightings().noteHead(held.getIndexName(), held.id(), head.orElse(null));
             if (node.leases.namesThisNode(head, held)) {
                 // The listing lagged, or the claim was never written. The head is what decides, and it
                 // says this shard is ours; keep serving it.
@@ -249,7 +249,7 @@ public final class WriterActivation {
         if (acquisition.acquired() == false) {
             // The winner's head is the freshest routing fact this node has, and it was paid for: a
             // write for this shard forwards there without another read.
-            node.noteHead(indexName, shardNumber, acquisition.head());
+            node.sightings().noteHead(indexName, shardNumber, acquisition.head());
             return java.util.Optional.empty();
         }
         // Open the one shard just won, from the head and descriptor already in hand. This used to run
@@ -259,7 +259,7 @@ public final class WriterActivation {
         final ShardAssignment assignment = new ShardAssignment(indexName, shardNumber, acquisition.head().term());
         // The head just won is the freshest there is: the first publish checks ownership against it rather than
         // reading it back.
-        node.noteHead(indexName, shardNumber, acquisition.head());
+        node.sightings().noteHead(indexName, shardNumber, acquisition.head());
         node.hosted.put(indexName, described.get());
         final String openingKey = ServerlessNode.shardKey(indexName, shardNumber);
         node.writerAssignments.put(openingKey, assignment);
@@ -294,7 +294,7 @@ public final class WriterActivation {
             // on this node would try again: a shard nobody serves and nobody is looking for. Give the
             // head back, so the next node to ask -- possibly this one -- acquires cleanly.
             node.writerAssignments.remove(ServerlessNode.shardKey(indexName, shardNumber));
-            node.noteHead(indexName, shardNumber, null);
+            node.sightings().noteHead(indexName, shardNumber, null);
             try {
                 // The head goes on naming every log it named, and this node's own: an open that failed published nothing.
                 plane.heads()

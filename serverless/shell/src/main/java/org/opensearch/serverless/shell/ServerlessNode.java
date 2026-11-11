@@ -60,60 +60,6 @@ import java.util.concurrent.TimeUnit;
  */
 public final class ServerlessNode implements Closeable {
 
-    /**
-     * The pool forwarded searches and explains are answered on, and the heartbeat's head scan reads on.
-     *
-     * <p>Not the coordinator's own shard tasks any more: those run on GENERIC (see {@code SearchFanout}),
-     * so a search that waits on GENERIC for tasks that also ran on GENERIC cannot park every thread
-     * waiting for work no thread is free to do. See the thread pool's construction for why it is
-     * separate at all.
-     */
-    public static final String FANOUT_POOL = "serverless_fanout";
-
-    /**
-     * The pool a forwarded write is applied on, at its owner.
-     *
-     * <p>Not WRITE. A write that arrives at a node that does not own its shard is forwarded, and the WRITE thread
-     * that took it waits for the owner's answer; when the owner applied forwarded writes on WRITE too, every node's
-     * WRITE threads could end up waiting on every other node's, and none was free to apply what the others were
-     * waiting for. A fleet of six under a few hundred writes a second stopped acknowledging almost entirely until
-     * the forwards timed out. A forwarded write is applied locally and forwards nothing further, so this pool waits
-     * on nothing that runs on a pool a forward waits on.
-     */
-    public static final String FORWARDED_WRITE_POOL = "serverless_forwarded_write";
-
-    /**
-     * The thread a node renews its lease on, and nothing else does.
-     *
-     * <p>A lease that is not renewed in time is a node its peers may take everything from, so renewal cannot wait behind
-     * other work. It ran on GENERIC, and under a burst of activations -- each a few object-store round trips -- renewals
-     * ran late, leases ran out, peers revoked them, and a busy node became a dead one, which made the burst bigger.
-     */
-    public static final String LEASE_POOL = "serverless_lease";
-
-    /**
-     * The threads shard activations run on, and nothing else does.
-     *
-     * <p>They ran on GENERIC, which is also where a write waits for the activation of the shard it is for, and where
-     * an activation pass waits for all of its own. A fleet run filled all 128 GENERIC threads with such waiters: the
-     * activations they waited for sat in GENERIC's queue behind them, one starting only when a waiting write timed out
-     * and gave its thread back. A shard whose owner had closed it locally waited ten minutes and more to be re-taken,
-     * answering every forwarded write "not open here" meanwhile.
-     */
-    public static final String ACTIVATION_POOL = "serverless_activation";
-
-    /**
-     * Where shards are published, several at once: a node holding hundreds published them one after another on GENERIC,
-     * and the passes that piled up behind each other starved everything else waiting there.
-     */
-    public static final String PUBLISH_POOL = "serverless_publish";
-
-    /** How many shards a node activates at once; see {@code ServerlessBootstrap#ACTIVATION_CONCURRENCY}. */
-    public static final String ACTIVATION_CONCURRENCY_SETTING = "serverless.activation.concurrency";
-
-    /** The pool a forwarded get is answered on, at its owner: not GET, for the reason {@link #FORWARDED_WRITE_POOL} is not WRITE. */
-    public static final String FORWARDED_READ_POOL = "serverless_forwarded_read";
-
     static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(ServerlessNode.class);
 
     /** Accepts writer activation: takes ownership of shards and indexes into them. */
@@ -480,6 +426,7 @@ public final class ServerlessNode implements Closeable {
         installed.addAll(plugins);
         this.plugins = new ServerlessPlugins(installed);
         this.settings = NodeServices.withShellDefaults(this.plugins.settingsWith(settings));
+        this.searchSettings = new SearchSettings(this.settings);
         settings = this.settings;
 
         this.nodeName = settings.get("node.name", "serverless-node");
@@ -543,50 +490,7 @@ public final class ServerlessNode implements Closeable {
         // thread waiting for tasks no thread was free to run. A forwarded search handler ran on SEARCH and
         // blocked on the query phase forked to SEARCH, with the same shape. Both now run here, and this
         // pool waits on nothing that runs on it.
-        final int processors = org.opensearch.common.util.concurrent.OpenSearchExecutors.allocatedProcessors(settings);
-        this.threadPool = new ThreadPool(
-            settings,
-            new org.opensearch.threadpool.ScalingExecutorBuilder(
-                FANOUT_POOL,
-                1,
-                Math.max(8, 4 * processors),
-                org.opensearch.common.unit.TimeValue.timeValueSeconds(30)
-            ),
-            // Sized and queued like WRITE and GET, whose work they take over for requests that were forwarded.
-            new org.opensearch.threadpool.FixedExecutorBuilder(
-                settings,
-                FORWARDED_WRITE_POOL,
-                processors,
-                10_000,
-                "thread_pool." + FORWARDED_WRITE_POOL
-            ),
-            new org.opensearch.threadpool.FixedExecutorBuilder(settings, LEASE_POOL, 1, 16, "thread_pool." + LEASE_POOL),
-            // Sized past the default activation concurrency, which is what bounds how many are submitted at once;
-            // the queue only absorbs a concurrency raised beyond the pool.
-            // Twice the activations allowed at once, and never fewer than sixteen: an activation can wait on another's
-            // single-flight while holding a thread.
-            new org.opensearch.threadpool.FixedExecutorBuilder(settings, PUBLISH_POOL, 8, 100_000, "thread_pool." + PUBLISH_POOL),
-            new org.opensearch.threadpool.FixedExecutorBuilder(
-                settings,
-                ACTIVATION_POOL,
-                Math.max(
-                    16,
-                    2 * settings.getAsInt(
-                        ACTIVATION_CONCURRENCY_SETTING,
-                        org.opensearch.serverless.reconcile.BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY
-                    )
-                ),
-                1000,
-                "thread_pool." + ACTIVATION_POOL
-            ),
-            new org.opensearch.threadpool.FixedExecutorBuilder(
-                settings,
-                FORWARDED_READ_POOL,
-                Math.max(4, processors),
-                1_000,
-                "thread_pool." + FORWARDED_READ_POOL
-            )
-        );
+        this.threadPool = NodeThreadPools.build(settings);
         this.services = new NodeServices(settings, this.plugins, threadPool, () -> metadataPlane, () -> this, this::indicesService);
         this.readerValidation = new ReaderValidation(
             () -> localNode.getId(),
@@ -822,69 +726,16 @@ public final class ServerlessNode implements Closeable {
      */
     public static final int DEFAULT_RECENT_HEADS_PRUNE_ABOVE = ShardHeadSightings.DEFAULT_RECENT_HEADS_PRUNE_ABOVE;
 
-    /** The shard heads this node has read lately; the methods below forward to it. */
+    /** The shard heads this node has read lately. */
     final ShardHeadSightings sightings = new ShardHeadSightings(() -> metadataPlane);
 
     /**
-     * Records a head this node has just read, for the other readers in the same pass and for routing.
+     * Returns the shard heads this node has read lately, for routing hints and for readers in the same pass.
      *
-     * @param index the index
-     * @param shard the shard
-     * @param head what was read, or null if there was no head
+     * @return the head sightings
      */
-    public void noteHead(String index, int shard, org.opensearch.serverless.metadata.ShardHead head) {
-        sightings.noteHead(index, shard, head);
-    }
-
-    /**
-     * Sets how many head sightings this node may hold before those older than a lease are dropped.
-     *
-     * @param entries the threshold
-     */
-    public void setRecentHeadsPruneAbove(int entries) {
-        sightings.setRecentHeadsPruneAbove(entries);
-    }
-
-    /**
-     * Returns how many shards this node holds a head sighting for, for tests that pin its bound.
-     *
-     * @return the entry count
-     */
-    public int recentHeadCount() {
-        return sightings.recentHeadCount();
-    }
-
-    /**
-     * Returns a head read within the given age, if this node has one.
-     *
-     * @param index the index
-     * @param shard the shard
-     * @param maxAgeMillis how old the read may be
-     * @return the head, or empty if none that young was read
-     */
-    public java.util.Optional<org.opensearch.serverless.metadata.ShardHead> recentHead(String index, int shard, long maxAgeMillis) {
-        return sightings.recentHead(index, shard, maxAgeMillis);
-    }
-
-    /**
-     * Returns the node last seen owning a shard, if the sighting is no older than one lease TTL.
-     *
-     * @param index the index
-     * @param shard the shard
-     * @return the owner's node id, or empty if no head young enough has been read here
-     */
-    public java.util.Optional<String> ownerHint(String index, int shard) {
-        return sightings.ownerHint(index, shard);
-    }
-
-    /**
-     * Forgets a hint an owner has just refused.
-     *
-     * @param index the index
-     * @param shard the shard
-     */
-    public void forgetOwner(String index, int shard) {
-        sightings.forgetOwner(index, shard);
+    public ShardHeadSightings sightings() {
+        return sightings;
     }
 
     /**
@@ -1022,97 +873,16 @@ public final class ServerlessNode implements Closeable {
         return pluginActions;
     }
 
-    /**
-     * The most indices a prefix pattern may match before the request is refused.
-     *
-     * <p>Configurable because it is a policy about how much fan-out a caller may ask for in one request,
-     * not a fact about the store — and because a default of ten thousand is unreachable in a test, which
-     * would leave the refusal path unexercised.
-     *
-     * @return the cap
-     */
-    public int patternCap() {
-        return settings.getAsInt(
-            "serverless.search.pattern.max_indices",
-            org.opensearch.serverless.metadata.MetadataPlane.DEFAULT_PATTERN_CAP
-        );
-    }
-
-    /** How many shards a search works on at once by default. */
-    public static final int DEFAULT_SEARCH_FANOUT_CONCURRENCY = 16;
+    /** The search settings this node was started with. */
+    final SearchSettings searchSettings;
 
     /**
-     * How many shards a search fans out to at once: the width of its sliding window.
+     * Returns the search settings this node was started with: fan-out width, pattern caps and rollup use.
      *
-     * <p>A search waits on object-store round trips, not on CPU, so its width is set by how many requests in
-     * flight a coordinator should hold rather than by cores. Configurable because that depends on the store.
-     *
-     * @return the width, at least one
+     * @return the search settings
      */
-    public int searchFanoutConcurrency() {
-        return Math.max(1, settings.getAsInt("serverless.search.fanout.concurrency", DEFAULT_SEARCH_FANOUT_CONCURRENCY));
-    }
-
-    /** How many indices a prefix pattern must match before a search reads its group's digest rollups. */
-    public static final int DEFAULT_ROLLUP_MIN_INDICES = 32;
-
-    /**
-     * Whether a prefix pattern long enough to name one rollup group is resolved from the group's entries rather
-     * than by listing every name under the prefix. On by default: a listing costs a page per thousand names, and a
-     * store holding a million under one prefix times out before the first page.
-     *
-     * @return true to resolve from the rollups
-     */
-    public boolean resolveFromRollups() {
-        return settings.getAsBoolean("serverless.search.resolve_from_rollups", true);
-    }
-
-    /**
-     * How old this node's copy of a rollup group may be and still resolve a pattern. Zero by default -- the group
-     * is read for every search -- because a copy that predates an index's activation leaves the index off the
-     * search, and a search on its owner would otherwise have seen its refreshed documents. A deployment that
-     * accepts that window for fewer reads can set it.
-     *
-     * @return the age in milliseconds; zero to read the group every time
-     */
-    public long rollupCacheMillis() {
-        return Math.max(0L, settings.getAsLong("serverless.search.rollup.cache_millis", 0L));
-    }
-
-    /**
-     * How many indices a pattern must match before the digest rollups are consulted: below it, the per-index
-     * checks cost less than the group's registers.
-     *
-     * @return the threshold
-     */
-    public int rollupMinIndices() {
-        return Math.max(1, settings.getAsInt("serverless.search.rollup.min_indices", DEFAULT_ROLLUP_MIN_INDICES));
-    }
-
-    /** How many cold shards one search may activate by default. */
-    public static final int DEFAULT_SEARCH_ACTIVATION_BUDGET = 1024;
-
-    /**
-     * How many shards not open on this node one search may ask for: each may cost a cold open somewhere.
-     *
-     * <p>A search past it is refused, or with {@code allow_partial_activation} answered from the first shards
-     * within it. What the pruning digest skips does not count, so the budget bounds what a query actually
-     * wakes, not how many indices its pattern names.
-     *
-     * @return the budget, at least one
-     */
-    public int searchActivationBudget() {
-        return Math.max(1, settings.getAsInt("serverless.search.max_activations_per_query", DEFAULT_SEARCH_ACTIVATION_BUDGET));
-    }
-
-    /**
-     * Whether a search skips the shards whose pruning digest rules the query out. On unless
-     * {@code serverless.search.prune} says otherwise, which exists to measure what pruning saves.
-     *
-     * @return true when pruning is on
-     */
-    public boolean searchPruning() {
-        return settings.getAsBoolean("serverless.search.prune", true);
+    public SearchSettings searchSettings() {
+        return searchSettings;
     }
 
     /**
@@ -1301,75 +1071,12 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * Records that a request touched this shard, on the clock the reconciler will compare against.
-     *
-     * <p><b>The plane's clock, not the wall clock, and that is not a detail.</b> Idle release compares a
-     * stamp made here against the time a reconcile pass was given, and a test drives that pass from a
-     * clock it controls. Stamping {@code System.currentTimeMillis()} instead makes every shard look as
-     * though it were used far in the future, so nothing is ever idle — which is exactly how the first run
-     * of these tests failed, with a controller that was working and a stamp that was not comparable.
-     *
-     * @param shardId the shard a request used
-     */
-    public void markUsed(org.opensearch.core.index.shard.ShardId shardId) {
-        final org.opensearch.serverless.metadata.MetadataPlane plane = metadataPlane;
-        reconciler.markUsed(shardId, plane == null ? System.currentTimeMillis() : plane.clock().getAsLong());
-    }
-
-    /**
-     * Publishes a shard's current commit to the object store, fenced by the owning term.
-     *
-     * @param shardId the shard to publish
-     * @param term the term this node owns the shard at
-     * @return the manifest published
-     * @throws java.io.IOException if the shard is not held here, or a newer term already published
-     */
-    public org.opensearch.serverless.store.CommitManifest publishShard(org.opensearch.core.index.shard.ShardId shardId, long term)
-        throws java.io.IOException {
-        ensureStarted();
-        return reconciler.publish(shardId, term);
-    }
-
-    /**
      * Returns the roles this node advertises.
      *
      * @return the roles
      */
     public Set<String> roles() {
         return roles;
-    }
-
-    /**
-     * Closes a shard this node has stopped owning.
-     *
-     * <p>Deliberately separate from {@link WriterActivation#applyTruth}: a shard is never closed because a view omitted
-     * it, only because truth says ownership is gone. See {@code ShardReconciler}.
-     *
-     * @param shardId the shard to release
-     * @param reason why, for the log
-     */
-    public void releaseShard(org.opensearch.core.index.shard.ShardId shardId, String reason) {
-        ensureStarted();
-        reconciler.releaseShard(shardId, reason);
-        forgetShardRecords(shardId);
-    }
-
-    /**
-     * Drops what this node remembered about a shard once it is no longer open here: the reader records
-     * that would otherwise be re-projected on every open, the head it last read, and -- once no shard of
-     * the index remains -- the descriptor versions it had applied.
-     */
-    void forgetShardRecords(org.opensearch.core.index.shard.ShardId shardId) {
-        if (reconciler.shard(shardId) != null) {
-            return;
-        }
-        readerServing.forgetReader(shardId);
-        sightings.forgetOwner(shardId.getIndexName(), shardId.id());
-        writerAssignments.remove(shardKey(shardId.getIndexName(), shardId.id()));
-        if (reconciler.openShards().stream().noneMatch(open -> open.getIndexName().equals(shardId.getIndexName()))) {
-            appliedDescriptorVersions.remove(shardId.getIndexName());
-            hosted.remove(shardId.getIndexName());
-        }
     }
 
     /**
@@ -1406,76 +1113,28 @@ public final class ServerlessNode implements Closeable {
 
     final java.util.Map<String, Long> readerTerms = new java.util.concurrent.ConcurrentHashMap<>();
 
-    org.opensearch.core.index.shard.ShardId localShardOf(String indexName, int shardNumber) {
-        return reconciler.openShards()
-            .stream()
-            .filter(s -> s.getIndexName().equals(indexName) && s.id() == shardNumber)
-            .findFirst()
-            .orElse(null);
-    }
-
-    private record CachedTransportSecrets(org.opensearch.serverless.metadata.MetadataPlane plane,
-        org.opensearch.serverless.metadata.MetadataPlane.TransportSecrets secrets, long readAt) {
-    }
-
-    volatile CachedTransportSecrets transportSecrets;
-    final Object transportSecretsLock = new Object();
+    /** This node's per-shard bookkeeping around its reconciler. */
+    final NodeShards shards = new NodeShards(this);
 
     /**
-     * Returns the transport secrets as last read, re-reading the register at most once per lease TTL and
-     * on demand.
+     * Returns this node's per-shard bookkeeping: marking used, publishing and releasing shards.
      *
-     * <p>The bearer used to be read once and kept for the life of the process, so rotating it meant
-     * restarting every node. The MAC design ({@code TransportAuthenticator}) verifies under the current
-     * generation and, for one window, the previous one, and re-reads when it sees a generation it does
-     * not know -- that is the {@code refresh} argument. The TTL bound on the cache is what makes a
-     * rotation reach every node inside one lease even when nobody forwards it anything under the new
-     * generation.
-     *
-     * @param forceReread true to re-read now -- a verifier that met a generation newer than its copy
-     * @return the secrets, or null before a metadata plane is adopted
-     * @throws java.io.UncheckedIOException if the register cannot be read
+     * @return the shard bookkeeping
      */
-    public org.opensearch.serverless.metadata.MetadataPlane.TransportSecrets transportSecrets(boolean forceReread) {
-        final var plane = metadataPlane;
-        if (plane == null) {
-            return null;
-        }
-        final CachedTransportSecrets observed = transportSecrets;
-        final long now = plane.clock().getAsLong();
-        if (forceReread || expiredSecrets(observed, plane, now)) {
-            synchronized (transportSecretsLock) {
-                CachedTransportSecrets cached = transportSecrets;
-                // Another reader may have refreshed while this one waited. Publish the value and its
-                // timestamp together, and coalesce concurrent explicit refreshes of the same snapshot.
-                if ((forceReread && cached == observed) || expiredSecrets(cached, plane, plane.clock().getAsLong())) {
-                    try {
-                        final var fresh = plane.transportSecrets();
-                        cached = new CachedTransportSecrets(plane, fresh, plane.clock().getAsLong());
-                        transportSecrets = cached;
-                    } catch (java.io.IOException e) {
-                        throw new java.io.UncheckedIOException(e);
-                    }
-                }
-                return cached.secrets();
-            }
-        }
-        return observed.secrets();
+    public NodeShards shards() {
+        return shards;
     }
 
-    private static boolean expiredSecrets(CachedTransportSecrets cached, org.opensearch.serverless.metadata.MetadataPlane plane, long now) {
-        return cached == null || cached.plane() != plane || now < cached.readAt() || now - cached.readAt() > plane.leaseTtlMillis();
-    }
+    /** The transport secrets as last read, re-read at most once per lease TTL. */
+    final TransportSecretCache transportSecrets = new TransportSecretCache(() -> metadataPlane);
 
     /**
-     * Returns the secret this deployment's nodes present to one another on forwarded requests: the
-     * current generation of {@link #transportSecrets(boolean)}.
+     * Returns this node's cache of the transport secrets its nodes present to one another.
      *
-     * @return the secret, or null before a metadata plane is adopted
+     * @return the transport secret cache
      */
-    public String transportToken() {
-        final var secrets = transportSecrets(false);
-        return secrets == null ? null : secrets.current();
+    public TransportSecretCache secrets() {
+        return transportSecrets;
     }
 
     void ensureStarted() {

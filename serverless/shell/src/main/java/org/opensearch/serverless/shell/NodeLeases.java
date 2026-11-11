@@ -316,7 +316,7 @@ public final class NodeLeases {
             // The head still needs reading, because losing a shard is something only the head can tell
             // us -- but it is a read, not a write, and that is the whole saving. This used to have an
             // else-branch that renewed each head individually; that mode is gone.
-            node.noteHead(shardId.getIndexName(), shardId.id(), head.orElse(null));
+            node.sightings().noteHead(shardId.getIndexName(), shardId.id(), head.orElse(null));
             if (namesThisNode(head, shardId)) {
                 continue;
             }
@@ -361,7 +361,7 @@ public final class NodeLeases {
             }
             return;
         }
-        final java.util.concurrent.Executor executor = node.threadPool.executor(ServerlessNode.FANOUT_POOL);
+        final java.util.concurrent.Executor executor = node.threadPool.executor(NodeThreadPools.FANOUT_POOL);
         for (int start = 0; start < shards.size(); start += ServerlessNode.HEAD_READ_LANES) {
             final java.util.List<org.opensearch.core.index.shard.ShardId> lane = shards.subList(
                 start,
@@ -422,7 +422,7 @@ public final class NodeLeases {
             return null;
         });
         node.writeFenced.remove(shardId);
-        node.forgetShardRecords(shardId);
+        node.shards().forgetShardRecords(shardId);
         if (forgetClaim) {
             // Drop the claim too. Leaving it is safe -- it is verified on read -- but a node that has
             // churned through shards for a year should not list a year of them to find today's.
@@ -459,7 +459,7 @@ public final class NodeLeases {
                 final var result = node.reconciler.releaseFailedShard(failed, "its engine failed");
                 if (result != ShardReconciler.FailedShardRelease.NOT_CURRENT) {
                     node.writeFenced.remove(shardId);
-                    node.forgetShardRecords(shardId);
+                    node.shards().forgetShardRecords(shardId);
                 }
                 return result;
             });

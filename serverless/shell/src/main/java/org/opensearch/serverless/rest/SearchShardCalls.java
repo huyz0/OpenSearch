@@ -173,7 +173,7 @@ final class SearchShardCalls {
      */
     static void markUsedIfMatched(ServerlessNode serving, ShardId shardId, org.opensearch.serverless.shard.ShardQuery.Result result) {
         if (result.total() > 0) {
-            serving.markUsed(shardId);
+            serving.shards().markUsed(shardId);
         }
     }
 
@@ -192,7 +192,7 @@ final class SearchShardCalls {
             // We are the placement for this shard but do not hold it yet. Open it here rather
             // than asking ourselves over the network.
             final ShardId opened = serving.readers().serveAsReader(metadata, index, shard, descriptor.uuid());
-            serving.markUsed(opened);
+            serving.shards().markUsed(opened);
             return new SearchFanout.ShardAnswer(queryHere(serving, opened, perShard, nowInMillis));
         }
         // The search bound, not the write bound: a peer that is merely busy should cost latency,

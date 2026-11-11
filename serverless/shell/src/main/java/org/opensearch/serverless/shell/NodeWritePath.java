@@ -166,7 +166,7 @@ public final class NodeWritePath {
         // and settings up to the descriptor, so a change made on another node is in force for the first operation
         // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
         node.fences().ensureIncarnationLive(shardId);
-        node.markUsed(shardId);
+        node.shards().markUsed(shardId);
         // Apply first, then log. This is the reverse of what this path used to do, and the reason is the
         // whole point of carrying sequence numbers: the engine assigns one, so there is nothing worth
         // recording until it has run. The durability contract the javadoc above states is unchanged --
@@ -394,7 +394,7 @@ public final class NodeWritePath {
         // and settings up to the descriptor, so a change made on another node is in force for the first operation
         // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
         node.fences().ensureIncarnationLive(shardId);
-        node.markUsed(shardId);
+        node.shards().markUsed(shardId);
         // Apply, then log -- the same reordering, for the same reason, as the index path above.
         final var result = shard.applyDeleteOperationOnPrimary(
             org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
@@ -501,7 +501,7 @@ public final class NodeWritePath {
         // and settings up to the descriptor, so a change made on another node is in force for the first operation
         // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
         node.fences().ensureIncarnationLive(shardId);
-        node.markUsed(shardId);
+        node.shards().markUsed(shardId);
 
         // Applied first, then logged once for the whole batch -- the same reordering the single-document
         // path took, and the batch economics are unchanged: one PUT for the batch, not one per document.

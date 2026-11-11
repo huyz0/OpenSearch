@@ -153,7 +153,7 @@ final class SearchIndexResolver {
             final String prefix = name.substring(0, name.length() - 1);
             final java.util.List<String> matched;
             java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> groupEntries = null;
-            if (serving.resolveFromRollups() && org.opensearch.serverless.metadata.DigestRollups.coversGroup(prefix)) {
+            if (serving.searchSettings().resolveFromRollups() && org.opensearch.serverless.metadata.DigestRollups.coversGroup(prefix)) {
                 // The group's entries are its name list: every index that can hold a document has one, so the
                 // names the listing would add are indices with nothing to find. See DigestRollups.
                 try {
@@ -176,7 +176,7 @@ final class SearchIndexResolver {
                 matched = fromRollups;
             } else {
                 try {
-                    matched = metadata.namesWithPrefix(prefix, serving.patternCap());
+                    matched = metadata.namesWithPrefix(prefix, serving.searchSettings().patternCap());
                 } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
                     return SearchHandler.Resolution.refuse(RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
                 }
@@ -192,20 +192,20 @@ final class SearchIndexResolver {
                 judged,
                 groupEntries
             );
-            if (groupEntries != null && matched.size() - ruledOut.size() > serving.patternCap()) {
+            if (groupEntries != null && matched.size() - ruledOut.size() > serving.searchSettings().patternCap()) {
                 // The cap bounds the work a search fans out to, so it counts what is left to search, not names a
                 // digest has already ruled out.
                 return SearchHandler.Resolution.refuse(
                     RestStatus.BAD_REQUEST,
                     "too_many_indices",
                     "more than "
-                        + serving.patternCap()
+                        + serving.searchSettings().patternCap()
                         + " indices begin with ["
                         + prefix
                         + "] and could match this query ("
                         + (matched.size() - ruledOut.size())
                         + "). Narrowing the pattern or naming the indices is the answer; returning the first "
-                        + serving.patternCap()
+                        + serving.searchSettings().patternCap()
                         + " would be a partial result that looks complete."
                 );
             }
@@ -381,8 +381,8 @@ final class SearchIndexResolver {
         java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> alreadyRead
     ) {
         if (source == null
-            || serving.searchPruning() == false
-            || matched.size() < serving.rollupMinIndices()
+            || serving.searchSettings().searchPruning() == false
+            || matched.size() < serving.searchSettings().rollupMinIndices()
             || org.opensearch.serverless.metadata.DigestRollups.coversGroup(prefix) == false
             || org.opensearch.serverless.store.PruningDigest.mayPrune(source.query()) == false
             || source.suggest() != null
@@ -437,10 +437,10 @@ final class SearchIndexResolver {
                     @Override
                     public <T> java.util.List<T> runAll(java.util.List<java.util.concurrent.Callable<T>> tasks)
                         throws InterruptedException {
-                        return Fanout.run(pool, serving.searchFanoutConcurrency(), tasks);
+                        return Fanout.run(pool, serving.searchSettings().searchFanoutConcurrency(), tasks);
                     }
                 },
-                serving.rollupCacheMillis()
+                serving.searchSettings().rollupCacheMillis()
             );
     }
 
@@ -463,7 +463,7 @@ final class SearchIndexResolver {
             });
         }
         try {
-            Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), serving.searchFanoutConcurrency(), reads);
+            Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), serving.searchSettings().searchFanoutConcurrency(), reads);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
