@@ -15,6 +15,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
+import org.opensearch.serverless.reconcile.TickResult;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -85,13 +86,13 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
             a.index(shardId, "1", "{\"msg\":\"auto\",\"n\":1}");
             a.index(shardId, "2", "{\"msg\":\"auto\",\"n\":2}");
 
-            final BackgroundReconciler.TickResult published = loop.tick(clock.get() + 1_000);
+            final TickResult published = loop.tick(clock.get() + 1_000);
             assertEquals("the tick should have published the shard", 1, published.published().size());
             assertTrue("a commit should now exist in the object store", plane.segmentPublisher("alpha", 0).readManifest().isPresent());
 
             // An idle tick must not publish. Otherwise an untouched shard uploads a fresh commit every
             // tick forever -- an object-store bill for saying nothing happened.
-            final BackgroundReconciler.TickResult idle = loop.tick(clock.get() + 2_000);
+            final TickResult idle = loop.tick(clock.get() + 2_000);
             assertTrue("an idle tick must publish nothing", idle.published().isEmpty());
         }
     }

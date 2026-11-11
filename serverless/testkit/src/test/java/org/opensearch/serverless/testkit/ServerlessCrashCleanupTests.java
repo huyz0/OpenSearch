@@ -18,6 +18,7 @@ import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.DigestRollups;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
+import org.opensearch.serverless.reconcile.JanitorPass;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -327,7 +328,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             later.renewLease(plane);
             plane.membership().refresh();
             final BackgroundReconciler loop = new BackgroundReconciler(later, plane).setDemandDrivenActivation(true);
-            final BackgroundReconciler.JanitorPass pass = loop.sweepAbandoned(100, 8);
+            final JanitorPass pass = loop.sweepAbandoned(100, 8);
             assertEquals("the published shard is given back: " + pass, 1, pass.released());
             assertEquals("the other is taken to be replayed: " + pass, 1, pass.replays());
 

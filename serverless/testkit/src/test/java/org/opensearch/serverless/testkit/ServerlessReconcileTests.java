@@ -17,6 +17,7 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.GarbageCollector;
+import org.opensearch.serverless.reconcile.TickResult;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.test.OpenSearchTestCase;
@@ -85,7 +86,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             final BackgroundReconciler loop = new BackgroundReconciler(a, d.plane);
             loop.want("alpha", 0);
 
-            final BackgroundReconciler.TickResult first = loop.tick(clock.get());
+            final TickResult first = loop.tick(clock.get());
             assertEquals("the first tick should acquire the wanted shard", 1, first.activated().size());
             assertEquals(1, first.hintCount());
 
@@ -94,7 +95,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             assertTrue(thief.activateWriter(d.plane, "alpha", 0).isPresent());
 
             // One tick: A notices the loss, lets go, and does not silently re-take it from the thief.
-            final BackgroundReconciler.TickResult second = loop.tick(clock.get());
+            final TickResult second = loop.tick(clock.get());
             assertEquals("A did not release the shard it lost", 1, second.released().size());
             assertEquals("A stole back a shard with a live lease", 0, second.activated().size());
             assertTrue(a.reconciler().openShards().isEmpty());
@@ -102,7 +103,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             // The thief goes quiet. A takes it back on the tick after expiry -- automatically, which is
             // the whole point of the loop.
             clock.set(1_000L + 2 * TTL);
-            final BackgroundReconciler.TickResult third = loop.tick(clock.get());
+            final TickResult third = loop.tick(clock.get());
             assertEquals("A did not reacquire an expired shard", 1, third.activated().size());
         }
     }

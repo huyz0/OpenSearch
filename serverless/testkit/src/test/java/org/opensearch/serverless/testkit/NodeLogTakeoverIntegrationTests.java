@@ -17,6 +17,7 @@ import org.opensearch.serverless.metadata.Acquisition;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.ShardHead;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
+import org.opensearch.serverless.reconcile.TickResult;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -48,14 +49,14 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
             .build();
     }
 
-    private static BackgroundReconciler.TickResult takeAll(ServerlessNode node, MetadataPlane plane, AtomicLong clock) throws Exception {
+    private static TickResult takeAll(ServerlessNode node, MetadataPlane plane, AtomicLong clock) throws Exception {
         node.renewLease(plane);
         plane.membership().refresh();
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
         for (int shard = 0; shard < SHARDS; shard++) {
             loop.want("alpha", shard);
         }
-        final BackgroundReconciler.TickResult pass = loop.tick(clock.get());
+        final TickResult pass = loop.tick(clock.get());
         assertEquals("one pass opens every shard it wants", SHARDS, node.reconciler().openShards().size());
         return pass;
     }
