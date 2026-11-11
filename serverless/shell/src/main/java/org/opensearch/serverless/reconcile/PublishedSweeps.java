@@ -214,6 +214,7 @@ final class PublishedSweeps {
                     reconciler.unreferencedFor.remove(shardId);
                     reconciler.sweptAgainst.remove(shardId);
                     reconciler.lastManifests.remove(shardId);
+                    reconciler.sweepScopes.remove(shardId);
                     continue;
                 }
                 final Map<String, Integer> seen = reconciler.unreferencedFor.getOrDefault(shardId, Map.of());
@@ -236,8 +237,14 @@ final class PublishedSweeps {
                         shardId.id(),
                         eligible,
                         views,
-                        snapshots
+                        snapshots,
+                        reconciler.sweepScopes.get(shardId)
                     );
+                    if (swept.known() == null) {
+                        reconciler.sweepScopes.remove(shardId);
+                    } else {
+                        reconciler.sweepScopes.put(shardId, swept.known());
+                    }
                     final var manifest = reconciler.lastManifests.get(shardId);
                     if (manifest != null) {
                         reconciler.sweptAgainst.put(shardId, Set.copyOf(manifest.files().keySet()));

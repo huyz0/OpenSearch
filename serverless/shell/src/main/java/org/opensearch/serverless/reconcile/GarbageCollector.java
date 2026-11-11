@@ -172,8 +172,19 @@ public final class GarbageCollector {
      * @param deleted the blobs deleted, qualified by term container
      * @param candidates the blobs that were unreferenced this time, which a later sweep may delete
      */
-    public record ShardSweep(List<String> deleted, Set<String> candidates) {
+    public record ShardSweep(List<String> deleted, Set<String> candidates, SweepScope known) {
+
+        /**
+         * What a sweep did, with nothing for the next one to judge without listing.
+         *
+         * @param deleted the blobs deleted
+         * @param candidates the blobs unreferenced this time
+         */
+        public ShardSweep(List<String> deleted, Set<String> candidates) {
+            this(deleted, candidates, null);
+        }
     }
+
 
     /**
      * Sweeps one shard, deleting only what was already unreferenced last time.
@@ -235,6 +246,36 @@ public final class GarbageCollector {
         Set<String> previousCandidates,
         List<PointInTime> views,
         List<SnapshotRecord> snapshots
+    ) throws IOException {
+        return sweepShard(plane, indexName, shardId, previousCandidates, views, snapshots, null);
+    }
+
+    /**
+     * Sweeps one shard, judging from what the last sweep remembered rather than a listing when it can.
+     *
+     * <p>A merge on a busy shard used to cost a listing of the shard's term containers every time it dropped a
+     * file. With {@code known} from the previous sweep under the same live term, and listed within
+     * {@link SweepScope#RELIST_AFTER_MILLIS}, this judges those names and lists nothing. The rule is the same either way:
+     * an older term's blob that nothing names, seen so twice across the grace.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param previousCandidates what a previous sweep saw unreferenced, or null for everything
+     * @param views every live view
+     * @param snapshots every live snapshot
+     * @param known what the previous sweep returned in {@link ShardSweep#known()}, or null to list
+     * @return what was deleted, what is now a candidate, and what the next sweep may judge without listing
+     * @throws IOException if a listing or a delete fails
+     */
+    public ShardSweep sweepShard(
+        MetadataPlane plane,
+        String indexName,
+        int shardId,
+        Set<String> previousCandidates,
+        List<PointInTime> views,
+        List<SnapshotRecord> snapshots,
+        SweepScope known
     ) throws IOException {
         // Resolve the incarnation once. Resolving the manifest and storage independently by name
         // can apply the old incarnation's references to a replacement created midway through a sweep.
@@ -345,17 +386,16 @@ public final class GarbageCollector {
             );
         final Map<String, Long> firstSeen = tracked == null ? null : tracked.times();
         final long now = plane.clock().getAsLong();
-        final BlobContainer shardContainer = blobStore.blobContainer(RegisterMap.shardData(plane.basePath(), indexName, uuid, shardId));
-        for (Map.Entry<String, BlobContainer> child : shardContainer.children().entrySet()) {
+        final org.opensearch.common.blobstore.BlobPath shardPath = RegisterMap.shardData(plane.basePath(), indexName, uuid, shardId);
+        final boolean fromKnown = known != null && known.term() == liveTerm && now - known.listedAtMillis() < SweepScope.RELIST_AFTER_MILLIS;
+        final Map<String, Set<String>> toJudge = fromKnown
+            ? SweepScope.olderTermBlobs(known.blobs(), previousCandidates, liveTerm)
+            : SweepScope.listOlderTerms(blobStore.blobContainer(shardPath), liveTerm);
+        for (Map.Entry<String, Set<String>> child : toJudge.entrySet()) {
             final String termDir = child.getKey();
-            final Long term = parseTerm(termDir);
-            if (term == null || term >= liveTerm) {
-                // Not a term container, or the live term, or a higher one. A higher term container means
-                // a newer writer is mid-publish and about to become the truth; leave it entirely alone.
-                continue;
-            }
+            final BlobContainer termContainer = blobStore.blobContainer(shardPath.add(termDir));
             final List<String> orphans = new ArrayList<>();
-            for (String blobName : child.getValue().listBlobs().keySet()) {
+            for (String blobName : child.getValue()) {
                 final String qualified = termDir + "/" + blobName;
                 if (referenced.contains(qualified)) {
                     if (firstSeen != null) {
@@ -376,7 +416,7 @@ public final class GarbageCollector {
                 }
             }
             if (orphans.isEmpty() == false) {
-                child.getValue().deleteBlobsIgnoringIfNotExists(orphans);
+                termContainer.deleteBlobsIgnoringIfNotExists(orphans);
                 for (String orphan : orphans) {
                     deleted.add(termDir + "/" + orphan);
                 }
@@ -390,8 +430,13 @@ public final class GarbageCollector {
                 firstSeenUnreferenced.remove(shardKey, tracked);
             }
         }
-        return new ShardSweep(deleted, candidates);
+        // Everything the manifest and the pins named, and what is on watch: what the next sweep judges unlisted.
+        final Set<String> named = new HashSet<>(referenced);
+        named.addAll(candidates);
+        final SweepScope next = new SweepScope(liveTerm, fromKnown ? known.listedAtMillis() : now, SweepScope.olderOnly(named, liveTerm));
+        return new ShardSweep(deleted, candidates, next);
     }
+
 
     /**
      * Sweeps every shard of every index, deleting on first sight.
