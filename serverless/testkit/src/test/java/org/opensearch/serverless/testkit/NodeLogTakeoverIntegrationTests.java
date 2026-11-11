@@ -194,7 +194,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
                 );
                 final ShardHead head = plane.heads().read("alpha", shard).orElseThrow();
                 assertNull("given back", head.ownerNodeId());
-                assertEquals("naming whose log to read", dead, head.lastWriter());
+                assertEquals("naming whose log to read", List.of(dead), head.writers());
             }
 
             // Whoever takes them next reads the dead writer's log, fenced, since it is not live.
@@ -233,23 +233,75 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
         }
     }
 
-    public void testAHeadGivenBackNamesItsLastWriterToTheNextTaker() throws Exception {
+    public void testASuccessorThatDiesBeforeItPublishesLeavesTheNextOneEveryLogToRead() throws Exception {
+        final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
+        final ServerlessNode first = new ServerlessNode(nodeSettings("node-log-chain-first"));
+        try {
+            first.start();
+            first.setMetadataPlane(plane);
+            final Map<Integer, String> unpublished = writeAndLeaveUnpublished(first, plane, clock, "chain");
+
+            // A second node takes every head and dies before it opens any shard, so it replays and publishes nothing.
+            clock.addAndGet(2 * TTL);
+            for (int shard = 0; shard < SHARDS; shard++) {
+                final Acquisition taken = plane.heads()
+                    .acquire("alpha", shard, "node-log-chain-second", "eph-second", "uuid-alpha-00000000");
+                assertTrue(taken.acquired());
+                assertEquals(List.of(first.localNode().getId()), taken.head().writers());
+            }
+
+            clock.addAndGet(2 * TTL);
+            try (ServerlessNode third = new ServerlessNode(nodeSettings("node-log-chain-third"))) {
+                third.start();
+                third.setMetadataPlane(plane);
+                takeAll(third, plane, clock);
+                assertFound(third, unpublished);
+                for (int shard = 0; shard < SHARDS; shard++) {
+                    assertEquals(
+                        "replayed and published, the head names no other log",
+                        List.of(),
+                        plane.heads().read("alpha", shard).orElseThrow().writers()
+                    );
+                }
+            }
+        } finally {
+            closeQuietly(first);
+        }
+    }
+
+    public void testAHeadNamesEveryLogItMayNeedUntilItsOwnerHasPublished() throws Exception {
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
-        final Acquisition taken = plane.heads().acquire("alpha", 0, "taker", "eph-taker", "uuid-alpha-00000000");
-        assertTrue(taken.acquired());
-        assertTrue(
-            "an open that failed gives the head back naming the node it was taking the shard from",
-            plane.heads().release("alpha", 0, "taker", taken.head().term(), "uuid-alpha-00000000", "eph-taker", "crashed-writer")
+        final String uuid = "uuid-alpha-00000000";
+        final Acquisition a = plane.heads().acquire("alpha", 0, "a", "eph-a", uuid);
+        assertEquals("a fresh head names no log", List.of(), a.head().writers());
+        assertTrue(plane.heads().release("alpha", 0, "a", a.head().term(), uuid, "eph-a"));
+        assertEquals("given back, it names the releaser", List.of("a"), plane.heads().read("alpha", 0).orElseThrow().writers());
+
+        final Acquisition b = plane.heads().acquire("alpha", 0, "b", "eph-b", uuid);
+        assertTrue(b.acquired());
+        assertEquals("taken, it goes on naming the log its owner has yet to publish", List.of("a"), b.head().writers());
+        assertEquals("and a renewal keeps it", List.of("a"), plane.heads().renew("alpha", 0, "b").orElseThrow().writers());
+
+        // b dies before it publishes: whoever takes the shard from it reads a's log as well as b's, oldest first.
+        clock.addAndGet(2 * TTL);
+        final Acquisition c = plane.heads().acquire("alpha", 0, "c", "eph-c", uuid);
+        assertTrue(c.acquired());
+        assertEquals("b", c.previousOwner());
+        assertEquals(List.of("a", "b"), c.head().writers());
+
+        assertTrue("once c has replayed and published, the head names none", plane.heads().clearWriters("alpha", 0, "c", c.head().term()));
+        assertEquals(List.of(), plane.heads().read("alpha", 0).orElseThrow().writers());
+        assertFalse("only the owner at its term clears them", plane.heads().clearWriters("alpha", 0, "b", c.head().term()));
+        assertTrue(plane.heads().release("alpha", 0, "c", c.head().term(), uuid, "eph-c"));
+        assertEquals(List.of("c"), plane.heads().read("alpha", 0).orElseThrow().writers());
+        assertEquals(
+            "it survives a round trip",
+            List.of("c"),
+            ShardHead.fromStream(plane.heads().read("alpha", 0).orElseThrow().toBytes().streamInput()).writers()
         );
-        assertEquals("crashed-writer", plane.heads().read("alpha", 0).orElseThrow().lastWriter());
-        final Acquisition next = plane.heads().acquire("alpha", 0, "next", "eph-next", "uuid-alpha-00000000");
-        assertTrue(next.acquired());
-        assertEquals("crashed-writer", next.previousOwner());
-        assertTrue(next.previousLetGo());
-        assertNull("an owned head names no last writer", plane.heads().read("alpha", 0).orElseThrow().lastWriter());
-        assertTrue("an ordinary release names the releaser", plane.heads().release("alpha", 0, "next", next.head().term(), null, null));
-        assertEquals("next", plane.heads().read("alpha", 0).orElseThrow().lastWriter());
     }
 }

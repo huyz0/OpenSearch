@@ -2168,9 +2168,9 @@ public final class ServerlessNode implements Closeable {
         // The takeover fenced every older term at the swap, so the open need not list them again.
         reconciler.noteOlderTermsFenced(indexName, shardNumber, acquisition.head().term());
         if (nodeLogEnabled) {
-            // Whose node log the open replays: the node this takeover replaced in the head.
+            // Whose node logs the open replays: every node the head names as holding what was not published.
             nodeLog(plane);
-            reconciler.noteNodeLogPredecessor(indexName, shardNumber, acquisition.previousOwner(), acquisition.previousLetGo());
+            reconciler.noteNodeLogWriters(indexName, shardNumber, acquisition.head().writers());
         }
         try {
             // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed
@@ -2197,8 +2197,7 @@ public final class ServerlessNode implements Closeable {
             writerAssignments.remove(shardKey(indexName, shardNumber));
             noteHead(indexName, shardNumber, null);
             try {
-                // Naming whose log still holds what was not published: the node it was being taken from, whose records an
-                // open that failed did not get to publish, or this node's own.
+                // The head goes on naming every log it named, and this node's own: an open that failed published nothing.
                 plane.heads()
                     .release(
                         indexName,
@@ -2206,8 +2205,7 @@ public final class ServerlessNode implements Closeable {
                         localNode.getId(),
                         assignment.term(),
                         described.get().uuid(),
-                        localNode.getEphemeralId(),
-                        acquisition.previousOwner() != null ? acquisition.previousOwner() : localNode.getId()
+                        localNode.getEphemeralId()
                     );
                 plane.forgetAssignment(localNode.getId(), indexName, shardNumber);
             } catch (Exception giveBack) {

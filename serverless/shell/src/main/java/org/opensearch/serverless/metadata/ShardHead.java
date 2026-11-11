@@ -18,6 +18,8 @@ import org.opensearch.core.xcontent.XContentParser;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -47,7 +49,7 @@ public final class ShardHead {
     private final String ownerNodeId;
     private final String ownerEphemeralId;
     private final long leaseExpiresAtMillis;
-    private final String lastWriter;
+    private final List<String> writers;
 
     /**
      * Creates a head.
@@ -98,10 +100,10 @@ public final class ShardHead {
         this.ownerNodeId = ownerNodeId;
         this.ownerEphemeralId = ownerEphemeralId;
         this.leaseExpiresAtMillis = leaseExpiresAtMillis;
-        this.lastWriter = null;
+        this.writers = List.of();
     }
 
-    private ShardHead(ShardHead head, String lastWriter) {
+    private ShardHead(ShardHead head, List<String> writers) {
         this.indexName = head.indexName;
         this.indexUuid = head.indexUuid;
         this.shardId = head.shardId;
@@ -109,27 +111,56 @@ public final class ShardHead {
         this.ownerNodeId = head.ownerNodeId;
         this.ownerEphemeralId = head.ownerEphemeralId;
         this.leaseExpiresAtMillis = head.leaseExpiresAtMillis;
-        this.lastWriter = lastWriter;
+        this.writers = List.copyOf(writers);
     }
 
     /**
-     * Returns this head naming the node whose write log may still hold the shard's unpublished records: for a head
-     * given back with no owner, so whoever takes it next knows whose log to read.
+     * Returns this head naming the nodes whose write logs may still hold the shard's unpublished records, oldest first.
      *
-     * @param lastWriter the node, or null
+     * <p>With one write log per node, what a writer acknowledged and did not publish is in its own log, not the shard's.
+     * A head given back names the nodes whose logs its next owner reads; a head just taken keeps naming them, and the
+     * node it was taken from, until its owner has replayed them and published, so an owner that dies before that
+     * leaves its successor every log it would have read.
+     *
+     * @param writers the nodes, oldest first
      * @return the copy
      */
-    public ShardHead withLastWriter(String lastWriter) {
-        return new ShardHead(this, lastWriter);
+    public ShardHead withWriters(List<String> writers) {
+        return new ShardHead(this, writers);
     }
 
     /**
-     * Returns the node whose write log may still hold this shard's unpublished records, for a head with no owner.
+     * Returns this head with one more node whose write log may hold the shard's unpublished records, as the newest.
      *
-     * @return the node, or null if none was recorded
+     * @param writer the node, or null for none
+     * @return the copy
+     */
+    public ShardHead withWriter(String writer) {
+        if (writer == null) {
+            return this;
+        }
+        final List<String> next = new ArrayList<>(writers);
+        next.remove(writer);
+        next.add(writer);
+        return new ShardHead(this, next);
+    }
+
+    /**
+     * Returns the nodes whose write logs may still hold this shard's unpublished records, oldest first.
+     *
+     * @return the nodes; empty if none
+     */
+    public List<String> writers() {
+        return writers;
+    }
+
+    /**
+     * Returns the newest node whose write log may still hold this shard's unpublished records.
+     *
+     * @return the node, or null if none
      */
     public String lastWriter() {
-        return lastWriter;
+        return writers.isEmpty() ? null : writers.get(writers.size() - 1);
     }
 
     /**
@@ -228,8 +259,8 @@ public final class ShardHead {
             if (indexUuid != null) {
                 builder.field("index_uuid", indexUuid);
             }
-            if (lastWriter != null) {
-                builder.field("last_writer", lastWriter);
+            if (writers.isEmpty() == false) {
+                builder.array("writers", writers.toArray(new String[0]));
             }
             builder.endObject();
             return BytesReference.bytes(builder);
@@ -255,7 +286,7 @@ public final class ShardHead {
             String uuid = null;
             String owner = null;
             String ephemeral = null;
-            String lastWriter = null;
+            final List<String> writers = new ArrayList<>();
             int shard = -1;
             long term = 0;
             long expiry = 0;
@@ -267,6 +298,13 @@ public final class ShardHead {
                 }
                 if (token == XContentParser.Token.FIELD_NAME) {
                     field = parser.currentName();
+                } else if (token == XContentParser.Token.START_ARRAY && "writers".equals(field)) {
+                    while ((token = parser.nextToken()) != XContentParser.Token.END_ARRAY) {
+                        if (token == null) {
+                            throw new IOException("malformed shard head: unterminated writers");
+                        }
+                        writers.add(parser.text());
+                    }
                 } else if (token == XContentParser.Token.START_OBJECT || token == XContentParser.Token.START_ARRAY) {
                     parser.skipChildren();
                 } else if (token.isValue() || token == XContentParser.Token.VALUE_NULL) {
@@ -278,7 +316,6 @@ public final class ShardHead {
                         case "owner_node_id" -> owner = parser.textOrNull();
                         case "owner_ephemeral_id" -> ephemeral = parser.textOrNull();
                         case "lease_expires_at_millis" -> expiry = parser.longValue();
-                        case "last_writer" -> lastWriter = parser.textOrNull();
                         default -> {
                             // forward compatibility
                         }
@@ -288,12 +325,22 @@ public final class ShardHead {
             if (index == null || shard < 0 || term < 1) {
                 throw new IOException("malformed shard head: missing a required field");
             }
-            return new ShardHead(index, shard, term, owner, ephemeral, expiry, uuid).withLastWriter(lastWriter);
+            return new ShardHead(index, shard, term, owner, ephemeral, expiry, uuid).withWriters(writers);
         }
     }
 
     @Override
     public String toString() {
-        return "ShardHead[" + indexName + "][" + shardId + "] term=" + term + " owner=" + ownerNodeId + " expires=" + leaseExpiresAtMillis;
+        return "ShardHead["
+            + indexName
+            + "]["
+            + shardId
+            + "] term="
+            + term
+            + " owner="
+            + ownerNodeId
+            + " expires="
+            + leaseExpiresAtMillis
+            + (writers.isEmpty() ? "" : " writers=" + writers);
     }
 }
