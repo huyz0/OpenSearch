@@ -21,7 +21,10 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shard.NoSuchIndexException;
+import org.opensearch.serverless.shard.NotHereException;
 import org.opensearch.serverless.shard.ShardOperations;
+import org.opensearch.serverless.shard.SystemIndexException;
 import org.opensearch.serverless.shell.ActionGate;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.threadpool.ThreadPool;
@@ -184,11 +187,11 @@ public final class MultiGetHandler extends BaseRestHandler {
                     final var found = new MultiGetItemResponse(operations.get(get), null);
                     budget.keep(found, () -> responses[position] = found);
                     return true;
-                } catch (ShardOperations.NoSuchIndexException e) {
+                } catch (NoSuchIndexException e) {
                     failed = failure(item, new IndexNotFoundException(item.index()));
-                } catch (ShardOperations.SystemIndexException e) {
+                } catch (SystemIndexException e) {
                     failed = failure(item, new OpenSearchSecurityException("system_index: " + e.getMessage(), RestStatus.FORBIDDEN));
-                } catch (ShardOperations.NotHereException e) {
+                } catch (NotHereException e) {
                     failed = failure(
                         item,
                         new OpenSearchStatusException(e.restType(serving.localNode().getId()) + ": " + e.getMessage(), e.restStatus())

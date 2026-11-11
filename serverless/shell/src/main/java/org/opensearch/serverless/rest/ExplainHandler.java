@@ -21,7 +21,11 @@ import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shard.Explained;
+import org.opensearch.serverless.shard.NoSuchIndexException;
+import org.opensearch.serverless.shard.NotHereException;
 import org.opensearch.serverless.shard.ShardOperations;
+import org.opensearch.serverless.shard.SystemIndexException;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -172,11 +176,11 @@ public final class ExplainHandler extends BaseRestHandler {
             try {
                 final ShardOperations operations = new ShardOperations(serving, metadata, true);
                 respond(channel, index, id, operations.explain(index, id, query));
-            } catch (ShardOperations.NoSuchIndexException e) {
+            } catch (NoSuchIndexException e) {
                 sendQuietly(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index);
-            } catch (ShardOperations.SystemIndexException e) {
+            } catch (SystemIndexException e) {
                 sendQuietly(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage());
-            } catch (ShardOperations.NotHereException e) {
+            } catch (NotHereException e) {
                 // The same status and type the get and update endpoints give the same state.
                 sendQuietly(channel, e.restStatus(), e.restType(serving.localNode().getId()), e.getMessage());
             } catch (Exception e) {
@@ -189,7 +193,7 @@ public final class ExplainHandler extends BaseRestHandler {
         });
     }
 
-    private void respond(RestChannel channel, String index, String id, ShardOperations.Explained explained) throws IOException {
+    private void respond(RestChannel channel, String index, String id, Explained explained) throws IOException {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.field("_index", index);

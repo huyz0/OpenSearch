@@ -15,7 +15,12 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shard.DocumentMissingException;
+import org.opensearch.serverless.shard.NoSuchIndexException;
+import org.opensearch.serverless.shard.NotHereException;
 import org.opensearch.serverless.shard.ShardOperations;
+import org.opensearch.serverless.shard.SystemIndexException;
+import org.opensearch.serverless.shard.UpdateOutcome;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -185,13 +190,13 @@ public final class UpdateHandler extends BaseRestHandler {
             final var operations = new ShardOperations(serving, metadata, true);
             try {
                 respond(channel, operations.update(parsed));
-            } catch (ShardOperations.NoSuchIndexException e) {
+            } catch (NoSuchIndexException e) {
                 sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + e.index());
-            } catch (ShardOperations.DocumentMissingException e) {
+            } catch (DocumentMissingException e) {
                 sendError(channel, RestStatus.NOT_FOUND, "document_missing_exception", e.getMessage());
-            } catch (ShardOperations.SystemIndexException e) {
+            } catch (SystemIndexException e) {
                 sendError(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage());
-            } catch (ShardOperations.NotHereException e) {
+            } catch (NotHereException e) {
                 // The get endpoint's vocabulary, not an update-shaped approximation of it: an update is a
                 // get and a write, and either half can be the one that could not find a home. The status
                 // is the exception's own: "nobody owns the shard" is the 421 PUT answers, not a 503 that
@@ -215,7 +220,7 @@ public final class UpdateHandler extends BaseRestHandler {
         }
     }
 
-    private void respond(org.opensearch.rest.RestChannel channel, ShardOperations.UpdateOutcome outcome) throws IOException {
+    private void respond(org.opensearch.rest.RestChannel channel, UpdateOutcome outcome) throws IOException {
         final var response = outcome.response();
         try (XContentBuilder builder = channel.newBuilder()) {
             if (outcome.servedBy() == null) {

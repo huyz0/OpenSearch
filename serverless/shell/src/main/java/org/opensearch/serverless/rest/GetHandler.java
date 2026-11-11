@@ -213,9 +213,9 @@ public final class GetHandler extends BaseRestHandler {
                 fetchSource,
                 sourceOnly
             );
-        } catch (org.opensearch.serverless.shard.ShardOperations.SystemIndexException e) {
+        } catch (org.opensearch.serverless.shard.SystemIndexException e) {
             channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
-        } catch (org.opensearch.serverless.shard.ShardOperations.NotHereException e) {
+        } catch (org.opensearch.serverless.shard.NotHereException e) {
             // A "not here" is never answered from a published commit that a live writer is already ahead
             // of, which would be a stale document -- or a 404 for a document that exists -- reported as
             // success. The status and type are the exception's own, so this endpoint says the same thing

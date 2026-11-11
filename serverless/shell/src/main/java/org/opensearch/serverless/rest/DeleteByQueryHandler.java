@@ -16,6 +16,8 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shard.DeleteByQueryOutcome;
+import org.opensearch.serverless.shard.NoSuchIndexException;
 import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.threadpool.ThreadPool;
@@ -228,7 +230,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
                 final var operations = new ShardOperations(serving, metadata, true);
                 final var outcome = operations.deleteByQuery(index, query, maxDocs, refresh, abortOnConflict);
                 respond(channel, outcome);
-            } catch (ShardOperations.NoSuchIndexException e) {
+            } catch (NoSuchIndexException e) {
                 sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + e.index());
             } catch (Exception e) {
                 try {
@@ -298,7 +300,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
     }
 
     /** Renders the result after the response filters, preserving the legacy matched counter. */
-    private void respond(org.opensearch.rest.RestChannel channel, ShardOperations.DeleteByQueryOutcome outcome) throws IOException {
+    private void respond(org.opensearch.rest.RestChannel channel, DeleteByQueryOutcome outcome) throws IOException {
         final var response = outcome.response();
         RestStatus status = response.isTimedOut() ? RestStatus.REQUEST_TIMEOUT : RestStatus.OK;
         for (var failure : response.getBulkFailures()) {

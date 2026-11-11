@@ -1171,7 +1171,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
 
     static BytesRestResponse failure(org.opensearch.rest.RestChannel channel, Exception e) throws IOException {
         for (Throwable cause = e; cause != null; cause = cause.getCause()) {
-            if (cause instanceof org.opensearch.serverless.shard.ShardOperations.UnsupportedRequestOptionException) {
+            if (cause instanceof org.opensearch.serverless.shard.UnsupportedRequestOptionException) {
                 return new BytesRestResponse(channel, RestStatus.NOT_IMPLEMENTED, e);
             }
             if (cause instanceof org.opensearch.serverless.store.WriteBackpressure.ThrottledException throttled) {
