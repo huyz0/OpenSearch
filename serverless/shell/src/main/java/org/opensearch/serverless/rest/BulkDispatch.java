@@ -10,6 +10,7 @@ package org.opensearch.serverless.rest;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.WriteTarget;
 import org.opensearch.serverless.shell.BulkOperation;
 import org.opensearch.serverless.shell.BulkOutcome;
 import org.opensearch.serverless.shell.ServerlessNode;
@@ -42,7 +43,7 @@ final class BulkDispatch {
      * Decides, per item, which shard it belongs to and who owns it — or records why it cannot be placed.
      */
     void route(ServerlessNode serving, MetadataPlane metadata, List<BulkHandler.Item> items) throws IOException {
-        final Map<String, Optional<MetadataPlane.WriteTarget>> targets = new HashMap<>();
+        final Map<String, Optional<WriteTarget>> targets = new HashMap<>();
         final java.util.Set<String> failures = new java.util.HashSet<>();
         for (BulkHandler.Item item : items) {
             if (item.failed()) {
@@ -65,7 +66,7 @@ final class BulkDispatch {
                 );
                 continue;
             }
-            final Optional<MetadataPlane.WriteTarget> target = targets.computeIfAbsent(item.index, name -> {
+            final Optional<WriteTarget> target = targets.computeIfAbsent(item.index, name -> {
                 try {
                     return metadata.writeTarget(name);
                 } catch (IOException e) {

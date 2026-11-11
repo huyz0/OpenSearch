@@ -16,6 +16,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.AliasRecord;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.metadata.AliasAtGeneration;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.TemplateResolver;
 import org.opensearch.serverless.metadata.TooManyMatchesException;
@@ -421,7 +422,7 @@ public final class DataStreamHandler extends BaseRestHandler {
 
     private void delete(MetadataPlane metadata, String name) throws Exception {
         validateName(name);
-        final Optional<MetadataPlane.AliasAtGeneration> found = metadata.aliasWithGeneration(name);
+        final Optional<AliasAtGeneration> found = metadata.aliasWithGeneration(name);
         if (found.isEmpty() || found.get().alias().dataStream() == false) {
             throw new IndexAdminHandler.RefusedException(
                 RestStatus.NOT_FOUND,

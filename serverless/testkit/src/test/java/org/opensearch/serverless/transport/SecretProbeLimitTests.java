@@ -9,7 +9,7 @@ package org.opensearch.serverless.transport;
 
 import org.opensearch.OpenSearchSecurityException;
 import org.opensearch.action.get.GetRequest;
-import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.TransportSecrets;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.concurrent.atomic.AtomicInteger;
@@ -21,7 +21,7 @@ public class SecretProbeLimitTests extends OpenSearchTestCase {
         final AtomicInteger reads = new AtomicInteger();
         final java.util.concurrent.atomic.AtomicReference<TransportAuthenticator> reference =
             new java.util.concurrent.atomic.AtomicReference<>();
-        final var secrets = new MetadataPlane.TransportSecrets(1L, "ab".repeat(32), null, 0L);
+        final var secrets = new TransportSecrets(1L, "ab".repeat(32), null, 0L);
         final var request = new GetRequest("index", "id");
         final Runnable slowRead = () -> {
             reads.incrementAndGet();
@@ -40,7 +40,7 @@ public class SecretProbeLimitTests extends OpenSearchTestCase {
     public void testUnauthenticatedGenerationClaimsCannotReadTheStorePerRequest() {
         final AtomicLong nanos = new AtomicLong();
         final AtomicInteger reads = new AtomicInteger();
-        final var secrets = new MetadataPlane.TransportSecrets(1L, "ab".repeat(32), null, 0L);
+        final var secrets = new TransportSecrets(1L, "ab".repeat(32), null, 0L);
         final var auth = new TransportAuthenticator(
             () -> secrets,
             reads::incrementAndGet,

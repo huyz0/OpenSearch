@@ -31,17 +31,17 @@ final class ShardRelease {
      *
      * @param failed the actual failed engine
      * @param reason why it is being removed
-     * @return the removed engine's role, or {@link ShardReconciler.FailedShardRelease#NOT_CURRENT}
+     * @return the removed engine's role, or {@link FailedShardRelease#NOT_CURRENT}
      */
-    public ShardReconciler.FailedShardRelease releaseFailedShard(IndexShard failed, String reason) {
+    public FailedShardRelease releaseFailedShard(IndexShard failed, String reason) {
         final ShardId shardId = failed.shardId();
         synchronized (reconciler.lifecycle(shardId)) {
             if (reconciler.open.get(shardId) != failed) {
-                return ShardReconciler.FailedShardRelease.NOT_CURRENT;
+                return FailedShardRelease.NOT_CURRENT;
             }
             final boolean reader = reconciler.readers.contains(shardId);
             releaseShardLocked(shardId, reason, false, true);
-            return reader ? ShardReconciler.FailedShardRelease.READER : ShardReconciler.FailedShardRelease.WRITER;
+            return reader ? FailedShardRelease.READER : FailedShardRelease.WRITER;
         }
     }
 

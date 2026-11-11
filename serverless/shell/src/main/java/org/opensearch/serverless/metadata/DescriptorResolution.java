@@ -31,7 +31,7 @@ public final class DescriptorResolution {
     /**
      * Returns the generation the register held when this was read, for a compare-and-swap on what
      * was read -- never a generation read separately, which guards nothing (see
-     * {@code MetadataPlane.AliasAtGeneration}).
+     * {@code AliasAtGeneration}).
      *
      * @return the generation, or {@link BlobRegister#ABSENT_GENERATION} when the name is absent
      */

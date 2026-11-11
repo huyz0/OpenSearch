@@ -29,6 +29,7 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.cluster.LocalViewProjector;
 import org.opensearch.serverless.cluster.ShardAssignment;
 import org.opensearch.serverless.membership.MembershipSource;
+import org.opensearch.serverless.shard.BeforePublish;
 import org.opensearch.serverless.shard.ShardReconciler;
 import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.threadpool.ThreadPool;
@@ -559,7 +560,7 @@ public final class ServerlessNode implements Closeable {
      * What a publish does to the plane's digest rollups before its manifest is written: widen the shard's entry, unless
      * the publishing writer's own mark already keeps the shard from being ruled out.
      */
-    static ShardReconciler.BeforePublish widensRollupsOf(org.opensearch.serverless.metadata.MetadataPlane plane) {
+    static BeforePublish widensRollupsOf(org.opensearch.serverless.metadata.MetadataPlane plane) {
         return (id, shards, term, digest) -> plane.rollups()
             .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest);
     }

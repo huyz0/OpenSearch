@@ -13,7 +13,7 @@ import org.opensearch.common.hash.MessageDigests;
 import org.opensearch.core.common.io.stream.OutputStreamStreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.TransportSecrets;
 import org.opensearch.transport.TransportRequest;
 
 import javax.crypto.Mac;
@@ -54,7 +54,7 @@ public final class TransportAuthenticator {
     private static final String ALGORITHM = "HmacSHA256";
     private static final SecureRandom RANDOM = new SecureRandom();
 
-    private final Supplier<MetadataPlane.TransportSecrets> secrets;
+    private final Supplier<TransportSecrets> secrets;
     private final Runnable refresh;
     private final Supplier<String> localNodeId;
     private final LongSupplier clock;
@@ -75,7 +75,7 @@ public final class TransportAuthenticator {
      * @param windowMillis how far a timestamp may be from now, and how long a nonce is remembered: one lease
      */
     public TransportAuthenticator(
-        Supplier<MetadataPlane.TransportSecrets> secrets,
+        Supplier<TransportSecrets> secrets,
         Runnable refresh,
         Supplier<String> localNodeId,
         LongSupplier clock,
@@ -95,7 +95,7 @@ public final class TransportAuthenticator {
      * @param capacity maximum live nonces; size for peak forwarded traffic over twice the window
      */
     public TransportAuthenticator(
-        Supplier<MetadataPlane.TransportSecrets> secrets,
+        Supplier<TransportSecrets> secrets,
         Runnable refresh,
         Supplier<String> localNodeId,
         LongSupplier clock,
@@ -106,7 +106,7 @@ public final class TransportAuthenticator {
     }
 
     TransportAuthenticator(
-        Supplier<MetadataPlane.TransportSecrets> secrets,
+        Supplier<TransportSecrets> secrets,
         Runnable refresh,
         Supplier<String> localNodeId,
         LongSupplier clock,
@@ -150,7 +150,7 @@ public final class TransportAuthenticator {
      */
     public String sign(String action, TransportRequest request, String recipient, java.util.Map<String, String> headers)
         throws IOException {
-        final MetadataPlane.TransportSecrets current = secrets.get();
+        final TransportSecrets current = secrets.get();
         if (current == null) {
             return null;
         }
@@ -217,7 +217,7 @@ public final class TransportAuthenticator {
         if (age < -window || age > window) {
             throw refuse("transport authentication outside the time window");
         }
-        MetadataPlane.TransportSecrets current = secrets.get();
+        TransportSecrets current = secrets.get();
         if (current == null) {
             throw refuse("this node has no transport secret yet");
         }
@@ -231,7 +231,7 @@ public final class TransportAuthenticator {
                     endSecretProbe();
                 }
             } else {
-                final MetadataPlane.TransportSecrets latest = secrets.get();
+                final TransportSecrets latest = secrets.get();
                 if (latest != null && generation > latest.generation()) {
                     throw new org.opensearch.core.concurrency.OpenSearchRejectedExecutionException(
                         "transport secret refresh is pending or rate limited; retry after one second"

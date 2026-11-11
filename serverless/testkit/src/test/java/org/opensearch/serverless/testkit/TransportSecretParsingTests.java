@@ -8,7 +8,7 @@
 
 package org.opensearch.serverless.testkit;
 
-import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.TransportSecrets;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -18,7 +18,7 @@ import java.util.List;
 public class TransportSecretParsingTests extends OpenSearchTestCase {
     public void testBlankLegacySecretsAreRejected() {
         for (String body : List.of("", " \n\t")) {
-            expectThrows(IOException.class, () -> MetadataPlane.TransportSecrets.parse(body));
+            expectThrows(IOException.class, () -> TransportSecrets.parse(body));
         }
     }
 
@@ -32,26 +32,23 @@ public class TransportSecretParsingTests extends OpenSearchTestCase {
             "{\"current\":\"valid\",\"previous\":\"\"}",
             "{\"current\":\"valid\",\"previous\":{}}"
         )) {
-            expectThrows(IOException.class, () -> MetadataPlane.TransportSecrets.parse(body));
+            expectThrows(IOException.class, () -> TransportSecrets.parse(body));
         }
     }
 
     public void testSecretObjectsCannotIgnoreTrailingData() {
-        expectThrows(IOException.class, () -> MetadataPlane.TransportSecrets.parse("{\"current\":\"first\"} {\"current\":\"second\"}"));
+        expectThrows(IOException.class, () -> TransportSecrets.parse("{\"current\":\"first\"} {\"current\":\"second\"}"));
     }
 
     public void testMalformedJsonDoesNotEchoSecretTextInErrors() {
-        final var failure = expectThrows(
-            IOException.class,
-            () -> MetadataPlane.TransportSecrets.parse("{\"current\": accidental_secret_text}")
-        );
+        final var failure = expectThrows(IOException.class, () -> TransportSecrets.parse("{\"current\": accidental_secret_text}"));
         assertFalse(failure.toString(), failure.toString().contains("accidental_secret_text"));
         assertNull("parser causes may echo sensitive input", failure.getCause());
     }
 
     public void testLegacySecretsAndUnknownFieldsRemainReadable() throws Exception {
-        assertEquals("legacy-key", MetadataPlane.TransportSecrets.parse(" legacy-key ").current());
-        final var parsed = MetadataPlane.TransportSecrets.parse(
+        assertEquals("legacy-key", TransportSecrets.parse(" legacy-key ").current());
+        final var parsed = TransportSecrets.parse(
             "{\"current\":\"first\",\"previous\":\"before\",\"generation\":2,\"rotated_at\":1000,\"future\":{\"nested\":[1,2]}}"
         );
         assertEquals("first", parsed.current());

@@ -96,16 +96,16 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
                 final String changedMapping = "{\"properties\":{\"added\":{\"type\":\"keyword\"}}}";
                 final Settings changedSettings = Settings.builder().put("index.refresh_interval", "5s").build();
                 if (mapping) {
-                    node.reconciler().refreshMapping("alpha", replacement.withMapping(changedMapping));
+                    node.reconciler().refresh().refreshMapping("alpha", replacement.withMapping(changedMapping));
                 } else {
-                    node.reconciler().refreshSettings("alpha", replacement.withSettings(changedSettings));
+                    node.reconciler().refresh().refreshSettings("alpha", replacement.withSettings(changedSettings));
                 }
                 assertSame("metadata for another UUID must not touch the open service", before, service.getMetadata());
                 if (mapping) {
-                    node.reconciler().refreshMapping("alpha", original.withMapping(changedMapping));
+                    node.reconciler().refresh().refreshMapping("alpha", original.withMapping(changedMapping));
                     assertNotNull(service.mapperService().fieldType("added"));
                 } else {
-                    node.reconciler().refreshSettings("alpha", original.withSettings(changedSettings));
+                    node.reconciler().refresh().refreshSettings("alpha", original.withSettings(changedSettings));
                     assertEquals("5s", service.getMetadata().getSettings().get("index.refresh_interval"));
                 }
             }
