@@ -10,6 +10,7 @@ package org.opensearch.serverless.shard;
 
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shell.Document;
 import org.opensearch.serverless.shell.ServerlessNode;
 
 import java.io.IOException;
@@ -54,7 +55,7 @@ final class DocumentReads {
             return read;
         }
         return new Read(
-            new ServerlessNode.Document(
+            new Document(
                 document.id(),
                 document.found(),
                 org.opensearch.serverless.rest.SourceFiltering.apply(document.source(), request.fetchSourceContext()),
@@ -117,7 +118,7 @@ final class DocumentReads {
                     // action filter installed, every get reported _seq_no -2 and _version -1, and the
                     // conditional write a caller built on those tokens lost every time.
                     return new Read(
-                        new org.opensearch.serverless.shell.ServerlessNode.Document(
+                        new org.opensearch.serverless.shell.Document(
                             answered.getId(),
                             answered.isExists(),
                             answered.isSourceEmpty() ? null : answered.getSourceAsString(),
@@ -197,7 +198,7 @@ final class DocumentReads {
             // Here the owner check already ruled that out.
             if (plane.segmentPublisher(index, placement.uuid(), placement.shard()).readManifest().isEmpty()) {
                 return new Read(
-                    org.opensearch.serverless.shell.ServerlessNode.Document.absent(id),
+                    org.opensearch.serverless.shell.Document.absent(id),
                     node.localNode().getId(),
                     false,
                     new ShardId(new org.opensearch.core.index.Index(index, placement.uuid()), placement.shard())

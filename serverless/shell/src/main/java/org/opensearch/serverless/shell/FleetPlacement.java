@@ -58,7 +58,7 @@ final class FleetPlacement {
      * @param plane the metadata plane
      * @return the members counted and the nodes wanted
      */
-    public ServerlessNode.FleetSize fleetSize(MetadataPlane plane) {
+    public FleetSize fleetSize(MetadataPlane plane) {
         final long now = plane.clock().getAsLong();
         int members = 0;
         long demand = 0;
@@ -80,10 +80,10 @@ final class FleetPlacement {
         }
         if (members == 0) {
             // Nobody reports a load yet -- a fleet starting, or a view from before leases carried it. Not "none wanted".
-            return new ServerlessNode.FleetSize(0, -1, 0);
+            return new FleetSize(0, -1, 0);
         }
         final double perNode = (double) caps / members * TARGET_UTILISATION;
-        return new ServerlessNode.FleetSize(members, (int) Math.max(1, Math.ceil(demand / perNode)), demand);
+        return new FleetSize(members, (int) Math.max(1, Math.ceil(demand / perNode)), demand);
     }
 
     /** Above this share of its cap a node looks for a member to hand work to. */

@@ -12,10 +12,8 @@ import org.opensearch.Version;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.NodeConnectionsService;
-import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.node.DiscoveryNodeRole;
-import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.cluster.service.ClusterApplier;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.network.NetworkModule;
@@ -52,7 +50,6 @@ import java.net.InetAddress;
 import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -124,7 +121,7 @@ public final class ServerlessNode implements Closeable {
     /** The pool a forwarded get is answered on, at its owner: not GET, for the reason {@link #FORWARDED_WRITE_POOL} is not WRITE. */
     public static final String FORWARDED_READ_POOL = "serverless_forwarded_read";
 
-    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(ServerlessNode.class);
+    static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(ServerlessNode.class);
 
     /** Accepts writer activation: takes ownership of shards and indexes into them. */
     public static final String ROLE_INGEST = "ingest";
@@ -135,43 +132,43 @@ public final class ServerlessNode implements Closeable {
     /** The store type that reads published segments lazily, a block at a time. */
     public static final String BLOCK_CACHE_STORE_TYPE = "serverless_block_cache";
 
-    private final String nodeName;
-    private final Settings settings;
-    private final ServerlessPlugins plugins;
-    private final ThreadPool threadPool;
+    final String nodeName;
+    final Settings settings;
+    final ServerlessPlugins plugins;
+    final ThreadPool threadPool;
     /** Builds the core services and the shared collaborators the node and its plugins are handed. */
-    private final NodeServices services;
+    final NodeServices services;
     /** The check that keeps a reader from serving a commit behind the log, and its memo. */
-    private final ReaderValidation readerValidation;
-    private final NodeEnvironment nodeEnvironment;
-    private final ClusterService clusterService;
-    private final IndicesService indicesService;
-    private final SearchService searchService;
-    private final PluginsService pluginsService;
-    private org.opensearch.serverless.rest.SystemIndices systemIndices;
-    private final RestController restController;
-    private final TransportService transportService;
-    private final HttpServerTransport httpServerTransport;
-    private final NodeClient nodeClient;
-    private volatile DiscoveryNode localNode;
-    private volatile MembershipSource membershipSource;
-    private volatile org.opensearch.serverless.metadata.MetadataPlane metadataPlane;
-    private volatile org.opensearch.serverless.transport.ShardRouter router;
-    private final Set<String> roles;
-    private final org.opensearch.serverless.store.BlockCache blockCache;
-    private final Map<String, IndexDescriptor> served = new java.util.concurrent.ConcurrentHashMap<>();
-    private final Set<Map.Entry<String, Integer>> readerShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    final ReaderValidation readerValidation;
+    final NodeEnvironment nodeEnvironment;
+    final ClusterService clusterService;
+    final IndicesService indicesService;
+    final SearchService searchService;
+    final PluginsService pluginsService;
+    org.opensearch.serverless.rest.SystemIndices systemIndices;
+    final RestController restController;
+    final TransportService transportService;
+    final HttpServerTransport httpServerTransport;
+    final NodeClient nodeClient;
+    volatile DiscoveryNode localNode;
+    volatile MembershipSource membershipSource;
+    volatile org.opensearch.serverless.metadata.MetadataPlane metadataPlane;
+    volatile org.opensearch.serverless.transport.ShardRouter router;
+    final Set<String> roles;
+    final org.opensearch.serverless.store.BlockCache blockCache;
+    final Map<String, IndexDescriptor> served = new java.util.concurrent.ConcurrentHashMap<>();
+    final Set<Map.Entry<String, Integer>> readerShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
     /** The descriptors of the indices this node holds writer shards of, as last read; the reader half is {@link #served}. */
-    private final Map<String, IndexDescriptor> hosted = new java.util.concurrent.ConcurrentHashMap<>();
+    final Map<String, IndexDescriptor> hosted = new java.util.concurrent.ConcurrentHashMap<>();
     /** The term each writer shard was acquired at, keyed {@code index#shard}; pruned to what is open when a view is projected. */
-    private final Map<String, ShardAssignment> writerAssignments = new java.util.concurrent.ConcurrentHashMap<>();
+    final Map<String, ShardAssignment> writerAssignments = new java.util.concurrent.ConcurrentHashMap<>();
     /**
      * One fence per shard. The write path holds the read side from applying an operation to the engine
      * until it is acknowledged; anything that gives the shard away -- an idle release, a lost head, a
      * lapsed lease -- holds the write side from before the publish until after the close. See
      * {@link #underShardFence}.
      */
-    private final Map<org.opensearch.core.index.shard.ShardId, java.util.concurrent.locks.ReentrantReadWriteLock> shardFences =
+    final Map<org.opensearch.core.index.shard.ShardId, java.util.concurrent.locks.ReentrantReadWriteLock> shardFences =
         new java.util.concurrent.ConcurrentHashMap<>();
     /**
      * Shares one object-store PUT between the concurrent writes to a shard. See
@@ -179,30 +176,30 @@ public final class ServerlessNode implements Closeable {
      * is already in flight, so a quiet shard pays exactly what it did before and a busy one stops paying
      * per document.
      */
-    private final org.opensearch.serverless.store.WalGroupCommitter walCommitter;
+    final org.opensearch.serverless.store.WalGroupCommitter walCommitter;
 
     /**
      * Whether writes go to one log for the whole node, written once per window, instead of one log per shard. See
      * {@link NodeLogWriter}.
      */
-    private final boolean nodeLogEnabled;
+    final boolean nodeLogEnabled;
 
     /**
      * Whether a publish writes the files it adds as one blob per segment rather than one blob per file:
      * {@code serverless.segments.pack.enabled}.
      * See {@link org.opensearch.serverless.store.SegmentPublisher#packing}.
      */
-    private final boolean packSegments;
+    final boolean packSegments;
 
     /** This node's write log when {@link #nodeLogEnabled}, started with the first metadata plane it writes through. */
-    private volatile NodeLogWriter nodeLogWriter;
+    volatile NodeLogWriter nodeLogWriter;
 
     /** Whether the reconciler has been given {@link #nodeLogWriter}, which may start before the reconciler exists. */
-    private volatile boolean nodeLogHooked;
+    volatile boolean nodeLogHooked;
 
     /** How many writes may wait on the object store at once; see WriteBackpressure. */
-    private final org.opensearch.serverless.store.WriteBackpressure writeBackpressure;
-    private final int writeBackpressureMax;
+    final org.opensearch.serverless.store.WriteBackpressure writeBackpressure;
+    final int writeBackpressureMax;
 
     /**
      * How much of its room the write path's limiter is giving writes now: its limit over its most, in (0, 1]. Below 1 the
@@ -216,57 +213,32 @@ public final class ServerlessNode implements Closeable {
 
     /**
      * Writer shards whose log could not be appended to. Still open and still readable; refusing writes;
-     * reopened from the log by the next heartbeat that reaches the store. See {@link #appendOrRelease}.
+     * reopened from the log by the next heartbeat that reaches the store. See {@link NodeWritePath#appendOrRelease}.
      */
-    private final Set<org.opensearch.core.index.shard.ShardId> writeFenced = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    final Set<org.opensearch.core.index.shard.ShardId> writeFenced = java.util.concurrent.ConcurrentHashMap.newKeySet();
     /**
      * Heads this node lost to its own lapsed lease and has not yet given back in the register, with the
      * term it lost them at. Drained on every renewal, so a store that was unreachable when the loss was
      * discovered does not leave a head naming a node that is not serving the shard.
      */
-    private final Map<org.opensearch.core.index.shard.ShardId, Long> headsToGiveBack = new java.util.concurrent.ConcurrentHashMap<>();
-    private final Object leaseRenewalLock = new Object();
+    final Map<org.opensearch.core.index.shard.ShardId, Long> headsToGiveBack = new java.util.concurrent.ConcurrentHashMap<>();
+    final Object leaseRenewalLock = new Object();
     /** Serialises head verification: two passes interleaving their releases was the hazard, and waiting is cheaper than skipping. */
-    private final Object headVerificationLock = new Object();
+    final Object headVerificationLock = new Object();
     /** Whether a head verification is running, so an activation can tell it would only wait behind one. */
-    private final java.util.concurrent.atomic.AtomicBoolean verifyingHeads = new java.util.concurrent.atomic.AtomicBoolean();
+    final java.util.concurrent.atomic.AtomicBoolean verifyingHeads = new java.util.concurrent.atomic.AtomicBoolean();
     /**
      * True from the moment this node's lease is found lapsed until a head verification that began after
      * the renewal has read every head. While set, no write is acknowledged and no forwarded write is
      * accepted. See {@link #renewLease}.
      */
-    private volatile boolean ownershipUnverified;
+    volatile boolean ownershipUnverified;
     /** Bumped on every lapse, so a verification that began before the renewal cannot lift the suspension. */
-    private final java.util.concurrent.atomic.AtomicLong lapseEpoch = new java.util.concurrent.atomic.AtomicLong();
+    final java.util.concurrent.atomic.AtomicLong lapseEpoch = new java.util.concurrent.atomic.AtomicLong();
     /** How many shard-head reads a verification pass has in flight at once. */
     public static final int HEAD_READ_LANES = 8;
 
-    /**
-     * What a reader or a frozen view asks before taking a slot on this node: the cap, and whether room
-     * can be made under it.
-     *
-     * <p>The cap and the eviction policy live in the reconciler; readers and views used to compare
-     * against the constant default and refuse, so a node configured for two hundred shards opened a
-     * thousand readers, and one at the constant refused the next search until the idle sweep came
-     * round. {@code BackgroundReconciler} installs itself here when it is built.
-     */
-    public interface ShardAdmission {
-        /**
-         * Returns how many shards this node will hold.
-         *
-         * @return the cap
-         */
-        int maxShardsHeld();
-
-        /**
-         * Tries to free a slot by letting go of a shard nobody has used lately.
-         *
-         * @return true if there is now room under the cap
-         */
-        boolean makeRoom();
-    }
-
-    private volatile ShardAdmission admission = new ShardAdmission() {
+    volatile ShardAdmission admission = new ShardAdmission() {
         @Override
         public int maxShardsHeld() {
             return org.opensearch.serverless.reconcile.BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD;
@@ -288,30 +260,15 @@ public final class ServerlessNode implements Closeable {
     }
 
     /** Reader opens this node refused at its shard cap. */
-    private final java.util.concurrent.atomic.AtomicLong readerOpensRefusedAtCap = new java.util.concurrent.atomic.AtomicLong();
+    final java.util.concurrent.atomic.AtomicLong readerOpensRefusedAtCap = new java.util.concurrent.atomic.AtomicLong();
     /** Writer activations this node refused at its shard cap. */
-    private final java.util.concurrent.atomic.AtomicLong activationsRefusedAtCap = new java.util.concurrent.atomic.AtomicLong();
+    final java.util.concurrent.atomic.AtomicLong activationsRefusedAtCap = new java.util.concurrent.atomic.AtomicLong();
     /** Shards given up to make room for another. */
-    private final java.util.concurrent.atomic.AtomicLong evictedForRoom = new java.util.concurrent.atomic.AtomicLong();
+    final java.util.concurrent.atomic.AtomicLong evictedForRoom = new java.util.concurrent.atomic.AtomicLong();
     /** Shards given up because a member with room could take them. */
-    private final java.util.concurrent.atomic.AtomicLong handedOff = new java.util.concurrent.atomic.AtomicLong();
+    final java.util.concurrent.atomic.AtomicLong handedOff = new java.util.concurrent.atomic.AtomicLong();
     /** Writes for a shard nobody held that this node sent to a member with room rather than take. */
-    private final java.util.concurrent.atomic.AtomicLong writesSteered = new java.util.concurrent.atomic.AtomicLong();
-
-    /**
-     * How full this node is and what fullness has cost: the numbers to scale on.
-     *
-     * @param maxShardsHeld the cap
-     * @param held shards held now
-     * @param readerOpensRefused reader opens refused at the cap
-     * @param activationsRefused writer activations refused at the cap
-     * @param evicted shards given up to make room
-     * @param handedOff shards given up for a member with room
-     * @param writesSteered writes for an unheld shard sent to a member with room
-     */
-    public record Capacity(int maxShardsHeld, int held, long readerOpensRefused, long activationsRefused, long evicted, long handedOff,
-        long writesSteered) {
-    }
+    final java.util.concurrent.atomic.AtomicLong writesSteered = new java.util.concurrent.atomic.AtomicLong();
 
     /**
      * Returns how full this node is and what fullness has cost.
@@ -345,9 +302,9 @@ public final class ServerlessNode implements Closeable {
      * When each shard turned away at the cap was last turned away: distinct shards, not refusals. A burst of searches asked
      * for the same shards over and over, and counted as events one minute's refusals said the fleet wanted forty-three nodes.
      */
-    private final Map<String, Long> refusedShards = new java.util.concurrent.ConcurrentHashMap<>();
+    final Map<String, Long> refusedShards = new java.util.concurrent.ConcurrentHashMap<>();
 
-    private void noteRefusedRecently(String indexName, int shard) {
+    void noteRefusedRecently(String indexName, int shard) {
         refusedShards.put(shardKey(indexName, shard), System.nanoTime());
     }
 
@@ -391,17 +348,6 @@ public final class ServerlessNode implements Closeable {
     public static final double TARGET_UTILISATION = FleetPlacement.TARGET_UTILISATION;
 
     /**
-     * How many writer nodes the fleet has and how many its demand wants: the number to scale on.
-     *
-     * @param members live writer nodes that report their load
-     * @param wanted the nodes the demand of the last minute needs at {@link #TARGET_UTILISATION}, or -1 if no member
-     *     reports a load
-     * @param demand shards used or turned away across those nodes in the last minute
-     */
-    public record FleetSize(int members, int wanted, long demand) {
-    }
-
-    /**
      * Sizes the writer fleet from the load every member renews into its lease. See {@link FleetPlacement#fleetSize}.
      *
      * @param plane the metadata plane
@@ -420,7 +366,7 @@ public final class ServerlessNode implements Closeable {
         (forHandOff ? handedOff : evictedForRoom).incrementAndGet();
     }
 
-    private final java.util.concurrent.atomic.AtomicLong takeoversOvercommitted = new java.util.concurrent.atomic.AtomicLong();
+    final java.util.concurrent.atomic.AtomicLong takeoversOvercommitted = new java.util.concurrent.atomic.AtomicLong();
 
     /** Counts a dead member's shard taken past the cap, without evicting for it. */
     public void noteTakeoverOvercommitted() {
@@ -448,7 +394,7 @@ public final class ServerlessNode implements Closeable {
     public static final double MEAN_MATTERS_FROM = FleetPlacement.MEAN_MATTERS_FROM;
 
     /** Decides where this node's work belongs across the fleet; the methods below forward to it. */
-    private final FleetPlacement placement = new FleetPlacement(
+    final FleetPlacement placement = new FleetPlacement(
         () -> localNode.getId(),
         () -> admission.maxShardsHeld(),
         () -> this.reconciler == null ? 0 : this.reconciler.heldShards().size()
@@ -596,13 +542,13 @@ public final class ServerlessNode implements Closeable {
      * the local view that names it is a part of its own. With {@link #activationsOpened}
      * an operator reads the average of each, and which one a burst of cold shards is waiting on.
      */
-    private final java.util.concurrent.atomic.AtomicLong[] activationPhases = {
+    final java.util.concurrent.atomic.AtomicLong[] activationPhases = {
         new java.util.concurrent.atomic.AtomicLong(),
         new java.util.concurrent.atomic.AtomicLong(),
         new java.util.concurrent.atomic.AtomicLong(),
         new java.util.concurrent.atomic.AtomicLong(),
         new java.util.concurrent.atomic.AtomicLong() };
-    private final java.util.concurrent.atomic.AtomicLong activationsOpened = new java.util.concurrent.atomic.AtomicLong();
+    final java.util.concurrent.atomic.AtomicLong activationsOpened = new java.util.concurrent.atomic.AtomicLong();
 
     /**
      * Writer activations' time by phase, in milliseconds summed since the node started, and how many opened.
@@ -625,11 +571,28 @@ public final class ServerlessNode implements Closeable {
         writesSteered.incrementAndGet();
     }
 
-    private volatile org.opensearch.serverless.reconcile.ReconcileSignals signals =
-        org.opensearch.serverless.reconcile.ReconcileSignals.NONE;
-    private volatile LocalViewProjector projector;
-    private volatile ShardReconciler reconciler;
-    private volatile boolean started;
+    volatile org.opensearch.serverless.reconcile.ReconcileSignals signals = org.opensearch.serverless.reconcile.ReconcileSignals.NONE;
+    volatile LocalViewProjector projector;
+    volatile ShardReconciler reconciler;
+    volatile boolean started;
+
+    /** Writes this node's documents. */
+    final NodeWritePath writes = new NodeWritePath(this);
+
+    /** Fences this node's writes. */
+    final WriteFences fences = new WriteFences(this);
+
+    /** Grows mappings for this node's writes. */
+    final MappingGrowthPath mappings = new MappingGrowthPath(this);
+
+    /** Keeps this node's lease and heads current. */
+    final NodeLeases leases = new NodeLeases(this);
+
+    /** Activates this node's writers. */
+    final WriterActivation activation = new WriterActivation(this);
+
+    /** Serves this node's readers. */
+    final ReaderServing readerServing = new ReaderServing(this);
 
     /**
      * Constructs a node. Nothing is started until {@link #start()} is called.
@@ -1346,7 +1309,7 @@ public final class ServerlessNode implements Closeable {
         return org.opensearch.cluster.ClusterName.CLUSTER_NAME_SETTING.get(settings).value();
     }
 
-    private final java.util.Map<String, long[]> appliedDescriptorVersions = new java.util.concurrent.ConcurrentHashMap<>();
+    final java.util.Map<String, long[]> appliedDescriptorVersions = new java.util.concurrent.ConcurrentHashMap<>();
 
     /**
      * Past this many shards, head sightings older than a lease are dropped. See {@link ShardHeadSightings}.
@@ -1354,7 +1317,7 @@ public final class ServerlessNode implements Closeable {
     public static final int DEFAULT_RECENT_HEADS_PRUNE_ABOVE = ShardHeadSightings.DEFAULT_RECENT_HEADS_PRUNE_ABOVE;
 
     /** The shard heads this node has read lately; the methods below forward to it. */
-    private final ShardHeadSightings sightings = new ShardHeadSightings(() -> metadataPlane);
+    final ShardHeadSightings sightings = new ShardHeadSightings(() -> metadataPlane);
 
     /**
      * Records a head this node has just read, for the other readers in the same pass and for routing.
@@ -1425,7 +1388,7 @@ public final class ServerlessNode implements Closeable {
      * shard kept the old one until it was reopened. One descriptor read per open index per heartbeat --
      * the heartbeat already reads a head per shard -- and a refresh only when a version moved.
      */
-    private java.util.Map<String, java.util.Optional<IndexDescriptor>> refreshDescriptorsOfOpenIndices(
+    java.util.Map<String, java.util.Optional<IndexDescriptor>> refreshDescriptorsOfOpenIndices(
         org.opensearch.serverless.metadata.MetadataPlane plane
     ) {
         final java.util.Set<String> indices = new java.util.LinkedHashSet<>();
@@ -1466,7 +1429,7 @@ public final class ServerlessNode implements Closeable {
      * What a publish does to the plane's digest rollups before its manifest is written: widen the shard's entry, unless
      * the publishing writer's own mark already keeps the shard from being ruled out.
      */
-    private static ShardReconciler.BeforePublish widensRollupsOf(org.opensearch.serverless.metadata.MetadataPlane plane) {
+    static ShardReconciler.BeforePublish widensRollupsOf(org.opensearch.serverless.metadata.MetadataPlane plane) {
         return (id, shards, term, digest) -> plane.rollups()
             .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest);
     }
@@ -1477,7 +1440,7 @@ public final class ServerlessNode implements Closeable {
      * <p>From the per-pass refresh and from the incarnation fence, which reads the same register for an
      * index being used and so keeps its mapping and settings current at no further cost.
      */
-    private void applyDescriptor(String indexName, IndexDescriptor descriptor) throws java.io.IOException {
+    void applyDescriptor(String indexName, IndexDescriptor descriptor) throws java.io.IOException {
         // The copies the next projection is built from follow what was read, or a reader opened after a
         // mapping update would be projected with the mapping from before it.
         hosted.computeIfPresent(indexName, (k, v) -> descriptor);
@@ -1499,7 +1462,7 @@ public final class ServerlessNode implements Closeable {
      * Applies a descriptor some other read found -- one routing a request, say -- if it is newer than what this node's
      * shards carry. Newer, not merely different: such a read can be older than the one the fence last applied.
      */
-    private void applyIfNewer(String indexName, IndexDescriptor descriptor, long readStartedNanos) {
+    void applyIfNewer(String indexName, IndexDescriptor descriptor, long readStartedNanos) {
         final long[] applied = appliedDescriptorVersions.get(indexName);
         if (applied != null) {
             synchronized (applied) {
@@ -1517,9 +1480,9 @@ public final class ServerlessNode implements Closeable {
     }
 
     /** When each open index's descriptor was last read, by the refresh or by the fence, in {@link System#nanoTime} terms. */
-    private final java.util.Map<String, Long> descriptorReadAtNanos = new java.util.concurrent.ConcurrentHashMap<>();
+    final java.util.Map<String, Long> descriptorReadAtNanos = new java.util.concurrent.ConcurrentHashMap<>();
 
-    private volatile long descriptorRefreshIntervalMillis = 0L;
+    volatile long descriptorRefreshIntervalMillis = 0L;
 
     /**
      * Sets how long the descriptors of open indices go between re-reads when nothing else has read them;
@@ -1534,7 +1497,7 @@ public final class ServerlessNode implements Closeable {
         return this;
     }
 
-    private void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
+    void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
         if (nodeLogEnabled) {
             // Through the log, which names its epochs and writes under the lock a new epoch's recording takes.
             nodeLog(plane).renew();
@@ -1547,7 +1510,7 @@ public final class ServerlessNode implements Closeable {
      * Returns this node's write log, starting it on first use: it reads the epochs an earlier process of this node left in
      * the lease, before anything renews over them.
      */
-    private NodeLogWriter nodeLog(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
+    NodeLogWriter nodeLog(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
         final NodeLogWriter started = nodeLogWriter;
         if (started != null && nodeLogHooked) {
             return started;
@@ -1565,7 +1528,7 @@ public final class ServerlessNode implements Closeable {
                     }
                     writeOwnLease(plane, epochs);
                 },
-                    (shardId, term) -> ownsAtTerm(plane, shardId, term),
+                    (shardId, term) -> leases.ownsAtTerm(plane, shardId, term),
                     settings.getAsLong(
                         "serverless.wal.node_log.window_millis",
                         org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_WINDOW_MILLIS
@@ -1629,10 +1592,10 @@ public final class ServerlessNode implements Closeable {
      * Until when, by the plane's clock, this node's own lease is known valid: the start of its last successful
      * renewal plus the TTL. Its own, not the membership's, which several nodes in one test share.
      */
-    private volatile long ownLeaseValidUntilMillis = 0L;
+    volatile long ownLeaseValidUntilMillis = 0L;
 
     /** Shards being opened right now, by index and number: no concurrent view may drop their bookkeeping. */
-    private final java.util.Set<String> openingShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    final java.util.Set<String> openingShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /**
      * Reader opens in flight, by index and number, so concurrent callers for one shard share one open.
@@ -1642,13 +1605,13 @@ public final class ServerlessNode implements Closeable {
      * shard lock", which a client reads as documents missing. The fleet run found it as acknowledged writes
      * that were absent on first read-back and present on the second.
      */
-    private final Map<String, java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId>> readerOpens =
+    final Map<String, java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId>> readerOpens =
         new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Applies the node-local view and counts its cost; see {@link LocalViewApplier}. */
-    private final LocalViewApplier views;
+    final LocalViewApplier views;
 
-    private ClusterState projectAndApply(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening)
+    ClusterState projectAndApply(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening)
         throws Exception {
         return views.projectAndApply(extra, opening);
     }
@@ -1664,7 +1627,7 @@ public final class ServerlessNode implements Closeable {
     }
 
     /** Records that an incarnation was read and found live at {@code startedAtNanos}, for the incarnation fence. */
-    private void confirmIncarnation(String uuid, long startedAtNanos) {
+    void confirmIncarnation(String uuid, long startedAtNanos) {
         incarnationConfirmedAtNanos.merge(uuid, startedAtNanos, Math::max);
     }
 
@@ -1739,7 +1702,7 @@ public final class ServerlessNode implements Closeable {
         reconciler.setOnShardFailed((failed, cause) -> {
             // Off the failing thread, which may hold engine locks the release needs.
             try {
-                threadPool.generic().execute(() -> onShardFailed(failed, cause));
+                threadPool.generic().execute(() -> leases.onShardFailed(failed, cause));
             } catch (Exception rejected) {
                 logger.warn("could not schedule the release of failed shard " + failed, rejected);
             }
@@ -1765,7 +1728,7 @@ public final class ServerlessNode implements Closeable {
         plugins.onNodeStarted(localNode);
     }
 
-    private PluginActions pluginActions = PluginActions.none();
+    PluginActions pluginActions = PluginActions.none();
 
     /**
      * The names of every action the installed plugins declare, known before any of them is built.
@@ -1782,7 +1745,7 @@ public final class ServerlessNode implements Closeable {
      * list of descriptors, so this is filled in before the transport accepts anything and the window
      * closes. Volatile because it is written on the starting thread and read on transport threads.
      */
-    private volatile Set<String> pluginActionNames = Set.of();
+    volatile Set<String> pluginActionNames = Set.of();
 
     /**
      * Returns the actions the plugins provide.
@@ -1942,488 +1905,61 @@ public final class ServerlessNode implements Closeable {
         return settings.getAsBoolean("serverless.search.prune", true);
     }
 
-    /**
-     * Opens one shard of a frozen view, so a search can read the commit it froze.
-     *
-     * <p>The view is opened as an index of its own — see
-     * {@link org.opensearch.serverless.shard.ShardReconciler#openFrozenReader} for why it has to be — which
-     * means a node can serve a frozen view of a shard it is at the same time writing to.
-     *
-     * @param plane the metadata plane
-     * @param pit the frozen view
-     * @param shardNumber the shard
-     * @return the shard id the view was opened under
-     * @throws Exception if the shard cannot be opened
-     */
+    /** Opens one shard of a frozen view, so a search can read the commit it froze. */
     public org.opensearch.core.index.shard.ShardId openFrozenView(
         org.opensearch.serverless.metadata.MetadataPlane plane,
         org.opensearch.serverless.metadata.PointInTime pit,
         int shardNumber
     ) throws Exception {
-        ensureStarted();
-        adopt(plane);
-        reconciler.setSegmentPublishers(
-            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(packSegments)
-        );
-        reconciler.setBeforePublish(widensRollupsOf(plane));
-        reconciler.setWalStores(
-            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
-        );
-        reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
-        final IndexDescriptor descriptor = plane.describe(pit.index())
-            .orElseThrow(() -> new IllegalArgumentException("no such index: " + pit.index()));
-        // Every shard's term, not just this one's: the view's IndexService is created once and updated as
-        // each shard opens, and metadata that knew only one shard's term would push the others back to
-        // zero.
-        final java.util.Map<Integer, Long> terms = new java.util.HashMap<>();
-        pit.shards().forEach((shard, commit) -> terms.put(shard, commit.term()));
-        if (reconciler.heldShards().size() >= admission.maxShardsHeld() && admission.makeRoom() == false) {
-            throw new IllegalStateException(
-                "this node holds " + reconciler.heldShards().size() + " shards, the cap; the view was not opened here"
-            );
-        }
-        // The reconciler checks that the view is of this incarnation of the index and that it froze this
-        // shard; an IllegalArgumentException saying "no longer held" is the REST layer's 404.
-        return reconciler.openFrozenReader(
-            descriptor.toIndexMetadata(terms),
-            pit,
-            shardNumber,
-            DiscoveryNodes.builder().add(localNode).localNodeId(localNode.getId()).build()
-        );
+        return activation.openFrozenView(plane, pit, shardNumber);
     }
 
-    /**
-     * Projects the given truth into this node's local view, applies it, and opens every shard this node
-     * owns. Idempotent.
-     *
-     * <p>This is the whole shell loop in one call: descriptors and shard-heads in, serving shards out.
-     *
-     * @param descriptors the indices this node should know about
-     * @param owned the shards this node owns, per shard-heads
-     * @return the shards opened by this call
-     * @throws Exception if projection, application or shard opening fails
-     */
+    /** Projects the given truth into this node's local view, applies it, and opens every shard this node owns. */
     public java.util.Set<org.opensearch.core.index.shard.ShardId> applyTruth(
         java.util.Collection<IndexDescriptor> descriptors,
         java.util.Collection<ShardAssignment> owned
     ) throws Exception {
-        ensureStarted();
-        // What this node hosts as a writer is exactly what it was handed; the view is that plus whatever
-        // it serves as a reader, so a dual-role node's readers are not projected away by a writer sync
-        // or its writers by a reader open. That used to happen: serveAsReader projected the reader set
-        // alone, and the writer indices vanished from the applied state.
-        hosted.clear();
-        for (IndexDescriptor descriptor : descriptors) {
-            hosted.put(descriptor.name(), descriptor);
-        }
-        for (ShardAssignment assignment : owned) {
-            writerAssignments.put(shardKey(assignment.indexName(), assignment.shardId()), assignment);
-        }
-        final ClusterState view = projectAndApply(java.util.List.of(), owned);
-        return reconciler.ensureOpen(view, owned);
+        return activation.applyTruth(descriptors, owned);
     }
 
-    /**
-     * Reads this node's truth from the metadata plane and applies it.
-     *
-     * <p>This is the whole steady-state loop, and it replaces cluster-state publication: no node tells
-     * this one what to serve, it reads the object store and works it out. The background reconciler runs
-     * this on a timer; tests call it explicitly.
-     *
-     * @param plane the metadata plane to read from
-     * @return the shards opened by this call
-     * @throws Exception if reading, projection or shard opening fails
-     */
+    /** Reads this node's truth from the metadata plane and applies it. */
     public java.util.Set<org.opensearch.core.index.shard.ShardId> syncFrom(org.opensearch.serverless.metadata.MetadataPlane plane)
         throws Exception {
-        ensureStarted();
-        adopt(plane);
-        reconciler.setSegmentPublishers(
-            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(packSegments)
-        );
-        reconciler.setBeforePublish(widensRollupsOf(plane));
-        reconciler.setWalStores(
-            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
-        );
-        reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
-        final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(localNode.getId(), localNode.getEphemeralId());
-
-        // A node that does not accept writer activation must not open a writer shard. A search-only
-        // node opens reader shards instead -- so this gate is on the role, not on "has any role".
-        final java.util.Collection<ShardAssignment> assignable = roles.contains(ROLE_INGEST) ? truth.assignments() : java.util.List.of();
-        final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyTruth(truth.descriptors(), assignable);
-
-        // Closing here does NOT treat absence from a view as removal, but only because of what the close
-        // is keyed on -- and it used to be keyed on the wrong thing. Truth's assignment list is derived
-        // from a listing of this node's claim blobs, and RegisterMap says of that listing what holds for every
-        // listing: a hint, not truth. A claim blob whose write failed after the head was won, or a
-        // listing that lagged, made truth omit a shard whose head still named this node, and the old
-        // loop released it on that evidence alone. So a shard the listing does not vouch for is judged
-        // by its head, read directly: only "the head no longer names this node" closes it. That is the
-        // rule as written. Readers are skipped outright -- they hold no head and no claim, and on a
-        // dual-role node every writer activation used to evict every warm reader through this loop.
-        final java.util.Set<String> stillOwned = new java.util.HashSet<>();
-        for (ShardAssignment assignment : assignable) {
-            stillOwned.add(shardKey(assignment.indexName(), assignment.shardId()));
-        }
-        for (org.opensearch.core.index.shard.ShardId held : reconciler.openShards()) {
-            if (reconciler.isReader(held) || stillOwned.contains(shardKey(held.getIndexName(), held.id()))) {
-                continue;
-            }
-            final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = plane.heads()
-                .read(held.getIndexName(), held.id());
-            noteHead(held.getIndexName(), held.id(), head.orElse(null));
-            if (namesThisNode(head, held)) {
-                // The listing lagged, or the claim was never written. The head is what decides, and it
-                // says this shard is ours; keep serving it.
-                continue;
-            }
-            releaseLost(plane, held, "the shard-head no longer names " + nodeName, true);
-        }
-        return opened;
+        return activation.syncFrom(plane);
     }
 
-    /**
-     * Takes ownership of a shard and opens it for writing.
-     *
-     * <p>One compare-and-swap, then the ordinary sync. A node that loses the race gets an empty result
-     * rather than an exception, because losing is not an error: the winner's head is in the metadata
-     * plane and the correct response is to route there, never to retry activation elsewhere.
-     *
-     * @param plane the metadata plane
-     * @param indexName the index
-     * @param shardNumber the shard
-     * @return the shard, or empty if another node holds a live lease on it
-     * @throws Exception if activation or opening fails
-     */
+    /** Takes ownership of a shard and opens it for writing. */
     public java.util.Optional<org.opensearch.core.index.shard.ShardId> activateWriter(
         org.opensearch.serverless.metadata.MetadataPlane plane,
         String indexName,
         int shardNumber
     ) throws Exception {
-        ensureStarted();
-        if (roles.contains(ROLE_INGEST) == false) {
-            throw new IllegalStateException("node " + nodeName + " does not accept writer activation; its roles are " + roles);
-        }
-        adopt(plane);
-        reconciler.setSegmentPublishers(
-            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(packSegments)
-        );
-        reconciler.setBeforePublish(widensRollupsOf(plane));
-        reconciler.setWalStores(
-            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
-        );
-        reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
-        {
-            // The lease first, and it has to be first. Under batched liveness a shard-head is not
-            // self-describing: it names an owner, and whether that ownership is live is a fact stored in
-            // the owner's node lease. A node that acquired a shard before publishing a lease would hold a
-            // head that every peer reads as dead, and the shard would be stolen out from under it
-            // immediately -- with both nodes believing they had won it fairly.
-            //
-            // The head's own stamp is a floor that covers this window, but only just: publishing the
-            // lease first is what makes the invariant hold rather than merely usually hold.
-            //
-            // And with the lapsed-lease guard, the same one the heartbeat applies: a node whose lease
-            // lapsed lets go of every writer shard before it renews, or this renewal would reopen the
-            // write path on shards a successor may already have sealed.
-            //
-            // Unless the lease was renewed recently enough that it will outlive this activation by a wide
-            // margin: renewing then costs a write on every activation and proves nothing the last renewal did
-            // not. Half the TTL left, less the skew margin, is the bar -- the renewal timer runs at a third.
-            final long now = plane.clock().getAsLong();
-            if (now + plane.leaseTtlMillis() / 2 >= ownLeaseValidUntilMillis - plane.membership().skewMarginMillis()) {
-                renewLease(plane, false);
-            }
-            if (ownershipUnverified) {
-                // The lease lapsed, or was revoked, and another thread is re-reading the heads this node holds. Writes are
-                // refused until it finishes, so a shard taken now could not be written; and waiting for it put every
-                // activation thread behind that scan, on one lock, for as long as the store took to answer four hundred
-                // reads -- a store slowed to seconds a request stopped a whole fleet taking any shard for an hour. The
-                // activation is asked again once the scan is done.
-                logger.debug("not taking {}[{}]: this node's held heads are being re-read after its lease lapsed", indexName, shardNumber);
-                return java.util.Optional.empty();
-            }
-        }
-        // The incarnation being activated, so a head left by a deleted index of the same name is not
-        // mistaken for a live owner of this one. The read confirms the incarnation too, for the fence the
-        // first write after the open would otherwise pay again.
-        final long describedAt = System.nanoTime();
-        final java.util.Optional<IndexDescriptor> described = plane.describe(indexName);
-        if (described.isEmpty()) {
-            return java.util.Optional.empty();
-        }
-        final long acquiringAt = System.nanoTime();
-        activationPhases[0].addAndGet(acquiringAt - describedAt);
-        final org.opensearch.serverless.metadata.Acquisition acquisition = plane.activate(
-            indexName,
-            shardNumber,
-            localNode.getId(),
-            localNode.getEphemeralId(),
-            described.get().uuid()
-        );
-        activationPhases[1].addAndGet(System.nanoTime() - acquiringAt);
-        if (acquisition.acquired() == false) {
-            // The winner's head is the freshest routing fact this node has, and it was paid for: a
-            // write for this shard forwards there without another read.
-            noteHead(indexName, shardNumber, acquisition.head());
-            return java.util.Optional.empty();
-        }
-        // Open the one shard just won, from the head and descriptor already in hand. This used to run
-        // the full sync -- a listing of this node's claims and one head read per claim -- so taking one
-        // shard cost a node holding a thousand a thousand reads, and a failover storm cost the square of
-        // that. The full sync still runs from the backstop, rarely, for what only it can find.
-        final ShardAssignment assignment = new ShardAssignment(indexName, shardNumber, acquisition.head().term());
-        // The head just won is the freshest there is: the first publish checks ownership against it rather than
-        // reading it back.
-        noteHead(indexName, shardNumber, acquisition.head());
-        hosted.put(indexName, described.get());
-        final String openingKey = shardKey(indexName, shardNumber);
-        writerAssignments.put(openingKey, assignment);
-        openingShards.add(openingKey);
-        // The takeover fenced every older term at the swap, so the open need not list them again.
-        reconciler.noteOlderTermsFenced(indexName, shardNumber, acquisition.head().term());
-        if (nodeLogEnabled) {
-            // Whose node logs the open replays: every node the head names as holding what was not published.
-            nodeLog(plane);
-            reconciler.noteNodeLogWriters(indexName, shardNumber, acquisition.head().writers());
-        }
-        try {
-            // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed
-            // documents its published digest does not describe.
-            //
-            // In turn, not alongside the view. Run on GENERIC beside it, the mark can wait behind the writes that are
-            // themselves waiting on activations: in a fleet test a dead node's shards stopped being taken at all. And the view it
-            // would have overlapped averages 14 ms of a 460 ms open.
-            final long markingAt = System.nanoTime();
-            plane.rollups().markOwned(indexName, described.get().uuid(), described.get().numberOfShards(), shardNumber, assignment.term());
-            final long openingAt = System.nanoTime();
-            activationPhases[2].addAndGet(openingAt - markingAt);
-            final ClusterState view = projectAndApply(java.util.List.of(described.get()), java.util.List.of(assignment));
-            activationPhases[4].addAndGet(System.nanoTime() - openingAt);
-            reconciler.ensureOpen(view, java.util.List.of(assignment));
-            activationPhases[3].addAndGet(System.nanoTime() - openingAt);
-            activationsOpened.incrementAndGet();
-            confirmIncarnation(described.get().uuid(), describedAt);
-        } catch (Exception e) {
-            // The head was won and the shard could not be opened. Held and unserved, that head would
-            // refuse every other node's acquisition for as long as this node's lease lives, and nothing
-            // on this node would try again: a shard nobody serves and nobody is looking for. Give the
-            // head back, so the next node to ask -- possibly this one -- acquires cleanly.
-            writerAssignments.remove(shardKey(indexName, shardNumber));
-            noteHead(indexName, shardNumber, null);
-            try {
-                // The head goes on naming every log it named, and this node's own: an open that failed published nothing.
-                plane.heads()
-                    .release(
-                        indexName,
-                        shardNumber,
-                        localNode.getId(),
-                        assignment.term(),
-                        described.get().uuid(),
-                        localNode.getEphemeralId()
-                    );
-                plane.forgetAssignment(localNode.getId(), indexName, shardNumber);
-            } catch (Exception giveBack) {
-                e.addSuppressed(giveBack);
-            }
-            throw e;
-        } finally {
-            openingShards.remove(openingKey);
-        }
-        final IndexMetadata metadata = clusterService.state().metadata().index(indexName);
-        return metadata == null
-            ? java.util.Optional.empty()
-            : java.util.Optional.of(new org.opensearch.core.index.shard.ShardId(metadata.getIndex(), shardNumber));
+        return activation.activateWriter(plane, indexName, shardNumber);
     }
 
-    /**
-     * Renews this node's lease and lets go of anything it has lost: {@link #renewLease} then
-     * {@link #verifyHeads}, as one pass.
-     *
-     * <p>This is the whole of failure detection, and it runs on the node that might be failing rather
-     * than on one watching it. A node whose process is paused, partitioned or dead simply stops calling
-     * this, its leases lapse, and another node acquires by compare-and-swap. Nothing needs to agree that
-     * it died.
-     *
-     * <p>A lease found lapsed suspends acknowledgement until the verification has read every head; see
-     * {@link #renewLease}. The two halves are separable, and the scheduler separates them: the lease is renewed on its own
-     * timer, and the head scan -- one read per held writer shard -- runs after the next renewal is
-     * already on the clock, so a node holding many shards on a slow store cannot lapse behind its own
-     * scan. This method is the composition, for callers that drive a node by hand.
-     *
-     * @param plane the metadata plane
-     * @return the shards released because this node no longer owns them
-     * @throws Exception if the metadata plane cannot be read or written
-     */
+    /** Renews this node's lease and lets go of anything it has lost: {@link #renewLease} then {@link #verifyHeads}, as one pass. */
     public java.util.Set<org.opensearch.core.index.shard.ShardId> heartbeat(org.opensearch.serverless.metadata.MetadataPlane plane)
         throws Exception {
-        ensureStarted();
-        final java.util.Set<org.opensearch.core.index.shard.ShardId> released = new java.util.LinkedHashSet<>(renewLease(plane));
-        // IfDue: the periodic half. renewLease above has already scanned every head unconditionally if the
-        // lease had lapsed, which is the case where the scan is load-bearing; this is the routine sweep,
-        // and running it on every heartbeat was one register read per held shard per beat. See
-        // DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS.
-        released.addAll(verifyHeadsIfDue(plane));
-        return released;
+        return leases.heartbeat(plane);
     }
 
-    /**
-     * Renews this node's lease -- and, if the lease had already lapsed, re-verifies every held head
-     * before a single write can be acknowledged again.
-     *
-     * <p><b>The rule this makes explicit: a node whose own lease lapsed can prove nothing about the
-     * shards it holds until it has renewed and re-read their heads.</b> The moment its lease is expired
-     * by its own clock (less the skew margin, {@code BlobLeaseMembership#selfLeaseLapsedAt}), any other
-     * node is entitled to take any of its shards and seal their logs, and this node cannot tell from
-     * here which ones were taken. Renewing first and finding out afterwards -- which is what this did --
-     * reopened the write path on every shard for the length of the head scan: a coordinator with a
-     * stale hint forwarded a write, the lease was valid again, the record landed behind a successor's
-     * seal, and the client was told 201. Nobody replays a record behind a seal.
-     *
-     * <p>So a lapse <em>suspends acknowledgement</em> ({@link #ownershipUnverified}) before the renewal,
-     * and the suspension is lifted only by a head verification that started after the renewal and read
-     * every head. Between the two, every write is refused before it is applied. A shard whose head still
-     * names this node is kept -- nobody took it, and closing it would move it for no reason; one whose
-     * head names another node is released. Once the lease is live again nothing can be taken, so what the
-     * verification found is what this node holds.
-     *
-     * <p>Heads this node lost on the write path ({@link #ensureOwnLeaseIsStillValid}) are given back in
-     * the register here, keyed on the term they were lost at, so a closed shard does not sit naming a node
-     * that is not serving it once the lease is live again. A give-back the store refused is retried on the
-     * next renewal.
-     *
-     * <p>Always, not only under lease batching. Under batching this is what keeps the node's shards
-     * alive; in either mode it is what keeps the node addressable, since peers resolve a forwarding
-     * target from its lease. One write per renewal per node.
-     *
-     * @param plane the metadata plane
-     * @return the writer shards released because the verification after a lapse found them taken
-     * @throws Exception if the lease cannot be renewed
-     */
+    /** Renews this node's lease -- and, if the lease had already lapsed, re-verifies every held head before a single write can be acknowledged again. */
     public java.util.Set<org.opensearch.core.index.shard.ShardId> renewLease(org.opensearch.serverless.metadata.MetadataPlane plane)
         throws Exception {
-        return renewLease(plane, true);
+        return leases.renewLease(plane);
     }
 
-    /**
-     * Renews the lease and, after a lapse, re-reads the held heads -- unless asked not to wait and another thread is already
-     * re-reading them, as an activation is.
-     */
-    private java.util.Set<org.opensearch.core.index.shard.ShardId> renewLease(
+    java.util.Set<org.opensearch.core.index.shard.ShardId> renewLease(
         org.opensearch.serverless.metadata.MetadataPlane plane,
         boolean verifyAfterLapse
     ) throws Exception {
-        ensureStarted();
-        adopt(plane);
-        final java.util.Set<org.opensearch.core.index.shard.ShardId> released = new java.util.LinkedHashSet<>();
-        final long now = plane.clock().getAsLong();
-        final boolean lapsed = plane.membership().selfLeaseLapsedAt(now);
-        if (lapsed) {
-            // Before the renewal, never after: from here until a verification that started after the
-            // renewal completes, nothing is acknowledged. The epoch is what tells a verification that
-            // began before this moment from one that began after it.
-            lapseEpoch.incrementAndGet();
-            ownershipUnverified = true;
-            logger.info(
-                "this node's lease lapsed at {} by its own clock (now {}); acknowledgement is suspended until every held head is re-read",
-                plane.membership().ownExpiresAtMillis() - plane.membership().skewMarginMillis(),
-                now
-            );
-        }
-        for (java.util.Map.Entry<org.opensearch.core.index.shard.ShardId, Long> lost : new java.util.ArrayList<>(
-            headsToGiveBack.entrySet()
-        )) {
-            try {
-                plane.heads()
-                    .release(
-                        lost.getKey().getIndexName(),
-                        lost.getKey().id(),
-                        localNode.getId(),
-                        lost.getValue(),
-                        lost.getKey().getIndex().getUUID(),
-                        localNode.getEphemeralId()
-                    );
-                headsToGiveBack.remove(lost.getKey(), lost.getValue());
-            } catch (java.io.IOException e) {
-                logger.warn("could not give back the head of " + lost.getKey() + "; will retry on the next renewal", e);
-            }
-        }
-        boolean revoked = false;
-        synchronized (leaseRenewalLock) {
-            try {
-                renewOwnLease(plane);
-            } catch (org.opensearch.serverless.membership.LeaseRevokedException e) {
-                // Someone changed this node's lease: a node taking one of its shards revoked it, which a
-                // taker does only once it judges the lease expired -- so a clock beyond the skew budget
-                // has had this node serving shards it may have lost. The same suspension as a lapse, and
-                // the same full scan before it lifts. The renewal after this one starts the lease afresh.
-                lapseEpoch.incrementAndGet();
-                ownershipUnverified = true;
-                revoked = true;
-                logger.warn("{}; acknowledgement is suspended until every held head is re-read", e.getMessage());
-                renewOwnLease(plane);
-            }
-        }
-        if ((lapsed || revoked) && (verifyAfterLapse || verifyingHeads.get() == false)) {
-            // Now, not on the next timer: the suspension lasts exactly as long as this scan.
-            released.addAll(verifyHeads(plane));
-        }
-        return released;
+        return leases.renewLease(plane, verifyAfterLapse);
     }
 
-    /**
-     * Whether the shard's head names this very process as owner at exactly this term: what a writer asks
-     * after fencing its own term, so one superseded before it had written anything stops rather than writes.
-     * Unreadable answers no, which stops the writer and costs a retry, never a second writer.
-     */
-    private boolean ownsAtTerm(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        org.opensearch.core.index.shard.ShardId id,
-        long term
-    ) {
-        try {
-            final var head = plane.heads().read(id.getIndexName(), id.id());
-            return head.isPresent()
-                && head.get().term() == term
-                && (head.get().indexUuid() == null || id.getIndex().getUUID().equals(head.get().indexUuid()))
-                && localNode.getId().equals(head.get().ownerNodeId())
-                && (head.get().ownerEphemeralId() == null || localNode.getEphemeralId().equals(head.get().ownerEphemeralId()));
-        } catch (java.io.IOException e) {
-            return false;
-        }
-    }
-
-    /**
-     * Reads the head of every writer shard this node holds and lets go of the ones it has lost.
-     *
-     * <p>The release half of failure detection. A node that has lost a shard must stop serving it, and
-     * this is where it finds out — a head that no longer names this node means someone else won it.
-     * Also where a shard of a deleted index is let go, where the head was never deleted: the descriptor
-     * is read once per open index anyway, and a shard whose index is tombstoned or recreated under a
-     * different uuid is an orphan whatever its head says.
-     *
-     * <p><b>Bounded and parallel.</b> One register read per held writer shard, in {@link #HEAD_READ_LANES}
-     * lanes on the fan-out pool once there are more shards than lanes, so a node holding a thousand pays
-     * a thousand reads in a hundred-odd round trips rather than a thousand. Single-flight: a pass that
-     * finds one already running returns nothing, rather than interleaving two sets of releases.
-     *
-     * @param plane the metadata plane
-     * @return the shards released because this node no longer owns them
-     * @throws Exception if a head could not be read; the shards whose heads were read are still judged
-     */
+    /** Reads the head of every writer shard this node holds and lets go of the ones it has lost. */
     public java.util.Set<org.opensearch.core.index.shard.ShardId> verifyHeads(org.opensearch.serverless.metadata.MetadataPlane plane)
         throws Exception {
-        ensureStarted();
-        adopt(plane);
-        synchronized (headVerificationLock) {
-            verifyingHeads.set(true);
-            try {
-                return verifyHeadsExclusively(plane, true);
-            } finally {
-                verifyingHeads.set(false);
-            }
-        }
+        return leases.verifyHeads(plane);
     }
 
     /**
@@ -2479,8 +2015,8 @@ public final class ServerlessNode implements Closeable {
      */
     public static final long DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS = 0L;
 
-    private volatile long headVerifyIntervalMillis = DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS;
-    private volatile long headsVerifiedAtNanos = Long.MIN_VALUE;
+    volatile long headVerifyIntervalMillis = DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS;
+    volatile long headsVerifiedAtNanos = Long.MIN_VALUE;
 
     /**
      * Sets how long between periodic head verifications; zero verifies on every pass, as this used to.
@@ -2493,340 +2029,45 @@ public final class ServerlessNode implements Closeable {
         return this;
     }
 
-    /**
-     * Verifies every held head, but only if {@link #DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS} has passed since
-     * the last time.
-     *
-     * <p>What the periodic callers use. A lapse, a doubt raised against a specific shard, and an operator
-     * asking all still go through {@link #verifyHeads}, which never skips.
-     *
-     * @param plane the metadata plane
-     * @return the shards released, empty when this pass did not scan
-     * @throws Exception if the metadata plane cannot be reached
-     */
+    /** Verifies every held head, but only if {@link #DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS} has passed since the last time. */
     public java.util.Set<org.opensearch.core.index.shard.ShardId> verifyHeadsIfDue(org.opensearch.serverless.metadata.MetadataPlane plane)
         throws Exception {
-        ensureStarted();
-        adopt(plane);
-        final long last = headsVerifiedAtNanos;
-        // Due on every pass while acknowledgement is suspended: only a full read of the heads lifts the suspension,
-        // and the read right after a lapse fails under exactly the conditions that cause one. Waiting for the interval
-        // left a node refusing every write for minutes after a minute of SlowDown had ended.
-        final boolean due = ownershipUnverified
-            || headVerifyIntervalMillis <= 0L
-            || last == Long.MIN_VALUE
-            || System.nanoTime() - last >= java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(headVerifyIntervalMillis);
-        if (due) {
-            headsVerifiedAtNanos = System.nanoTime();
-        }
-        // Not due still runs the pass, minus the per-shard head reads: the index half of it -- releasing a
-        // shard whose index was deleted or recreated, and reopening one whose log could not be appended to
-        // -- is not what costs, and deferring it would leave a deleted index served until the next scan.
-        synchronized (headVerificationLock) {
-            verifyingHeads.set(true);
-            try {
-                return verifyHeadsExclusively(plane, due);
-            } finally {
-                verifyingHeads.set(false);
-            }
-        }
+        return leases.verifyHeadsIfDue(plane);
     }
 
-    private java.util.Set<org.opensearch.core.index.shard.ShardId> verifyHeadsExclusively(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        boolean readHeads
-    ) throws Exception {
-        final java.util.Set<org.opensearch.core.index.shard.ShardId> released = new java.util.LinkedHashSet<>();
-        // Taken before any read: a lapse that happens during this pass bumps it, and this pass's reads
-        // then predate the renewal and may not lift the suspension.
-        final long epoch = lapseEpoch.get();
-
-        // First, shards whose log could not be appended to. Reaching this point means the store answered
-        // a lease renewal, so it is time to reopen them from their logs: close, and ask for activation,
-        // which re-acquires at a bumped term, seals, and replays -- without the operation the failed
-        // append left in the engine, which is the state the caller was told about.
-        for (org.opensearch.core.index.shard.ShardId shardId : new java.util.ArrayList<>(writeFenced)) {
-            if (reconciler.shard(shardId) == null) {
-                writeFenced.remove(shardId);
-                continue;
-            }
-            releaseLost(plane, shardId, "reopening from its log after a failed append", false);
-            released.add(shardId);
-            signals.ownershipDoubted(shardId.getIndexName(), shardId.id());
-        }
-
-        final java.util.Map<String, java.util.Optional<IndexDescriptor>> descriptors = refreshDescriptorsOfOpenIndices(plane);
-
-        final java.util.List<org.opensearch.core.index.shard.ShardId> writers = new java.util.ArrayList<>();
-        for (org.opensearch.core.index.shard.ShardId shardId : reconciler.openShards()) {
-            if (reconciler.isReader(shardId) == false) {
-                writers.add(shardId);
-            }
-        }
-        final java.util.Map<
-            org.opensearch.core.index.shard.ShardId,
-            java.util.Optional<org.opensearch.serverless.metadata.ShardHead>> heads = new java.util.concurrent.ConcurrentHashMap<>();
-        final java.util.Map<org.opensearch.core.index.shard.ShardId, java.io.IOException> failures =
-            new java.util.concurrent.ConcurrentHashMap<>();
-        if (readHeads) {
-            readHeads(plane, writers, heads, failures);
-        }
-
-        for (org.opensearch.core.index.shard.ShardId shardId : writers) {
-            // The index half first, and it does not need a head. A shard whose index is gone is an orphan
-            // whatever any head says, so this runs on every pass even when the head scan does not -- which
-            // is what keeps a deleted index's shards from being served until the next scan comes round.
-            // It also now runs for a shard whose head read failed, where it used to be skipped with it: a
-            // store that could not answer for one register is no reason to go on serving a deleted index.
-            final java.util.Optional<IndexDescriptor> descriptor = descriptors.get(shardId.getIndexName());
-            if (descriptor != null && (descriptor.isEmpty() || descriptor.get().uuid().equals(shardId.getIndex().getUUID()) == false)) {
-                // The index is gone, or has been recreated under another uuid, and this shard's head
-                // was not deleted with it -- a delete that crashed between the tombstone and its head
-                // deletes. The head may well still name this node; it is an orphan regardless.
-                releaseLost(plane, shardId, "its index was deleted or recreated; this shard belongs to a previous incarnation", true);
-                released.add(shardId);
-                continue;
-            }
-            if (readHeads == false) {
-                // The ownership half is what this pass skipped; see DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS.
-                continue;
-            }
-            final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = heads.get(shardId);
-            if (head == null) {
-                // The read failed. Not evidence of anything; judged on the next pass.
-                continue;
-            }
-            // The head still needs reading, because losing a shard is something only the head can tell
-            // us -- but it is a read, not a write, and that is the whole saving. This used to have an
-            // else-branch that renewed each head individually; that mode is gone.
-            noteHead(shardId.getIndexName(), shardId.id(), head.orElse(null));
-            if (namesThisNode(head, shardId)) {
-                continue;
-            }
-            releaseLost(plane, shardId, "lease lost: the shard-head no longer names " + nodeName, true);
-            released.add(shardId);
-        }
-        if (failures.isEmpty() == false) {
-            throw failures.values().iterator().next();
-        }
-        // Only a pass that actually read every head may lift the suspension: that is the whole content of
-        // the claim it is making. A pass that skipped the scan has established nothing about ownership.
-        if (readHeads && ownershipUnverified && lapseEpoch.get() == epoch) {
-            // Every head this node holds was read after the renewal that followed the lapse, and each
-            // one either still names this node or has been let go. Nothing can be taken from a node with
-            // a live lease, so acknowledgement is safe again.
-            ownershipUnverified = false;
-            logger.info("every held head re-read after the lapse; acknowledgement resumes");
-        }
-        return released;
-    }
-
-    /**
-     * Reads the given heads, in lanes on the fan-out pool once there are more than fit in one.
-     *
-     * <p>Each lane's reads are issued together and waited for together, so the store sees at most
-     * {@link #HEAD_READ_LANES} reads from this pass at once. A pool that refuses the work runs the read
-     * inline instead, which is slower and correct.
-     */
-    private void readHeads(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        java.util.List<org.opensearch.core.index.shard.ShardId> shards,
-        java.util.Map<org.opensearch.core.index.shard.ShardId, java.util.Optional<org.opensearch.serverless.metadata.ShardHead>> heads,
-        java.util.Map<org.opensearch.core.index.shard.ShardId, java.io.IOException> failures
-    ) throws InterruptedException {
-        if (shards.size() <= HEAD_READ_LANES) {
-            for (org.opensearch.core.index.shard.ShardId shardId : shards) {
-                try {
-                    heads.put(shardId, plane.heads().read(shardId.getIndexName(), shardId.id()));
-                } catch (java.io.IOException e) {
-                    failures.put(shardId, e);
-                }
-            }
-            return;
-        }
-        final java.util.concurrent.Executor executor = threadPool.executor(FANOUT_POOL);
-        for (int start = 0; start < shards.size(); start += HEAD_READ_LANES) {
-            final java.util.List<org.opensearch.core.index.shard.ShardId> lane = shards.subList(
-                start,
-                Math.min(shards.size(), start + HEAD_READ_LANES)
-            );
-            final CountDownLatch done = new CountDownLatch(lane.size());
-            for (org.opensearch.core.index.shard.ShardId shardId : lane) {
-                final Runnable read = () -> {
-                    try {
-                        heads.put(shardId, plane.heads().read(shardId.getIndexName(), shardId.id()));
-                    } catch (java.io.IOException e) {
-                        failures.put(shardId, e);
-                    } catch (RuntimeException e) {
-                        failures.put(shardId, new java.io.IOException("could not read the head of " + shardId, e));
-                    } finally {
-                        done.countDown();
-                    }
-                };
-                try {
-                    executor.execute(read);
-                } catch (RuntimeException rejected) {
-                    read.run();
-                }
-            }
-            done.await();
-        }
-    }
-
-    /** Whether a head names this node, this incarnation of it, and this incarnation of the index. */
-    private boolean namesThisNode(
+    boolean namesThisNode(
         java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head,
         org.opensearch.core.index.shard.ShardId shardId
     ) {
-        return head.isPresent() && localNode.getId().equals(head.get().ownerNodeId())
-        // This incarnation's, not a previous one's under the same node id.
-            && (head.get().ownerEphemeralId() == null || localNode.getEphemeralId().equals(head.get().ownerEphemeralId()))
-            // And for this index, not a deleted one of the same name.
-            && (head.get().indexUuid() == null || head.get().indexUuid().equals(shardId.getIndex().getUUID()));
+        return leases.namesThisNode(head, shardId);
     }
 
-    /**
-     * Closes a writer shard this node no longer holds, under its fence, and tidies what referred to it.
-     *
-     * @param plane the metadata plane
-     * @param shardId the shard
-     * @param reason why, for the log
-     * @param forgetClaim whether to drop this node's claim blob too; not for a shard that is about to be
-     *        re-acquired by this node
-     */
-    private void releaseLost(
+    void releaseLost(
         org.opensearch.serverless.metadata.MetadataPlane plane,
         org.opensearch.core.index.shard.ShardId shardId,
         String reason,
         boolean forgetClaim
     ) throws Exception {
-        underShardFence(shardId, () -> {
-            reconciler.releaseShard(shardId, reason);
-            return null;
-        });
-        writeFenced.remove(shardId);
-        forgetShardRecords(shardId);
-        if (forgetClaim) {
-            // Drop the claim too. Leaving it is safe -- it is verified on read -- but a node that has
-            // churned through shards for a year should not list a year of them to find today's.
-            try {
-                plane.forgetAssignment(localNode.getId(), shardId.getIndexName(), shardId.id());
-            } catch (java.io.IOException e) {
-                logger.warn("could not forget the claim on " + shardId + "; it costs one head read per resync until it is", e);
-            }
-        }
+        leases.releaseLost(plane, shardId, reason, forgetClaim);
     }
 
-    /**
-     * Closes a shard whose engine has failed, and has it taken again from the object store.
-     *
-     * <p><b>Why a failed writer must not stay.</b> The shard still counted as open, so this node kept the head with a
-     * live lease: every peer forwarded to it, every activation found it already held, and every request was told
-     * "engine is closed". A fleet run stranded acknowledged writes behind one -- durable in the log, and readable
-     * by nobody, because nobody would take the shard. The engine's state is gone, but nothing acknowledged was ever
-     * only there: the published commit and the log behind it hold every acknowledged write.
-     *
-     * <p>So the writer is closed under its fence and the head left as it is, still naming this node -- given back
-     * unpublished it would be read from a commit behind its log -- and its ownership doubted. The doubt's activation
-     * takes the shard at a higher term, which fences whatever the failed engine might still append, opens it from
-     * the published commit and replays the log. A failed reader holds no head and is simply closed.
-     */
-    private void onShardFailed(org.opensearch.index.shard.IndexShard failed, Exception cause) {
-        final var shardId = failed.shardId();
-        logger.warn("shard " + shardId + " failed; closing it and taking it again from its published commit and log", cause);
-        try {
-            final var released = underShardFence(shardId, () -> {
-                final var result = reconciler.releaseFailedShard(failed, "its engine failed");
-                if (result != ShardReconciler.FailedShardRelease.NOT_CURRENT) {
-                    writeFenced.remove(shardId);
-                    forgetShardRecords(shardId);
-                }
-                return result;
-            });
-            if (released == ShardReconciler.FailedShardRelease.WRITER && metadataPlane != null) {
-                signals.ownershipDoubted(shardId.getIndexName(), shardId.id());
-            }
-        } catch (Exception e) {
-            logger.warn("could not close failed shard " + shardId, e);
-        }
-    }
-
-    /**
-     * Serves a shard as a reader: opens the published commit without owning the shard.
-     *
-     * <p>Reader activation is the cheap half of the design. There is no compare-and-swap and no entry in
-     * the shard-head, because a reader cannot conflict with anything — it does not write, and the node's
-     * engine is read-only when it does not accept writer activation. Any number of search nodes may
-     * serve the same shard at once.
-     *
-     * <p>Accumulating rather than replacing: a search node typically serves many shards, and each call
-     * re-projects the full set so the view keeps describing everything this node holds.
-     *
-     * @param plane the metadata plane to read from
-     * @param indexName the index to serve
-     * @param shardNumber the shard to serve
-     * @return the shard id now open as a reader
-     * @throws Exception if the index does not exist, nothing has been published, or opening fails
-     */
+    /** Serves a shard as a reader: opens the published commit without owning the shard. */
     public org.opensearch.core.index.shard.ShardId serveAsReader(
         org.opensearch.serverless.metadata.MetadataPlane plane,
         String indexName,
         int shardNumber
     ) throws Exception {
-        return serveAsReader(plane, indexName, shardNumber, null);
+        return readerServing.serveAsReader(plane, indexName, shardNumber);
     }
 
-    /**
-     * Opens a reader only for the incarnation this request resolved.
-     *
-     * @param plane the metadata plane
-     * @param indexName the index name
-     * @param shardNumber the shard number
-     * @param expectedUuid the resolved incarnation, or null for an unbound control-plane caller
-     * @return the shard to serve
-     * @throws Exception if opening fails or the name now resolves to another incarnation
-     */
+    /** Opens a reader only for the incarnation this request resolved. */
     public org.opensearch.core.index.shard.ShardId serveAsReader(
         org.opensearch.serverless.metadata.MetadataPlane plane,
         String indexName,
         int shardNumber,
         String expectedUuid
     ) throws Exception {
-        ensureStarted();
-        adopt(plane);
-        reconciler.setSegmentPublishers(
-            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(packSegments)
-        );
-        reconciler.setBeforePublish(widensRollupsOf(plane));
-        reconciler.setWalStores(
-            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
-        );
-        reconciler.setOwnershipCheck((id, term) -> ownsAtTerm(plane, id, term));
-        final String openingKey = indexName + "#" + shardNumber;
-        final org.opensearch.core.index.shard.ShardId served = openOrShareReader(plane, indexName, shardNumber, openingKey);
-        requireReaderIncarnation(served, expectedUuid);
-        try {
-            validateReader(plane, indexName, shardNumber, served);
-        } catch (ShardBehindLogException e) {
-            if (e.superseded() == false || reconciler.isReader(served)) {
-                throw e;
-            }
-            // The copy was on a replaced commit and has been let go: one open now is onto the current one.
-            final org.opensearch.core.index.shard.ShardId reopened = openOrShareReader(plane, indexName, shardNumber, openingKey);
-            requireReaderIncarnation(reopened, expectedUuid);
-            validateReader(plane, indexName, shardNumber, reopened);
-            return reopened;
-        }
-        return served;
-    }
-
-    private static void requireReaderIncarnation(org.opensearch.core.index.shard.ShardId actual, String expectedUuid)
-        throws StaleIncarnationException {
-        if (expectedUuid != null && expectedUuid.equals(actual.getIndex().getUUID()) == false) {
-            throw new StaleIncarnationException(
-                new org.opensearch.core.index.shard.ShardId(actual.getIndexName(), expectedUuid, actual.id())
-            );
-        }
+        return readerServing.serveAsReader(plane, indexName, shardNumber, expectedUuid);
     }
 
     /** How long a reader's check stands before the shard's head is read again, by default. See {@link ReaderValidation}. */
@@ -2841,35 +2082,14 @@ public final class ServerlessNode implements Closeable {
         readerValidation.setReaderCheckMillis(millis);
     }
 
-    /** Refuses to let a reader serve a commit behind an acknowledged write; see {@link ReaderValidation#validateReader}. */
-    private void validateReader(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        String indexName,
-        int shardNumber,
-        org.opensearch.core.index.shard.ShardId shardId
-    ) throws java.io.IOException {
-        readerValidation.validateReader(plane, indexName, shardNumber, shardId);
-    }
-
-    /**
-     * Checks a shard open here before it answers, if it is open as a reader; see {@link #validateReader}.
-     *
-     * <p>For the paths that find a reader already open and query it directly, without going through
-     * {@link #serveAsReader}: they would otherwise answer from a commit behind the log the moment its writer died.
-     *
-     * @param plane the metadata plane
-     * @param indexName the index
-     * @param shardNumber the shard
-     * @param shardId the shard open here
-     * @throws java.io.IOException {@link ShardBehindLogException} if it may not answer, or if the check could not run
-     */
+    /** Checks a shard open here before it answers, if it is open as a reader; see {@link ReaderServing#validateReader}. */
     public void ensureReaderCurrent(
         org.opensearch.serverless.metadata.MetadataPlane plane,
         String indexName,
         int shardNumber,
         org.opensearch.core.index.shard.ShardId shardId
     ) throws java.io.IOException {
-        validateReader(plane, indexName, shardNumber, shardId);
+        readerServing.ensureReaderCurrent(plane, indexName, shardNumber, shardId);
     }
 
     /**
@@ -2881,202 +2101,29 @@ public final class ServerlessNode implements Closeable {
         return writeBackpressure.stats();
     }
 
-    private org.opensearch.core.index.shard.ShardId openOrShareReader(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        String indexName,
-        int shardNumber,
-        String openingKey
-    ) throws Exception {
-        final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> mine =
-            new java.util.concurrent.CompletableFuture<>();
-        final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> running = readerOpens.putIfAbsent(
-            openingKey,
-            mine
-        );
-        if (running != null) {
-            // Someone is opening it already: their answer is this one's, success or failure.
-            try {
-                return running.get();
-            } catch (java.util.concurrent.ExecutionException e) {
-                throw e.getCause() instanceof Exception cause ? cause : e;
-            }
-        }
-        final long describedAt = System.nanoTime();
-        openingShards.add(openingKey);
-        try {
-            final IndexDescriptor descriptor = plane.describe(indexName)
-                .orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
-            final org.opensearch.core.index.shard.ShardId opened = openReader(plane, indexName, shardNumber, descriptor, openingKey);
-            // The read above confirmed the incarnation, so the query this open serves need not read it again.
-            confirmIncarnation(descriptor.uuid(), describedAt);
-            mine.complete(opened);
-            return opened;
-        } catch (Exception e) {
-            mine.completeExceptionally(e);
-            throw e;
-        } finally {
-            openingShards.remove(openingKey);
-            readerOpens.remove(openingKey, mine);
-        }
-    }
-
     /**
      * What a reader open refused at this node's shard cap says, so a coordinator can tell a full node, which another
      * node may stand in for, from a shard nobody can open.
      */
     public static final String AT_THE_CAP = " shards, the cap; ";
 
-    private org.opensearch.core.index.shard.ShardId openReader(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        String indexName,
-        int shardNumber,
-        IndexDescriptor descriptor,
-        String openingKey
-    ) throws Exception {
-        // Readers this node has since let go of are dropped from the record before this one is added,
-        // or a search node that cycles through many distinct readers carries every one it ever opened
-        // into every reader open for the rest of its life: the N-th open cost O(N) and descriptors of
-        // deleted indices stayed projected forever.
-        pruneReaderBookkeeping();
-        served.put(indexName, descriptor);
-        readerShards.add(new java.util.AbstractMap.SimpleEntry<>(indexName, shardNumber));
-
-        if (localShardOf(indexName, shardNumber) == null
-            && reconciler.heldShards().size() >= admission.maxShardsHeld()
-            && admission.makeRoom() == false) {
-            // Readers used to be uncapped: a wide search burst could open thousands of shards on one
-            // node. The same ceiling demand-driven writers have applies -- the configured one, counting
-            // views -- and the same eviction makes room before this refuses.
-            readerOpensRefusedAtCap.incrementAndGet();
-            noteRefusedRecently(indexName, shardNumber);
-            throw new IllegalStateException(
-                "this node holds " + reconciler.openShards().size() + AT_THE_CAP + indexName + "[" + shardNumber + "] was not opened"
-            );
-        }
-        // One manifest read: the shard being opened. Every other reader's term is what was read when it
-        // was opened. This used to re-read every held reader's manifest on every open -- the 500th reader
-        // cost 500 reads before its own.
-        //
-        // Read once, and handed on: the reconciler and the directory factory each used to read the same
-        // register again, so one reader open was three to four reads of one manifest. By the uuid already in
-        // hand: the two-argument form resolves it with another descriptor read.
-        final java.util.Optional<org.opensearch.serverless.store.CommitManifest> manifest = plane.segmentPublisher(
-            indexName,
-            descriptor.uuid(),
-            shardNumber
-        ).readManifest();
-        readerTerms.put(openingKey, manifest.map(org.opensearch.serverless.store.CommitManifest::term).orElse(1L));
-        // The union of what this node serves and what it hosts, plus the reader being opened: a view
-        // that described only the readers used to drop every writer index from the applied state on a
-        // dual-role node.
-        final ShardAssignment opening = new ShardAssignment(indexName, shardNumber, readerTerms.getOrDefault(openingKey, 1L));
-        final ClusterState view = projectAndApply(java.util.List.of(descriptor), java.util.List.of(opening));
-        return reconciler.openReader(view, indexName, shardNumber, manifest.orElse(null));
-    }
-
-    /**
-     * Forgets that this node served a shard as a reader, once it no longer does.
-     *
-     * @param shardId the reader shard that was closed
-     */
+    /** Forgets that this node served a shard as a reader, once it no longer does. */
     public void forgetReader(org.opensearch.core.index.shard.ShardId shardId) {
-        readerShards.remove(new java.util.AbstractMap.SimpleEntry<>(shardId.getIndexName(), shardId.id()));
-        readerTerms.remove(shardKey(shardId.getIndexName(), shardId.id()));
-        pruneServedIndices();
+        readerServing.forgetReader(shardId);
     }
 
-    /** Drops reader records for shards no longer open here as readers, and the descriptors nothing refers to. */
-    private void pruneReaderBookkeeping() {
-        final java.util.Set<org.opensearch.core.index.shard.ShardId> readers = reconciler.readerShards();
-        final java.util.Set<String> openReaderKeys = new java.util.HashSet<>();
-        for (org.opensearch.core.index.shard.ShardId reader : readers) {
-            openReaderKeys.add(shardKey(reader.getIndexName(), reader.id()));
-        }
-        for (Map.Entry<String, Integer> entry : new java.util.ArrayList<>(readerShards)) {
-            final String key = shardKey(entry.getKey(), entry.getValue());
-            if (openReaderKeys.contains(key) == false && openingShards.contains(key) == false) {
-                readerShards.remove(entry);
-                readerTerms.remove(key);
-            }
-        }
-        pruneServedIndices();
-    }
-
-    private void pruneServedIndices() {
-        final java.util.Set<String> referenced = new java.util.HashSet<>();
-        for (Map.Entry<String, Integer> entry : readerShards) {
-            referenced.add(entry.getKey());
-        }
-        served.keySet().removeIf(index -> referenced.contains(index) == false);
-    }
-
-    /**
-     * Indexes a document durably: the write reaches the object store's log before it is acknowledged.
-     *
-     * <p>This is the ordering that closes the unpublished-write window — the record is in the log before
-     * this method returns, and returning is what acknowledges the write. What changed is <em>where</em> in the method
-     * the append happens: it used to come first, and now it comes after the engine has run, because the
-     * sequence number the record carries does not exist until then. See {@link #appendOrRelease} for what
-     * happens when the append is the thing that fails.
-     *
-     * @param shardId the shard to write to
-     * @param id the document id
-     * @param source the document source
-     * @return what the engine assigned this write
-     * @throws java.io.IOException if the shard is not held here, or the write fails
-     */
+    /** Indexes a document durably: the write reaches the object store's log before it is acknowledged. */
     public WriteOutcome index(org.opensearch.core.index.shard.ShardId shardId, String id, String source) throws java.io.IOException {
-        return index(shardId, id, source, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L);
+        return writes.index(shardId, id, source);
     }
 
-    /**
-     * Indexes a document, optionally only if it is still at the sequence number the caller expects.
-     *
-     * <p><b>The compare-and-swap is the engine's own, not a re-implementation.</b> {@code ifSeqNo} and
-     * {@code ifPrimaryTerm} are passed straight through to
-     * {@code IndexShard#applyIndexOperationOnPrimary}, where core compares them against the live version
-     * map (falling back to a Lucene doc-values lookup) under the per-document lock it already takes. A
-     * mismatch is a {@code VersionConflictEngineException}, which this method rethrows so the caller
-     * cannot mistake a lost race for a completed write.
-     *
-     * @param shardId the shard to write to
-     * @param id the document id
-     * @param source the document source
-     * @param ifSeqNo the sequence number the document must currently be at, or
-     *     {@link org.opensearch.index.seqno.SequenceNumbers#UNASSIGNED_SEQ_NO} for an unconditional write
-     * @param ifPrimaryTerm the primary term the document must currently be at, or 0 when unconditional
-     * @return what the engine assigned this write
-     * @throws org.opensearch.index.engine.VersionConflictEngineException if the condition was not met
-     * @throws java.io.IOException if the shard is not held here, or the write fails
-     */
+    /** Indexes a document, optionally only if it is still at the sequence number the caller expects. */
     public WriteOutcome index(org.opensearch.core.index.shard.ShardId shardId, String id, String source, long ifSeqNo, long ifPrimaryTerm)
         throws java.io.IOException {
-        return index(shardId, id, source, ifSeqNo, ifPrimaryTerm, false);
+        return writes.index(shardId, id, source, ifSeqNo, ifPrimaryTerm);
     }
 
-    /**
-     * Indexes a document, optionally only if no document with that id exists.
-     *
-     * <p><b>Create is one constant, not a feature.</b> Core's own {@code _create} is an ordinary index
-     * operation at {@code Versions.MATCH_DELETED} — the engine compares against its live version map under
-     * the per-document lock it already takes, and a document that is present fails the comparison. Nothing
-     * here re-implements exists-checking, and in particular nothing does a read first, which would be a
-     * race rather than a check.
-     *
-     * <p>A lost race arrives as a {@code VersionConflictEngineException}, the same type a failed
-     * {@code if_seq_no} produces, and reaches the caller as a 409 by the same path.
-     *
-     * @param shardId the shard to write to
-     * @param id the document id
-     * @param source the document source
-     * @param ifSeqNo the sequence number the document must currently be at, or
-     *     {@link org.opensearch.index.seqno.SequenceNumbers#UNASSIGNED_SEQ_NO} for an unconditional write
-     * @param ifPrimaryTerm the primary term the document must currently be at, or 0 when unconditional
-     * @param requireAbsent whether the write must fail if the document already exists
-     * @return what the engine assigned this write
-     * @throws org.opensearch.index.engine.VersionConflictEngineException if the condition was not met
-     * @throws java.io.IOException if the shard is not held here, or the write fails
-     */
+    /** Indexes a document, optionally only if no document with that id exists. */
     public WriteOutcome index(
         org.opensearch.core.index.shard.ShardId shardId,
         String id,
@@ -3085,34 +2132,10 @@ public final class ServerlessNode implements Closeable {
         long ifPrimaryTerm,
         boolean requireAbsent
     ) throws java.io.IOException {
-        return index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
+        return writes.index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent);
     }
 
-    /**
-     * Indexes a document, optionally growing the mapping to fit it.
-     *
-     * <p><b>Dynamic mapping, which this shell did not have.</b> When a document carries a field the mapping
-     * does not describe, core's engine does not index it and does not fail either: it returns
-     * {@code MAPPING_UPDATE_REQUIRED} along with the mapping addition that would let the write succeed. A
-     * classic node sends that addition to the cluster manager, waits for it to be applied, and retries.
-     * There is no cluster manager here, and nothing was doing the equivalent — so an index created without a
-     * complete mapping could not accept a single document, and every write of an undeclared field answered
-     * with a 500. Every test in this repository happened to declare its mappings, which is why it went unseen.
-     *
-     * <p>The equivalent here is the one the mapping update uses: merge the addition into the descriptor under a
-     * compare-and-swap, apply it to the open shard, and retry once. Concurrent writers adding different
-     * fields both win, because that is what the compare-and-swap is for.
-     *
-     * @param shardId the shard to write to
-     * @param id the document id
-     * @param source the document source
-     * @param ifSeqNo the sequence number the document must be at, or unassigned
-     * @param ifPrimaryTerm the primary term the document must be at, or 0
-     * @param requireAbsent whether the write must fail if the document already exists
-     * @param mayGrowMapping whether a required mapping update should be applied and the write retried
-     * @return what the engine assigned this write
-     * @throws java.io.IOException if the shard is not held here, or the write fails
-     */
+    /** Indexes a document, optionally growing the mapping to fit it. */
     public WriteOutcome index(
         org.opensearch.core.index.shard.ShardId shardId,
         String id,
@@ -3122,206 +2145,7 @@ public final class ServerlessNode implements Closeable {
         boolean requireAbsent,
         boolean mayGrowMapping
     ) throws java.io.IOException {
-        ensureStarted();
-        // Admitted before anything is applied, so a write refused for back-pressure is in neither the engine nor the log.
-        try (org.opensearch.common.lease.Releasable admitted = writeBackpressure.admit()) {
-            // Under the shard's fence from before the engine applies the operation until after it is
-            // acknowledged. See appendOrRelease for the interleaving this closes.
-            final java.util.concurrent.locks.Lock fence = enterWritePath(shardId);
-            try (org.opensearch.common.lease.Releasable guard = reconciler.writeGuard(shardId)) {
-                return indexUnderFence(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
-            } finally {
-                fence.unlock();
-            }
-        }
-    }
-
-    private WriteOutcome indexUnderFence(
-        org.opensearch.core.index.shard.ShardId shardId,
-        String id,
-        String source,
-        long ifSeqNo,
-        long ifPrimaryTerm,
-        boolean requireAbsent,
-        boolean mayGrowMapping
-    ) throws java.io.IOException {
-        final var shard = reconciler.shard(shardId);
-        if (shard == null) {
-            throw new java.io.IOException("cannot index into " + shardId + ": not open on " + nodeName);
-        }
-        if (reconciler.isReader(shardId)) {
-            throw new java.io.IOException("cannot index into " + shardId + ": it is open as a reader");
-        }
-        refuseIfWriteFenced(shardId);
-        // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
-        // and settings up to the descriptor, so a change made on another node is in force for the first operation
-        // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
-        ensureIncarnationLive(shardId);
-        markUsed(shardId);
-        // Apply first, then log. This is the reverse of what this path used to do, and the reason is the
-        // whole point of carrying sequence numbers: the engine assigns one, so there is nothing worth
-        // recording until it has run. The durability contract the javadoc above states is unchanged --
-        // the record is in the log before the write is acknowledged, and acknowledgement is this method
-        // returning. It is also the order classic OpenSearch uses internally: Lucene, then the translog,
-        // then fsync.
-        final var result = shard.applyIndexOperationOnPrimary(
-            requireAbsent ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-            org.opensearch.index.VersionType.INTERNAL,
-            new org.opensearch.index.mapper.SourceToParse(
-                shardId.getIndexName(),
-                id,
-                new org.opensearch.core.common.bytes.BytesArray(source),
-                org.opensearch.common.xcontent.XContentType.JSON
-            ),
-            ifSeqNo,
-            ifPrimaryTerm,
-            org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
-            false
-        );
-        if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.FAILURE) {
-            // Core returns parsing and conditional-write failures as values. Preserve their native
-            // exceptions so a client error keeps its status instead of becoming a generic I/O error.
-            if (result.getFailure() instanceof RuntimeException failure) {
-                throw failure;
-            }
-        }
-        if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.MAPPING_UPDATE_REQUIRED && mayGrowMapping) {
-            // The document named a field the mapping does not have. Grow the mapping and write it again;
-            // once, because a second MAPPING_UPDATE_REQUIRED after the update has been applied means
-            // something other than a missing field, and retrying forever would hide it.
-            growMapping(shardId, result.getRequiredMappingUpdate());
-            return indexUnderFence(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, false);
-        }
-        if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
-            // This is a value, not a throw. A caller that ignores it indexes nothing
-            // and reports no error.
-            throw new java.io.IOException("indexing " + id + " returned " + result.getResultType(), result.getFailure());
-        }
-        appendOrRelease(
-            shardId,
-            shard,
-            java.util.List.of(
-                new org.opensearch.serverless.store.WalRecord(id, source, result.getSeqNo(), result.getTerm(), result.getVersion())
-            )
-        );
-        // The local translog is never replayed by any open path -- a shard opens from a published commit
-        // and its object-store log -- so this sync is not for durability; the log append above is. It is
-        // for memory: the translog holds its write buffer, a 16 KB page charged to the request breaker,
-        // until it is synced, and a node with a one-kilobyte request limit found every later search
-        // refused by a page a write had left behind. One local fsync per acknowledged write is the price,
-        // and it is not an object-store request.
-        syncIfStillOpen(shard);
-        // The edge. Fired after the write is durable and applied, so a listener that publishes on it
-        // can never publish a commit describing an operation the caller was not told about.
-        signals.wrote(shardId);
-        return new WriteOutcome(result.getSeqNo(), result.getTerm(), result.getVersion(), result.isCreated(), true);
-    }
-
-    /**
-     * Syncs the shard's local translog, unless the shard was released after its record reached the log.
-     *
-     * <p>The record is durable in the object store by then, and a successor replays it; the local translog is
-     * only this node's copy, and a shard released for a lapsed lease has no further use for it. Failing the
-     * write here would report as refused a write that is in the log.
-     */
-    private static void syncIfStillOpen(org.opensearch.index.shard.IndexShard shard) throws java.io.IOException {
-        try {
-            shard.sync();
-        } catch (org.opensearch.index.shard.IndexShardClosedException e) {
-            // Released after the append; see above.
-        }
-    }
-
-    /**
-     * Appends a record to the log, and fences the shard against further writes if that fails.
-     *
-     * <p><b>Why a failed append cannot simply be reported to the caller.</b> By the time this runs, the
-     * operation is already in the engine. Reporting failure while leaving it there would make the refusal
-     * a lie: this node would go on serving the document and would eventually publish it, so a caller told
-     * the write failed would find it present, permanently. The refusal is made true by never publishing
-     * that engine state and rebuilding the shard from the log, which does not contain the operation.
-     *
-     * <p><b>Fenced rather than released, which is a brownout decision.</b> This used to close the shard
-     * on the spot, and a store that was merely slow for a moment took every writer shard on the node
-     * offline for reads too -- a fully cached copy answering "not open" to a get. The rule is that
-     * reads degrade to staleness and writes to rejection. So the shard stays open and readable, refuses
-     * every further write ({@link #refuseIfWriteFenced}), is skipped by publication, and is closed and
-     * re-acquired from its log by the next heartbeat that reaches the store. Until then a read from this
-     * node's own copy can see the operation the caller was told failed; that window is one renewal
-     * interval, and the alternative was no reads at all.
-     *
-     * <p><b>The fence around this method is what makes acknowledgement safe against a voluntary
-     * release.</b> Idle release, eviction and a clean shutdown all run publish, release the head, close.
-     * With no exclusion against the write path, a write applied after the publish and appended after the
-     * head release -- by which time a successor may have acquired and sealed the log -- was acknowledged
-     * and never replayed. The caller holds the shard's read fence from before applying to after the
-     * check below, and the release holds the write fence around the whole sequence, so the two cannot
-     * interleave: a write either completes before the release begins, or finds no shard after it ends.
-     *
-     * @param shardId the shard being written to
-     * @param shard the open shard
-     * @param records the records to append, in order; empty is a no-op
-     * @throws java.io.IOException if the append failed, after the shard has been fenced
-     */
-    private void appendOrRelease(
-        org.opensearch.core.index.shard.ShardId shardId,
-        org.opensearch.index.shard.IndexShard shard,
-        java.util.List<org.opensearch.serverless.store.WalRecord> records
-    ) throws java.io.IOException {
-        final var wal = reconciler.wal(shardId);
-        if (wal == null || records.isEmpty()) {
-            return;
-        }
-        ensureOwnLeaseIsStillValid(shardId);
-        if (wal.begun(shard.getOperationPrimaryTerm()) == false) {
-            // Not this term's writer: only a writer's open begins its term, after confirming the head names it. Appending
-            // anyway would begin the term here, unchecked, and fence the real writer's records off behind this one.
-            writeFenced.add(shardId);
-            throw new java.io.IOException(
-                "could not log to "
-                    + shardId
-                    + ": this node is not writing its log at term "
-                    + shard.getOperationPrimaryTerm()
-                    + " -- never began it here, or stopped after a failed append; the write was not acknowledged"
-            );
-        }
-        final long appendStarted = System.nanoTime();
-        try {
-            // Through the group committer rather than straight to the log: concurrent writes to this shard
-            // share one PUT, and this caller returns only once the blob carrying its own records has
-            // landed. The two lease checks around this call are unchanged and remain per-caller, so every
-            // member of a group independently establishes that its record sits ahead of any seal.
-            if (nodeLogEnabled) {
-                // One blob per window for every shard of this node, rather than one per shard.
-                nodeLog(metadataPlane).commit(shardId, shard.getOperationPrimaryTerm(), records);
-            } else {
-                walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
-            }
-            writeBackpressure.onAppend(System.nanoTime() - appendStarted, true);
-        } catch (Exception | Error e) {
-            writeBackpressure.onAppend(System.nanoTime() - appendStarted, false);
-            writeFenced.add(shardId);
-            if (e instanceof Error fatal) {
-                throw fatal;
-            }
-            throw new java.io.IOException(
-                "could not log "
-                    + records.size()
-                    + " operation(s) to "
-                    + shardId
-                    + "; the write was not acknowledged, the shard now refuses writes and will be reopened from its log",
-                e
-            );
-        }
-        // The PUT landed, so the record is durable: a successor fences this term before it replays, and a
-        // fence occupies the slot this writer would have written next, so a record that landed is ahead of
-        // every fence and every successor replays it. It is acknowledged whatever the lease now says --
-        // refusing it was what turned a durable record into one "refused" and later replayed. A lapsed
-        // lease still releases the shard, so nothing further is written here. See
-        // serverless/rfc-fencing-closure.md.
-        releaseIfLeaseLapsed(shardId);
-        // After the PUT, so the confirmation is of the index as it stood once the record was down.
-        ensureIncarnationLive(shardId);
+        return writes.index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
     }
 
     /**
@@ -3350,14 +2174,13 @@ public final class ServerlessNode implements Closeable {
      */
     public static final long DELETE_SETTLE_MILLIS = INCARNATION_FENCE_MILLIS + 250L;
 
-    private volatile long incarnationFenceMillis = INCARNATION_FENCE_MILLIS;
+    volatile long incarnationFenceMillis = INCARNATION_FENCE_MILLIS;
 
     /** When each incarnation was last confirmed to exist, by uuid, in {@link System#nanoTime} terms. */
-    private final java.util.concurrent.ConcurrentHashMap<String, Long> incarnationConfirmedAtNanos =
-        new java.util.concurrent.ConcurrentHashMap<>();
+    final java.util.concurrent.ConcurrentHashMap<String, Long> incarnationConfirmedAtNanos = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** Striped, so a burst of writes to one index pays one confirming read rather than one each. */
-    private final Object[] incarnationLocks = newLocks(64);
+    final Object[] incarnationLocks = newLocks(64);
 
     private static Object[] newLocks(int n) {
         final Object[] locks = new Object[n];
@@ -3377,1051 +2200,62 @@ public final class ServerlessNode implements Closeable {
         this.incarnationFenceMillis = Math.max(0L, millis);
     }
 
-    /**
-     * Refuses to answer from a shard unless its index incarnation was confirmed to exist within the window.
-     *
-     * @param shardId the shard about to answer
-     * @throws StaleIncarnationException if the index is gone or has been recreated under another uuid
-     * @throws java.io.IOException if the descriptor cannot be read
-     */
+    /** Refuses to answer from a shard unless its index incarnation was confirmed to exist within the window. */
     public void ensureIncarnationLive(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
-        final org.opensearch.serverless.metadata.MetadataPlane plane = metadataPlane;
-        if (plane == null) {
-            // No metadata plane, nothing that can delete an index behind this node's back.
-            return;
-        }
-        final String uuid = shardId.getIndex().getUUID();
-        final long window = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(incarnationFenceMillis);
-        if (confirmedWithin(uuid, window)) {
-            return;
-        }
-        // A routing read this node made moments ago -- resolving a search's names, say -- found this very
-        // incarnation, and a read is a read whoever made it: stamped with when it began, it confirms exactly
-        // what the fence's own read would. A wide search used to read every descriptor twice, once to route
-        // and once here.
-        final var routed = plane.readConfirmingIncarnation(shardId.getIndexName(), uuid);
-        if (routed.isPresent() && System.nanoTime() - routed.get().readStartedNanos() <= window) {
-            confirmIncarnation(uuid, routed.get().readStartedNanos());
-            // And it is a read of the mapping and settings like any other: a change made on another node reaches
-            // this one's shards through whichever read sees it first, so the periodic refresh is only a backstop.
-            applyIfNewer(shardId.getIndexName(), routed.get().descriptor(), routed.get().readStartedNanos());
-            return;
-        }
-        synchronized (incarnationLocks[Math.floorMod(uuid.hashCode(), incarnationLocks.length)]) {
-            if (confirmedWithin(uuid, window)) {
-                return;
-            }
-            // Stamped with when the read began, never when it returned: the descriptor was live at some
-            // instant after this, so this is the earliest the confirmation can honestly claim.
-            final long startedAt = System.nanoTime();
-            final var descriptor = plane.describe(shardId.getIndexName());
-            if (descriptor.isEmpty() || descriptor.get().uuid().equals(uuid) == false) {
-                incarnationConfirmedAtNanos.remove(uuid);
-                throw new StaleIncarnationException(shardId);
-            }
-            incarnationConfirmedAtNanos.put(uuid, startedAt);
-            // The read is the refresh's read too: apply it, and let the periodic refresh skip this index.
-            try {
-                applyDescriptor(shardId.getIndexName(), descriptor.get());
-                descriptorReadAtNanos.put(shardId.getIndexName(), startedAt);
-            } catch (Exception e) {
-                logger.warn("could not apply the descriptor of " + shardId.getIndexName() + " read by the incarnation fence", e);
-            }
-            if (incarnationConfirmedAtNanos.size() > 4096) {
-                // A confirmation older than the window licenses nothing, so those are all that is dropped.
-                final long now = System.nanoTime();
-                incarnationConfirmedAtNanos.values().removeIf(at -> now - at > window);
-            }
-        }
+        fences.ensureIncarnationLive(shardId);
     }
 
-    private boolean confirmedWithin(String uuid, long windowNanos) {
-        final Long at = incarnationConfirmedAtNanos.get(uuid);
-        return at != null && System.nanoTime() - at <= windowNanos;
+    void refuseIfWriteFenced(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
+        fences.refuseIfWriteFenced(shardId);
     }
 
-    /**
-     * Refuses a write to a shard whose log could not be appended to, before the engine applies it.
-     *
-     * @param shardId the shard
-     * @throws java.io.IOException if the shard is write-fenced
-     */
-    private void refuseIfWriteFenced(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
-        if (ownershipUnverified) {
-            throw new java.io.IOException(
-                "refusing to write to "
-                    + shardId
-                    + ": this node's lease lapsed and it has not yet re-read the shard-heads it holds; retry shortly"
-            );
-        }
-        if (writeFenced.contains(shardId)) {
-            throw new java.io.IOException(
-                "refusing to write to "
-                    + shardId
-                    + ": its write-ahead log could not be appended to and the shard is being reopened from the log; reads are still served"
-            );
-        }
-    }
-
-    /**
-     * Reports whether a writer shard is refusing writes after a failed log append.
-     *
-     * @param shardId the shard
-     * @return true while the shard is fenced and awaiting a reopen
-     */
+    /** Reports whether a writer shard is refusing writes after a failed log append. */
     public boolean isWriteFenced(org.opensearch.core.index.shard.ShardId shardId) {
-        return writeFenced.contains(shardId);
+        return fences.isWriteFenced(shardId);
     }
 
-    private static final class MappingGrowth {
-        private final java.util.Queue<org.opensearch.index.mapper.Mapping> pending = new java.util.concurrent.ConcurrentLinkedQueue<>();
-        // Guarded by mappingGrowth.compute, never by this object's monitor.
-        private int users;
-    }
-
-    private final Map<org.opensearch.core.index.Index, MappingGrowth> mappingGrowth = new java.util.concurrent.ConcurrentHashMap<>();
+    final Map<org.opensearch.core.index.Index, MappingGrowthPath.MappingGrowth> mappingGrowth =
+        new java.util.concurrent.ConcurrentHashMap<>();
 
     /** How many compare-and-swaps one mapping growth attempts before failing the write. */
-    private static final int MAPPING_GROWTH_ATTEMPTS = 5;
+    static final int MAPPING_GROWTH_ATTEMPTS = 5;
 
-    /**
-     * Adds what a document needed to the index's mapping, durably, and applies it here.
-     *
-     * <p>The descriptor is the mapping's home, so this is the same compare-and-swap
-     * {@code PUT /{index}/_mapping} performs — deliberately, because two ways of changing a mapping would be
-     * two ways for it to drift. A lost swap re-reads and retries, so two writers introducing different fields
-     * at the same time both keep theirs.
-     *
-     * @param shardId the shard whose write needed the field
-     * @param addition what core says the mapping is missing
-     * @throws java.io.IOException if the mapping cannot be stored
-     */
-    private void growMapping(org.opensearch.core.index.shard.ShardId shardId, org.opensearch.index.mapper.Mapping addition)
+    void growMapping(org.opensearch.core.index.shard.ShardId shardId, org.opensearch.index.mapper.Mapping addition)
         throws java.io.IOException {
-        final var plane = metadataPlane;
-        if (plane == null || addition == null) {
-            return;
-        }
-        final var index = shardId.getIndex();
-        // Coalesced, per index, on this node. This is the one register write a data path performs, and
-        // it used to be one compare-and-swap per document that named a new field: a bulk of a thousand
-        // such documents across the write pool was a thousand swaps on one register, of which one won
-        // per round and the rest re-read and retried, four times each, and then failed the write. Now
-        // every thread queues what it needs and the first to take the index's monitor swaps once for
-        // all of them; a thread that finds its addition already drained by that leader has nothing left
-        // to do. The rate is bounded by the field limit, which is the argument for allowing the write
-        // here at all.
-        final MappingGrowth growth = mappingGrowth.compute(index, (key, existing) -> {
-            final MappingGrowth retained = existing == null ? new MappingGrowth() : existing;
-            retained.users++;
-            return retained;
-        });
-        try {
-            growth.pending.add(addition);
-            synchronized (growth) {
-                final java.util.List<org.opensearch.index.mapper.Mapping> batch = new java.util.ArrayList<>();
-                org.opensearch.index.mapper.Mapping next;
-                while ((next = growth.pending.poll()) != null) {
-                    batch.add(next);
-                }
-                if (batch.isEmpty()) {
-                    // Another participant already committed and applied this caller's addition.
-                    return;
-                }
-                try {
-                    growMappingBy(plane, index, batch);
-                } catch (MappingConflictException e) {
-                    // An incompatible addition must not poison every future growth.
-                    throw e;
-                } catch (Exception e) {
-                    // Waiting participants must retry the whole uncommitted batch.
-                    growth.pending.addAll(batch);
-                    throw e;
-                }
-            }
-        } finally {
-            mappingGrowth.compute(index, (key, current) -> {
-                assert current == growth;
-                // Evict only once no caller can still enqueue or wait on this monitor. Any additions
-                // left then belong to failed requests; keeping them retains every departed index UUID.
-                return --growth.users == 0 ? null : growth;
-            });
-        }
+        mappings.growMapping(shardId, addition);
     }
 
-    /** One index's mapping grown by a batch of additions: read, merge all of them, swap once, retry with backoff. */
-    private void growMappingBy(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        org.opensearch.core.index.Index index,
-        java.util.List<org.opensearch.index.mapper.Mapping> additions
-    ) throws java.io.IOException {
-        final String indexName = index.getName();
-        for (int attempt = 0; attempt < MAPPING_GROWTH_ATTEMPTS; attempt++) {
-            if (attempt > 0) {
-                // Exponential, jittered, capped: the register's other writers are other nodes doing the
-                // same thing, and four immediate retries by every loser was a stampede that mostly lost.
-                final long upper = Math.min(500L, 20L << Math.min(attempt, 6));
-                try {
-                    Thread.sleep(java.util.concurrent.ThreadLocalRandom.current().nextLong(1L, upper + 1L));
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    throw new java.io.IOException("interrupted while growing the mapping of " + indexName, e);
-                }
-            }
-            final long generation = plane.descriptorGeneration(indexName);
-            final var current = plane.describe(indexName);
-            if (current.isEmpty() || index.getUUID().equals(current.get().uuid()) == false) {
-                throw new java.io.IOException("cannot grow mapping for " + index + ": the index was deleted or recreated");
-            }
-            final String merged;
-            final var mapperService = indicesService.createIndexMapperService(current.get().toIndexMetadata(java.util.Map.of()));
-            try {
-                if (current.get().mapping() != null) {
-                    mapperService.merge(
-                        org.opensearch.index.mapper.MapperService.SINGLE_MAPPING_NAME,
-                        new org.opensearch.common.compress.CompressedXContent(current.get().mapping()),
-                        org.opensearch.index.mapper.MapperService.MergeReason.MAPPING_RECOVERY
-                    );
-                }
-                org.opensearch.index.mapper.DocumentMapper grown = null;
-                for (org.opensearch.index.mapper.Mapping addition : additions) {
-                    grown = mapperService.merge(
-                        org.opensearch.index.mapper.MapperService.SINGLE_MAPPING_NAME,
-                        new org.opensearch.common.compress.CompressedXContent(addition.toString()),
-                        org.opensearch.index.mapper.MapperService.MergeReason.MAPPING_UPDATE
-                    );
-                }
-                merged = unwrapMappingType(grown.mappingSource().string());
-            } catch (Exception e) {
-                // Most likely this shard is behind the descriptor -- it mapped the field dynamically because a
-                // mapping declaring it had not reached it yet. Brought up to it, the client's retry indexes the
-                // document with the declared mapping instead of failing the same way.
-                try {
-                    applyDescriptor(indexName, current.get());
-                } catch (Exception nested) {
-                    e.addSuppressed(nested);
-                }
-                throw new MappingConflictException("could not grow the mapping of " + indexName + " to fit the document", e);
-            } finally {
-                mapperService.close();
-            }
-            if (merged.equals(current.get().mapping())) {
-                // Another node already grew it. The descriptor is right; this node's open shard is not,
-                // and without this refresh every write carrying the field failed here until the shard
-                // reopened.
-                reconciler.refreshMapping(indexName, current.get());
-                return;
-            }
-            final var updated = current.get().withMapping(merged);
-            if (plane.updateDescriptor(updated, generation).isPresent()) {
-                hosted.computeIfPresent(indexName, (k, v) -> v.uuid().equals(index.getUUID()) ? updated : v);
-                reconciler.refreshMapping(indexName, updated);
-                return;
-            }
-        }
-        throw new java.io.IOException("the mapping of " + indexName + " is being changed concurrently; retry the write");
+    void ensureOwnLeaseIsStillValid(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
+        fences.ensureOwnLeaseIsStillValid(shardId);
     }
 
-    /** A document's dynamic mapping addition that the index's mapping refuses: the write fails, and retrying it as is cannot help. */
-    private static final class MappingConflictException extends java.io.IOException {
-        MappingConflictException(String message, Exception cause) {
-            super(message, cause);
-        }
+    boolean releaseIfLeaseLapsed(org.opensearch.core.index.shard.ShardId shardId) {
+        return fences.releaseIfLeaseLapsed(shardId);
     }
 
-    /** Strips the single mapping type core wraps a merged mapping in, as MappingUpdateHandler does. */
-    private static String unwrapMappingType(String source) throws java.io.IOException {
-        final java.util.Map<String, Object> parsed = org.opensearch.common.xcontent.XContentHelper.convertToMap(
-            new org.opensearch.core.common.bytes.BytesArray(source),
-            false,
-            org.opensearch.common.xcontent.XContentType.JSON
-        ).v2();
-        final Object inner = parsed.get(org.opensearch.index.mapper.MapperService.SINGLE_MAPPING_NAME);
-        if (parsed.size() != 1 || inner instanceof java.util.Map == false) {
-            return source;
-        }
-        try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
-            @SuppressWarnings("unchecked")
-            final java.util.Map<String, Object> body = (java.util.Map<String, Object>) inner;
-            builder.map(body);
-            return builder.toString();
-        }
-    }
-
-    /**
-     * Refuses the write if this node's own lease has already expired by its own clock.
-     *
-     * <p><b>Why the write path and not just the heartbeat.</b> A node learns it has lost a shard by reading
-     * the shard-head, which it does on its heartbeat. A node that cannot reach the object store cannot read
-     * the head <em>or</em> renew its lease, so today it keeps accepting writes for as long as the partition
-     * lasts — the one case where the existing check is guaranteed not to fire is the one where it is needed.
-     * Checking the lease this node last published costs nothing, needs no I/O, and is therefore affordable
-     * on every write.
-     *
-     * <p><b>It bounds; it does not fence.</b> The check and the append are not atomic, so a pause between
-     * them long enough to outlive the deadline still lands the append. That is the classic lease race and
-     * it cannot be closed from the writer's side. It is closed on the reader's side instead, by the replay
-     * cutoff in {@link org.opensearch.serverless.store.WalStore#position()}: a successor does not read what
-     * was appended after it took over, whether the appender believed itself entitled or not.
-     *
-     * <p>The shard is released rather than merely refused, because a node past its own deadline has lost
-     * every shard it held, not just this one's write — and a released shard is one a successor can take
-     * cleanly instead of racing.
-     *
-     * @param shardId the shard being written to
-     * @throws java.io.IOException if this node may no longer write
-     */
-    private void ensureOwnLeaseIsStillValid(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
-        if (releaseIfLeaseLapsed(shardId)) {
-            throw new java.io.IOException(
-                "refusing to write to "
-                    + shardId
-                    + ": this node's lease has expired, so it can no longer claim to hold the shard; "
-                    + "the shard has been released and the write was not acknowledged"
-            );
-        }
-    }
-
-    /**
-     * Releases the shard if this node's own lease has expired by its own clock, without refusing anything.
-     *
-     * @param shardId the shard
-     * @return true if the lease had lapsed and the shard was released
-     */
-    private boolean releaseIfLeaseLapsed(org.opensearch.core.index.shard.ShardId shardId) {
-        final var plane = metadataPlane;
-        if (plane == null) {
-            return false;
-        }
-        final long now = plane.clock().getAsLong();
-        if (plane.membership().selfLeaseValidAt(now) && ownershipUnverified == false) {
-            return false;
-        }
-        // Remembered so the next renewal gives the head back in the register: a closed shard whose head
-        // still names this node, once the lease is renewed, is a shard nobody serves and nobody can take.
-        final var shard = reconciler.shard(shardId);
-        if (shard != null) {
-            headsToGiveBack.put(shardId, shard.getOperationPrimaryTerm());
-        }
-        reconciler.releaseShard(shardId, "this node's own lease expired at or before " + now);
-        writeFenced.remove(shardId);
-        writerAssignments.remove(shardKey(shardId.getIndexName(), shardId.id()));
-        return true;
-    }
-
-    /**
-     * Deletes a document durably: the deletion reaches the object store's log before it is acknowledged.
-     *
-     * <p>Same ordering as {@link #index}, and for a sharper reason. A write lost between acknowledgement
-     * and publication is a write the caller was told about and cannot find — bad. A <em>deletion</em>
-     * lost the same way is worse than bad: replay rebuilds the shard from the log, and a deletion missing
-     * from the log means the document it removed reappears, during a recovery that reports success. The
-     * caller is told the delete worked, the failover is told the recovery worked, and the document is
-     * there.
-     *
-     * @param shardId the shard to delete from
-     * @param id the document id
-     * @return what the engine assigned this deletion, including whether anything was actually removed
-     * @throws java.io.IOException if the shard is not held here, or the delete fails
-     */
+    /** Deletes a document durably: the deletion reaches the object store's log before it is acknowledged. */
     public WriteOutcome delete(org.opensearch.core.index.shard.ShardId shardId, String id) throws java.io.IOException {
-        return delete(shardId, id, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L);
+        return writes.delete(shardId, id);
     }
 
-    /**
-     * Deletes a document, optionally only if it is still at the sequence number the caller expects.
-     *
-     * <p>The same engine-owned compare-and-swap {@link #index(ShardId, String, String, long, long)}
-     * describes, on the deletion path.
-     *
-     * @param shardId the shard to delete from
-     * @param id the document id
-     * @param ifSeqNo the sequence number the document must currently be at, or
-     *     {@link org.opensearch.index.seqno.SequenceNumbers#UNASSIGNED_SEQ_NO} for an unconditional delete
-     * @param ifPrimaryTerm the primary term the document must currently be at, or 0 when unconditional
-     * @return what the engine assigned this deletion, including whether anything was actually removed
-     * @throws org.opensearch.index.engine.VersionConflictEngineException if the condition was not met
-     * @throws java.io.IOException if the shard is not held here, or the delete fails
-     */
+    /** Deletes a document, optionally only if it is still at the sequence number the caller expects. */
     public WriteOutcome delete(org.opensearch.core.index.shard.ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm)
         throws java.io.IOException {
-        ensureStarted();
-        try (org.opensearch.common.lease.Releasable admitted = writeBackpressure.admit()) {
-            final java.util.concurrent.locks.Lock fence = enterWritePath(shardId);
-            try (org.opensearch.common.lease.Releasable guard = reconciler.writeGuard(shardId)) {
-                return deleteUnderFence(shardId, id, ifSeqNo, ifPrimaryTerm);
-            } finally {
-                fence.unlock();
-            }
-        }
+        return writes.delete(shardId, id, ifSeqNo, ifPrimaryTerm);
     }
 
-    private WriteOutcome deleteUnderFence(org.opensearch.core.index.shard.ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm)
-        throws java.io.IOException {
-        final var shard = reconciler.shard(shardId);
-        if (shard == null) {
-            throw new java.io.IOException("cannot delete from " + shardId + ": not open on " + nodeName);
-        }
-        if (reconciler.isReader(shardId)) {
-            throw new java.io.IOException("cannot delete from " + shardId + ": it is open as a reader");
-        }
-        refuseIfWriteFenced(shardId);
-        // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
-        // and settings up to the descriptor, so a change made on another node is in force for the first operation
-        // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
-        ensureIncarnationLive(shardId);
-        markUsed(shardId);
-        // Apply, then log -- the same reordering, for the same reason, as the index path above.
-        final var result = shard.applyDeleteOperationOnPrimary(
-            org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-            id,
-            org.opensearch.index.VersionType.INTERNAL,
-            ifSeqNo,
-            ifPrimaryTerm
-        );
-        if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.FAILURE
-            && result.getFailure() instanceof org.opensearch.index.engine.VersionConflictEngineException conflict) {
-            throw conflict;
-        }
-        if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
-            // A value, not a throw -- the same trap as for indexing.
-            throw new java.io.IOException("deleting " + id + " returned " + result.getResultType());
-        }
-        appendOrRelease(
-            shardId,
-            shard,
-            java.util.List.of(
-                org.opensearch.serverless.store.WalRecord.deletion(id, result.getSeqNo(), result.getTerm(), result.getVersion())
-            )
-        );
-        // The same edge a write raises: a deletion changes the shard as surely as an addition, and a
-        // shard whose only recent change was a delete still needs publishing or the tombstone lives
-        // nowhere but this node's disk and its log.
-        // For the breaker, not for durability -- see index.
-        syncIfStillOpen(shard);
-        signals.wrote(shardId);
-        return new WriteOutcome(result.getSeqNo(), result.getTerm(), result.getVersion(), false, result.isFound());
-    }
-
-    /**
-     * Applies a batch to one shard: one log append for all of it, then each operation in order.
-     *
-     * <p><b>Why this is not a loop over {@link #index} and {@link #delete}.</b> Those append one record
-     * each, so a hundred-document request would be a hundred object-store PUTs — the write path priced
-     * per document, which is what made {@code _bulk} worth building rather than worth faking. Here the
-     * whole batch is one append, and the durability contract is unchanged: every record is in the log
-     * before any of it is acknowledged, which is strictly the same promise a single write makes.
-     *
-     * <p><b>Ordering within the batch is preserved</b>, and it has to be. A batch that writes a document
-     * and then deletes it must leave it gone, and one that deletes and then rewrites must leave it
-     * present. Since a record's kind travels with it, replay reproduces the same sequence — see
-     * {@link org.opensearch.serverless.store.WalStore#append(long, java.util.List)}.
-     *
-     * <p><b>A failed operation does not roll back the ones before it</b>, exactly as in classic
-     * OpenSearch: a bulk is a batch, not a transaction. The failure is reported for its own item and the
-     * rest of the batch stands.
-     *
-     * @param shardId the shard, which this node must own as a writer
-     * @param operations the writes and deletions, in request order
-     * @return one outcome per operation, in the same order
-     * @throws java.io.IOException if the shard is not open here, is a reader, or the log append fails
-     */
+    /** Applies a batch to one shard: one log append for all of it, then each operation in order. */
     public java.util.List<BulkOutcome> bulk(
         org.opensearch.core.index.shard.ShardId shardId,
         java.util.List<org.opensearch.serverless.store.WalRecord> operations
     ) throws java.io.IOException {
-        final java.util.List<BulkOperation> plain = new java.util.ArrayList<>(operations.size());
-        for (org.opensearch.serverless.store.WalRecord record : operations) {
-            plain.add(BulkOperation.of(record));
-        }
-        return bulkOperations(shardId, plain);
+        return writes.bulk(shardId, operations);
     }
 
-    /**
-     * One operation in a batch, with whatever condition the caller attached to it.
-     *
-     * <p><b>Why this type exists.</b> The batch path used to take {@link org.opensearch.serverless.store.WalRecord}
-     * — the write-ahead <em>log</em> record — as its input type. A log record describes what happened, so
-     * there was nowhere in it for a condition, which describes what must be true before anything happens.
-     * That is the whole reason {@code _bulk} refused {@code create} and per-item {@code if_seq_no} after
-     * the single-document path gained both: not a missing capability, a missing input type.
-     */
-    public static final class BulkOperation {
-        private final org.opensearch.serverless.store.WalRecord record;
-        private final long ifSeqNo;
-        private final long ifPrimaryTerm;
-        private final boolean requireAbsent;
-
-        /**
-         * Creates an operation carrying a condition.
-         *
-         * @param record what to write or delete
-         * @param ifSeqNo the sequence number the document must be at, or unassigned when unconditional
-         * @param ifPrimaryTerm the primary term the document must be at, or 0 when unconditional
-         * @param requireAbsent whether the write must fail if the document already exists
-         */
-        public BulkOperation(org.opensearch.serverless.store.WalRecord record, long ifSeqNo, long ifPrimaryTerm, boolean requireAbsent) {
-            this.record = record;
-            this.ifSeqNo = ifSeqNo;
-            this.ifPrimaryTerm = ifPrimaryTerm;
-            this.requireAbsent = requireAbsent;
-        }
-
-        /**
-         * An unconditional operation.
-         *
-         * @param record what to write or delete
-         * @return the operation
-         */
-        public static BulkOperation of(org.opensearch.serverless.store.WalRecord record) {
-            return new BulkOperation(record, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L, false);
-        }
-
-        /**
-         * Returns what this operation writes or deletes.
-         *
-         * @return the record
-         */
-        public org.opensearch.serverless.store.WalRecord record() {
-            return record;
-        }
-
-        /**
-         * Returns the condition on the document's current sequence number, if any.
-         *
-         * @return the sequence number the document must be at, or unassigned
-         */
-        public long ifSeqNo() {
-            return ifSeqNo;
-        }
-
-        /**
-         * Returns the condition on the document's current primary term, if any.
-         *
-         * @return the primary term the document must be at, or 0
-         */
-        public long ifPrimaryTerm() {
-            return ifPrimaryTerm;
-        }
-
-        /**
-         * Returns whether this operation is a create rather than an overwrite.
-         *
-         * @return whether the document must not already exist
-         */
-        public boolean requireAbsent() {
-            return requireAbsent;
-        }
-    }
-
-    /**
-     * Applies a batch whose items may carry conditions.
-     *
-     * @param shardId the shard to write to
-     * @param batch the operations, in request order
-     * @return one outcome per operation, in the same order
-     * @throws java.io.IOException if the shard is not open here, is a reader, or the log append fails
-     */
+    /** Applies a batch whose items may carry conditions. */
     public java.util.List<BulkOutcome> bulkOperations(org.opensearch.core.index.shard.ShardId shardId, java.util.List<BulkOperation> batch)
         throws java.io.IOException {
-        ensureStarted();
-        try (org.opensearch.common.lease.Releasable admitted = writeBackpressure.admit()) {
-            final java.util.concurrent.locks.Lock fence = enterWritePath(shardId);
-            try (org.opensearch.common.lease.Releasable guard = reconciler.writeGuard(shardId)) {
-                return bulkOperationsUnderFence(shardId, batch);
-            } finally {
-                fence.unlock();
-            }
-        }
-    }
-
-    private java.util.List<BulkOutcome> bulkOperationsUnderFence(
-        org.opensearch.core.index.shard.ShardId shardId,
-        java.util.List<BulkOperation> batch
-    ) throws java.io.IOException {
-        final var shard = reconciler.shard(shardId);
-        if (shard == null) {
-            throw new java.io.IOException("cannot write to " + shardId + ": not open on " + nodeName);
-        }
-        if (reconciler.isReader(shardId)) {
-            throw new java.io.IOException("cannot write to " + shardId + ": it is open as a reader");
-        }
-        if (batch.isEmpty()) {
-            return java.util.List.of();
-        }
-        refuseIfWriteFenced(shardId);
-        // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
-        // and settings up to the descriptor, so a change made on another node is in force for the first operation
-        // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
-        ensureIncarnationLive(shardId);
-        markUsed(shardId);
-
-        // Applied first, then logged once for the whole batch -- the same reordering the single-document
-        // path took, and the batch economics are unchanged: one PUT for the batch, not one per document.
-        // Only operations that actually applied are logged, so replay never reproduces an item the caller
-        // was told had failed.
-        // Mapping growth is coalesced per batch, and request order is kept while it is. The first item
-        // that needs a field the mapping lacks stops the pass: what it needs is grown once, and the pass
-        // resumes from that item. It used to grow inline, per item, so a batch of a thousand documents
-        // naming one new field was a thousand descriptor swaps on one register. Stopping at the first
-        // such item rather than skipping it is what keeps the batch's order: an item deferred past a
-        // later delete of the same id would resurrect the document the request said to remove.
-        final BulkOutcome[] outcomes = new BulkOutcome[batch.size()];
-        final java.util.List<org.opensearch.serverless.store.WalRecord> applied = new java.util.ArrayList<>(batch.size());
-        final boolean[] grewFor = new boolean[batch.size()];
-        int from = 0;
-        while (from < batch.size()) {
-            int deferredAt = -1;
-            org.opensearch.index.mapper.Mapping required = null;
-            for (int i = from; i < batch.size(); i++) {
-                final BulkOperation item = batch.get(i);
-                final org.opensearch.serverless.store.WalRecord operation = item.record();
-                try {
-                    if (operation.isDeletion()) {
-                        final var result = shard.applyDeleteOperationOnPrimary(
-                            org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                            operation.id(),
-                            org.opensearch.index.VersionType.INTERNAL,
-                            item.ifSeqNo(),
-                            item.ifPrimaryTerm()
-                        );
-                        if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
-                            // A failure here is a value, and a caller that reads
-                            // only the exception channel reports success for an operation that did nothing.
-                            outcomes[i] = conflicted(result)
-                                ? BulkOutcome.conflicted(operation.id(), describe("deleting", result))
-                                : BulkOutcome.failed(operation.id(), describe("deleting", result));
-                            continue;
-                        }
-                        applied.add(
-                            org.opensearch.serverless.store.WalRecord.deletion(
-                                operation.id(),
-                                result.getSeqNo(),
-                                result.getTerm(),
-                                result.getVersion()
-                            )
-                        );
-                        outcomes[i] = BulkOutcome.deleted(
-                            operation.id(),
-                            result.isFound(),
-                            result.getSeqNo(),
-                            result.getTerm(),
-                            result.getVersion()
-                        );
-                    } else {
-                        final var result = shard.applyIndexOperationOnPrimary(
-                            item.requireAbsent()
-                                ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
-                                : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                            org.opensearch.index.VersionType.INTERNAL,
-                            new org.opensearch.index.mapper.SourceToParse(
-                                shardId.getIndexName(),
-                                operation.id(),
-                                new org.opensearch.core.common.bytes.BytesArray(operation.source()),
-                                org.opensearch.common.xcontent.XContentType.JSON
-                            ),
-                            item.ifSeqNo(),
-                            item.ifPrimaryTerm(),
-                            org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
-                            false
-                        );
-                        if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.MAPPING_UPDATE_REQUIRED) {
-                            if (grewFor[i]) {
-                                // The mapping was grown for this item once already, and it still does
-                                // not fit: something other than a missing field, and growing again
-                                // forever would hide it.
-                                outcomes[i] = BulkOutcome.failed(operation.id(), describe("indexing", result));
-                                continue;
-                            }
-                            deferredAt = i;
-                            required = result.getRequiredMappingUpdate();
-                            break;
-                        }
-                        if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
-                            // A lost condition is a FAILURE carrying a VersionConflictEngineException rather
-                            // than a thrown one, so the item has to be inspected rather than only its type
-                            // reported -- otherwise a caller that asked a compare-and-swap question is told
-                            // only that "indexing returned FAILURE", which is not an answer to it.
-                            outcomes[i] = conflicted(result)
-                                ? BulkOutcome.conflicted(operation.id(), describe("indexing", result))
-                                : BulkOutcome.failed(operation.id(), describe("indexing", result));
-                            continue;
-                        }
-                        applied.add(
-                            new org.opensearch.serverless.store.WalRecord(
-                                operation.id(),
-                                operation.source(),
-                                result.getSeqNo(),
-                                result.getTerm(),
-                                result.getVersion()
-                            )
-                        );
-                        outcomes[i] = BulkOutcome.indexed(
-                            operation.id(),
-                            result.getSeqNo(),
-                            result.getTerm(),
-                            result.getVersion(),
-                            result.isCreated()
-                        );
-                    }
-                } catch (Exception e) {
-                    // One bad document does not fail the batch. A mapping conflict on item 40 is item 40's
-                    // problem, and failing the other 99 would make a bulk request less useful than the loop
-                    // it replaces.
-                    final String message = e.getMessage() == null ? e.toString() : e.getMessage();
-                    outcomes[i] = e instanceof org.opensearch.index.engine.VersionConflictEngineException
-                        ? BulkOutcome.conflicted(operation.id(), message)
-                        : BulkOutcome.failed(operation.id(), message);
-                }
-            }
-            if (deferredAt < 0) {
-                break;
-            }
-            // One growth for everything from here on that needs what this item needs -- which in the
-            // common case, a batch of like documents, is all of it. Then the pass resumes at this item.
-            grewFor[deferredAt] = true;
-            try {
-                growMapping(shardId, required);
-                from = deferredAt;
-            } catch (java.io.IOException e) {
-                final String id = batch.get(deferredAt).record().id();
-                final String message = e.getMessage() == null ? e.toString() : e.getMessage();
-                // Contention on the descriptor is not this document's fault, and a retry writes it;
-                // anything else about the growth is.
-                outcomes[deferredAt] = message.contains("being changed concurrently")
-                    ? BulkOutcome.retryable(id, message)
-                    : BulkOutcome.failed(id, message);
-                from = deferredAt + 1;
-            }
-        }
-
-        appendOrRelease(shardId, shard, applied);
-        // One local sync for the batch, for the reason index gives: it gives the translog's page back to
-        // the request breaker, and costs no object-store request.
-        syncIfStillOpen(shard);
-        // One edge for the batch, not one per document. The
-        // edge is raised after everything is applied, so a publish it triggers describes the whole batch
-        // or none of it.
-        signals.wrote(shardId);
-        return java.util.Arrays.asList(outcomes);
-    }
-
-    /**
-     * Describes a non-success engine result, naming the cause when there is one.
-     *
-     * @param result the engine's answer
-     * @return whether the failure was a lost condition
-     */
-    private static boolean conflicted(org.opensearch.index.engine.Engine.Result result) {
-        return result.getFailure() instanceof org.opensearch.index.engine.VersionConflictEngineException;
-    }
-
-    /**
-     * Describes a non-success engine result, naming the cause when there is one.
-     *
-     * @param what the operation kind, for the message
-     * @param result the engine's answer
-     * @return a message for the failed item
-     */
-    private static String describe(String what, org.opensearch.index.engine.Engine.Result result) {
-        if (result.getFailure() != null) {
-            final String message = result.getFailure().getMessage();
-            return message == null ? result.getFailure().toString() : message;
-        }
-        return what + " returned " + result.getResultType();
-    }
-
-    /**
-     * What the engine assigned one single-document write or deletion.
-     *
-     * <p>These are the numbers real OpenSearch returns as {@code _seq_no}, {@code _primary_term} and
-     * {@code _version}. They were always being generated here — the engine is core's own and assigns them
-     * on every operation — and were simply discarded at this boundary. Returning them is what lets a
-     * caller hold one and send it back as {@code if_seq_no}.
-     *
-     * <p>A plain class rather than a record because this module's javadoc check rejects records.
-     */
-    public static final class WriteOutcome {
-
-        private final long seqNo;
-        private final long primaryTerm;
-        private final long version;
-        private final boolean created;
-        private final boolean found;
-
-        /**
-         * Creates an outcome.
-         *
-         * @param seqNo the sequence number assigned
-         * @param primaryTerm the primary term the operation ran at
-         * @param version the version assigned
-         * @param created whether a write created the document rather than overwriting one
-         * @param found whether a deletion found anything; always true for a write
-         */
-        public WriteOutcome(long seqNo, long primaryTerm, long version, boolean created, boolean found) {
-            this.seqNo = seqNo;
-            this.primaryTerm = primaryTerm;
-            this.version = version;
-            this.created = created;
-            this.found = found;
-        }
-
-        /**
-         * Returns the sequence number the engine assigned.
-         *
-         * @return the sequence number
-         */
-        public long seqNo() {
-            return seqNo;
-        }
-
-        /**
-         * Returns the primary term the operation ran at — this shard's shard-head term.
-         *
-         * @return the primary term
-         */
-        public long primaryTerm() {
-            return primaryTerm;
-        }
-
-        /**
-         * Returns the version the engine assigned.
-         *
-         * @return the version
-         */
-        public long version() {
-            return version;
-        }
-
-        /**
-         * Reports whether a write created the document rather than overwriting an existing one.
-         *
-         * @return true when the document did not exist before
-         */
-        public boolean created() {
-            return created;
-        }
-
-        /**
-         * Reports whether a deletion found the document. Always true for a write.
-         *
-         * @return true when there was something to remove
-         */
-        public boolean found() {
-            return found;
-        }
-    }
-
-    /**
-     * What one operation in a batch did.
-     *
-     * <p>A plain class rather than a record because this module's javadoc check rejects records.
-     */
-    public static final class BulkOutcome {
-
-        private final String id;
-        private final boolean deletion;
-        private final boolean found;
-        private final String failure;
-        private boolean conflict;
-        private boolean retryable;
-        private final long seqNo;
-        private final long primaryTerm;
-        private final long version;
-        private final boolean created;
-
-        private BulkOutcome(
-            String id,
-            boolean deletion,
-            boolean found,
-            String failure,
-            long seqNo,
-            long primaryTerm,
-            long version,
-            boolean created
-        ) {
-            this.id = id;
-            this.deletion = deletion;
-            this.found = found;
-            this.failure = failure;
-            this.seqNo = seqNo;
-            this.primaryTerm = primaryTerm;
-            this.version = version;
-            this.created = created;
-        }
-
-        /**
-         * Records a document written, with the sequence identity the engine assigned it.
-         *
-         * @param id the document id
-         * @param seqNo the sequence number assigned
-         * @param primaryTerm the primary term it ran at
-         * @param version the version assigned
-         * @param created whether the document did not exist before this write
-         * @return the outcome
-         */
-        public static BulkOutcome indexed(String id, long seqNo, long primaryTerm, long version, boolean created) {
-            return new BulkOutcome(id, false, false, null, seqNo, primaryTerm, version, created);
-        }
-
-        /**
-         * Records a deletion, which may or may not have found anything.
-         *
-         * @param id the document id
-         * @param found whether the document was there
-         * @param seqNo the sequence number assigned
-         * @param primaryTerm the primary term it ran at
-         * @param version the version assigned
-         * @return the outcome
-         */
-        public static BulkOutcome deleted(String id, boolean found, long seqNo, long primaryTerm, long version) {
-            return new BulkOutcome(id, true, found, null, seqNo, primaryTerm, version, false);
-        }
-
-        /**
-         * Records an operation the engine refused.
-         *
-         * @param id the document id
-         * @param reason why it failed
-         * @return the outcome
-         */
-        public static BulkOutcome conflicted(String id, String reason) {
-            final BulkOutcome outcome = failed(id, reason);
-            outcome.conflict = true;
-            return outcome;
-        }
-
-        /**
-         * Whether this item failed because a condition it carried was not met.
-         *
-         * <p>Separated from any other failure because it is the one a caller asked a question with: a lost
-         * compare-and-swap is a 409 and must not be retried blindly, while an ordinary item failure is a
-         * 400 and usually can be.
-         *
-         * @return whether this was a version conflict
-         */
-        public boolean conflict() {
-            return conflict;
-        }
-
-        /**
-         * Records an operation that failed for a reason that will not recur if the caller simply tries
-         * again: the index's mapping was being grown by someone else at the same moment.
-         *
-         * @param id the document id
-         * @param reason why it failed
-         * @return the outcome
-         */
-        public static BulkOutcome retryable(String id, String reason) {
-            final BulkOutcome outcome = failed(id, reason);
-            outcome.retryable = true;
-            return outcome;
-        }
-
-        /**
-         * Whether this item failed on contention rather than on its own content.
-         *
-         * <p>A 503 rather than a 400: nothing about the document was wrong, and a client that retries the
-         * item gets it written. Separated from {@link #conflict()} because a lost condition must not be
-         * retried blindly and this must.
-         *
-         * @return whether the caller should retry the item as it is
-         */
-        public boolean retryable() {
-            return retryable;
-        }
-
-        /**
-         * An outcome for an item that could not be applied.
-         *
-         * @param id the document id
-         * @param reason what went wrong, as the caller should see it
-         * @return the outcome
-         */
-        public static BulkOutcome failed(String id, String reason) {
-            return new BulkOutcome(
-                id,
-                false,
-                false,
-                reason == null ? "unknown failure" : reason,
-                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
-                org.opensearch.common.lucene.uid.Versions.NOT_FOUND,
-                false
-            );
-        }
-
-        /**
-         * Returns the sequence number the engine assigned.
-         *
-         * @return the sequence number, unassigned for a failed item
-         */
-        public long seqNo() {
-            return seqNo;
-        }
-
-        /**
-         * Returns the primary term the operation ran at.
-         *
-         * @return the primary term, unassigned for a failed item
-         */
-        public long primaryTerm() {
-            return primaryTerm;
-        }
-
-        /**
-         * Returns the version the engine assigned.
-         *
-         * @return the version
-         */
-        public long version() {
-            return version;
-        }
-
-        /**
-         * Reports whether a write created the document rather than overwriting one.
-         *
-         * @return true when the document did not exist before
-         */
-        public boolean created() {
-            return created;
-        }
-
-        /**
-         * Returns the document id.
-         *
-         * @return the id
-         */
-        public String id() {
-            return id;
-        }
-
-        /**
-         * Reports whether this operation removed a document rather than adding one.
-         *
-         * @return true for a deletion
-         */
-        public boolean isDeletion() {
-            return deletion;
-        }
-
-        /**
-         * Reports whether a deletion found the document. Meaningless for a write.
-         *
-         * @return true when the document was there to delete
-         */
-        public boolean found() {
-            return found;
-        }
-
-        /**
-         * Returns why the operation failed, or null if it did not.
-         *
-         * @return the failure message, or null
-         */
-        public String failure() {
-            return failure;
-        }
+        return writes.bulkOperations(shardId, batch);
     }
 
     /**
@@ -4679,118 +2513,6 @@ public final class ServerlessNode implements Closeable {
         return new Document(id, true, result.sourceAsString(), result.getSeqNo(), result.getPrimaryTerm(), result.getVersion());
     }
 
-    /** One document, or the fact that there is none. */
-    public static final class Document {
-
-        private final String id;
-        private final boolean found;
-        private final String source;
-        private final long seqNo;
-        private final long primaryTerm;
-        private final long version;
-
-        /**
-         * Creates a found document with no sequence identity.
-         *
-         * @param id the document id
-         * @param found whether it exists
-         * @param source its source, or null when it does not
-         */
-        public Document(String id, boolean found, String source) {
-            this(
-                id,
-                found,
-                source,
-                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-                org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
-                org.opensearch.common.lucene.uid.Versions.NOT_FOUND
-            );
-        }
-
-        /**
-         * Creates a found document, carrying the sequence identity it currently holds.
-         *
-         * @param id the document id
-         * @param found whether it exists
-         * @param source its source, or null when it does not
-         * @param seqNo the sequence number of the operation that last wrote it
-         * @param primaryTerm the primary term that operation ran at
-         * @param version its current version
-         */
-        public Document(String id, boolean found, String source, long seqNo, long primaryTerm, long version) {
-            this.id = id;
-            this.found = found;
-            this.source = source;
-            this.seqNo = seqNo;
-            this.primaryTerm = primaryTerm;
-            this.version = version;
-        }
-
-        /**
-         * Returns the sequence number of the operation that last wrote this document.
-         *
-         * @return the sequence number, unassigned when the document was not found
-         */
-        public long seqNo() {
-            return seqNo;
-        }
-
-        /**
-         * Returns the primary term that operation ran at.
-         *
-         * @return the primary term, unassigned when the document was not found
-         */
-        public long primaryTerm() {
-            return primaryTerm;
-        }
-
-        /**
-         * Returns the document's current version.
-         *
-         * @return the version
-         */
-        public long version() {
-            return version;
-        }
-
-        /**
-         * Records that no such document exists.
-         *
-         * @param id the document id
-         * @return the absence
-         */
-        public static Document absent(String id) {
-            return new Document(id, false, null);
-        }
-
-        /**
-         * Returns the document id.
-         *
-         * @return the id
-         */
-        public String id() {
-            return id;
-        }
-
-        /**
-         * Reports whether the document exists.
-         *
-         * @return true when it does
-         */
-        public boolean found() {
-            return found;
-        }
-
-        /**
-         * Returns the document source, or null when there is none.
-         *
-         * @return the source
-         */
-        public String source() {
-            return source;
-        }
-    }
-
     /**
      * Publishes a shard's current commit to the object store, fenced by the owning term.
      *
@@ -4834,7 +2556,7 @@ public final class ServerlessNode implements Closeable {
      * that would otherwise be re-projected on every open, the head it last read, and -- once no shard of
      * the index remains -- the descriptor versions it had applied.
      */
-    private void forgetShardRecords(org.opensearch.core.index.shard.ShardId shardId) {
+    void forgetShardRecords(org.opensearch.core.index.shard.ShardId shardId) {
         if (reconciler.shard(shardId) != null) {
             return;
         }
@@ -4873,15 +2595,15 @@ public final class ServerlessNode implements Closeable {
      * argument would build local-only directories and silently serve nothing — which is how this was
      * found.
      */
-    private void adopt(org.opensearch.serverless.metadata.MetadataPlane plane) {
+    void adopt(org.opensearch.serverless.metadata.MetadataPlane plane) {
         if (metadataPlane == null) {
             metadataPlane = plane;
         }
     }
 
-    private final java.util.Map<String, Long> readerTerms = new java.util.concurrent.ConcurrentHashMap<>();
+    final java.util.Map<String, Long> readerTerms = new java.util.concurrent.ConcurrentHashMap<>();
 
-    private org.opensearch.core.index.shard.ShardId localShardOf(String indexName, int shardNumber) {
+    org.opensearch.core.index.shard.ShardId localShardOf(String indexName, int shardNumber) {
         return reconciler.openShards()
             .stream()
             .filter(s -> s.getIndexName().equals(indexName) && s.id() == shardNumber)
@@ -4893,8 +2615,8 @@ public final class ServerlessNode implements Closeable {
         org.opensearch.serverless.metadata.MetadataPlane.TransportSecrets secrets, long readAt) {
     }
 
-    private volatile CachedTransportSecrets transportSecrets;
-    private final Object transportSecretsLock = new Object();
+    volatile CachedTransportSecrets transportSecrets;
+    final Object transportSecretsLock = new Object();
 
     /**
      * Returns the transport secrets as last read, re-reading the register at most once per lease TTL and
@@ -4953,7 +2675,7 @@ public final class ServerlessNode implements Closeable {
         return secrets == null ? null : secrets.current();
     }
 
-    private void ensureStarted() {
+    void ensureStarted() {
         if (started == false) {
             throw new IllegalStateException("node " + nodeName + " has not been started");
         }
@@ -5021,135 +2743,19 @@ public final class ServerlessNode implements Closeable {
         return indexName + "#" + shardNumber;
     }
 
-    /**
-     * Runs an action that gives a shard away while holding the shard's write fence.
-     *
-     * <p>Waits for every write in flight on the shard -- applied to the engine, appending to the log,
-     * about to be acknowledged -- and keeps new ones out until the action returns. A write that arrives
-     * during the action then finds whatever the action left: no shard, and it is refused. This is what
-     * makes "publish, release the head, close" safe against the write path; see {@link #appendOrRelease}.
-     *
-     * <p><b>Two locks, two jobs, one order.</b> This fence guards the shard being <em>given away</em>;
-     * the reconciler's write guard ({@code ShardReconciler#writeGuard}) guards a <em>commit</em> landing
-     * between an apply and its append. The write path holds this fence's read side and then the guard's
-     * read side; a release holds this fence's write side and, through the publish inside it, the guard's
-     * write side around the flush; an ordinary publish holds only the guard's. Nothing that holds the
-     * guard ever waits on this fence, so the two cannot deadlock, and a publish still overlaps with
-     * writes everywhere but the flush.
-     *
-     * @param shardId the shard
-     * @param action what to do while nothing can be acknowledged against the shard
-     * @param <T> the action's result
-     * @return the action's result
-     * @throws Exception whatever the action throws
-     */
+    /** Runs an action that gives a shard away while holding the shard's write fence. */
     public <T> T underShardFence(org.opensearch.core.index.shard.ShardId shardId, java.util.concurrent.Callable<T> action)
         throws Exception {
-        final java.util.concurrent.locks.ReentrantReadWriteLock fence = shardFences.computeIfAbsent(
-            shardId,
-            k -> new java.util.concurrent.locks.ReentrantReadWriteLock()
-        );
-        fence.writeLock().lock();
-        try {
-            return action.call();
-        } finally {
-            fence.writeLock().unlock();
-            if (reconciler == null || reconciler.shard(shardId) == null) {
-                // Closed: the fence goes with it, or a node that churns through shards keeps a lock per
-                // shard it ever held. A writer that fetched this fence and locks it after this point
-                // notices the swap in enterWritePath and starts over on the current one.
-                shardFences.remove(shardId, fence);
-                // And the group committer's queue for it, for the same reason and with the same safety: a
-                // flush already in flight holds its own reference and finishes, and its members are judged
-                // by the shard-identity check every caller makes after the append.
-                walCommitter.forget(shardId);
-                final NodeLogWriter log = nodeLogWriter;
-                if (log != null) {
-                    log.forget(shardId);
-                }
-            }
-        }
+        return fences.underShardFence(shardId, action);
     }
 
-    /** Takes the read side of a shard's fence; the caller unlocks what is returned. */
-    private java.util.concurrent.locks.Lock enterWritePath(org.opensearch.core.index.shard.ShardId shardId) {
-        while (true) {
-            final java.util.concurrent.locks.ReentrantReadWriteLock fence = shardFences.computeIfAbsent(
-                shardId,
-                k -> new java.util.concurrent.locks.ReentrantReadWriteLock()
-            );
-            fence.readLock().lock();
-            if (shardFences.get(shardId) == fence) {
-                return fence.readLock();
-            }
-            // The shard was closed, and possibly reopened, between fetching the fence and locking it; the
-            // fence in the map is the one the next release will take, so that is the one to hold.
-            fence.readLock().unlock();
-        }
+    java.util.concurrent.locks.Lock enterWritePath(org.opensearch.core.index.shard.ShardId shardId) {
+        return fences.enterWritePath(shardId);
     }
 
-    /**
-     * Reports whether this node holds a shard as its writer, by evidence no older than the given age.
-     *
-     * <p>For the node a write was forwarded to. Being open here was the only check, and "open here" is
-     * true of a shard whose head has named another node since the last heartbeat: the lease fences a
-     * write only once the lapsed-lease rule in {@link #renewLease} holds, and the head is the truth the
-     * rule approximates. The heartbeat notes every held head once per renewal, so with an age of one
-     * renewal this costs no register read on a healthy node; a head older than that is read fresh, and
-     * one that names another node closes the shard here on the spot.
-     *
-     * <p>A head that cannot be read is no evidence, and the answer is then no: a write needs the store
-     * for its log append anyway, so refusing costs the caller one retry it was going to need.
-     *
-     * @param shardId the shard
-     * @param maxHeadAgeMillis how old a noted head may be before it is re-read
-     * @return true if the shard may accept a write on this node right now
-     */
+    /** Reports whether this node holds a shard as its writer, by evidence no older than the given age. */
     public boolean holdsAsWriter(org.opensearch.core.index.shard.ShardId shardId, long maxHeadAgeMillis) {
-        ensureStarted();
-        if (reconciler.shard(shardId) == null || reconciler.isReader(shardId) || writeFenced.contains(shardId)) {
-            return false;
-        }
-        if (ownershipUnverified) {
-            // The lease lapsed and the heads have not been re-read since the renewal; see renewLease.
-            return false;
-        }
-        final org.opensearch.serverless.metadata.MetadataPlane plane = metadataPlane;
-        if (plane == null) {
-            return true;
-        }
-        if (plane.membership().selfLeaseValidAt(plane.clock().getAsLong()) == false) {
-            return false;
-        }
-        java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = recentHead(
-            shardId.getIndexName(),
-            shardId.id(),
-            maxHeadAgeMillis
-        );
-        if (head.isEmpty()) {
-            try {
-                head = plane.heads().read(shardId.getIndexName(), shardId.id());
-            } catch (java.io.IOException e) {
-                logger.debug("could not read the head of {} to answer a forwarded write; refusing it", shardId);
-                return false;
-            }
-            noteHead(shardId.getIndexName(), shardId.id(), head.orElse(null));
-        }
-        if (namesThisNode(head, shardId)) {
-            return true;
-        }
-        try {
-            releaseLost(
-                plane,
-                shardId,
-                "a forwarded write found the shard-head naming " + head.map(h -> h.ownerNodeId()).orElse("nobody"),
-                true
-            );
-        } catch (Exception e) {
-            logger.warn("could not release " + shardId + " after its head stopped naming this node", e);
-        }
-        signals.ownershipDoubted(shardId.getIndexName(), shardId.id());
-        return false;
+        return fences.holdsAsWriter(shardId, maxHeadAgeMillis);
     }
 
     /** Of two copies of one descriptor, the one with the newer mapping and settings. */
@@ -5207,17 +2813,6 @@ public final class ServerlessNode implements Closeable {
             assignments.put(shardKey(assignment.indexName(), assignment.shardId()), assignment);
         }
         return projector.project(descriptors.values(), assignments.values());
-    }
-
-    /** Minimal timeout abstraction so the shell does not depend on a specific TimeValue import path. */
-    @FunctionalInterface
-    public interface TimeValueLike {
-        /**
-         * Returns the timeout.
-         *
-         * @return the timeout in milliseconds
-         */
-        long millis();
     }
 
     /**

@@ -123,10 +123,10 @@ final class DocumentWrites {
     /** Who served a write, and what the engine assigned it. */
     static final class Written {
         private final String servedBy;
-        private final org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome;
+        private final org.opensearch.serverless.shell.WriteOutcome outcome;
         final ShardId shardId;
 
-        Written(String servedBy, org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome, ShardId shardId) {
+        Written(String servedBy, org.opensearch.serverless.shell.WriteOutcome outcome, ShardId shardId) {
             this.servedBy = servedBy;
             this.outcome = outcome;
             this.shardId = shardId;
@@ -136,7 +136,7 @@ final class DocumentWrites {
             return servedBy;
         }
 
-        org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome() {
+        org.opensearch.serverless.shell.WriteOutcome outcome() {
             return outcome;
         }
     }
@@ -249,13 +249,7 @@ final class DocumentWrites {
                 );
             return new Written(
                 ack.ownerNodeId(),
-                new org.opensearch.serverless.shell.ServerlessNode.WriteOutcome(
-                    ack.seqNo(),
-                    ack.primaryTerm(),
-                    ack.version(),
-                    ack.created(),
-                    ack.found()
-                ),
+                new org.opensearch.serverless.shell.WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
                 new ShardId(new org.opensearch.core.index.Index(index, placement.uuid()), placement.shard())
             );
         } catch (NotHereException e) {
