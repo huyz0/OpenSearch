@@ -8,13 +8,11 @@
 
 package org.opensearch.serverless.shard;
 
-import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
 
 import java.io.IOException;
-import java.util.Optional;
 
 /**
  * Where a document lives, who may serve it, and the four things you can do to it.
@@ -35,6 +33,10 @@ public final class ShardOperations {
     private final ServerlessNode node;
     private final MetadataPlane plane;
     private final boolean refuseSystemIndices;
+    private final RequestRouting routing;
+    private final DocumentReads reads;
+    private final DocumentWrites writes;
+    private final DeleteByQueryExecution deletes;
 
     /**
      * Creates the operations view for a caller inside the node -- a plugin's {@code Client}, which may
@@ -64,55 +66,10 @@ public final class ShardOperations {
         this.node = node;
         this.plane = plane;
         this.refuseSystemIndices = refuseSystemIndices;
-    }
-
-    /**
-     * What this request has already looked up.
-     *
-     * <p><b>Scoped to the request because this object is.</b> One of these is built per REST request and per
-     * client call, so memoising inside it is memoising for exactly as long as it is safe to: a multi-get of
-     * ten documents in one index read that index's descriptor ten times, and each shard's head once per
-     * document that landed on it. Measurement made that visible — ten documents fetched singly cost thirty
-     * object-store requests and the same ten as one multi-get cost twenty, which is batching that does not
-     * batch the part that matters.
-     *
-     * <p><b>What it costs is freshness within one request, and that changes nothing.</b> A shard-head read
-     * at the start of a request can be stale by the end of it whether or not it was read again — routing is
-     * a moment in time, and every caller of this already handles being wrong about the owner. Reading it
-     * twice narrows no window; it only pays twice for the same answer.
-     *
-     * <p>{@code computeIfAbsent} rather than check-then-put, so two items for the same index cannot both
-     * pay: the second blocks on the first rather than racing it, which makes the saving a number rather
-     * than a likelihood.
-     */
-    private final java.util.concurrent.ConcurrentHashMap<String, Optional<IndexDescriptor>> described =
-        new java.util.concurrent.ConcurrentHashMap<>();
-    private final java.util.concurrent.ConcurrentHashMap<String, Optional<String>> owners = new java.util.concurrent.ConcurrentHashMap<>();
-
-    private Optional<IndexDescriptor> describeOnce(String index) throws IOException {
-        // Every use here is placement -- a shard number and a uuid -- so the routing cache answers it: a
-        // stale uuid lands on a shard that refuses to answer for a deleted incarnation (see
-        // ServerlessNode#INCARNATION_FENCE_MILLIS) or on none at all.
-        return once(described, index, () -> plane.describeForRouting(index));
-    }
-
-    private Optional<String> ownerOnce(String index, int shard) throws IOException {
-        // The owner as this node last saw it, before the register: a wrong hint is refused by the node it
-        // names and corrected by one read then, see freshOwner.
-        return once(owners, index + "#" + shard, () -> {
-            final Optional<String> hinted = node.ownerHint(index, shard);
-            if (hinted.isPresent()) {
-                return hinted;
-            }
-            return freshOwner(index, shard);
-        });
-    }
-
-    /** Reads the head and notes it for the node. Called from inside the cache's compute, so it does not touch the cache. */
-    private Optional<String> freshOwner(String index, int shard) throws IOException {
-        final var head = plane.heads().read(index, shard);
-        node.noteHead(index, shard, head.orElse(null));
-        return head.map(h -> h.ownerNodeId());
+        this.routing = new RequestRouting(node, plane, refuseSystemIndices);
+        this.reads = new DocumentReads(node, plane, routing);
+        this.writes = new DocumentWrites(node, routing);
+        this.deletes = new DeleteByQueryExecution(node, plane, refuseSystemIndices, routing, writes);
     }
 
     /**
@@ -121,129 +78,7 @@ public final class ShardOperations {
      * @param descriptor the descriptor
      */
     public void assumeDescribed(IndexDescriptor descriptor) {
-        described.put(descriptor.name(), Optional.of(descriptor));
-    }
-
-    /**
-     * What to do after a forward failed, whatever the failure was.
-     *
-     * <p><b>The hint is forgotten first, unconditionally.</b> It used to survive everything except the one
-     * refusal whose message said "does not own", so a hint naming a node that had died, or that held the
-     * shard only as a reader, or that was shedding load, was consulted again on every request and every
-     * request failed the same way -- indefinitely, on that coordinator, while the same write through
-     * {@code _bulk} succeeded because the batch path reads the register every time.
-     *
-     * <p>Then the failure is sorted by {@link org.opensearch.serverless.transport.ForwardFailure}. A refusal or an unreachable owner means the
-     * request was never applied: the register is read once and, if it names somebody new, the caller
-     * forwards there. A deadline or a dropped connection means it may have been applied, so it is not sent
-     * again; the caller is told to read before retrying. An answer from the owner -- a lost condition, a
-     * 429, a mapper's 400 -- is the owner's answer and is thrown as itself.
-     *
-     * @return the placement to forward to next
-     * @throws IOException when there is nothing to retry, worded for the caller
-     */
-    private Placement afterForwardFailure(String index, Placement stale, Exception failure, boolean mayRetry) throws IOException {
-        node.forgetOwner(index, stale.shard());
-        owners.remove(index + "#" + stale.shard());
-        final org.opensearch.serverless.transport.ForwardFailure kind = org.opensearch.serverless.transport.ForwardFailure.classify(
-            failure
-        );
-        switch (kind) {
-            case CONFLICT:
-                // A lost compare-and-swap came back from a healthy owner that answered correctly. It is
-                // not stale routing, must not cast doubt on ownership, and must not be retried blindly --
-                // so it is rethrown as itself rather than dressed as a routing failure.
-                throw (org.opensearch.index.engine.VersionConflictEngineException) org.opensearch.ExceptionsHelper.unwrap(
-                    failure,
-                    org.opensearch.index.engine.VersionConflictEngineException.class
-                );
-            case REJECTED:
-            case REMOTE:
-                // The owner answered. A client-side status -- its 429, a mapper's 400 -- is the owner's
-                // answer and reaches the caller as it is, with the status the owner gave it. A server-side
-                // one means the operation did not land there, and the caller retries against a re-read head.
-                if (org.opensearch.serverless.transport.ForwardFailure.isClientStatus(failure)) {
-                    if (failure instanceof RuntimeException runtime) {
-                        throw runtime;
-                    }
-                    throw new IOException(failure);
-                }
-                throw new NotHereException(
-                    org.opensearch.serverless.transport.ForwardFailure.describe(stale.owner(), failure),
-                    stale.owner(),
-                    true,
-                    failure
-                );
-            case DEADLINE:
-            case INTERRUPTED:
-                // May have been applied: not sent again, and worded so the caller reads before it retries.
-                node.signals().ownershipDoubted(index, stale.shard());
-                throw new NotHereException(
-                    org.opensearch.serverless.transport.ForwardFailure.describe(stale.owner(), failure),
-                    stale.owner(),
-                    true,
-                    failure
-                );
-            case NOT_OWNER:
-            case UNREACHABLE:
-            default:
-                break;
-        }
-        // The owner never applied it. One register read, and one more forward to whoever it names now.
-        final Optional<String> fresh = mayRetry ? freshOwner(index, stale.shard()) : Optional.empty();
-        if (mayRetry) {
-            owners.put(index + "#" + stale.shard(), fresh);
-            if (fresh.isPresent() && fresh.get().equals(stale.owner()) == false && fresh.get().equals(node.localNode().getId()) == false) {
-                return new Placement(null, stale.shard(), fresh.get(), stale.uuid());
-            }
-        }
-        node.signals().ownershipDoubted(index, stale.shard());
-        if (mayRetry && fresh.isEmpty()) {
-            // Whoever the hint named is gone and nobody has taken over: the same state, and the same
-            // answer, as a register that never named anyone.
-            throw new NotHereException(
-                "no node currently owns shard " + stale.shard() + " of " + index + "; activate it before writing",
-                null,
-                false,
-                failure
-            );
-        }
-        if (mayRetry && fresh.get().equals(node.localNode().getId())) {
-            throw new NotHereException(
-                "this node is acquiring shard " + stale.shard() + " of " + index + "; retry",
-                fresh.get(),
-                true,
-                failure
-            );
-        }
-        // An owner with no live lease keeps its own words, which name the missing lease; anything else is
-        // worded as the forward that failed.
-        throw new NotHereException(
-            failure instanceof org.opensearch.serverless.transport.OwnerUnreachableException
-                ? failure.getMessage()
-                : org.opensearch.serverless.transport.ForwardFailure.describe(stale.owner(), failure),
-            stale.owner(),
-            true,
-            failure
-        );
-    }
-
-    private static <T> T once(
-        java.util.concurrent.ConcurrentHashMap<String, T> cache,
-        String key,
-        org.opensearch.common.CheckedSupplier<T, IOException> read
-    ) throws IOException {
-        try {
-            return cache.computeIfAbsent(key, ignored -> {
-                try {
-                    return read.get();
-                } catch (IOException e) {
-                    throw new java.io.UncheckedIOException(e);
-                }
-            });
-        } catch (java.io.UncheckedIOException e) {
-            throw e.getCause();
-        }
+        routing.assumeDescribed(descriptor);
     }
 
     /**
@@ -256,53 +91,7 @@ public final class ShardOperations {
      * @throws NoSuchIndexException if the index does not exist
      */
     public Placement place(String index, String id) throws IOException {
-        if (refuseSystemIndices && node.isSystemIndex(index)) {
-            // Before the descriptor is read: a refusal that first confirmed the index exists would say so.
-            throw new SystemIndexException(index);
-        }
-        final Optional<IndexDescriptor> descriptor = describeOnce(index);
-        if (descriptor.isEmpty()) {
-            throw new NoSuchIndexException(index);
-        }
-        final int shard = org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor.get(), id);
-        // Exact identity keeps routing independent of the number of other shards held here and
-        // cannot select a previous incarnation or a frozen view with the same logical name.
-        final var writer = node.reconciler().writerShard(new ShardId(index, descriptor.get().uuid(), shard));
-        final ShardId local = writer == null ? null : writer.shardId();
-        final String owner = ownerOnce(index, shard).orElse(null);
-        return new Placement(local, shard, owner, descriptor.get().uuid());
-    }
-
-    /**
-     * Explains why this node cannot serve a placement, in the terms every caller needs.
-     *
-     * <p>Split out because the three "not here" cases are genuinely different and collapsing them is how
-     * a brief, self-healing state gets reported as a permanent failure. A head naming <em>this</em> node
-     * with no open shard is the activation window; a head naming somebody else is routing; no head at all
-     * means nothing will change until a node activates the shard, and the arrival of this request is the
-     * only reason one would.
-     */
-    private NotHereException notHere(String index, Placement placement) {
-        if (placement.owner() == null) {
-            node.signals().ownershipDoubted(index, placement.shard());
-            return new NotHereException("no node currently owns shard " + placement.shard() + " of " + index, null, false);
-        }
-        if (placement.owner().equals(node.localNode().getId())) {
-            // Brief only if an activation is actually running. A head naming this node with nothing open and
-            // nothing opening is a wedge -- every peer forwards here and gets this answer -- so the doubt goes
-            // up either way: it joins an activation in flight, or starts the one that re-takes and replays.
-            node.signals().ownershipDoubted(index, placement.shard());
-            return new NotHereException(
-                "this node is acquiring shard " + placement.shard() + " of " + index + "; retry",
-                placement.owner(),
-                true
-            );
-        }
-        return new NotHereException(
-            "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner(),
-            placement.owner(),
-            true
-        );
+        return routing.place(index, id);
     }
 
     /**
@@ -324,8 +113,8 @@ public final class ShardOperations {
         return gated(
             org.opensearch.action.get.GetAction.NAME,
             new org.opensearch.action.get.GetRequest(index, id),
-            admitted -> readAcceptedGet((org.opensearch.action.get.GetRequest) admitted),
-            getView(index)
+            admitted -> reads.readAcceptedGet((org.opensearch.action.get.GetRequest) admitted),
+            DocumentReads.getView(index)
         );
     }
 
@@ -341,117 +130,9 @@ public final class ShardOperations {
             org.opensearch.action.get.GetAction.NAME,
             request,
             org.opensearch.action.get.GetResponse.class,
-            admitted -> (org.opensearch.action.get.GetResponse) getView(request.index()).show(
-                readAcceptedGet((org.opensearch.action.get.GetRequest) admitted)
-            )
+            admitted -> (org.opensearch.action.get.GetResponse) DocumentReads.getView(request.index())
+                .show(reads.readAcceptedGet((org.opensearch.action.get.GetRequest) admitted))
         );
-    }
-
-    private Read readAcceptedGet(org.opensearch.action.get.GetRequest request) throws Exception {
-        final var validation = request.validate();
-        if (validation != null) {
-            throw validation;
-        }
-        if (request.routing() != null) {
-            throw new UnsupportedRequestOptionException("routing is not supported: documents are placed by their id");
-        }
-        if (request.storedFields() != null) {
-            throw new UnsupportedRequestOptionException("stored_fields is not supported");
-        }
-        final Read read = doGet(request.index(), request.id());
-        final var document = read.document();
-        if (document.found() && request.versionType().isVersionConflictForReads(document.version(), request.version())) {
-            throw new org.opensearch.index.engine.VersionConflictEngineException(
-                read.shardId(),
-                request.id(),
-                request.versionType().explainConflictForReads(document.version(), request.version())
-            );
-        }
-        if (request.fetchSourceContext() == null) {
-            return read;
-        }
-        return new Read(
-            new ServerlessNode.Document(
-                document.id(),
-                document.found(),
-                org.opensearch.serverless.rest.SourceFiltering.apply(document.source(), request.fetchSourceContext()),
-                document.seqNo(),
-                document.primaryTerm(),
-                document.version()
-            ),
-            read.servedBy(),
-            read.realtime(),
-            read.shardId()
-        );
-    }
-
-    /**
-     * How a get is shown to a filter, and how the filter's answer is read back.
-     *
-     * <p><b>A redaction that covered only search would not be one.</b> A filter that removes a field from
-     * every hit and cannot touch a get leaves the field one request away, under a URL any caller can
-     * guess — which is worse than no redaction, because it looks like protection. So a get is shown its
-     * real {@code GetResponse} for the same reason a search is.
-     *
-     * <p>Who served the read and whether it was realtime are kept from the original: they are facts about
-     * this node's routing, not about the document, and a filter has no business restating them.
-     *
-     * @param index the index, which a {@code GetResponse} has to carry
-     * @return the view
-     */
-    private static org.opensearch.serverless.shell.ActionGate.ResponseView<Read> getView(String index) {
-        return new org.opensearch.serverless.shell.ActionGate.ResponseView<>() {
-
-            @Override
-            public org.opensearch.core.action.ActionResponse show(Read read) {
-                final var document = read.document();
-                final org.opensearch.index.get.GetResult result = new org.opensearch.index.get.GetResult(
-                    read.shardId() == null ? index : read.shardId().getIndexName(),
-                    document.id(),
-                    // Real now, not placeholders. A filter deciding what a caller may see should be shown
-                    // the document as it actually is; a redaction policy keyed on a version it was told
-                    // was always 1 would be keyed on nothing.
-                    document.seqNo(),
-                    document.primaryTerm(),
-                    document.version(),
-                    document.found(),
-                    document.source() == null
-                        ? null
-                        : new org.opensearch.core.common.bytes.BytesArray(
-                            document.source().getBytes(java.nio.charset.StandardCharsets.UTF_8)
-                        ),
-                    java.util.Map.of(),
-                    java.util.Map.of()
-                );
-                return new org.opensearch.action.get.GetResponse(result);
-            }
-
-            @Override
-            public Read read(org.opensearch.core.action.ActionResponse response, Read original) {
-                if (response instanceof org.opensearch.action.get.GetResponse answered) {
-                    // The sequence identity travels with the document. This used to rebuild it with the
-                    // three-argument constructor, whose defaults are the unassigned sentinels -- so with any
-                    // action filter installed, every get reported _seq_no -2 and _version -1, and the
-                    // conditional write a caller built on those tokens lost every time.
-                    return new Read(
-                        new org.opensearch.serverless.shell.ServerlessNode.Document(
-                            answered.getId(),
-                            answered.isExists(),
-                            answered.isSourceEmpty() ? null : answered.getSourceAsString(),
-                            answered.getSeqNo(),
-                            answered.getPrimaryTerm(),
-                            answered.getVersion()
-                        ),
-                        original == null ? null : original.servedBy(),
-                        original != null && original.realtime(),
-                        original == null ? null : original.shardId()
-                    );
-                }
-                throw new IllegalStateException(
-                    "an action filter answered a get with " + response.getClass().getName() + ", which is not a get response"
-                );
-            }
-        };
     }
 
     /**
@@ -497,124 +178,6 @@ public final class ShardOperations {
         }
     }
 
-    /** How long a get of a shard whose commit is behind its log waits for this node to take the shard. */
-    static final long BEHIND_LOG_WAIT_MILLIS = 10_000L;
-
-    /**
-     * Answers a get whose reader was behind the log by taking the shard here and reading from the writer.
-     *
-     * <p>The refusal already asked for the takeover; this waits for it, the way a write to a shard nobody holds
-     * does, so the caller is answered from the log rather than told to come back. The writer's answer is the
-     * realtime one. If the shard is not taken in time -- another node won it, or this one is full -- the caller is
-     * told to retry, which is true: the takeover is under way.
-     */
-    private Read readOnceTaken(
-        String index,
-        String id,
-        int shard,
-        String expectedUuid,
-        org.opensearch.serverless.shell.ShardBehindLogException behind
-    ) throws IOException {
-        if (node.takeoverBelongsElsewhere(plane, index, shard)) {
-            // A dead member's shard another survivor is named to take: asking for it here queued it on every survivor
-            // a get reached. The caller retries, and finds it taken there.
-            throw NotHereException.behindLog(behind);
-        }
-        java.util.Optional<org.opensearch.core.index.shard.ShardId> taken = java.util.Optional.empty();
-        try {
-            taken = node.signals().activate(index, shard).get(BEHIND_LOG_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
-        } catch (java.util.concurrent.TimeoutException | java.util.concurrent.ExecutionException e) {
-            behind.addSuppressed(e);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            behind.addSuppressed(e);
-        }
-        if (taken.isPresent() && node.reconciler().isReader(taken.get()) == false) {
-            if (expectedUuid.equals(taken.get().getIndex().getUUID()) == false) {
-                throw new org.opensearch.serverless.shell.StaleIncarnationException(new ShardId(index, expectedUuid, shard));
-            }
-            return new Read(node.get(taken.get(), id), node.localNode().getId(), true, taken.get());
-        }
-        throw NotHereException.behindLog(behind);
-    }
-
-    private Read doGet(String index, String id) throws IOException {
-        final Placement placement = place(index, id);
-        // Local only while the head agrees. A writer this node still holds after the head moved to another
-        // node is a writer that has not noticed it lost the shard, and its documents are behind the real
-        // owner's: the forward below asks the node the head names, which is the one answer that is fresh.
-        if (placement.local() != null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
-            return new Read(node.get(placement.local(), id), node.localNode().getId(), true, placement.local());
-        }
-        if (placement.owner() == null) {
-            // Nobody owns it, so there is no writer holding unpublished writes and the commit is the
-            // current state -- except when nothing has ever been published at all. Then there is no
-            // commit to open a reader onto, and with no owner there is no writer about to make one either.
-            // That is not a failure to report, it is a document that has never existed: a fresh index,
-            // read before its first write ever lands. Checked here rather than left to openReader's own
-            // refusal, which exists for a different reader -- the search fan-out, where "unpublished"
-            // must not collapse into "empty" because a live writer really might be mid-first-publish.
-            // Here the owner check already ruled that out.
-            if (plane.segmentPublisher(index, placement.uuid(), placement.shard()).readManifest().isEmpty()) {
-                return new Read(
-                    org.opensearch.serverless.shell.ServerlessNode.Document.absent(id),
-                    node.localNode().getId(),
-                    false,
-                    new ShardId(new org.opensearch.core.index.Index(index, placement.uuid()), placement.shard())
-                );
-            }
-            try {
-                final var shardId = node.serveAsReader(plane, index, placement.shard(), placement.uuid());
-                return new Read(node.get(shardId, id), node.localNode().getId(), false, shardId);
-            } catch (org.opensearch.serverless.shell.ShardBehindLogException behind) {
-                return readOnceTaken(index, id, placement.shard(), placement.uuid(), behind);
-            } catch (IOException e) {
-                throw e;
-            } catch (Exception e) {
-                // serveAsReader opens a shard from the object store, which can fail for reasons that are
-                // not IO. Wrapped rather than swallowed so the caller still sees one exception type.
-                throw new IOException("could not open shard " + placement.shard() + " of " + index + " as a reader", e);
-            }
-        }
-        if (placement.owner().equals(node.localNode().getId())) {
-            throw notHere(index, placement);
-        }
-        return forwardGet(index, id, placement, true);
-    }
-
-    /**
-     * Asks the owner for a document, and once -- after a refusal or an unreachable owner -- whoever the
-     * register names instead.
-     */
-    private Read forwardGet(String index, String id, Placement placement, boolean mayRetry) throws IOException {
-        // Resolving the peer connects to it, so this can throw as readily as the forward itself can --
-        // and both mean the same thing. Leaving the connect outside the catch let a transport failure
-        // escape as a 500 for what is a routing problem and a retry.
-        try {
-            final var peer = node.router().peer(placement.owner());
-            if (peer.isEmpty()) {
-                throw new org.opensearch.serverless.transport.OwnerUnreachableException(
-                    "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease"
-                );
-            }
-            final var response = node.router()
-                .forwardGet(
-                    peer.get(),
-                    new org.opensearch.serverless.transport.ForwardedGetRequest(index, placement.uuid(), placement.shard(), id)
-                );
-            return new Read(
-                response.document(),
-                response.ownerNodeId(),
-                true,
-                new ShardId(new org.opensearch.core.index.Index(index, placement.uuid()), placement.shard())
-            );
-        } catch (NotHereException e) {
-            throw e;
-        } catch (Exception e) {
-            return forwardGet(index, id, afterForwardFailure(index, placement, e, mayRetry), false);
-        }
-    }
-
     /**
      * Explains why a document does or does not match a query.
      *
@@ -637,67 +200,8 @@ public final class ShardOperations {
         return gated(
             org.opensearch.action.explain.ExplainAction.NAME,
             new org.opensearch.action.explain.ExplainRequest(index, id),
-            () -> doExplain(index, id, query)
+            () -> reads.doExplain(index, id, query)
         );
-    }
-
-    private Explained doExplain(String index, String id, org.opensearch.index.query.QueryBuilder query) throws IOException {
-        final Placement placement = place(index, id);
-        // A retained writer may lag the successor's acknowledged writes, just as in doGet.
-        if (placement.local() != null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
-            final ShardExplain.Outcome outcome = node.explain(placement.local(), id, query);
-            return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), true);
-        }
-        if (placement.owner() == null) {
-            // Nobody owns it, so the published commit is the current state -- except before the first publish,
-            // where there is no commit to open and no writer about to make one. The same case doGet handles,
-            // and the same answer: a document that has never existed, rather than a failure.
-            if (plane.segmentPublisher(index, placement.uuid(), placement.shard()).readManifest().isEmpty()) {
-                return new Explained(false, null, node.localNode().getId(), false);
-            }
-            try {
-                final var shardId = node.serveAsReader(plane, index, placement.shard(), placement.uuid());
-                final ShardExplain.Outcome outcome = node.explain(shardId, id, query);
-                return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), false);
-            } catch (org.opensearch.serverless.shell.ShardBehindLogException behind) {
-                throw NotHereException.behindLog(behind);
-            } catch (IOException e) {
-                throw e;
-            } catch (Exception e) {
-                throw new IOException("could not open shard " + placement.shard() + " of " + index + " as a reader", e);
-            }
-        }
-        if (placement.owner().equals(node.localNode().getId())) {
-            throw notHere(index, placement);
-        }
-        return forwardExplain(index, id, query, placement, true);
-    }
-
-    private Explained forwardExplain(
-        String index,
-        String id,
-        org.opensearch.index.query.QueryBuilder query,
-        Placement placement,
-        boolean mayRetry
-    ) throws IOException {
-        try {
-            final var peer = node.router().peer(placement.owner());
-            if (peer.isEmpty()) {
-                throw new org.opensearch.serverless.transport.OwnerUnreachableException(
-                    "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease"
-                );
-            }
-            final var response = node.router()
-                .forwardExplain(
-                    peer.get(),
-                    new org.opensearch.serverless.transport.ForwardedExplainRequest(index, placement.uuid(), placement.shard(), id, query)
-                );
-            return new Explained(response.exists(), response.explanation(), response.ownerNodeId(), true);
-        } catch (NotHereException e) {
-            throw e;
-        } catch (Exception e) {
-            return forwardExplain(index, id, query, afterForwardFailure(index, placement, e, mayRetry), false);
-        }
     }
 
     /**
@@ -717,7 +221,7 @@ public final class ShardOperations {
             if (refuseSystemIndices && node.isSystemIndex(index)) {
                 throw new SystemIndexException(index);
             }
-            final IndexDescriptor descriptor = describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
+            final IndexDescriptor descriptor = routing.describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
             return org.opensearch.serverless.rest.SearchFanout.run(node, plane, descriptor, accepted);
         });
     }
@@ -743,16 +247,19 @@ public final class ShardOperations {
         return gated(
             org.opensearch.action.index.IndexAction.NAME,
             request,
-            admitted -> executeNativeIndex((org.opensearch.action.index.IndexRequest) admitted),
-            new org.opensearch.serverless.shell.ActionGate.ResponseView<NativeIndexResult>() {
+            admitted -> writes.executeNativeIndex((org.opensearch.action.index.IndexRequest) admitted),
+            new org.opensearch.serverless.shell.ActionGate.ResponseView<DocumentWrites.NativeIndexResult>() {
                 @Override
-                public org.opensearch.core.action.ActionResponse show(NativeIndexResult result) {
+                public org.opensearch.core.action.ActionResponse show(DocumentWrites.NativeIndexResult result) {
                     return result.response();
                 }
 
                 @Override
-                public NativeIndexResult read(org.opensearch.core.action.ActionResponse response, NativeIndexResult original) {
-                    return new NativeIndexResult(
+                public DocumentWrites.NativeIndexResult read(
+                    org.opensearch.core.action.ActionResponse response,
+                    DocumentWrites.NativeIndexResult original
+                ) {
+                    return new DocumentWrites.NativeIndexResult(
                         (org.opensearch.action.index.IndexResponse) response,
                         original == null ? null : original.servedBy()
                     );
@@ -773,64 +280,8 @@ public final class ShardOperations {
             org.opensearch.action.index.IndexAction.NAME,
             request,
             org.opensearch.action.index.IndexResponse.class,
-            admitted -> executeNativeIndex((org.opensearch.action.index.IndexRequest) admitted).response()
+            admitted -> writes.executeNativeIndex((org.opensearch.action.index.IndexRequest) admitted).response()
         );
-    }
-
-    private record NativeIndexResult(org.opensearch.action.index.IndexResponse response, String servedBy) {
-    }
-
-    /** Executes an admitted native index request without running its filters a second time. */
-    private NativeIndexResult executeNativeIndex(org.opensearch.action.index.IndexRequest accepted) throws IOException {
-        final var invalid = accepted.validate();
-        if (invalid != null) {
-            throw invalid;
-        }
-        final boolean create = accepted.opType() == org.opensearch.action.DocWriteRequest.OpType.CREATE;
-        validateNativeWrite(accepted.routing(), accepted.version(), accepted.versionType(), accepted.waitForActiveShards(), create);
-        if (accepted.isRequireAlias()) {
-            throw new UnsupportedOperationException("require_alias is not supported through the native Client");
-        }
-        final var descriptor = describeOnce(accepted.index()).orElseThrow(() -> new NoSuchIndexException(accepted.index()));
-        if (org.opensearch.serverless.ingest.IngestPipelines.pipelinesFor(accepted.getPipeline(), descriptor.extraSettings())
-            .isEmpty() == false
-            || (accepted.getFinalPipeline() != null && "_none".equals(accepted.getFinalPipeline()) == false)) {
-            throw new UnsupportedOperationException("ingest pipelines require the REST write API; the native Client cannot apply them");
-        }
-        final String id = accepted.id() == null ? org.opensearch.common.UUIDs.base64UUID() : accepted.id();
-        accepted.id(id);
-        final String source = org.opensearch.common.xcontent.XContentHelper.convertToJson(
-            accepted.source(),
-            false,
-            accepted.getContentType()
-        );
-        final boolean refresh = accepted.getRefreshPolicy() != org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
-        try (
-            var ignored = node.indexingPressure()
-                .markCoordinatingOperationStarted(org.opensearch.serverless.store.WalRecord.contentBytes(id, source), false)
-        ) {
-            final Written written = written(
-                accepted.index(),
-                id,
-                source,
-                refresh,
-                false,
-                accepted.ifSeqNo(),
-                accepted.ifPrimaryTerm(),
-                create
-            );
-            final var outcome = written.outcome();
-            final var response = new org.opensearch.action.index.IndexResponse(
-                written.shardId,
-                id,
-                outcome.seqNo(),
-                outcome.primaryTerm(),
-                outcome.version(),
-                outcome.created()
-            );
-            completeNativeWriteResponse(response, refresh);
-            return new NativeIndexResult(response, written.servedBy());
-        }
     }
 
     /**
@@ -851,7 +302,13 @@ public final class ShardOperations {
                 if (invalid != null) {
                     throw invalid;
                 }
-                validateNativeWrite(accepted.routing(), accepted.version(), accepted.versionType(), accepted.waitForActiveShards(), false);
+                DocumentWrites.validateNativeWrite(
+                    accepted.routing(),
+                    accepted.version(),
+                    accepted.versionType(),
+                    accepted.waitForActiveShards(),
+                    false
+                );
                 final boolean refresh = accepted.getRefreshPolicy() != org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
                 try (
                     var ignored = node.indexingPressure()
@@ -860,7 +317,7 @@ public final class ShardOperations {
                             false
                         )
                 ) {
-                    final Written written = written(
+                    final DocumentWrites.Written written = writes.written(
                         accepted.index(),
                         accepted.id(),
                         "",
@@ -878,36 +335,11 @@ public final class ShardOperations {
                         outcome.version(),
                         outcome.found()
                     );
-                    completeNativeWriteResponse(response, refresh);
+                    DocumentWrites.completeNativeWriteResponse(response, refresh);
                     return response;
                 }
             }
         );
-    }
-
-    private static void validateNativeWrite(
-        String routing,
-        long version,
-        org.opensearch.index.VersionType versionType,
-        org.opensearch.action.support.ActiveShardCount activeShards,
-        boolean create
-    ) {
-        if (routing != null) {
-            throw new UnsupportedOperationException("routing is not supported: documents are placed by their id");
-        }
-        if (versionType != org.opensearch.index.VersionType.INTERNAL
-            || (version != org.opensearch.common.lucene.uid.Versions.MATCH_ANY
-                && (create == false || version != org.opensearch.common.lucene.uid.Versions.MATCH_DELETED))) {
-            throw new UnsupportedOperationException("version/version_type is not supported; use if_seq_no and if_primary_term");
-        }
-        if (activeShards.validate(0) == false) {
-            throw new UnsupportedOperationException("wait_for_active_shards cannot exceed one: shards have no replicas");
-        }
-    }
-
-    static void completeNativeWriteResponse(org.opensearch.action.DocWriteResponse response, boolean refresh) {
-        response.setForcedRefresh(refresh);
-        response.setShardInfo(new org.opensearch.action.support.replication.ReplicationResponse.ShardInfo(1, 1));
     }
 
     private <T extends org.opensearch.core.action.ActionResponse> T gatedNative(
@@ -942,12 +374,6 @@ public final class ShardOperations {
         );
         return delete(request).getResult() == org.opensearch.action.DocWriteResponse.Result.DELETED;
     }
-
-    /** How many matches are fetched per page, per shard, while walking a frozen view. */
-    static final int DELETE_BY_QUERY_BATCH_SIZE = 1000;
-
-    /** How long the frozen view a delete-by-query takes is held. Bounded, not indefinite. */
-    static final long DELETE_BY_QUERY_KEEP_ALIVE_MILLIS = 3_600_000L;
 
     /**
      * Deletes every document a query matches.
@@ -1047,7 +473,7 @@ public final class ShardOperations {
                 );
             }
             final long started = System.nanoTime();
-            final var result = doDeleteByQuery(
+            final var result = deletes.doDeleteByQuery(
                 accepted.indices()[0],
                 acceptedQuery,
                 accepted.getMaxDocs() == org.opensearch.index.reindex.AbstractBulkByScrollRequest.MAX_DOCS_ALL_MATCHES
@@ -1087,123 +513,6 @@ public final class ShardOperations {
                 );
             }
         });
-    }
-
-    private DeleteByQueryOutcome doDeleteByQuery(
-        String index,
-        org.opensearch.index.query.QueryBuilder query,
-        long maxDocs,
-        boolean refresh,
-        boolean abortOnConflict
-    ) throws Exception {
-        if (refuseSystemIndices && node.isSystemIndex(index)) {
-            throw new SystemIndexException(index);
-        }
-        final IndexDescriptor descriptor = describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
-
-        // A frozen view, exactly as _pit takes one -- see the class javadoc for why the query is decided
-        // once rather than re-evaluated as the walk goes.
-        // The capture marker before the first manifest read, so the commits this is about to freeze
-        // cannot be swept while it is reading them. See PointInTime#isCapturing.
-        final String pitId = org.opensearch.common.UUIDs.randomBase64UUID();
-        final long expiresAt = plane.clock().getAsLong() + DELETE_BY_QUERY_KEEP_ALIVE_MILLIS;
-        plane.beginPointInTime(
-            new org.opensearch.serverless.metadata.PointInTime(pitId, index, descriptor.uuid(), expiresAt, java.util.Map.of(), true)
-        );
-
-        final java.util.Map<Integer, org.opensearch.serverless.store.CommitManifest> shards = new java.util.LinkedHashMap<>();
-        for (int shard = 0; shard < descriptor.numberOfShards(); shard++) {
-            final var manifest = plane.segmentPublisher(index, descriptor.uuid(), shard).readManifest();
-            if (manifest.isEmpty()) {
-                // Nothing published on this shard: nothing to match, and nothing silently skipped either
-                // -- an unpublished shard has no documents a search could have found.
-                continue;
-            }
-            shards.put(shard, manifest.get());
-        }
-        if (shards.isEmpty()) {
-            // Nothing to freeze, so the marker must not be left pinning the index's sweep.
-            plane.releasePointInTime(pitId);
-            return new DeleteByQueryOutcome(0, 0);
-        }
-
-        final var pit = new org.opensearch.serverless.metadata.PointInTime(pitId, index, descriptor.uuid(), expiresAt, shards);
-        plane.finishPointInTime(pit);
-        try {
-            long visited = 0;
-            long deleted = 0;
-            long conflicts = 0;
-            int batches = 0;
-            for (Integer shard : shards.keySet()) {
-                final var frozenShardId = node.openFrozenView(plane, pit, shard);
-                Object[] cursor = null;
-                while (visited < maxDocs) {
-                    final var page = new org.opensearch.search.builder.SearchSourceBuilder().query(query)
-                        .sort(new org.opensearch.search.sort.FieldSortBuilder(org.opensearch.search.sort.FieldSortBuilder.DOC_FIELD_NAME))
-                        .size((int) Math.min(DELETE_BY_QUERY_BATCH_SIZE, maxDocs - visited))
-                        .trackTotalHits(false)
-                        // The sequence number each delete is conditional on.
-                        .seqNoAndPrimaryTerm(true)
-                        .fetchSource(false);
-                    if (cursor != null) {
-                        page.searchAfter(cursor);
-                    }
-                    final var result = org.opensearch.serverless.shard.ShardQuery.execute(node.searchService(), frozenShardId, page);
-                    final var hits = result.hits();
-                    if (hits.isEmpty()) {
-                        break;
-                    }
-                    batches = Math.incrementExact(batches);
-                    final boolean lastPageOfShard = hits.size() < page.size() || visited + hits.size() >= maxDocs;
-                    long pageBytes = 0L;
-                    for (var hit : hits) {
-                        pageBytes += 64L + (hit.getId() == null ? 0 : hit.getId().length());
-                    }
-                    // A page of deletes is a page of writes, and accounted as one: this operation used to
-                    // be the only writer on the node that indexing pressure could not see.
-                    try (
-                        org.opensearch.common.lease.Releasable inFlight = node.indexingPressure()
-                            .markCoordinatingOperationStarted(pageBytes, false)
-                    ) {
-                        for (int i = 0; i < hits.size(); i++) {
-                            final var hit = hits.get(i);
-                            visited++;
-                            // The refresh -- when asked for -- rides the last delete of the shard, not every
-                            // one: refreshing per document would refresh the shard once per document instead
-                            // of once for the whole operation.
-                            final boolean isLastOfShard = refresh && lastPageOfShard && i == hits.size() - 1;
-                            try {
-                                if (doDeleteIfUnchanged(index, hit.getId(), isLastOfShard, hit.getSeqNo(), hit.getPrimaryTerm())) {
-                                    deleted++;
-                                }
-                            } catch (org.opensearch.index.engine.VersionConflictEngineException e) {
-                                // Rewritten -- or already removed -- after the view was taken. Left alone,
-                                // and counted, rather than deleted regardless.
-                                conflicts++;
-                                if (abortOnConflict) {
-                                    return new DeleteByQueryOutcome(visited, deleted, conflicts, hit.getId(), null, e, batches);
-                                }
-                            }
-                        }
-                    }
-                    cursor = hits.get(hits.size() - 1).getSortValues();
-                    if (lastPageOfShard) {
-                        // Fewer than a full page, or the cap was reached: this shard has nothing left to
-                        // give (or nothing more is wanted), and asking again would cost a round trip to
-                        // learn what this already knows.
-                        break;
-                    }
-                }
-                // A shard with no match never entered the loop above, so it never issued a delete and
-                // never needed a refresh -- correctly, since nothing changed on it to make visible.
-            }
-            return new DeleteByQueryOutcome(visited, deleted, conflicts, null, null, null, batches);
-        } finally {
-            // Local shards first, then the record -- the same order _pit's own release does, so this node
-            // is never left holding open frozen shards for a view no longer recorded anywhere.
-            node.reconciler().closeFrozenReader(pit.id());
-            plane.releasePointInTime(pit.id());
-        }
     }
 
     /**
@@ -1400,7 +709,7 @@ public final class ShardOperations {
         // doGet, not get: this whole method is one gated operation under UpdateAction's own name, and
         // calling the public get() here would run the filter chain a second time under GetAction's --
         // which is not what a filter checking "may this caller write" expects to see for an update.
-        final Read current = doGet(index, id);
+        final Read current = reads.doGet(index, id);
         final ServerlessNode.Document existing = current.document();
         if (existing.found()
             && ifSeqNo != org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO
@@ -1510,7 +819,7 @@ public final class ShardOperations {
             }
             // The script decided against the document we read. Deleting unconditionally here
             // removed a newer concurrent write; use the same compare-and-swap as an indexed update.
-            final Written removed = written(index, id, "", refresh, true, existing.seqNo(), existing.primaryTerm());
+            final DocumentWrites.Written removed = writes.written(index, id, "", refresh, true, existing.seqNo(), existing.primaryTerm());
             return new UpdateOutcome(
                 "deleted",
                 removed.servedBy(),
@@ -1549,7 +858,7 @@ public final class ShardOperations {
         // retry_on_conflict loop could never fire. A missing document is written as a
         // create, so two concurrent upserts cannot both "create".
         final boolean unconditional = ifSeqNo == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
-        final Written written = written(
+        final DocumentWrites.Written written = writes.written(
             index,
             id,
             mergedJson,
@@ -1571,175 +880,4 @@ public final class ShardOperations {
         );
     }
 
-    private boolean doDelete(String index, String id, boolean refresh) throws IOException {
-        return written(index, id, "", refresh, true, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L).outcome().found();
-    }
-
-    /** Deletes against the sequence identity a frozen view recorded, when it recorded one. */
-    private boolean doDeleteIfUnchanged(String index, String id, boolean refresh, long seqNo, long primaryTerm) throws IOException {
-        if (seqNo < 0 || primaryTerm <= 0) {
-            return doDelete(index, id, refresh);
-        }
-        return written(index, id, "", refresh, true, seqNo, primaryTerm).outcome().found();
-    }
-
-    /** Who served a write, and what the engine assigned it. */
-    private static final class Written {
-        private final String servedBy;
-        private final org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome;
-        private final ShardId shardId;
-
-        Written(String servedBy, org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome, ShardId shardId) {
-            this.servedBy = servedBy;
-            this.outcome = outcome;
-            this.shardId = shardId;
-        }
-
-        String servedBy() {
-            return servedBy;
-        }
-
-        org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome() {
-            return outcome;
-        }
-    }
-
-    private Written written(String index, String id, String source, boolean refresh, boolean deletion, long ifSeqNo, long ifPrimaryTerm)
-        throws IOException {
-        return written(index, id, source, refresh, deletion, ifSeqNo, ifPrimaryTerm, false);
-    }
-
-    private Written written(
-        String index,
-        String id,
-        String source,
-        boolean refresh,
-        boolean deletion,
-        long ifSeqNo,
-        long ifPrimaryTerm,
-        boolean requireAbsent
-    ) throws IOException {
-        final Placement placement = place(index, id);
-        if (placement.local() != null) {
-            final var outcome = deletion
-                ? node.delete(placement.local(), id, ifSeqNo, ifPrimaryTerm)
-                : node.index(placement.local(), id, source, ifSeqNo, ifPrimaryTerm, requireAbsent);
-            if (refresh) {
-                node.reconciler().shard(placement.local()).refresh("serverless-ops-refresh");
-            }
-            return new Written(node.localNode().getId(), outcome, placement.local());
-        }
-        return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent);
-    }
-
-    private String forward(String index, String id, String source, boolean refresh, boolean deletion, Placement placement)
-        throws IOException {
-        return forwardWritten(
-            index,
-            id,
-            source,
-            refresh,
-            deletion,
-            placement,
-            org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-            0L
-        ).servedBy();
-    }
-
-    private Written forwardWritten(
-        String index,
-        String id,
-        String source,
-        boolean refresh,
-        boolean deletion,
-        Placement placement,
-        long ifSeqNo,
-        long ifPrimaryTerm
-    ) throws IOException {
-        return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, false);
-    }
-
-    private Written forwardWritten(
-        String index,
-        String id,
-        String source,
-        boolean refresh,
-        boolean deletion,
-        Placement placement,
-        long ifSeqNo,
-        long ifPrimaryTerm,
-        boolean requireAbsent
-    ) throws IOException {
-        return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
-    }
-
-    private Written forwardWritten(
-        String index,
-        String id,
-        String source,
-        boolean refresh,
-        boolean deletion,
-        Placement placement,
-        long ifSeqNo,
-        long ifPrimaryTerm,
-        boolean requireAbsent,
-        boolean mayRetry
-    ) throws IOException {
-        if (placement.owner() == null || placement.owner().equals(node.localNode().getId())) {
-            throw notHere(index, placement);
-        }
-        try {
-            final var peer = node.router().peer(placement.owner());
-            if (peer.isEmpty()) {
-                throw new org.opensearch.serverless.transport.OwnerUnreachableException(
-                    "shard " + placement.shard() + " of " + index + " is owned by " + placement.owner() + ", which has no reachable lease"
-                );
-            }
-            final var ack = node.router()
-                .forwardIndex(
-                    peer.get(),
-                    new org.opensearch.serverless.transport.ForwardedIndexRequest(
-                        index,
-                        placement.uuid(),
-                        placement.shard(),
-                        id,
-                        source,
-                        refresh,
-                        deletion,
-                        ifSeqNo,
-                        ifPrimaryTerm,
-                        requireAbsent
-                    )
-                );
-            return new Written(
-                ack.ownerNodeId(),
-                new org.opensearch.serverless.shell.ServerlessNode.WriteOutcome(
-                    ack.seqNo(),
-                    ack.primaryTerm(),
-                    ack.version(),
-                    ack.created(),
-                    ack.found()
-                ),
-                new ShardId(new org.opensearch.core.index.Index(index, placement.uuid()), placement.shard())
-            );
-        } catch (NotHereException e) {
-            throw e;
-        } catch (Exception e) {
-            // Sorted by afterForwardFailure: a lost condition is rethrown as itself, an owner's own answer
-            // keeps its status, a deadline is not retried, and a refusal or an unreachable owner costs one
-            // register read and one more forward.
-            return forwardWritten(
-                index,
-                id,
-                source,
-                refresh,
-                deletion,
-                afterForwardFailure(index, placement, e, mayRetry),
-                ifSeqNo,
-                ifPrimaryTerm,
-                requireAbsent,
-                false
-            );
-        }
-    }
 }
