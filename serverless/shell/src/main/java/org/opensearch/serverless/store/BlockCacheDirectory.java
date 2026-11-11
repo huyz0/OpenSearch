@@ -171,6 +171,20 @@ public final class BlockCacheDirectory extends FilterDirectory {
     }
 
     /**
+     * Returns the cache key prefix of every published file this directory reads from the object store: the files of
+     * the commit it is open on, so a block under any other prefix belongs to a file merged away or deleted since.
+     *
+     * @return the prefixes, each a key up to its {@code #}
+     */
+    public Set<String> keyPrefixes() {
+        final Set<String> prefixes = new LinkedHashSet<>();
+        for (Map.Entry<String, RemoteFile> entry : remote.entrySet()) {
+            prefixes.add(keyPrefix(cacheScope, entry.getValue().termDir(), entry.getKey()));
+        }
+        return prefixes;
+    }
+
+    /**
      * Fetches those of some blocks that belong to this shard's published files and are not held, in coalesced ranged
      * reads. Keys of other shards, of files no longer in this commit, or of files held locally are ignored.
      *

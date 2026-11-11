@@ -59,6 +59,15 @@ public final class CacheWarmCopy {
     /** The default batch: 4 MB of 64 KB blocks. */
     static final int DEFAULT_BATCH_BLOCKS = 64;
 
+    /** The most bytes of warm blocks a joiner copies, across all its peers. Defaults to a quarter of its cache. */
+    public static final String MAX_BYTES = "serverless.search.warm_copy.max_bytes";
+
+    /** How recently a block must have been read on a peer to be copied. */
+    public static final String RECENT_WINDOW = "serverless.search.warm_copy.recent_window";
+
+    /** The default window: a block no search has read for half an hour is not what the next searches want. */
+    static final org.opensearch.common.unit.TimeValue DEFAULT_RECENT_WINDOW = org.opensearch.common.unit.TimeValue.timeValueMinutes(30);
+
     /** How many peers a joiner copies from at once. */
     public static final String PARALLEL_PEERS = "serverless.search.warm_copy.parallel_peers";
 
@@ -110,6 +119,8 @@ public final class CacheWarmCopy {
     private final long maxBytesPerSecond;
     private final int batchBlocks;
     private final int parallelPeers;
+    private final long maxBytes;
+    private final long recentMillis;
     private volatile LongSupplier nanoClock = System::nanoTime;
     private volatile Pause pause = nanos -> Thread.sleep(nanos / 1_000_000L, (int) (nanos % 1_000_000L));
 
@@ -118,6 +129,9 @@ public final class CacheWarmCopy {
         this.maxBytesPerSecond = Math.max(1L, router.node.settings().getAsLong(MAX_BYTES_PER_SECOND, DEFAULT_MAX_BYTES_PER_SECOND));
         this.batchBlocks = Math.max(1, Math.min(MAX_BATCH_BLOCKS, router.node.settings().getAsInt(BATCH_BLOCKS, DEFAULT_BATCH_BLOCKS)));
         this.parallelPeers = Math.max(1, router.node.settings().getAsInt(PARALLEL_PEERS, DEFAULT_PARALLEL_PEERS));
+        final BlockCache cache = router.node.blockCache();
+        this.maxBytes = Math.max(0L, router.node.settings().getAsLong(MAX_BYTES, (long) cache.maxBlocks() * cache.blockSize() / 4));
+        this.recentMillis = router.node.settings().getAsTime(RECENT_WINDOW, DEFAULT_RECENT_WINDOW).millis();
     }
 
     /**
@@ -225,7 +239,9 @@ public final class CacheWarmCopy {
                     node,
                     members,
                     request.joinerId(),
-                    org.opensearch.serverless.cluster.HotShardSpread.of(node, node.settings())
+                    org.opensearch.serverless.cluster.HotShardSpread.of(node, node.settings()),
+                    request.recentMillis() == Long.MAX_VALUE ? Long.MIN_VALUE : node.blockCache().nowMillis() - request.recentMillis(),
+                    request.maxBytes()
                 )
             )
         );
@@ -325,7 +341,12 @@ public final class CacheWarmCopy {
                     if (peer.isEmpty()) {
                         return Optional.empty();
                     }
-                    final HotSetResponse hot = router.send(peer.get(), HotSetRequest.ACTION, new HotSetRequest(self), HotSetResponse::new);
+                    final HotSetResponse hot = router.send(
+                        peer.get(),
+                        HotSetRequest.ACTION,
+                        new HotSetRequest(self, maxBytes, recentMillis),
+                        HotSetResponse::new
+                    );
                     return Optional.of(Map.entry(peer.get(), hot));
                 });
             }
@@ -336,9 +357,8 @@ public final class CacheWarmCopy {
                 asked.put(peers.get(i), answers.get(i));
             }
             final Map<Shard, java.util.LinkedHashSet<String>> shards = new LinkedHashMap<>();
-            final Map<DiscoveryNode, List<String>> wantedFrom = new LinkedHashMap<>();
-            final Set<String> claimed = new java.util.HashSet<>();
-            long held = 0;
+            final Map<String, Shard> shardOfKey = new java.util.HashMap<>();
+            final Map<DiscoveryNode, List<String>> offered = new LinkedHashMap<>();
             for (Map.Entry<String, java.util.concurrent.Future<Optional<Map.Entry<DiscoveryNode, HotSetResponse>>>> answer : asked
                 .entrySet()) {
                 final Optional<Map.Entry<DiscoveryNode, HotSetResponse>> got;
@@ -354,23 +374,44 @@ public final class CacheWarmCopy {
                     continue;
                 }
                 final List<List<String>> perShard = new ArrayList<>();
-                for (CacheHotSet.HotShard shard : got.get().getValue().shards()) {
-                    shards.computeIfAbsent(
-                        new Shard(shard.indexName(), shard.indexUuid(), shard.shard()),
-                        k -> new java.util.LinkedHashSet<>()
-                    ).addAll(shard.keys());
-                    final List<String> mine = new ArrayList<>();
-                    for (String key : shard.keys()) {
-                        if (cache.holds(key)) {
-                            held++;
-                            missed.incrementAndGet();
-                        } else if (claimed.add(key)) {
-                            mine.add(key);
-                        }
+                for (CacheHotSet.HotShard hot : got.get().getValue().shards()) {
+                    final Shard shard = new Shard(hot.indexName(), hot.indexUuid(), hot.shard());
+                    shards.computeIfAbsent(shard, k -> new java.util.LinkedHashSet<>());
+                    for (String key : hot.keys()) {
+                        shardOfKey.putIfAbsent(key, shard);
                     }
-                    perShard.add(mine);
+                    perShard.add(hot.keys());
                 }
-                wantedFrom.put(got.get().getKey(), hottestFirst(perShard));
+                offered.put(got.get().getKey(), hottestFirst(perShard));
+            }
+            // One budget across every peer, after dedupe: the peers' lists are taken in turn, hottest first, and a block
+            // two peers both offer is taken once, from the first to offer it. A block already held costs nothing.
+            final Map<DiscoveryNode, List<String>> wantedFrom = new LinkedHashMap<>();
+            final Set<String> claimed = new java.util.HashSet<>();
+            long held = 0;
+            long budget = maxBytes;
+            for (int i = 0, left = offered.size(); left > 0; i++) {
+                left = 0;
+                for (Map.Entry<DiscoveryNode, List<String>> peer : offered.entrySet()) {
+                    final List<String> keys = peer.getValue();
+                    if (i + 1 < keys.size()) {
+                        left++;
+                    }
+                    if (i >= keys.size() || claimed.add(keys.get(i)) == false) {
+                        continue;
+                    }
+                    final String key = keys.get(i);
+                    if (cache.holds(key)) {
+                        held++;
+                        missed.incrementAndGet();
+                    } else if (budget >= cache.blockSize()) {
+                        budget -= cache.blockSize();
+                        wantedFrom.computeIfAbsent(peer.getKey(), k -> new ArrayList<>()).add(key);
+                    } else {
+                        continue;
+                    }
+                    shards.get(shardOfKey.get(key)).add(key);
+                }
             }
             final Set<Shard> share = Set.copyOf(shards.keySet());
             final Threshold threshold = new Threshold(
