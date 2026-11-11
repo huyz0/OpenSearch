@@ -11,6 +11,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.WriteTarget;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.ForwardFailed;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteRefusal;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteResult;
@@ -132,7 +133,7 @@ final class DocumentWritePlanner {
         long ifPrimaryTerm,
         org.opensearch.core.action.ActionListener<WriteResult> answer
     ) throws IOException {
-        final Optional<MetadataPlane.WriteTarget> target = metadata.writeTarget(index);
+        final Optional<WriteTarget> target = metadata.writeTarget(index);
         if (target.isEmpty()) {
             throw new WriteRefusal(RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index);
         }

@@ -83,11 +83,9 @@ final class AliasMutations {
      * @return the record and its generation, or empty when the name is not an alias
      * @throws IOException if the read fails
      */
-    public Optional<MetadataPlane.AliasAtGeneration> aliasWithGeneration(String name) throws IOException {
+    public Optional<AliasAtGeneration> aliasWithGeneration(String name) throws IOException {
         final DescriptorResolution resolved = resolveForAliasMutation(name);
-        return resolved.alias() == null
-            ? Optional.empty()
-            : Optional.of(new MetadataPlane.AliasAtGeneration(resolved.alias(), resolved.generation()));
+        return resolved.alias() == null ? Optional.empty() : Optional.of(new AliasAtGeneration(resolved.alias(), resolved.generation()));
     }
 
     /**

@@ -150,12 +150,12 @@ final class RoutingCache {
      * @param uuid the incarnation
      * @return what the read found and when it began, or empty if no cached read found this index at this uuid
      */
-    java.util.Optional<MetadataPlane.ConfirmingRead> readConfirmingIncarnation(String indexName, String uuid) {
+    java.util.Optional<ConfirmingRead> readConfirmingIncarnation(String indexName, String uuid) {
         final CachedResolution seen = routingCache.get(indexName);
         if (seen == null || seen.resolution().index() == null || uuid.equals(seen.resolution().index().uuid()) == false) {
             return java.util.Optional.empty();
         }
-        return java.util.Optional.of(new MetadataPlane.ConfirmingRead(seen.resolution().index(), seen.readStartedNanos()));
+        return java.util.Optional.of(new ConfirmingRead(seen.resolution().index(), seen.readStartedNanos()));
     }
 
     /**

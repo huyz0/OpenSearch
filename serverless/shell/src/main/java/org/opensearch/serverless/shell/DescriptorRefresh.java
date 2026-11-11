@@ -79,11 +79,11 @@ final class DescriptorRefresh {
         final long[] applied = node.appliedDescriptorVersions.computeIfAbsent(indexName, k -> new long[] { -1L, -1L });
         synchronized (applied) {
             if (applied[0] != descriptor.mappingVersion()) {
-                node.reconciler.refreshMapping(indexName, descriptor);
+                node.reconciler.refresh().refreshMapping(indexName, descriptor);
                 applied[0] = descriptor.mappingVersion();
             }
             if (applied[1] != descriptor.settingsVersion()) {
-                node.reconciler.refreshSettings(indexName, descriptor);
+                node.reconciler.refresh().refreshSettings(indexName, descriptor);
                 applied[1] = descriptor.settingsVersion();
             }
         }

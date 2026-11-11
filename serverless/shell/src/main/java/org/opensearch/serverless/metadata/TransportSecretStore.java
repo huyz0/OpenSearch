@@ -41,12 +41,12 @@ final class TransportSecretStore {
      * @return the secrets and the register generation they sit at
      * @throws IOException if the register cannot be read or created
      */
-    MetadataPlane.TransportSecrets transportSecrets() throws IOException {
+    TransportSecrets transportSecrets() throws IOException {
         final Optional<org.opensearch.common.blobstore.BlobRegister> existing = container.readRegister(TRANSPORT_SECRET_BLOB);
         if (existing.isPresent()) {
-            return atGeneration(MetadataPlane.TransportSecrets.parse(existing.get().value().utf8ToString()), existing.get().generation());
+            return atGeneration(TransportSecrets.parse(existing.get().value().utf8ToString()), existing.get().generation());
         }
-        final MetadataPlane.TransportSecrets minted = new MetadataPlane.TransportSecrets(1L, freshHex(), null, clock.getAsLong());
+        final TransportSecrets minted = new TransportSecrets(1L, freshHex(), null, clock.getAsLong());
         final var created = container.createRegisterIfAbsent(
             TRANSPORT_SECRET_BLOB,
             new org.opensearch.core.common.bytes.BytesArray(minted.toJson().getBytes(java.nio.charset.StandardCharsets.UTF_8))
@@ -58,7 +58,7 @@ final class TransportSecretStore {
         if (raced.isEmpty()) {
             throw new IOException("transport secret vanished");
         }
-        return atGeneration(MetadataPlane.TransportSecrets.parse(raced.get().value().utf8ToString()), raced.get().generation());
+        return atGeneration(TransportSecrets.parse(raced.get().value().utf8ToString()), raced.get().generation());
     }
 
     /**
@@ -71,15 +71,10 @@ final class TransportSecretStore {
      * @return the secrets as rotated
      * @throws IOException if the register cannot be read or the swap keeps losing
      */
-    MetadataPlane.TransportSecrets rotateTransportSecret() throws IOException {
+    TransportSecrets rotateTransportSecret() throws IOException {
         for (int attempt = 0; attempt < 8; attempt++) {
-            final MetadataPlane.TransportSecrets old = transportSecrets();
-            final MetadataPlane.TransportSecrets next = new MetadataPlane.TransportSecrets(
-                old.generation() + 1,
-                freshHex(),
-                old.current(),
-                clock.getAsLong()
-            );
+            final TransportSecrets old = transportSecrets();
+            final TransportSecrets next = new TransportSecrets(old.generation() + 1, freshHex(), old.current(), clock.getAsLong());
             final var swapped = container.compareAndSwapRegister(
                 TRANSPORT_SECRET_BLOB,
                 old.generation(),
@@ -97,8 +92,8 @@ final class TransportSecretStore {
      * than the counter it was written with -- the two agree except for a register written before
      * generations existed, whose stored counter is a placeholder.
      */
-    private static MetadataPlane.TransportSecrets atGeneration(MetadataPlane.TransportSecrets secrets, long registerGeneration) {
-        return new MetadataPlane.TransportSecrets(registerGeneration, secrets.current(), secrets.previous(), secrets.rotatedAtMillis());
+    private static TransportSecrets atGeneration(TransportSecrets secrets, long registerGeneration) {
+        return new TransportSecrets(registerGeneration, secrets.current(), secrets.previous(), secrets.rotatedAtMillis());
     }
 
     private static String freshHex() {

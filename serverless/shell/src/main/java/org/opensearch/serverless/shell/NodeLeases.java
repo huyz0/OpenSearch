@@ -8,7 +8,7 @@
 package org.opensearch.serverless.shell;
 
 import org.opensearch.serverless.cluster.IndexDescriptor;
-import org.opensearch.serverless.shard.ShardReconciler;
+import org.opensearch.serverless.shard.FailedShardRelease;
 
 import java.util.concurrent.CountDownLatch;
 
@@ -535,13 +535,13 @@ public final class NodeLeases {
         try {
             final var released = node.fences().underShardFence(shardId, () -> {
                 final var result = node.reconciler.releaseFailedShard(failed, "its engine failed");
-                if (result != ShardReconciler.FailedShardRelease.NOT_CURRENT) {
+                if (result != FailedShardRelease.NOT_CURRENT) {
                     node.writeFenced.remove(shardId);
                     node.shards().forgetShardRecords(shardId);
                 }
                 return result;
             });
-            if (released == ShardReconciler.FailedShardRelease.WRITER && node.metadataPlane != null) {
+            if (released == FailedShardRelease.WRITER && node.metadataPlane != null) {
                 node.signals.ownershipDoubted(shardId.getIndexName(), shardId.id());
             }
         } catch (Exception e) {

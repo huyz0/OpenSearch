@@ -289,7 +289,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
 
             final IndexDescriptor updated = current.get().withSettings(result);
             if (metadata.updateDescriptor(updated, generation).isPresent()) {
-                serving.reconciler().refreshSettings(index, updated);
+                serving.reconciler().refresh().refreshSettings(index, updated);
                 acknowledge(channel, index, true);
                 return;
             }

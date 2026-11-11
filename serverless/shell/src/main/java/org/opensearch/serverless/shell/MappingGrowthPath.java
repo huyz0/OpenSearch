@@ -149,13 +149,13 @@ final class MappingGrowthPath {
                 // Another node already grew it. The descriptor is right; this node's open shard is not,
                 // and without this refresh every write carrying the field failed here until the shard
                 // reopened.
-                node.reconciler.refreshMapping(indexName, current.get());
+                node.reconciler.refresh().refreshMapping(indexName, current.get());
                 return;
             }
             final var updated = current.get().withMapping(merged);
             if (plane.updateDescriptor(updated, generation).isPresent()) {
                 node.hosted.computeIfPresent(indexName, (k, v) -> v.uuid().equals(index.getUUID()) ? updated : v);
-                node.reconciler.refreshMapping(indexName, updated);
+                node.reconciler.refresh().refreshMapping(indexName, updated);
                 return;
             }
         }
