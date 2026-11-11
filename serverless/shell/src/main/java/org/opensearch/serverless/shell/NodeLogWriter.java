@@ -168,15 +168,58 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
     }
 
     /**
-     * Renews the lease with the epochs as they stand, under the lock a new epoch's recording takes.
+     * Renews the lease with the epochs as they stand, under the lock a new epoch's recording takes, then deletes what the
+     * lease now says nobody needs.
+     *
+     * <p><b>Deleted only behind the lease.</b> A successor's fence searches for the first free slot from the landed hint
+     * the lease records, trusting that every slot below it is taken. So a slot is deleted only once a lease naming a trim
+     * point above it has landed: the landed hint of that lease, and of every later one, is at or above the trim point, so
+     * no search starts inside what was deleted. An epoch that is complete -- no longer written, nothing unpublished -- is
+     * left out of the lease first and deleted whole once that lease has landed. All of it is by name, with no listing, and
+     * a delete is free where a PUT is not.
+     *
+     * <p>Only this process's own epochs. Those an earlier process left are deleted once every shard they hold records of
+     * has been taken and published again, which is the janitor's to decide.
      *
      * @throws IOException if the lease could not be written
      */
     public void renew() throws IOException {
         synchronized (leaseLock) {
-            leaseWriter.write(epochs());
+            completed.addAll(committer.takeComplete());
+            final List<NodeLogEpoch> mine = committer.positions();
+            leaseWriter.write(withInherited(mine));
+            deleteBehind(mine);
         }
     }
+
+    /** Epochs no longer named by the lease and not yet deleted. */
+    private final List<NodeLogEpoch> completed = new ArrayList<>();
+    /** Per epoch of this process, the slot below which everything has been deleted. */
+    private final Map<Long, Long> deletedBelow = new ConcurrentHashMap<>();
+
+    private void deleteBehind(List<NodeLogEpoch> recorded) {
+        try {
+            for (NodeLogEpoch epoch : recorded) {
+                final long from = deletedBelow.getOrDefault(epoch.epoch(), 0L);
+                if (epoch.trimPoint() > from) {
+                    own.deleteRange(epoch.epoch(), from, epoch.trimPoint());
+                    deletedBelow.put(epoch.epoch(), epoch.trimPoint());
+                }
+            }
+            while (completed.isEmpty() == false) {
+                final NodeLogEpoch epoch = completed.get(0);
+                // Past the landed hint too: the slot an append whose outcome was unknown may have taken, and a fence.
+                own.deleteRange(epoch.epoch(), deletedBelow.getOrDefault(epoch.epoch(), 0L), epoch.landed() + 2);
+                deletedBelow.remove(epoch.epoch());
+                completed.remove(0);
+            }
+        } catch (IOException e) {
+            // Tried again after the next renewal; what is left costs storage, never correctness.
+            logger.debug("could not delete node-log blobs behind the lease; will retry", e);
+        }
+    }
+
+    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(NodeLogWriter.class);
 
     /**
      * Returns the committer, for its counters.
@@ -262,7 +305,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
         if (predecessor == null || predecessor.equals(nodeId)) {
             if (inherited.isEmpty() == false) {
                 // Fenced at start; the fence is shared, so this costs only the reads.
-                takeoverOf(nodeId, own, inherited, term).forEachRecord(key, counting);
+                takeoverOf(nodeId, own, inherited, term, null).forEachRecord(key, counting);
             }
             final NodeLogTakeover reader = new NodeLogTakeover(own, List.of(), nodeId, term);
             for (Map.Entry<Long, List<Range>> runs : committer.unpublishedRuns(key).entrySet()) {
@@ -276,21 +319,30 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
         if (epochs.isEmpty()) {
             return 0L;
         }
-        takeoverOf(predecessor, new NodeLogStore(plane.blobStore(), plane.basePath(), predecessor), epochs, term).forEachRecord(
-            key,
-            counting
-        );
+        takeoverOf(
+            predecessor,
+            new NodeLogStore(plane.blobStore(), plane.basePath(), predecessor),
+            epochs,
+            term,
+            () -> plane.membership().read(predecessor).map(NodeLease::nodeLog).orElse(List.of())
+        ).forEachRecord(key, counting);
         return count[0];
     }
 
-    private NodeLogTakeover takeoverOf(String predecessor, NodeLogStore log, List<NodeLogEpoch> epochs, long term) {
+    private NodeLogTakeover takeoverOf(
+        String predecessor,
+        NodeLogStore log,
+        List<NodeLogEpoch> epochs,
+        long term,
+        NodeLogTakeover.LeaseReader reread
+    ) {
         // One reader per predecessor and set of epochs, so every shard taken from it shares its fences and headers. A
         // lease naming other epochs gets a new one: fencing an epoch again is shared, not repeated.
         return takeovers.compute(predecessor, (id, known) -> {
             if (known != null && known.epochs().equals(epochs)) {
                 return known;
             }
-            return new NodeLogTakeover(log, epochs, nodeId, term);
+            return new NodeLogTakeover(log, epochs, nodeId, term, reread);
         });
     }
 }
