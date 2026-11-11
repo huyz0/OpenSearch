@@ -494,6 +494,7 @@ public final class StatsHandler extends BaseRestHandler {
         builder.field("same_zone_bytes", meter.total(org.opensearch.serverless.transport.ZoneTraffic.Path.SAME_ZONE));
         builder.field("cross_zone_bytes", meter.total(org.opensearch.serverless.transport.ZoneTraffic.Path.CROSS_ZONE));
         builder.field("unknown_zone_bytes", meter.total(org.opensearch.serverless.transport.ZoneTraffic.Path.UNKNOWN));
+        builder.field("transport_tx_bytes", router.transportBytesSent());
         builder.startObject("cross_zone_by_action");
         for (var entry : meter.byAction(org.opensearch.serverless.transport.ZoneTraffic.Path.CROSS_ZONE).entrySet()) {
             builder.field(entry.getKey(), entry.getValue());
