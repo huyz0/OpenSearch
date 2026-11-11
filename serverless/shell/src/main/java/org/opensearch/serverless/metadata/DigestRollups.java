@@ -279,15 +279,61 @@ public final class DigestRollups {
      * @throws IOException if the register cannot be updated; the caller must not open the shard
      */
     public void markOwned(String name, String uuid, int shards, int shard, long term) throws IOException {
-        update(name, entry -> {
+        final Change change = entry -> {
             final Entry base = entry == null || entry.uuid().equals(uuid) == false ? fresh(uuid, shards) : entry;
             final ShardState was = base.states().get(shard);
             if (entry == base && was.ownerTerm() >= term) {
                 return null;
             }
             return with(base, shard, new ShardState(Math.max(was.ownerTerm(), term), was.digest()));
-        });
+        };
+        final String key = key(name);
+        final Map<String, Entry> remembered = known.get(key);
+        if (remembered != null && change.apply(remembered.get(name)) == null) {
+            return;
+        }
+        // Marks for one register are written together. A node taking several shards whose names share a bucket --
+        // every shard of one index does -- used to swap the register once per shard, concurrently, and most of
+        // those swaps lost and read it again: three shards of one index cost six reads and six swaps. The first
+        // mark to get the register writes every mark that arrived meanwhile in one swap; the rest wait for it.
+        final MarkBatch batch;
+        synchronized (gatheringMarks) {
+            batch = gatheringMarks.computeIfAbsent(key, k -> new MarkBatch());
+            batch.changes.add(Map.entry(name, change));
+        }
+        synchronized (markingLocks.computeIfAbsent(key, k -> new Object())) {
+            synchronized (gatheringMarks) {
+                gatheringMarks.remove(key, batch);
+            }
+            if (batch.done.isDone() == false) {
+                try {
+                    updateAll(group(name), bucket(name), batch.changes, false);
+                    batch.done.complete(null);
+                } catch (IOException | RuntimeException e) {
+                    batch.done.completeExceptionally(e);
+                }
+            }
+        }
+        try {
+            batch.done.join();
+        } catch (java.util.concurrent.CompletionException e) {
+            if (e.getCause() instanceof IOException io) {
+                throw io;
+            }
+            throw e.getCause() instanceof RuntimeException runtime ? runtime : e;
+        }
     }
+
+    /** Marks gathered for one register, written by whichever of their callers gets the register first. */
+    private static final class MarkBatch {
+        private final List<Map.Entry<String, Change>> changes = new ArrayList<>();
+        private final java.util.concurrent.CompletableFuture<Void> done = new java.util.concurrent.CompletableFuture<>();
+    }
+
+    /** The batch still taking marks, per register; guarded by itself. */
+    private final Map<String, MarkBatch> gatheringMarks = new java.util.HashMap<>();
+    /** One writer of marks at a time per register, so a batch closes while its predecessor is being swapped. */
+    private final Map<String, Object> markingLocks = new ConcurrentHashMap<>();
 
     /**
      * Clears a writer's mark, if it is still that writer's, widening the shard's digest to the published commit's in
@@ -509,30 +555,49 @@ public final class DigestRollups {
     }
 
     private void update(String name, boolean trustRemembered, Change change) throws IOException {
-        final String group = group(name);
-        final int bucket = bucket(name);
-        final String key = key(name);
+        updateAll(group(name), bucket(name), List.of(Map.entry(name, change)), trustRemembered);
+    }
+
+    /** A read-change-swap loop applying every change, in order, to one register, in one swap. */
+    private void updateAll(String group, int bucket, List<Map.Entry<String, Change>> changes, boolean trustRemembered) throws IOException {
+        final String key = group + "/" + blob(bucket);
         final BlobContainer container = container(group);
         final Map<String, Entry> remembered = known.get(key);
-        if (trustRemembered && remembered != null && change.apply(remembered.get(name)) == null) {
+        if (trustRemembered && remembered != null) {
             // Nothing this node knows of would change. The copy may be stale, but a register only ever widens
             // within an incarnation, so if the stale copy already covers the change the current one does too.
-            return;
+            boolean anyChange = false;
+            for (Map.Entry<String, Change> each : changes) {
+                if (each.getValue().apply(remembered.get(each.getKey())) != null) {
+                    anyChange = true;
+                    break;
+                }
+            }
+            if (anyChange == false) {
+                return;
+            }
         }
         for (int attempt = 0; attempt < CAS_ATTEMPTS; attempt++) {
             final Optional<BlobRegister> register = container.readRegister(blob(bucket));
             final Map<String, Entry> current = register.isEmpty()
                 ? new LinkedHashMap<>()
                 : new LinkedHashMap<>(parse(register.get().value()));
-            final Entry next = change.apply(current.get(name));
-            if (next == null) {
+            boolean changed = false;
+            for (Map.Entry<String, Change> each : changes) {
+                final Entry next = each.getValue().apply(current.get(each.getKey()));
+                if (next == null) {
+                    continue;
+                }
+                changed = true;
+                if (next == REMOVED) {
+                    current.remove(each.getKey());
+                } else {
+                    current.put(each.getKey(), next);
+                }
+            }
+            if (changed == false) {
                 known.put(key, current);
                 return;
-            }
-            if (next == REMOVED) {
-                current.remove(name);
-            } else {
-                current.put(name, next);
             }
             final BytesReference bytes = encode(current);
             final BlobRegisterCasResult result = register.isEmpty()
@@ -543,7 +608,13 @@ public final class DigestRollups {
                 return;
             }
         }
-        throw new IOException("could not update the digest rollup of [" + name + "]: the register kept moving");
+        throw new IOException(
+            "could not update the digest rollup of ["
+                + changes.get(0).getKey()
+                + "]"
+                + (changes.size() > 1 ? " and others in its register" : "")
+                + ": the register kept moving"
+        );
     }
 
     private static Entry fresh(String uuid, int shards) {

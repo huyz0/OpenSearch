@@ -76,6 +76,7 @@ public final class CountingBlobStore implements BlobStore {
         listings.set(0);
         deletes.set(0);
         places.clear();
+        callerPlaces.clear();
     }
 
     /**
@@ -104,6 +105,49 @@ public final class CountingBlobStore implements BlobStore {
             .replaceAll("segments_[a-z0-9]+", "segments_#")
             .replaceAll("[0-9]+", "#");
         places.computeIfAbsent(kind + " " + place, k -> new AtomicLong()).incrementAndGet();
+        if (traceCallers) {
+            final String callers = java.util.Arrays.stream(Thread.currentThread().getStackTrace())
+                .filter(f -> f.getClassName().startsWith("org.opensearch.serverless.") && f.getClassName().contains(".testkit.") == false)
+                .limit(callerDepth)
+                .map(
+                    f -> f.getClassName().substring(f.getClassName().lastIndexOf('.') + 1)
+                        + "."
+                        + f.getMethodName()
+                        + ":"
+                        + f.getLineNumber()
+                )
+                .collect(Collectors.joining(" < "));
+            callerPlaces.computeIfAbsent(kind + " " + place + " @ " + callers, k -> new AtomicLong()).incrementAndGet();
+        }
+    }
+
+    private volatile boolean traceCallers;
+    private volatile int callerDepth = 4;
+    private final Map<String, AtomicLong> callerPlaces = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Also records, for every request, the serverless code that made it, for {@link #byCaller()}.
+     *
+     * @param depth how many of the calling frames to keep, innermost first
+     */
+    public void traceCallers(int depth) {
+        this.callerDepth = depth;
+        this.traceCallers = true;
+    }
+
+    /**
+     * Returns where the operations went and which code made them: one line per kind, place and calling frames, most
+     * frequent first. Empty unless {@link #traceCallers(int)} was called.
+     *
+     * @return the breakdown, one {@code count kind place @ callers} per line
+     */
+    public String byCaller() {
+        final StringBuilder out = new StringBuilder();
+        callerPlaces.entrySet()
+            .stream()
+            .sorted((a, b) -> Long.compare(b.getValue().get(), a.getValue().get()))
+            .forEach(e -> out.append(e.getValue().get()).append(' ').append(e.getKey()).append('\n'));
+        return out.toString();
     }
 
     /**

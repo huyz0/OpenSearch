@@ -142,6 +142,72 @@ public class DigestRollupsTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * Marks taken at once for every shard of one index, as a node taking all of them does, all land; and they share
+     * swaps of the register rather than each losing to the others and reading it again. A second node marking another
+     * index in the same register at the same time loses nothing either.
+     */
+    public void testConcurrentMarksOnOneRegisterAllLandInFewSwaps() throws Exception {
+        final CountingBlobStore store = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false));
+        final DigestRollups node = new DigestRollups(store, BlobPath.cleanPath().add("rollups"));
+        final DigestRollups other = new DigestRollups(store, BlobPath.cleanPath().add("rollups"));
+        String neighbour = null;
+        for (int i = 0; neighbour == null; i++) {
+            final String candidate = "logs-other-" + i;
+            if (sameBucket(candidate, "logs-a")) {
+                neighbour = candidate;
+            }
+        }
+        final String sharing = neighbour;
+        final int shards = 8;
+        final CyclicBarrier together = new CyclicBarrier(shards + 1);
+        final ExecutorService pool = Executors.newFixedThreadPool(shards + 1);
+        try {
+            final List<Future<?>> done = new ArrayList<>();
+            for (int shard = 0; shard < shards; shard++) {
+                final int marked = shard;
+                done.add(pool.submit(() -> {
+                    together.await(10, TimeUnit.SECONDS);
+                    node.markOwned("logs-a", "uuid-a", shards, marked, 7L);
+                    return null;
+                }));
+            }
+            done.add(pool.submit(() -> {
+                together.await(10, TimeUnit.SECONDS);
+                other.markOwned(sharing, "uuid-other", 1, 0, 3L);
+                return null;
+            }));
+            for (Future<?> f : done) {
+                f.get(60, TimeUnit.SECONDS);
+            }
+        } finally {
+            terminate(pool);
+        }
+        final Map<String, DigestRollups.Entry> all = node.readGroup(DigestRollups.group("logs-a"), IN_SEQUENCE);
+        for (int shard = 0; shard < shards; shard++) {
+            assertEquals("shard " + shard + " keeps its mark", 7L, all.get("logs-a").states().get(shard).ownerTerm());
+        }
+        assertEquals("the other node's mark survives", 3L, all.get(sharing).states().get(0).ownerTerm());
+        assertTrue(
+            "the marks of one node share swaps: " + store.registerWrites() + " swaps for " + shards + " marks",
+            store.registerWrites() < shards
+        );
+    }
+
+    /** Whether two names land in the same register, found by marking one and seeing which bucket holds it. */
+    private boolean sameBucket(String a, String b) throws Exception {
+        final DigestRollups probe = rollups();
+        probe.markOwned(a, "uuid", 1, 0, 1L);
+        probe.markOwned(b, "uuid", 1, 0, 1L);
+        for (int bucket = 0; bucket < DigestRollups.BUCKETS; bucket++) {
+            final Map<String, DigestRollups.Entry> held = probe.readBucket(DigestRollups.group(a), bucket);
+            if (held.containsKey(a)) {
+                return held.containsKey(b);
+            }
+        }
+        return false;
+    }
+
     public void testCoarseningOnlyWidens() {
         final PruningDigest exact = new PruningDigest(
             Map.of(
