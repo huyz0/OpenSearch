@@ -108,8 +108,10 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
             counter.reset();
             assertTrue("a live node loses nothing on verification", node.leases().verifyHeads(plane).isEmpty());
             assertEquals(
-                "one head per held shard and one descriptor per open index: " + counter.breakdown(),
-                shards + 1L,
+                "one head per held shard, one descriptor per open index, and the cluster's segment placement "
+                    + "(read at most once in five minutes): "
+                    + counter.breakdown(),
+                shards + 2L,
                 counter.registerReads()
             );
             assertEquals("verification writes nothing: " + counter.breakdown(), 0L, counter.registerWrites());
@@ -127,7 +129,11 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
             holdingAll(node, plane, clock, shards);
             counter.reset();
             assertTrue(node.leases().verifyHeads(plane).isEmpty());
-            assertEquals("each head read once, in lanes: " + counter.breakdown(), shards + 1L, counter.registerReads());
+            assertEquals(
+                "each head read once, in lanes, plus a descriptor and the cluster's placement: " + counter.breakdown(),
+                shards + 2L,
+                counter.registerReads()
+            );
             assertEquals(shards, node.reconciler().openShards().size());
         }
     }

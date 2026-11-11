@@ -66,21 +66,49 @@ final class NodePackWiring {
      * @return the publisher for a shard
      */
     static Function<ShardId, SegmentPublisher> publishers(ServerlessNode node, MetadataPlane plane) {
-        final boolean enabled = node.packSegments && node.settings.getAsBoolean(ENABLED, false);
         final long staged = logCommitsStagedMillis(node);
+        if (node.packSegments == false) {
+            return id -> staging(plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(false), staged);
+        }
+        final boolean enabled = node.settings.getAsBoolean(ENABLED, false);
         if (enabled == false) {
-            return id -> staging(
-                plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(node.packSegments),
-                staged
-            );
+            collectEarlierPacks(node, plane);
         }
         final long maxBlobBytes = maxBlobBytes(node.settings);
-        return id -> staging(
-            plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id())
+        // Every publisher can use node packs: whether a publish does is decided per publish (see SegmentPlacement), and
+        // the node's writer, with its collector, is made the first time one does.
+        return id -> {
+            final SegmentPublisher publisher = plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id())
                 .packing(true)
-                .nodePacks(writer(node, plane), id.getIndexName(), id.getIndex().getUUID(), id.id(), maxBlobBytes),
-            staged
-        );
+                .nodePackSource(() -> writer(node, plane), id.getIndexName(), id.getIndex().getUUID(), id.id(), maxBlobBytes);
+            publisher.useNodePacks(enabled);
+            return staging(publisher, staged);
+        };
+    }
+
+    /**
+     * Starts collecting the packs this node wrote before, if its ledger names any, even though its packs are off now.
+     * Without it, a node restarted with packs off, or whose indices all moved to segment blobs, kept every pack it had
+     * written forever. One ledger read per plane.
+     */
+    private static void collectEarlierPacks(ServerlessNode node, MetadataPlane plane) {
+        synchronized (WRITERS) {
+            if (node.packLedgersChecked.add(plane) == false) {
+                return;
+            }
+            final Map<MetadataPlane, NodePackWriter> byPlane = WRITERS.get(node);
+            if (byPlane != null && byPlane.containsKey(plane)) {
+                return;
+            }
+        }
+        try {
+            final NodePackLedger ledger = new NodePackLedger(plane.blobStore(), plane.basePath(), node.localNode().getId());
+            if (ledger.read().epochs().isEmpty() == false) {
+                writer(node, plane);
+            }
+        } catch (Exception e) {
+            ServerlessNode.logger.warn("could not read this node's pack ledger; its earlier packs are collected once it writes one", e);
+        }
     }
 
     /**

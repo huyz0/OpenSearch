@@ -208,6 +208,50 @@ public final class SegmentPublisher {
         return this;
     }
 
+    /** Where the node's pack writer comes from once a publish uses node packs, or null if this node has none. */
+    private volatile java.util.function.Supplier<NodePackWriter> nodePackSource;
+
+    /**
+     * Lets this shard's publishes use node packs whenever {@link #useNodePacks} says so, with the writer made on first
+     * use; see {@link #nodePacks} for the arguments.
+     *
+     * @param source the node's pack writer, made on first call
+     * @param indexName this shard's index name
+     * @param indexUuid this shard's index
+     * @param shard this shard's number
+     * @param maxBlobBytes the largest segment blob that goes into a node pack
+     * @return this publisher
+     */
+    public SegmentPublisher nodePackSource(
+        java.util.function.Supplier<NodePackWriter> source,
+        String indexName,
+        String indexUuid,
+        int shard,
+        long maxBlobBytes
+    ) {
+        this.nodePackSource = source;
+        this.nodePackIndexName = indexName;
+        this.nodePackIndexUuid = indexUuid;
+        this.nodePackShard = shard;
+        this.nodePackMaxBlobBytes = maxBlobBytes;
+        return this;
+    }
+
+    /**
+     * Sets whether the next publish puts its segment blobs in node packs. Off when no source was given.
+     *
+     * @param on true for node packs
+     */
+    public void useNodePacks(boolean on) {
+        final java.util.function.Supplier<NodePackWriter> source = nodePackSource;
+        if (on == false || source == null) {
+            nodePacks = null;
+        } else if (nodePacks == null) {
+            packing = true;
+            nodePacks = source.get();
+        }
+    }
+
     /**
      * Returns the container-path segment a writer at the given term writes under.
      *

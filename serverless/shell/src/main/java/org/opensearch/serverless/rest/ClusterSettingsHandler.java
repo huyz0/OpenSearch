@@ -205,7 +205,18 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             RestStatus.NOT_IMPLEMENTED
                         );
                     }
-                    return nativeResponse(metadata.clusterConfig().update(flat));
+                    final Object placement = flat.get(org.opensearch.serverless.shell.SegmentPlacement.CLUSTER_SETTING);
+                    if (placement != null) {
+                        try {
+                            org.opensearch.serverless.shell.SegmentPlacement.check(String.valueOf(placement));
+                        } catch (IllegalArgumentException e) {
+                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+                        }
+                    }
+                    final Settings written = metadata.clusterConfig().update(flat);
+                    // This node's next publishes follow at once; the others within their next read of the register.
+                    org.opensearch.serverless.shell.SegmentPlacement.applyCluster(node.get(), written);
+                    return nativeResponse(written);
                 }, org.opensearch.serverless.shell.ActionGate.identity(ClusterUpdateSettingsResponse.class));
                 try (var builder = channel.newBuilder()) {
                     result.toXContent(builder, channel.request());
