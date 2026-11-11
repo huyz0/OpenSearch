@@ -171,6 +171,50 @@ public final class BlockCacheDirectory extends FilterDirectory {
     }
 
     /**
+     * Fetches those of some blocks that belong to this shard's published files and are not held, in coalesced ranged
+     * reads. Keys of other shards, of files no longer in this commit, or of files held locally are ignored.
+     *
+     * @param keys block cache keys
+     * @param executor where the helper reads run
+     * @return how many ranged reads were made
+     * @throws IOException if the local files cannot be listed
+     */
+    public int fetchMissing(java.util.Collection<String> keys, java.util.concurrent.Executor executor) throws IOException {
+        final Map<String, String> fileByPrefix = new java.util.HashMap<>();
+        for (Map.Entry<String, RemoteFile> entry : remote.entrySet()) {
+            fileByPrefix.put(keyPrefix(cacheScope, entry.getValue().termDir(), entry.getKey()), entry.getKey());
+        }
+        final Set<String> held = new LinkedHashSet<>(java.util.Arrays.asList(in.listAll()));
+        final Map<OpenPrefetch.Target, java.util.TreeSet<Long>> wanted = new LinkedHashMap<>();
+        final Map<String, OpenPrefetch.Target> targets = new java.util.HashMap<>();
+        for (String key : keys) {
+            final int hash = key.lastIndexOf('#');
+            if (hash < 0) {
+                continue;
+            }
+            final String name = fileByPrefix.get(key.substring(0, hash));
+            if (name == null || held.contains(name)) {
+                continue;
+            }
+            final long block;
+            try {
+                block = Long.parseLong(key.substring(hash + 1));
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            final RemoteFile file = remote.get(name);
+            final OpenPrefetch.Target target = targets.computeIfAbsent(
+                name,
+                n -> new OpenPrefetch.Target(file.container(), file.blobName(), key.substring(0, hash), file.length(), file.blobOffset())
+            );
+            if (block >= 0 && block * cache.blockSize() < file.length()) {
+                wanted.computeIfAbsent(target, t -> new java.util.TreeSet<>()).add(block);
+            }
+        }
+        return OpenPrefetch.fetchBlocks(wanted, cache, executor);
+    }
+
+    /**
      * The prefix of every cache key of one published file. The term directory is part of it: a same-named
      * file from another term is other bytes, and a cache that keyed on the name alone served them as this file's.
      */

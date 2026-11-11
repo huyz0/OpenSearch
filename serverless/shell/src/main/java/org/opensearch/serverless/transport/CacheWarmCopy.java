@@ -94,9 +94,10 @@ public final class CacheWarmCopy {
      * @param bytesCopied bytes stored
      * @param blocksMissed blocks named that were no longer held, already here, or not reached
      * @param pausedNanos time spent waiting to keep to the pace
+     * @param unheld per shard, the blocks peers named as warm that this node still does not hold, hottest first
      */
     public record Outcome(Set<Shard> shards, int peersAsked, int peersFailed, long blocksCopied, long bytesCopied, long blocksMissed,
-        long pausedNanos) {
+        long pausedNanos, Map<Shard, List<String>> unheld) {
     }
 
     private final ShardRouter router;
@@ -195,7 +196,7 @@ public final class CacheWarmCopy {
     public Outcome copyFromPeers() throws IOException {
         final MetadataPlane plane = router.plane.get();
         if (plane == null) {
-            return new Outcome(Set.of(), 0, 0, 0, 0, 0, 0);
+            return new Outcome(Set.of(), 0, 0, 0, 0, 0, 0, Map.of());
         }
         final String self = router.node.localNode().getId();
         final List<String> peers = new ArrayList<>();
@@ -210,7 +211,7 @@ public final class CacheWarmCopy {
         peers.sort(null);
         final BlockCache cache = router.node.blockCache();
         final Pacer pacer = new Pacer();
-        final Map<Shard, Boolean> shards = new LinkedHashMap<>();
+        final Map<Shard, java.util.LinkedHashSet<String>> shards = new LinkedHashMap<>();
         int failed = 0;
         long copied = 0;
         long bytes = 0;
@@ -224,7 +225,10 @@ public final class CacheWarmCopy {
                 }
                 final HotSetResponse hot = router.send(peer.get(), HotSetRequest.ACTION, new HotSetRequest(self), HotSetResponse::new);
                 for (CacheHotSet.HotShard shard : hot.shards()) {
-                    shards.put(new Shard(shard.indexName(), shard.indexUuid(), shard.shard()), Boolean.TRUE);
+                    shards.computeIfAbsent(
+                        new Shard(shard.indexName(), shard.indexUuid(), shard.shard()),
+                        k -> new java.util.LinkedHashSet<>()
+                    ).addAll(shard.keys());
                     final List<String> wanted = new ArrayList<>();
                     for (String key : shard.keys()) {
                         // A hot shard is spread over several peers, and each names the same blocks.
@@ -265,7 +269,14 @@ public final class CacheWarmCopy {
                 break;
             }
         }
-        return new Outcome(Set.copyOf(shards.keySet()), peers.size(), failed, copied, bytes, missed, pacer.paused);
+        final Map<Shard, List<String>> unheld = new LinkedHashMap<>();
+        for (Map.Entry<Shard, java.util.LinkedHashSet<String>> shard : shards.entrySet()) {
+            final List<String> keys = shard.getValue().stream().filter(key -> cache.holds(key) == false).toList();
+            if (keys.isEmpty() == false) {
+                unheld.put(shard.getKey(), keys);
+            }
+        }
+        return new Outcome(Set.copyOf(shards.keySet()), peers.size(), failed, copied, bytes, missed, pacer.paused, unheld);
     }
 
     /** Keeps the copy to {@link #maxBytesPerSecond} over its whole run. */
