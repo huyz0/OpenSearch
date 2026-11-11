@@ -11,6 +11,7 @@ package org.opensearch.serverless.testkit;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.metadata.DescriptorPage;
 import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.rest.Fanout;
@@ -71,7 +72,7 @@ public class ServerlessPagedListingTests extends OpenSearchTestCase {
                 String after = null;
                 int pages = 0;
                 do {
-                    final DescriptorStore.Page page = plane.descriptors().listPage("logs-", after, size, reads);
+                    final DescriptorPage page = plane.descriptors().listPage("logs-", after, size, reads);
                     assertTrue("a page holds at most its size", page.descriptors().size() <= size);
                     if (page.hasMore()) {
                         assertEquals("a page with more after it is full", size, page.descriptors().size());
@@ -95,10 +96,10 @@ public class ServerlessPagedListingTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor(name(i), "uuid-" + i, 1, MAPPING, null));
         }
         store.reset();
-        final DescriptorStore.Page first = plane.descriptors().listPage("logs-", null, 10);
+        final DescriptorPage first = plane.descriptors().listPage("logs-", null, 10);
         final long firstCost = store.impliedS3Requests();
         store.reset();
-        final DescriptorStore.Page late = plane.descriptors().listPage("logs-", name(180), 10);
+        final DescriptorPage late = plane.descriptors().listPage("logs-", name(180), 10);
         final long lateCost = store.impliedS3Requests();
         assertEquals(10, first.descriptors().size());
         assertEquals(List.of(name(181), name(182)), new ArrayList<>(late.descriptors().keySet()).subList(0, 2));
@@ -116,7 +117,7 @@ public class ServerlessPagedListingTests extends OpenSearchTestCase {
         for (int i = 0; i < 20; i += 2) {
             plane.createIndex(new IndexDescriptor(name(i), "uuid-" + i, 1, MAPPING, null));
         }
-        final DescriptorStore.Page first = plane.descriptors().listPage("logs-", null, 4);
+        final DescriptorPage first = plane.descriptors().listPage("logs-", null, 4);
         assertEquals(List.of(name(0), name(2), name(4), name(6)), new ArrayList<>(first.descriptors().keySet()));
 
         plane.createIndex(new IndexDescriptor(name(1), "uuid-1", 1, MAPPING, null)); // behind
@@ -127,7 +128,7 @@ public class ServerlessPagedListingTests extends OpenSearchTestCase {
         final List<String> rest = new ArrayList<>();
         String after = first.nextAfter();
         while (after != null) {
-            final DescriptorStore.Page page = plane.descriptors().listPage("logs-", after, 4);
+            final DescriptorPage page = plane.descriptors().listPage("logs-", after, 4);
             rest.addAll(page.descriptors().keySet());
             after = page.nextAfter();
         }

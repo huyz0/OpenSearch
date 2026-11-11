@@ -27,7 +27,7 @@ public final class TransportSecretCache {
     }
 
     private record CachedTransportSecrets(org.opensearch.serverless.metadata.MetadataPlane plane,
-        org.opensearch.serverless.metadata.MetadataPlane.TransportSecrets secrets, long readAt) {
+        org.opensearch.serverless.metadata.TransportSecrets secrets, long readAt) {
     }
 
     private volatile CachedTransportSecrets transportSecrets;
@@ -48,7 +48,7 @@ public final class TransportSecretCache {
      * @return the secrets, or null before a metadata plane is adopted
      * @throws java.io.UncheckedIOException if the register cannot be read
      */
-    public org.opensearch.serverless.metadata.MetadataPlane.TransportSecrets transportSecrets(boolean forceReread) {
+    public org.opensearch.serverless.metadata.TransportSecrets transportSecrets(boolean forceReread) {
         final var plane = metadataPlane.get();
         if (plane == null) {
             return null;

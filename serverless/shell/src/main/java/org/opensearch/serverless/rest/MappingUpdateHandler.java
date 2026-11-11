@@ -210,7 +210,7 @@ public final class MappingUpdateHandler extends BaseRestHandler {
             }
             final IndexDescriptor updated = current.get().withMapping(merged);
             if (metadata.updateDescriptor(updated, generation).isPresent()) {
-                serving.reconciler().refreshMapping(index, updated);
+                serving.reconciler().refresh().refreshMapping(index, updated);
                 return new MappingResult(new AcknowledgedResponse(true), index, true);
             }
         }

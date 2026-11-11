@@ -51,7 +51,7 @@ final class AliasMutations {
         for (String name : deleted.aliasedBy()) {
             boolean done = false;
             for (int attempt = 0; attempt < 4 && done == false; attempt++) {
-                final DescriptorStore.Resolution resolved = descriptors.resolveRaw(name);
+                final DescriptorResolution resolved = descriptors.resolveRaw(name);
                 if (resolved.alias() != null && resolved.alias().mutationPending() && resolved.alias().protectsHint(deleted.name())) {
                     abortAlias(resolved.alias(), resolved.generation());
                     continue;
@@ -83,11 +83,9 @@ final class AliasMutations {
      * @return the record and its generation, or empty when the name is not an alias
      * @throws IOException if the read fails
      */
-    public Optional<MetadataPlane.AliasAtGeneration> aliasWithGeneration(String name) throws IOException {
-        final DescriptorStore.Resolution resolved = resolveForAliasMutation(name);
-        return resolved.alias() == null
-            ? Optional.empty()
-            : Optional.of(new MetadataPlane.AliasAtGeneration(resolved.alias(), resolved.generation()));
+    public Optional<AliasAtGeneration> aliasWithGeneration(String name) throws IOException {
+        final DescriptorResolution resolved = resolveForAliasMutation(name);
+        return resolved.alias() == null ? Optional.empty() : Optional.of(new AliasAtGeneration(resolved.alias(), resolved.generation()));
     }
 
     /**
@@ -221,7 +219,7 @@ final class AliasMutations {
     }
 
     /** Expired preparations are aborted; the owner can publish only while its generation still holds. */
-    DescriptorStore.Resolution recoverAlias(String name) throws IOException {
+    DescriptorResolution recoverAlias(String name) throws IOException {
         for (int attempt = 0; attempt < 4; attempt++) {
             final var current = descriptors.resolveRaw(name);
             if (current.alias() == null
@@ -249,7 +247,7 @@ final class AliasMutations {
     public java.util.List<String> aliasesOf(IndexDescriptor descriptor) throws IOException {
         final java.util.List<String> confirmed = new java.util.ArrayList<>();
         for (String name : descriptor.aliasedBy()) {
-            final DescriptorStore.Resolution resolved = plane.resolve(name);
+            final DescriptorResolution resolved = plane.resolve(name);
             if (resolved.alias() != null && resolved.alias().indices().contains(descriptor.name())) {
                 confirmed.add(name);
             }
@@ -313,14 +311,14 @@ final class AliasMutations {
      * @return its published value and generation, or a still-busy reservation after the bounded wait
      * @throws IOException if the register cannot be read or the thread is interrupted
      */
-    public DescriptorStore.Resolution resolveForAliasMutation(String name) throws IOException {
+    public DescriptorResolution resolveForAliasMutation(String name) throws IOException {
         final long started = System.nanoTime();
         long pause = 1_000_000L;
         while (true) {
             final var current = recoverAlias(name);
             if (current.alias() == null || current.alias().mutationPending() == false || System.nanoTime() - started >= 250_000_000L) {
                 return current.alias() != null && current.alias().creationPending()
-                    ? new DescriptorStore.Resolution(null, null, current.generation())
+                    ? new DescriptorResolution(null, null, current.generation())
                     : current;
             }
             if (Thread.currentThread().isInterrupted()) {
@@ -342,7 +340,7 @@ final class AliasMutations {
      * @throws IOException if the delete fails
      */
     public boolean deleteAlias(String name) throws IOException {
-        final DescriptorStore.Resolution resolved = plane.resolve(name);
+        final DescriptorResolution resolved = plane.resolve(name);
         if (resolved.alias() == null) {
             return false;
         }

@@ -166,6 +166,7 @@ public class ManyShardTakeoverTests extends OpenSearchTestCase {
 
             final IndexDescriptor described = plane.describe("alpha").orElseThrow();
             second.reconciler()
+                .refresh()
                 .refreshSettings("alpha", described.withSettings(Settings.builder().put("index.refresh_interval", "5s").build()));
             final var service = second.indicesService().indexService(shardId.getIndex());
             assertEquals("5s", service.getMetadata().getSettings().get("index.refresh_interval"));

@@ -117,7 +117,7 @@ public class ServerlessFailedEngineTests extends OpenSearchTestCase {
                 final var replacement = reader.reconciler().shard(reopened);
                 assertNotSame(failed, replacement);
                 assertEquals(
-                    org.opensearch.serverless.shard.ShardReconciler.FailedShardRelease.NOT_CURRENT,
+                    org.opensearch.serverless.shard.FailedShardRelease.NOT_CURRENT,
                     reader.reconciler().releaseFailedShard(failed, "delayed failure")
                 );
                 assertSame(replacement, reader.reconciler().shard(reopened));
