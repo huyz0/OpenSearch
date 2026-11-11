@@ -202,7 +202,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("bulk-order-successor"))) {
             b.startup().start();
-            final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onB = b.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             b.reconciler().shard(onB).refresh("test");
             assertEquals("replay resurrected a document the batch had deleted", 0, hits(b, "n", "1"));
             assertEquals("replay lost a document the batch had rewritten", 1, hits(b, "n", "3"));
@@ -238,7 +238,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("bulk-durable-successor"))) {
             b.startup().start();
-            final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onB = b.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             b.reconciler().shard(onB).refresh("test");
             assertEquals("an acknowledged batch was lost when the writer died", documents, hits(b, "msg", "bulk"));
         }

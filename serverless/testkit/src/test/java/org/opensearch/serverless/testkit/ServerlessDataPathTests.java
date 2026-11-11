@@ -79,7 +79,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
             assertEquals(200, send(http, "PUT", "/library?shards=1", MAPPING).status());
-            node.activateWriter(plane, "library", 0);
+            node.activation().activateWriter(plane, "library", 0);
 
             final Response written = send(
                 http,
@@ -112,7 +112,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         a.setMetadataPlane(plane);
         final TransportAddress http = a.boundHttpAddress().publishAddress();
         send(http, "PUT", "/library?shards=1", MAPPING);
-        a.activateWriter(plane, "library", 0);
+        a.activation().activateWriter(plane, "library", 0);
 
         assertEquals(201, send(http, "PUT", "/library/_doc/only?refresh=true", "{\"msg\":\"never published\",\"n\":1}").status());
 
@@ -123,7 +123,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         try (ServerlessNode b = new ServerlessNode(nodeSettings("m11-successor"))) {
             b.startup().start();
             b.setMetadataPlane(plane);
-            final var shardId = b.activateWriter(plane, "library", 0).orElseThrow();
+            final var shardId = b.activation().activateWriter(plane, "library", 0).orElseThrow();
             assertEquals(
                 "a write acknowledged over HTTP was lost when its writer died",
                 1L,
@@ -144,7 +144,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
 
             assertEquals(200, send(http, "PUT", "/wide?shards=3", MAPPING).status());
             // Only one of the three shards is held here.
-            node.activateWriter(plane, "wide", 0);
+            node.activation().activateWriter(plane, "wide", 0);
 
             final Response partial = send(http, "GET", "/wide/_search?q=msg:anything", null);
             assertEquals(200, partial.status());
@@ -171,7 +171,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             final TransportAddress otherHttp = other.boundHttpAddress().publishAddress();
 
             send(ownerHttp, "PUT", "/library?shards=1", MAPPING);
-            owner.activateWriter(plane, "library", 0);
+            owner.activation().activateWriter(plane, "library", 0);
 
             // The client should not need to know which node owns which shard; that is what the
             // shard-head is for. Sending to the wrong node must work, not merely fail helpfully.
@@ -236,8 +236,8 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
 
             send(aHttp, "PUT", "/split?shards=2", MAPPING);
             // One shard each. Neither node can answer a whole search alone.
-            assertTrue(a.activateWriter(plane, "split", 0).isPresent());
-            assertTrue(b.activateWriter(plane, "split", 1).isPresent());
+            assertTrue(a.activation().activateWriter(plane, "split", 0).isPresent());
+            assertTrue(b.activation().activateWriter(plane, "split", 1).isPresent());
 
             // Written through one node; forwarding puts each document on whichever node owns its shard.
             for (int i = 0; i < 10; i++) {
@@ -273,7 +273,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         writer.setMetadataPlane(plane);
         final TransportAddress writerHttp = writer.boundHttpAddress().publishAddress();
         send(writerHttp, "PUT", "/cold?shards=1", MAPPING);
-        final var shardId = writer.activateWriter(plane, "cold", 0).orElseThrow();
+        final var shardId = writer.activation().activateWriter(plane, "cold", 0).orElseThrow();
         assertEquals(201, send(writerHttp, "PUT", "/cold/_doc/1?refresh=true", "{\"msg\":\"cached\",\"n\":1}").status());
         writer.publishShard(shardId, plane.heads().read("cold", 0).orElseThrow().term());
         writer.close();
@@ -350,7 +350,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             // Activated explicitly: the first write to an index with no owner is itself what triggers
             // activation, asynchronously, so it is refused rather than served -- a routing signal this
             // test is not about, and testAWriteToTheWrongNodeIsForwardedToTheOwner is.
-            node.activateWriter(plane, "fresh", 0);
+            node.activation().activateWriter(plane, "fresh", 0);
             assertEquals(201, send(http, "PUT", "/fresh/_doc/1", "{\"msg\":\"x\"}").status());
         }
     }
@@ -377,7 +377,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/conditional?shards=1", MAPPING);
-            node.activateWriter(plane, "conditional", 0);
+            node.activation().activateWriter(plane, "conditional", 0);
 
             // External versioning is still refused, and still says why -- it asks this system to order
             // writes by a number it does not maintain, which optimistic concurrency does not.

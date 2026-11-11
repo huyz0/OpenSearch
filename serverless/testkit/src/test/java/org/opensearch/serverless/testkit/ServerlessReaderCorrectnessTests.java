@@ -89,7 +89,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(nodeSettings("descriptor-refresh", "ingest"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                final var id = node.activateWriter(plane, "alpha", 0).orElseThrow();
+                final var id = node.activation().activateWriter(plane, "alpha", 0).orElseThrow();
                 final var service = node.indicesService().indexService(id.getIndex());
                 final var before = service.getMetadata();
                 final var replacement = new IndexDescriptor("alpha", "uuid-replacement-refresh", 1, MAPPING, null);
@@ -123,7 +123,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(nodeSettings("reader-plan-incarnation", "ingest"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                final var writer = node.activateWriter(plane, "recreated", 0).orElseThrow();
+                final var writer = node.activation().activateWriter(plane, "recreated", 0).orElseThrow();
                 node.writes().index(writer, "new-document", "{\"msg\":\"replacement\",\"n\":1}");
                 node.reconciler().shard(writer).refresh("test");
                 node.publishShard(writer, plane.heads().read("recreated", 0).orElseThrow().term());
@@ -163,7 +163,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(nodeSettings("reader-document-incarnation", "ingest"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                final var writer = node.activateWriter(plane, "recreated", 0).orElseThrow();
+                final var writer = node.activation().activateWriter(plane, "recreated", 0).orElseThrow();
                 node.writes().index(writer, "new-document", "{\"msg\":\"replacement\",\"n\":1}");
                 node.reconciler().shard(writer).refresh("test");
                 final long term = plane.heads().read("recreated", 0).orElseThrow().term();
@@ -208,7 +208,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             a.startup().start();
             b.startup().start();
 
-            final ShardId onA = a.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onA = a.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             final long termA = plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(a.reconciler().shard(onA), "1", "{\"msg\":\"shared\",\"n\":1}");
             a.reconciler().shard(onA).refresh("rc");
@@ -221,7 +221,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             // A's lease lapses; B takes the shard from A's published commit and publishes a segment of its
             // own -- which gets the name A's unpublished one had, because the counter came from the commit.
             clock.set(1_000L + TTL);
-            final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onB = b.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             final long termB = plane.heads().read("alpha", 0).orElseThrow().term();
             assertTrue("the successor must hold a higher term", termB > termA);
             ShardOps.indexDoc(b.reconciler().shard(onB), "3", "{\"msg\":\"successor\",\"n\":3}");
@@ -235,7 +235,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             // A discovers it lost the shard and lets go, then serves the very same shard as a reader from
             // the very same data path.
             assertEquals("A must release the shard it lost", Set.of(onA), a.leases().heartbeat(plane));
-            final ShardId asReader = a.serveAsReader(plane, "alpha", 0);
+            final ShardId asReader = a.readers().serveAsReader(plane, "alpha", 0);
 
             assertEquals("the successor's document is what a reader on the ex-writer serves", 1L, hits(a, asReader, "successor"));
             assertEquals("and the fenced writer's unpublished document is not", 0L, hits(a, asReader, "fenced"));
@@ -264,7 +264,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             .build();
         try (ServerlessNode a = new ServerlessNode(unpacked)) {
             a.startup().start();
-            final ShardId onA = a.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onA = a.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             for (int i = 1; i <= 3; i++) {
                 ShardOps.indexDoc(a.reconciler().shard(onA), String.valueOf(i), "{\"msg\":\"durable\",\"n\":" + i + "}");
             }
@@ -279,13 +279,13 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             // Reads of the published commit fail, after the shard exists in core. Every read, not the first only: the
             // open fetches its blocks ahead and lets a failed one be read again, so a single failure is absorbed.
             store.failSegmentsReads();
-            final Exception failed = expectThrows(Exception.class, () -> b.activateWriter(plane, "alpha", 0));
+            final Exception failed = expectThrows(Exception.class, () -> b.activation().activateWriter(plane, "alpha", 0));
             assertTrue("the fixture must have failed the read it was armed for: " + failed, store.tripped());
             assertTrue("nothing is recorded open after a failed activation", b.reconciler().openShards().isEmpty());
 
             store.recover();
             // The store is back. The same node, the same shard: this used to be "already exists", forever.
-            final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onB = b.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals("and the retry serves the published data", 3L, hits(b, onB, "durable"));
         }
     }
@@ -305,7 +305,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("rc-pit", "ingest"))) {
             node.startup().start();
-            final ShardId first = node.activateWriter(plane, "logs", 0).orElseThrow();
+            final ShardId first = node.activation().activateWriter(plane, "logs", 0).orElseThrow();
             ShardOps.indexDoc(node.reconciler().shard(first), "1", "{\"msg\":\"first\",\"n\":1}");
             node.reconciler().shard(first).refresh("rc");
             final CommitManifest frozen = node.publishShard(first, plane.heads().read("logs", 0).orElseThrow().term());
@@ -322,7 +322,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             assertTrue(plane.deleteIndex("logs"));
             node.leases().heartbeat(plane);
             plane.createIndex(new IndexDescriptor("logs", "uuid-logs-second-000", 1, MAPPING, null));
-            final ShardId second = node.activateWriter(plane, "logs", 0).orElseThrow();
+            final ShardId second = node.activation().activateWriter(plane, "logs", 0).orElseThrow();
             ShardOps.indexDoc(node.reconciler().shard(second), "1", "{\"msg\":\"second\",\"n\":1}");
             node.reconciler().shard(second).refresh("rc");
             node.publishShard(second, plane.heads().read("logs", 0).orElseThrow().term());
@@ -355,7 +355,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("rc-view-disk", "ingest"))) {
             node.startup().start();
-            final ShardId live = node.activateWriter(plane, "paged", 0).orElseThrow();
+            final ShardId live = node.activation().activateWriter(plane, "paged", 0).orElseThrow();
             ShardOps.indexDoc(node.reconciler().shard(live), "1", "{\"msg\":\"paged\",\"n\":1}");
             node.reconciler().shard(live).refresh("rc");
             final CommitManifest frozen = node.publishShard(live, plane.heads().read("paged", 0).orElseThrow().term());

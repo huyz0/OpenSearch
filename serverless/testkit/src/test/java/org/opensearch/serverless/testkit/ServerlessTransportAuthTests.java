@@ -265,8 +265,8 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            other.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            other.activation().syncFrom(plane);
             assertTrue(
                 "the other node must not own the shard, so the write has to be forwarded",
                 other.reconciler().openShards().isEmpty()
@@ -332,7 +332,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             owner.startup().start();
             stranger.startup().start();
             owner.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
+            owner.activation().activateWriter(plane, "alpha", 0);
 
             final TransportService transport = TRANSPORT.get();
             assertNotNull("the stranger's transport service must have been captured", transport);
@@ -391,8 +391,8 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            other.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            other.activation().syncFrom(plane);
 
             other.client().index(new IndexRequest("alpha").id("k").source("{\"msg\":\"first\",\"n\":1}", XContentType.JSON)).actionGet();
             assertTrue(owner.client().get(new GetRequest("alpha", "k")).actionGet().isExists());
@@ -448,8 +448,8 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            other.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            other.activation().syncFrom(plane);
 
             // Both nodes read generation 1 by forwarding once.
             write(other, "g1");

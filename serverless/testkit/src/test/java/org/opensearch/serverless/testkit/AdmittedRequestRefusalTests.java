@@ -74,7 +74,7 @@ public class AdmittedRequestRefusalTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
                 node.startup().start();
                 node.setMetadataPlane(metadata);
-                final var shard = node.activateWriter(metadata, "docs", 0).orElseThrow();
+                final var shard = node.activation().activateWriter(metadata, "docs", 0).orElseThrow();
                 node.writes().index(shard, "kept", "{}");
                 final var address = node.boundHttpAddress().publishAddress();
                 final String suffix = deletion ? "/docs/_delete_by_query" : "/docs/_doc/kept";

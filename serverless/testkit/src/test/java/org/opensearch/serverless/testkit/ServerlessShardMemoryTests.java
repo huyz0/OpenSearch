@@ -119,7 +119,7 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
         throws Exception {
         final List<ShardId> opened = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-            opened.add(node.activateWriter(plane, index, startAt + i).orElseThrow());
+            opened.add(node.activation().activateWriter(plane, index, startAt + i).orElseThrow());
         }
         return opened;
     }
@@ -258,7 +258,7 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
             writer.startup().start();
             writer.setMetadataPlane(plane);
             for (int shard = 0; shard < COMPARISON_BATCH; shard++) {
-                final var shardId = writer.activateWriter(plane, "alpha", shard).orElseThrow();
+                final var shardId = writer.activation().activateWriter(plane, "alpha", shard).orElseThrow();
                 final long term = plane.heads().read("alpha", shard).orElseThrow().term();
                 writer.publishShard(shardId, term);
             }
@@ -278,7 +278,7 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
         try (ServerlessNode warmup = new ServerlessNode(nodeSettings("mem-reader-warmup" + suffix, "search"))) {
             warmup.startup().start();
             warmup.setMetadataPlane(plane);
-            warmup.serveAsReader(plane, "alpha", 0);
+            warmup.readers().serveAsReader(plane, "alpha", 0);
         }
 
         final long writerCost;
@@ -296,7 +296,7 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
             node.setMetadataPlane(plane);
             final long baseline = usedHeapBytes();
             for (int shard = 0; shard < COMPARISON_BATCH; shard++) {
-                node.serveAsReader(plane, "alpha", shard);
+                node.readers().serveAsReader(plane, "alpha", shard);
             }
             readerCost = usedHeapBytes() - baseline;
             assertEquals("every shard must actually have opened as a reader", COMPARISON_BATCH, node.reconciler().readerShards().size());

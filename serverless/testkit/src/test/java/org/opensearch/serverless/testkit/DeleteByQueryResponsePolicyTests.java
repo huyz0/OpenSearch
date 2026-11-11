@@ -64,7 +64,7 @@ public class DeleteByQueryResponsePolicyTests extends OpenSearchTestCase {
                 node.startup().start();
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("original", "uuid-original", 1, "{}", null));
-                final var shard = node.activateWriter(metadata, "original", 0).orElseThrow();
+                final var shard = node.activation().activateWriter(metadata, "original", 0).orElseThrow();
                 new ShardOperations(node, metadata).index("original", "keep", "{\"value\":1}", true);
                 node.publishShard(shard, metadata.heads().read("original", 0).orElseThrow().term());
                 work.accept(node, metadata);

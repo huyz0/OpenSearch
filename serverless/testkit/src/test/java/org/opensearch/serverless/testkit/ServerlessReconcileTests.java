@@ -92,7 +92,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
 
             // The lease lapses and another node takes it. A is still holding the shard open.
             clock.set(1_000L + TTL);
-            assertTrue(thief.activateWriter(d.plane, "alpha", 0).isPresent());
+            assertTrue(thief.activation().activateWriter(d.plane, "alpha", 0).isPresent());
 
             // One tick: A notices the loss, lets go, and does not silently re-take it from the thief.
             final TickResult second = loop.tick(clock.get());
@@ -124,7 +124,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
 
             // Ownership moves without A being told. Its hint is now wrong, and that is allowed.
             clock.set(1_000L + TTL);
-            b.activateWriter(d.plane, "alpha", 0);
+            b.activation().activateWriter(d.plane, "alpha", 0);
             assertEquals(
                 "a hint must not update by magic; being stale is the normal case",
                 a.localNode().getId(),
@@ -157,7 +157,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             zombie.startup().start();
             successor.startup().start();
 
-            final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final ShardId onZombie = zombie.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
             zombie.reconciler().shard(onZombie).refresh("p8");
@@ -166,7 +166,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
 
             // Successor takes over and publishes, INHERITING term 1's files rather than re-uploading.
             clock.set(1_000L + TTL);
-            final ShardId onSuccessor = successor.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final ShardId onSuccessor = successor.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
             successor.reconciler().shard(onSuccessor).refresh("p8");
@@ -228,14 +228,14 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             zombie.startup().start();
             successor.startup().start();
 
-            final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final ShardId onZombie = zombie.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
             zombie.reconciler().shard(onZombie).refresh("p8");
             zombie.publishShard(onZombie, term1);
 
             clock.set(1_000L + TTL);
-            final ShardId onSuccessor = successor.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final ShardId onSuccessor = successor.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
             successor.reconciler().shard(onSuccessor).refresh("p8");
@@ -294,14 +294,14 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
         ) {
             zombie.startup().start();
             successor.startup().start();
-            final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final ShardId onZombie = zombie.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
             zombie.reconciler().shard(onZombie).refresh("p8");
             zombie.publishShard(onZombie, term1);
 
             clock.set(1_000L + TTL);
-            final ShardId onSuccessor = successor.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final ShardId onSuccessor = successor.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
             successor.reconciler().shard(onSuccessor).refresh("p8");
@@ -346,14 +346,14 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
         ) {
             zombie.startup().start();
             successor.startup().start();
-            final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final ShardId onZombie = zombie.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
             zombie.reconciler().shard(onZombie).refresh("p8");
             zombie.publishShard(onZombie, term1);
 
             clock.set(1_000L + TTL);
-            final ShardId onSuccessor = successor.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final ShardId onSuccessor = successor.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
             successor.reconciler().shard(onSuccessor).refresh("p8");
@@ -389,7 +389,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8-gc-live"))) {
             a.startup().start();
-            final ShardId shardId = a.activateWriter(d.plane, "alpha", 0).orElseThrow();
+            final ShardId shardId = a.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"live\",\"n\":1}");
             a.reconciler().shard(shardId).refresh("p8");
@@ -513,7 +513,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             assertEquals("every published file's length is in the manifest", manifest.files().keySet(), manifest.lengths().keySet());
 
             counter.reset();
-            b.serveAsReader(d.plane, "alpha", 0);
+            b.readers().serveAsReader(d.plane, "alpha", 0);
             assertEquals("opening a reader must not list: " + counter.breakdown(), 0, counter.listings());
         }
     }

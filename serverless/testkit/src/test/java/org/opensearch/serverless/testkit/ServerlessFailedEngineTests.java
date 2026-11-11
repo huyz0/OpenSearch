@@ -95,13 +95,13 @@ public class ServerlessFailedEngineTests extends OpenSearchTestCase {
             ) {
                 writer.startup().start();
                 writer.setMetadataPlane(plane);
-                final var writerId = writer.activateWriter(plane, "alpha", 0).orElseThrow();
+                final var writerId = writer.activation().activateWriter(plane, "alpha", 0).orElseThrow();
                 writer.writes().index(writerId, "doc", "{\"msg\":\"survives\",\"n\":1}");
                 writer.publishShard(writerId, plane.heads().read("alpha", 0).orElseThrow().term());
                 assertTrue(plane.heads().release("alpha", 0, writer.localNode().getId()));
                 reader.startup().start();
                 reader.setMetadataPlane(plane);
-                final var id = reader.serveAsReader(plane, "alpha", 0);
+                final var id = reader.readers().serveAsReader(plane, "alpha", 0);
                 assertTrue(reader.reconciler().isReader(id));
                 final var failed = reader.reconciler().shard(id);
                 reader.reconciler().enter(id);
@@ -113,7 +113,7 @@ public class ServerlessFailedEngineTests extends OpenSearchTestCase {
                 } finally {
                     reader.reconciler().exit(id);
                 }
-                final var reopened = reader.serveAsReader(plane, "alpha", 0);
+                final var reopened = reader.readers().serveAsReader(plane, "alpha", 0);
                 final var replacement = reader.reconciler().shard(reopened);
                 assertNotSame(failed, replacement);
                 assertEquals(

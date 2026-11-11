@@ -59,15 +59,15 @@ public class ServerlessEndToEndTests extends OpenSearchTestCase {
             final String nodeId = node.localNode().getId();
 
             // Nothing exists yet, and a sync must say so rather than inventing something.
-            assertTrue("a sync against an empty object store must open nothing", node.syncFrom(plane).isEmpty());
+            assertTrue("a sync against an empty object store must open nothing", node.activation().syncFrom(plane).isEmpty());
 
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
             // A descriptor alone is not an assignment: the index exists, but no node owns its shard.
-            assertTrue("an unactivated index must not open anywhere", node.syncFrom(plane).isEmpty());
+            assertTrue("an unactivated index must not open anywhere", node.activation().syncFrom(plane).isEmpty());
 
             assertTrue(plane.activate("alpha", 0, nodeId, node.localNode().getEphemeralId()).acquired());
 
-            final var opened = node.syncFrom(plane);
+            final var opened = node.activation().syncFrom(plane);
             assertEquals("the node did not open the shard it now owns", 1, opened.size());
 
             final ShardId shardId = opened.iterator().next();
@@ -81,7 +81,7 @@ public class ServerlessEndToEndTests extends OpenSearchTestCase {
 
             // Delete in the metadata plane, then sync: the node lets go because TRUTH changed.
             assertTrue(plane.deleteIndex("alpha"));
-            node.syncFrom(plane);
+            node.activation().syncFrom(plane);
             assertTrue("the node kept a shard whose index was deleted", node.reconciler().openShards().isEmpty());
             assertEquals(IndexShardState.CLOSED, shard.state());
         }
@@ -97,8 +97,8 @@ public class ServerlessEndToEndTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
             plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId());
 
-            assertEquals(1, a.syncFrom(plane).size());
-            assertTrue("node B owns nothing and must open nothing", b.syncFrom(plane).isEmpty());
+            assertEquals(1, a.activation().syncFrom(plane).size());
+            assertTrue("node B owns nothing and must open nothing", b.activation().syncFrom(plane).isEmpty());
             // B does not even learn the index exists: residency tracks the working set, not the world.
             assertFalse(b.clusterService().state().metadata().hasIndex("alpha"));
         }
@@ -123,11 +123,11 @@ public class ServerlessEndToEndTests extends OpenSearchTestCase {
             b.startup().start();
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
             plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId());
-            assertEquals(1, a.syncFrom(plane).size());
+            assertEquals(1, a.activation().syncFrom(plane).size());
 
             // While A holds a live lease, B cannot take the shard and must not open it.
             assertFalse(plane.activate("alpha", 0, b.localNode().getId(), b.localNode().getEphemeralId()).acquired());
-            assertTrue("B opened a shard it does not own", b.syncFrom(plane).isEmpty());
+            assertTrue("B opened a shard it does not own", b.activation().syncFrom(plane).isEmpty());
 
             // A's lease lapses. B wins the head at a bumped term.
             clock.set(1_000L + TTL);
@@ -135,12 +135,12 @@ public class ServerlessEndToEndTests extends OpenSearchTestCase {
             assertTrue(won.acquired());
             assertEquals("failover must bump the term", 2L, won.head().term());
 
-            assertEquals("B did not take over the shard", 1, b.syncFrom(plane).size());
+            assertEquals("B did not take over the shard", 1, b.activation().syncFrom(plane).size());
             final ShardId shardId = b.reconciler().openShards().iterator().next();
             assertEquals(2L, b.reconciler().shard(shardId).getOperationPrimaryTerm());
 
             // A syncs and discovers it no longer owns the shard. It lets go because truth said so.
-            a.syncFrom(plane);
+            a.activation().syncFrom(plane);
             assertTrue("A kept a shard it had lost", a.reconciler().openShards().isEmpty());
         }
     }

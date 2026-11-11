@@ -108,7 +108,7 @@ final class ReconcilePass {
             // BackgroundReconciler.RESYNC_EVERY_PASSES backstops, which at the default interval is once in ten minutes.
             if (reconciler.passes % BackgroundReconciler.RESYNC_EVERY_PASSES == BackgroundReconciler.RESYNC_EVERY_PASSES - 1) {
                 try {
-                    activated.addAll(reconciler.node.syncFrom(reconciler.plane));
+                    activated.addAll(reconciler.node.activation().syncFrom(reconciler.plane));
                 } catch (Exception e) {
                     BackgroundReconciler.logger.warn("periodic resync against the metadata plane failed; the next one will retry", e);
                 }

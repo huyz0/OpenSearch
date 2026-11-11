@@ -402,8 +402,8 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
             other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            other.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            other.activation().syncFrom(plane);
             assertTrue("the write must have to cross the wire", other.reconciler().openShards().isEmpty());
 
             final var address = other.boundHttpAddress().publishAddress();
