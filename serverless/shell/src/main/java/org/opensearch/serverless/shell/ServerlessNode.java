@@ -1050,12 +1050,6 @@ public final class ServerlessNode implements Closeable {
         sightings.forgetOwner(index, shard);
     }
 
-    java.util.Map<String, java.util.Optional<IndexDescriptor>> refreshDescriptorsOfOpenIndices(
-        org.opensearch.serverless.metadata.MetadataPlane plane
-    ) {
-        return descriptorRefresh.refreshDescriptorsOfOpenIndices(plane);
-    }
-
     /**
      * What a publish does to the plane's digest rollups before its manifest is written: widen the shard's entry, unless
      * the publishing writer's own mark already keeps the shard from being ruled out.
@@ -1063,14 +1057,6 @@ public final class ServerlessNode implements Closeable {
     static ShardReconciler.BeforePublish widensRollupsOf(org.opensearch.serverless.metadata.MetadataPlane plane) {
         return (id, shards, term, digest) -> plane.rollups()
             .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest);
-    }
-
-    void applyDescriptor(String indexName, IndexDescriptor descriptor) throws java.io.IOException {
-        descriptorRefresh.applyDescriptor(indexName, descriptor);
-    }
-
-    void applyIfNewer(String indexName, IndexDescriptor descriptor, long readStartedNanos) {
-        descriptorRefresh.applyIfNewer(indexName, descriptor, readStartedNanos);
     }
 
     /** When each open index's descriptor was last read, by the refresh or by the fence, in {@link System#nanoTime} terms. */
@@ -1431,22 +1417,6 @@ public final class ServerlessNode implements Closeable {
         return leases.verifyHeadsIfDue(plane);
     }
 
-    boolean namesThisNode(
-        java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head,
-        org.opensearch.core.index.shard.ShardId shardId
-    ) {
-        return leases.namesThisNode(head, shardId);
-    }
-
-    void releaseLost(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        org.opensearch.core.index.shard.ShardId shardId,
-        String reason,
-        boolean forgetClaim
-    ) throws Exception {
-        leases.releaseLost(plane, shardId, reason, forgetClaim);
-    }
-
     /** Serves a shard as a reader: opens the published commit without owning the shard. */
     public org.opensearch.core.index.shard.ShardId serveAsReader(
         org.opensearch.serverless.metadata.MetadataPlane plane,
@@ -1601,10 +1571,6 @@ public final class ServerlessNode implements Closeable {
         fences.ensureIncarnationLive(shardId);
     }
 
-    void refuseIfWriteFenced(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
-        fences.refuseIfWriteFenced(shardId);
-    }
-
     /** Reports whether a writer shard is refusing writes after a failed log append. */
     public boolean isWriteFenced(org.opensearch.core.index.shard.ShardId shardId) {
         return fences.isWriteFenced(shardId);
@@ -1619,14 +1585,6 @@ public final class ServerlessNode implements Closeable {
     void growMapping(org.opensearch.core.index.shard.ShardId shardId, org.opensearch.index.mapper.Mapping addition)
         throws java.io.IOException {
         mappings.growMapping(shardId, addition);
-    }
-
-    void ensureOwnLeaseIsStillValid(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
-        fences.ensureOwnLeaseIsStillValid(shardId);
-    }
-
-    boolean releaseIfLeaseLapsed(org.opensearch.core.index.shard.ShardId shardId) {
-        return fences.releaseIfLeaseLapsed(shardId);
     }
 
     /** Deletes a document durably: the deletion reaches the object store's log before it is acknowledged. */
@@ -2082,10 +2040,6 @@ public final class ServerlessNode implements Closeable {
     public <T> T underShardFence(org.opensearch.core.index.shard.ShardId shardId, java.util.concurrent.Callable<T> action)
         throws Exception {
         return fences.underShardFence(shardId, action);
-    }
-
-    java.util.concurrent.locks.Lock enterWritePath(org.opensearch.core.index.shard.ShardId shardId) {
-        return fences.enterWritePath(shardId);
     }
 
     /** Reports whether this node holds a shard as its writer, by evidence no older than the given age. */

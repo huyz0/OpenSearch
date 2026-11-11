@@ -158,12 +158,12 @@ final class WriterActivation {
             final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = plane.heads()
                 .read(held.getIndexName(), held.id());
             node.noteHead(held.getIndexName(), held.id(), head.orElse(null));
-            if (node.namesThisNode(head, held)) {
+            if (node.leases.namesThisNode(head, held)) {
                 // The listing lagged, or the claim was never written. The head is what decides, and it
                 // says this shard is ours; keep serving it.
                 continue;
             }
-            node.releaseLost(plane, held, "the shard-head no longer names " + node.nodeName, true);
+            node.leases.releaseLost(plane, held, "the shard-head no longer names " + node.nodeName, true);
         }
         return opened;
     }

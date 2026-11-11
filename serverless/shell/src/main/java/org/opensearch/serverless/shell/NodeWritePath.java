@@ -136,7 +136,7 @@ final class NodeWritePath {
         try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
             // Under the shard's fence from before the engine applies the operation until after it is
             // acknowledged. See appendOrRelease for the interleaving this closes.
-            final java.util.concurrent.locks.Lock fence = node.enterWritePath(shardId);
+            final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
             try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
                 return indexUnderFence(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
             } finally {
@@ -161,7 +161,7 @@ final class NodeWritePath {
         if (node.reconciler.isReader(shardId)) {
             throw new java.io.IOException("cannot index into " + shardId + ": it is open as a reader");
         }
-        node.refuseIfWriteFenced(shardId);
+        node.fences.refuseIfWriteFenced(shardId);
         // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
         // and settings up to the descriptor, so a change made on another node is in force for the first operation
         // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
@@ -254,7 +254,7 @@ final class NodeWritePath {
      * on the spot, and a store that was merely slow for a moment took every writer shard on the node
      * offline for reads too -- a fully cached copy answering "not open" to a get. The rule is that
      * reads degrade to staleness and writes to rejection. So the shard stays open and readable, refuses
-     * every further write ({@link ServerlessNode#refuseIfWriteFenced}), is skipped by publication, and is closed and
+     * every further write ({@link WriteFences#refuseIfWriteFenced}), is skipped by publication, and is closed and
      * re-acquired from its log by the next heartbeat that reaches the store. Until then a read from this
      * node's own copy can see the operation the caller was told failed; that window is one renewal
      * interval, and the alternative was no reads at all.
@@ -281,7 +281,7 @@ final class NodeWritePath {
         if (wal == null || records.isEmpty()) {
             return;
         }
-        node.ensureOwnLeaseIsStillValid(shardId);
+        node.fences.ensureOwnLeaseIsStillValid(shardId);
         if (wal.begun(shard.getOperationPrimaryTerm()) == false) {
             // Not this term's writer: only a writer's open begins its term, after confirming the head names it. Appending
             // anyway would begin the term here, unchecked, and fence the real writer's records off behind this one.
@@ -328,7 +328,7 @@ final class NodeWritePath {
         // refusing it was what turned a durable record into one "refused" and later replayed. A lapsed
         // lease still releases the shard, so nothing further is written here. See
         // serverless/rfc-fencing-closure.md.
-        node.releaseIfLeaseLapsed(shardId);
+        node.fences.releaseIfLeaseLapsed(shardId);
         // After the PUT, so the confirmation is of the index as it stood once the record was down.
         node.ensureIncarnationLive(shardId);
     }
@@ -371,7 +371,7 @@ final class NodeWritePath {
         throws java.io.IOException {
         node.ensureStarted();
         try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
-            final java.util.concurrent.locks.Lock fence = node.enterWritePath(shardId);
+            final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
             try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
                 return deleteUnderFence(shardId, id, ifSeqNo, ifPrimaryTerm);
             } finally {
@@ -389,7 +389,7 @@ final class NodeWritePath {
         if (node.reconciler.isReader(shardId)) {
             throw new java.io.IOException("cannot delete from " + shardId + ": it is open as a reader");
         }
-        node.refuseIfWriteFenced(shardId);
+        node.fences.refuseIfWriteFenced(shardId);
         // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
         // and settings up to the descriptor, so a change made on another node is in force for the first operation
         // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
@@ -473,7 +473,7 @@ final class NodeWritePath {
         throws java.io.IOException {
         node.ensureStarted();
         try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
-            final java.util.concurrent.locks.Lock fence = node.enterWritePath(shardId);
+            final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
             try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
                 return bulkOperationsUnderFence(shardId, batch);
             } finally {
@@ -496,7 +496,7 @@ final class NodeWritePath {
         if (batch.isEmpty()) {
             return java.util.List.of();
         }
-        node.refuseIfWriteFenced(shardId);
+        node.fences.refuseIfWriteFenced(shardId);
         // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
         // and settings up to the descriptor, so a change made on another node is in force for the first operation
         // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.

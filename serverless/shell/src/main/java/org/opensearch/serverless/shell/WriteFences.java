@@ -46,7 +46,7 @@ final class WriteFences {
             node.confirmIncarnation(uuid, routed.get().readStartedNanos());
             // And it is a read of the mapping and settings like any other: a change made on another node reaches
             // this one's shards through whichever read sees it first, so the periodic refresh is only a backstop.
-            node.applyIfNewer(shardId.getIndexName(), routed.get().descriptor(), routed.get().readStartedNanos());
+            node.descriptorRefresh.applyIfNewer(shardId.getIndexName(), routed.get().descriptor(), routed.get().readStartedNanos());
             return;
         }
         synchronized (node.incarnationLocks[Math.floorMod(uuid.hashCode(), node.incarnationLocks.length)]) {
@@ -64,7 +64,7 @@ final class WriteFences {
             node.incarnationConfirmedAtNanos.put(uuid, startedAt);
             // The read is the refresh's read too: apply it, and let the periodic refresh skip this index.
             try {
-                node.applyDescriptor(shardId.getIndexName(), descriptor.get());
+                node.descriptorRefresh.applyDescriptor(shardId.getIndexName(), descriptor.get());
                 node.descriptorReadAtNanos.put(shardId.getIndexName(), startedAt);
             } catch (Exception e) {
                 ServerlessNode.logger.warn(
@@ -293,11 +293,11 @@ final class WriteFences {
             }
             node.noteHead(shardId.getIndexName(), shardId.id(), head.orElse(null));
         }
-        if (node.namesThisNode(head, shardId)) {
+        if (node.leases.namesThisNode(head, shardId)) {
             return true;
         }
         try {
-            node.releaseLost(
+            node.leases.releaseLost(
                 plane,
                 shardId,
                 "a forwarded write found the shard-head naming " + head.map(h -> h.ownerNodeId()).orElse("nobody"),

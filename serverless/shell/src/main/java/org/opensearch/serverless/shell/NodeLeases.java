@@ -75,7 +75,7 @@ final class NodeLeases {
      * head names another node is released. Once the lease is live again nothing can be taken, so what the
      * verification found is what this node holds.
      *
-     * <p>Heads this node lost on the write path ({@link ServerlessNode#ensureOwnLeaseIsStillValid}) are given back in
+     * <p>Heads this node lost on the write path ({@link WriteFences#ensureOwnLeaseIsStillValid}) are given back in
      * the register here, keyed on the term they were lost at, so a closed shard does not sit naming a node
      * that is not serving it once the lease is live again. A give-back the store refused is retried on the
      * next renewal.
@@ -271,7 +271,8 @@ final class NodeLeases {
             node.signals.ownershipDoubted(shardId.getIndexName(), shardId.id());
         }
 
-        final java.util.Map<String, java.util.Optional<IndexDescriptor>> descriptors = node.refreshDescriptorsOfOpenIndices(plane);
+        final java.util.Map<String, java.util.Optional<IndexDescriptor>> descriptors = node.descriptorRefresh
+            .refreshDescriptorsOfOpenIndices(plane);
 
         final java.util.List<org.opensearch.core.index.shard.ShardId> writers = new java.util.ArrayList<>();
         for (org.opensearch.core.index.shard.ShardId shardId : node.reconciler.openShards()) {
