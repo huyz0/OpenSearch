@@ -165,6 +165,37 @@ public final class ShardRouter {
         return await(future, timeout, peer, ForwardedStatsRequest.ACTION);
     }
 
+    /**
+     * Sends a signed request to a peer and waits for its answer, bounded by the single-write deadline.
+     *
+     * @param peer the node to ask
+     * @param action the action
+     * @param request the request
+     * @param reader reads the answer
+     * @param <T> the answer's type
+     * @return the answer
+     * @throws IOException if the request cannot be signed or sent
+     */
+    <T extends org.opensearch.core.transport.TransportResponse> T send(
+        DiscoveryNode peer,
+        String action,
+        org.opensearch.transport.TransportRequest request,
+        org.opensearch.core.common.io.stream.Writeable.Reader<T> reader
+    ) throws IOException {
+        final PlainActionFuture<T> future = PlainActionFuture.newFuture();
+        final TimeValue timeout = forwardTimeout();
+        try (var ignored = withMac(action, request, peer)) {
+            transportService.sendRequest(
+                peer,
+                action,
+                request,
+                TransportRequestOptions.builder().withTimeout(timeout).build(),
+                new Handler<>(future, reader)
+            );
+        }
+        return await(future, timeout, peer, action);
+    }
+
     /** How long a steered write waits for this node to take its shard. */
     static final long STEERED_ACTIVATION_WAIT_MILLIS = 30_000L;
 
