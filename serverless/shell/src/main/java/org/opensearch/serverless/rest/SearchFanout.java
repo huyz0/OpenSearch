@@ -262,7 +262,7 @@ public final class SearchFanout {
         final long nowInMillis = options.nowMillis() > 0L ? options.nowMillis() : System.currentTimeMillis();
         final List<Target> everyShard = new ArrayList<>();
         for (org.opensearch.serverless.cluster.IndexDescriptor descriptor : indices.values()) {
-            for (int shard = 0; shard < descriptor.numberOfShards(); shard++) {
+            for (int shard : descriptor.unitIds()) {
                 everyShard.add(new Target(descriptor, shard));
             }
         }

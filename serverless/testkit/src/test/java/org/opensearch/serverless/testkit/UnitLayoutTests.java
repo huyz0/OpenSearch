@@ -219,8 +219,17 @@ public class UnitLayoutTests extends OpenSearchTestCase {
         assertEquals(4, fixed.numberOfShards());
         assertEquals(fixed.layout(), IndexDescriptor.fromStream(fixed.toBytes().streamInput()).layout());
 
-        // Unit ids must be the physical shards 0..n-1 while callers enumerate shards by count.
-        final UnitLayout split = UnitLayout.initial(ShardMode.ADAPTIVE, 8).apply(UnitLayout.initial(ShardMode.ADAPTIVE, 8).planSplit(0));
-        expectThrows(IllegalArgumentException.class, () -> adaptive.withLayout(split));
+        // After a split the shard slots run to the next unit id, and only the live units serve.
+        final UnitLayout initial = UnitLayout.initial(ShardMode.ADAPTIVE, 8);
+        final UnitLayout split = initial.apply(initial.planSplit(0));
+        final IndexDescriptor afterSplit = adaptive.withLayout(split);
+        assertEquals("slots 0, 1 and 2: unit 0 retired, 1 and 2 live", 3, afterSplit.numberOfShards());
+        assertArrayEquals(new int[] { 1, 2 }, afterSplit.unitIds());
+        assertArrayEquals(new int[] { 0, 1, 2 }, plain.unitIds());
+        assertEquals(afterSplit, IndexDescriptor.fromStream(afterSplit.toBytes().streamInput()));
+        expectThrows(
+            IllegalArgumentException.class,
+            () -> new IndexDescriptor("grow", "uuid-grow-0000000000", 2, null, null, 1L, 1L, 0L, 0, List.of(), split)
+        );
     }
 }
