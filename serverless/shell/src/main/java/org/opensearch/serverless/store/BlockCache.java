@@ -89,6 +89,7 @@ public final class BlockCache {
     private final AtomicLong bytesResident = new AtomicLong();
     private final AtomicLong bytesCopied = new AtomicLong();
     private volatile java.util.concurrent.Executor prefetchExecutor;
+    private volatile java.util.function.LongSupplier clock = System::currentTimeMillis;
 
     /**
      * Creates a cache.
@@ -146,7 +147,7 @@ public final class BlockCache {
 
     /** Looks up a block without counting a hit or a miss: a prefetch asking what it can skip is not a reader. */
     byte[] peek(String key) {
-        return stripeFor(key).get(key);
+        return stripeFor(key).get(key, false, 0L);
     }
 
     /**
@@ -166,7 +167,7 @@ public final class BlockCache {
      * @return the block, or null on a miss
      */
     public byte[] get(String key) {
-        final byte[] block = stripeFor(key).get(key);
+        final byte[] block = stripeFor(key).get(key, true, clock.getAsLong());
         if (block == null) {
             misses.incrementAndGet();
         } else {
@@ -183,13 +184,17 @@ public final class BlockCache {
      */
     public void put(String key, byte[] block) {
         final Stripe stripe = stripeFor(key);
-        final long evicted = stripe.put(key, block);
+        // A fetched block was fetched to be read, by a search or an open, so it counts as read once now.
+        final long evicted = stripe.put(key, block, clock.getAsLong(), 1);
         bytesFetched.addAndGet(block.length);
         bytesResident.addAndGet(block.length - evicted);
     }
 
     /**
      * Stores a block copied from a peer's cache, if this cache does not already hold it.
+     *
+     * <p>Stamped as never read here: it is hot on the peer, not yet on this node, and a node that is asked for its own
+     * hot set before searches reach it names only what it has read itself.
      *
      * <p>Not counted as fetched: {@link #bytesFetched} is what the object store was asked for, and a copy from a peer
      * cost it nothing. Counted in {@link #bytesCopied} instead, so a warm join can show what it was spared.
@@ -210,36 +215,70 @@ public final class BlockCache {
     }
 
     /**
-     * Returns the keys held for each of some cache scopes, most recently used first.
-     *
-     * <p>What a node hands a joining peer so that it can copy the blocks searches actually touch rather than whole
-     * files. One pass over the cache for all the scopes asked about, since a node holding hundreds of shards would
-     * otherwise walk every block once per shard. Each stripe is its own least-recently-used list and the stripes are
-     * taken in turn, so the order is by recency within a stripe and close to it across them, which is as near as the
-     * cache keeps.
+     * Returns the keys held for each of some cache scopes, most recently used first; see {@link #residentEntriesByScope}.
      *
      * @param scopes the scopes, the part of a key before its first {@code /}
-     * @return each scope's keys, hottest first; a scope holding nothing is absent
+     * @return each scope's keys, most recent first; a scope holding nothing is absent
      */
     public Map<String, java.util.List<String>> residentByScope(java.util.Set<String> scopes) {
-        final java.util.List<java.util.List<String>> perStripe = new java.util.ArrayList<>(stripes.length);
-        for (Stripe stripe : stripes) {
-            perStripe.add(stripe.keysMostRecentFirst(scopes));
+        final Map<String, java.util.List<String>> keys = new java.util.HashMap<>();
+        for (Map.Entry<String, java.util.List<Resident>> scope : residentEntriesByScope(scopes).entrySet()) {
+            keys.put(scope.getKey(), scope.getValue().stream().map(Resident::key).toList());
         }
-        final Map<String, java.util.List<String>> byScope = new java.util.HashMap<>();
+        return keys;
+    }
+
+    /**
+     * Returns the blocks held for each of some cache scopes, most recently used first, with how often and how lately
+     * each was read here.
+     *
+     * <p>What a node hands a joining peer to choose from. One pass over the cache for all the scopes asked about, since a
+     * node holding hundreds of shards would otherwise walk every block once per shard. Each stripe is its own
+     * least-recently-used list and the stripes are taken in turn, so the order is by recency within a stripe and close
+     * to it across them.
+     *
+     * @param scopes the scopes, the part of a key before its first {@code /}
+     * @return each scope's blocks, most recent first; a scope holding nothing is absent
+     */
+    public Map<String, java.util.List<Resident>> residentEntriesByScope(java.util.Set<String> scopes) {
+        final java.util.List<java.util.List<Resident>> perStripe = new java.util.ArrayList<>(stripes.length);
+        for (Stripe stripe : stripes) {
+            perStripe.add(stripe.residentMostRecentFirst(scopes));
+        }
+        final Map<String, java.util.List<Resident>> byScope = new java.util.HashMap<>();
         for (int i = 0, remaining = stripes.length; remaining > 0; i++) {
             remaining = 0;
-            for (java.util.List<String> keys : perStripe) {
-                if (i < keys.size()) {
-                    final String key = keys.get(i);
-                    byScope.computeIfAbsent(scopeOf(key), s -> new java.util.ArrayList<>()).add(key);
+            for (java.util.List<Resident> held : perStripe) {
+                if (i < held.size()) {
+                    final Resident block = held.get(i);
+                    byScope.computeIfAbsent(scopeOf(block.key()), s -> new java.util.ArrayList<>()).add(block);
                 }
-                if (i + 1 < keys.size()) {
+                if (i + 1 < held.size()) {
                     remaining++;
                 }
             }
         }
         return byScope;
+    }
+
+    /**
+     * Replaces the clock that stamps when a block was last read, for a test.
+     *
+     * @param millis a millisecond clock
+     * @return this
+     */
+    public BlockCache withClock(java.util.function.LongSupplier millis) {
+        this.clock = millis;
+        return this;
+    }
+
+    /**
+     * Returns the time by the clock that stamps reads.
+     *
+     * @return milliseconds
+     */
+    public long nowMillis() {
+        return clock.getAsLong();
     }
 
     /**
@@ -253,7 +292,7 @@ public final class BlockCache {
     public Map<String, byte[]> copyOut(java.util.List<String> keys) {
         final Map<String, byte[]> held = new LinkedHashMap<>();
         for (String key : keys) {
-            final byte[] block = stripeFor(key).get(key);
+            final byte[] block = stripeFor(key).get(key, false, 0L);
             if (block != null) {
                 held.put(key, block);
             }
@@ -261,8 +300,13 @@ public final class BlockCache {
         return held;
     }
 
-    /** The scope a key belongs to: everything before its first {@code /}. */
-    static String scopeOf(String key) {
+    /**
+     * The scope a key belongs to: everything before its first {@code /}.
+     *
+     * @param key a block key
+     * @return its scope
+     */
+    public static String scopeOf(String key) {
         final int slash = key.indexOf('/');
         return slash < 0 ? key : key.substring(0, slash);
     }
@@ -411,18 +455,45 @@ public final class BlockCache {
         return stripes.length == 1 ? stripes[0] : stripes[Math.floorMod(key.hashCode(), stripes.length)];
     }
 
+    /**
+     * A block held, with when it was last read here and how often: what tells a hot block from one that is merely
+     * resident. Mutable, and only touched under its stripe's monitor.
+     */
+    private static final class Entry {
+        final byte[] block;
+        long lastReadMillis;
+        int reads;
+
+        Entry(byte[] block, long lastReadMillis, int reads) {
+            this.block = block;
+            this.lastReadMillis = lastReadMillis;
+            this.reads = reads;
+        }
+    }
+
+    /**
+     * A held block as a peer is told of it.
+     *
+     * @param key the block's key
+     * @param bytes its size
+     * @param reads how many times it was read here
+     * @param lastReadMillis when it was last read here, or 0 if never: a block copied in and not yet read
+     */
+    public record Resident(String key, int bytes, int reads, long lastReadMillis) {
+    }
+
     /** One least-recently-used list under its own monitor. */
     private static final class Stripe {
 
-        private final Map<String, byte[]> blocks;
+        private final Map<String, Entry> blocks;
         private long evictedBytes;
 
         Stripe(int max) {
             this.blocks = new LinkedHashMap<>(16, 0.75f, true) {
                 @Override
-                protected boolean removeEldestEntry(Map.Entry<String, byte[]> eldest) {
+                protected boolean removeEldestEntry(Map.Entry<String, Entry> eldest) {
                     if (size() > max) {
-                        evictedBytes += eldest.getValue().length;
+                        evictedBytes += eldest.getValue().block.length;
                         return true;
                     }
                     return false;
@@ -430,15 +501,24 @@ public final class BlockCache {
             };
         }
 
-        synchronized byte[] get(String key) {
-            return blocks.get(key);
+        /** Looks a block up; a read, not a peek, counts as one. */
+        synchronized byte[] get(String key, boolean read, long now) {
+            final Entry entry = blocks.get(key);
+            if (entry == null) {
+                return null;
+            }
+            if (read) {
+                entry.reads++;
+                entry.lastReadMillis = now;
+            }
+            return entry.block;
         }
 
         /** Stores a block and returns how many bytes left the stripe to make room, replaced value included. */
-        synchronized long put(String key, byte[] block) {
+        synchronized long put(String key, byte[] block, long lastReadMillis, int reads) {
             evictedBytes = 0;
-            final byte[] replaced = blocks.put(key, block);
-            return evictedBytes + (replaced == null ? 0 : replaced.length);
+            final Entry replaced = blocks.put(key, new Entry(block, lastReadMillis, reads));
+            return evictedBytes + (replaced == null ? 0 : replaced.block.length);
         }
 
         /** Stores a block unless one is held; returns the bytes evicted to make room, or -1 if one was held. */
@@ -446,19 +526,20 @@ public final class BlockCache {
             if (blocks.containsKey(key)) {
                 return -1;
             }
-            return put(key, block);
+            return put(key, block, 0L, 0);
         }
 
-        /** The keys in some scopes, most recently used first. */
-        synchronized java.util.List<String> keysMostRecentFirst(java.util.Set<String> scopes) {
-            final java.util.ArrayList<String> keys = new java.util.ArrayList<>();
-            for (String key : blocks.keySet()) {
-                if (scopes.contains(scopeOf(key))) {
-                    keys.add(key);
+        /** The blocks in some scopes, most recently used first. */
+        synchronized java.util.List<Resident> residentMostRecentFirst(java.util.Set<String> scopes) {
+            final java.util.ArrayList<Resident> held = new java.util.ArrayList<>();
+            for (Map.Entry<String, Entry> entry : blocks.entrySet()) {
+                if (scopes.contains(scopeOf(entry.getKey()))) {
+                    final Entry e = entry.getValue();
+                    held.add(new Resident(entry.getKey(), e.block.length, e.reads, e.lastReadMillis));
                 }
             }
-            java.util.Collections.reverse(keys);
-            return keys;
+            java.util.Collections.reverse(held);
+            return held;
         }
 
         synchronized int size() {

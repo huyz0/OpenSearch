@@ -25,14 +25,29 @@ public final class HotSetRequest extends TransportRequest {
     public static final String ACTION = "internal:serverless/cache/hot_set";
 
     private final String joinerId;
+    private final long maxBytes;
+    private final long recentMillis;
+
+    /**
+     * Creates a request for every block held for the joiner's shards.
+     *
+     * @param joinerId the joining node, which the peer ranks as a search member
+     */
+    public HotSetRequest(String joinerId) {
+        this(joinerId, Long.MAX_VALUE, Long.MAX_VALUE);
+    }
 
     /**
      * Creates a request.
      *
      * @param joinerId the joining node, which the peer ranks as a search member
+     * @param maxBytes the most bytes of blocks to name
+     * @param recentMillis how long ago, at most, a block was last read for it to count as hot
      */
-    public HotSetRequest(String joinerId) {
+    public HotSetRequest(String joinerId, long maxBytes, long recentMillis) {
         this.joinerId = joinerId;
+        this.maxBytes = maxBytes;
+        this.recentMillis = recentMillis;
     }
 
     /**
@@ -44,12 +59,34 @@ public final class HotSetRequest extends TransportRequest {
     public HotSetRequest(StreamInput in) throws IOException {
         super(in);
         this.joinerId = in.readString();
+        this.maxBytes = in.readVLong();
+        this.recentMillis = in.readVLong();
     }
 
     @Override
     public void writeTo(StreamOutput out) throws IOException {
         super.writeTo(out);
         out.writeString(joinerId);
+        out.writeVLong(maxBytes);
+        out.writeVLong(recentMillis);
+    }
+
+    /**
+     * Returns the most bytes of blocks to name.
+     *
+     * @return the budget
+     */
+    public long maxBytes() {
+        return maxBytes;
+    }
+
+    /**
+     * Returns how long ago, at most, a block was last read for it to count as hot.
+     *
+     * @return the window in milliseconds
+     */
+    public long recentMillis() {
+        return recentMillis;
     }
 
     /**
