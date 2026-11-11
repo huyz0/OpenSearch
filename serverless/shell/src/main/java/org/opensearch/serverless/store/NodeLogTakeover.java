@@ -69,6 +69,15 @@ public final class NodeLogTakeover {
     }
 
     /**
+     * Returns the epochs this reads, as the predecessor's lease named them.
+     *
+     * @return the epochs
+     */
+    public List<NodeLogEpoch> epochs() {
+        return epochs;
+    }
+
+    /**
      * Returns the node whose log this reads.
      *
      * @return the predecessor's id
@@ -108,16 +117,36 @@ public final class NodeLogTakeover {
             if (last.isEmpty()) {
                 continue;
             }
-            for (Range run : last.get().ordinalsOf(shard)) {
-                for (long ordinal = run.from(); ordinal <= run.to(); ordinal++) {
-                    final Header header = header(epoch.epoch(), ordinal, last.get());
-                    if (header == null) {
-                        continue;
-                    }
-                    for (Slice slice : header.slicesOf(shard)) {
-                        for (WalRecord record : log.readSlice(epoch.epoch(), header, slice)) {
-                            consumer.accept(record);
-                        }
+            readRuns(epoch.epoch(), last.get().ordinalsOf(shard), last.get(), shard, consumer);
+        }
+    }
+
+    /**
+     * Streams a shard's records from known runs of one epoch, with no fence: for a node reading its own log, which knows
+     * what it landed and where.
+     *
+     * @param epoch the epoch
+     * @param runs the runs of slots holding the shard's records
+     * @param shard the shard
+     * @param consumer what takes each record
+     * @throws IOException if a read fails
+     */
+    public void forEachRecordIn(long epoch, List<Range> runs, ShardKey shard, CheckedConsumer<WalRecord, IOException> consumer)
+        throws IOException {
+        readRuns(epoch, runs, null, shard, consumer);
+    }
+
+    private void readRuns(long epoch, List<Range> runs, Header last, ShardKey shard, CheckedConsumer<WalRecord, IOException> consumer)
+        throws IOException {
+        for (Range run : runs) {
+            for (long ordinal = run.from(); ordinal <= run.to(); ordinal++) {
+                final Header header = header(epoch, ordinal, last);
+                if (header == null) {
+                    continue;
+                }
+                for (Slice slice : header.slicesOf(shard)) {
+                    for (WalRecord record : log.readSlice(epoch, header, slice)) {
+                        consumer.accept(record);
                     }
                 }
             }
@@ -138,7 +167,7 @@ public final class NodeLogTakeover {
     }
 
     private Header header(long epoch, long ordinal, Header last) throws IOException {
-        if (ordinal == last.ordinal()) {
+        if (last != null && ordinal == last.ordinal()) {
             return last;
         }
         final Map<Long, Header> ofEpoch = headers.computeIfAbsent(epoch, ignored -> new ConcurrentHashMap<>());

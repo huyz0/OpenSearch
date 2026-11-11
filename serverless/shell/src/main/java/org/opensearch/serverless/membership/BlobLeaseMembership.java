@@ -555,7 +555,8 @@ public final class BlobLeaseMembership implements MembershipSource {
                 remaining.remove(nodeId);
                 container.compareAndSwapRegister(MEMBERS, index.get().generation(), encodeIds(remaining));
             }
-            if (conditionalDeletes.getAsBoolean()) {
+            // Kept while it names epochs of the node's write log with records not yet published: a successor reads them here.
+            if (conditionalDeletes.getAsBoolean() && stored.nodeLog().isEmpty()) {
                 container.deleteRegisterIfUnchanged(LEASE_PREFIX + nodeId, released.currentGeneration());
             }
         }
@@ -731,7 +732,9 @@ public final class BlobLeaseMembership implements MembershipSource {
                     if (lease.isExpiredAt(now) == false) {
                         live.add(lease);
                         lastRead.put(nodeId, lease);
-                    } else if (now - lease.expiresAtMillis() >= DEAD_LEASE_PRUNE_TTLS * ttlMillis) {
+                    } else if (now - lease.expiresAtMillis() >= DEAD_LEASE_PRUNE_TTLS * ttlMillis && lease.nodeLog().isEmpty()) {
+                        // Never one that still names epochs of its write log: it is the only place a successor
+                        // finds them, so a shard of that node not yet taken would lose its unpublished records.
                         // Expired for many lifetimes. A slow node is expired for seconds; this is a node
                         // that is gone, and every refresh everywhere has been paying a read to confirm it.
                         // Pruned below, blob and index entry both. Recently expired leases are kept: the

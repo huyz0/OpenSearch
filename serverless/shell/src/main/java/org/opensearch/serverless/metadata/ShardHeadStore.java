@@ -182,7 +182,7 @@ public final class ShardHeadStore {
         final ShardHead next = new ShardHead(indexName, shardId, current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid);
         final BlobRegisterCasResult result = container.compareAndSwapRegister(name, existing.get().generation(), next.toBytes());
         if (result.applied()) {
-            return Acquisition.won(next);
+            return Acquisition.won(next, otherIncarnation ? null : current.ownerNodeId());
         }
         // Someone swapped it between our read and our write. They won; route to them.
         return read(indexName, shardId).map(Acquisition::heldByAnother)

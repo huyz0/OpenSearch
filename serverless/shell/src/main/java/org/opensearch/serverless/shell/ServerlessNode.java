@@ -181,6 +181,18 @@ public final class ServerlessNode implements Closeable {
      */
     private final org.opensearch.serverless.store.WalGroupCommitter walCommitter;
 
+    /**
+     * Whether writes go to one log for the whole node, written once per window, instead of one log per shard. See
+     * {@link NodeLogWriter}.
+     */
+    private final boolean nodeLogEnabled;
+
+    /** This node's write log when {@link #nodeLogEnabled}, started with the first metadata plane it writes through. */
+    private volatile NodeLogWriter nodeLogWriter;
+
+    /** Whether the reconciler has been given {@link #nodeLogWriter}, which may start before the reconciler exists. */
+    private volatile boolean nodeLogHooked;
+
     /** How many writes may wait on the object store at once; see WriteBackpressure. */
     private final org.opensearch.serverless.store.WriteBackpressure writeBackpressure;
     private final int writeBackpressureMax;
@@ -702,6 +714,7 @@ public final class ServerlessNode implements Closeable {
             ),
             settings.getAsLong("serverless.wal.group_commit.max_bytes", org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES)
         );
+        this.nodeLogEnabled = settings.getAsBoolean("serverless.wal.node_log.enabled", false);
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
         final Environment environment = new Environment(settings, null);
@@ -1514,6 +1527,71 @@ public final class ServerlessNode implements Closeable {
     }
 
     private void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
+        if (nodeLogEnabled) {
+            // Through the log, which names its epochs and writes under the lock a new epoch's recording takes.
+            nodeLog(plane).renew();
+            return;
+        }
+        writeOwnLease(plane, java.util.List.of());
+    }
+
+    /**
+     * Returns this node's write log, starting it on first use: it reads the epochs an earlier process of this node left in
+     * the lease, before anything renews over them.
+     */
+    private NodeLogWriter nodeLog(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
+        final NodeLogWriter started = nodeLogWriter;
+        if (started != null && nodeLogHooked) {
+            return started;
+        }
+        synchronized (this) {
+            if (nodeLogWriter == null) {
+                final NodeLogWriter writer = NodeLogWriter.start(plane, localNode.getId(), epochs -> {
+                    final long validUntil = ownLeaseValidUntilMillis;
+                    if (validUntil != 0L && plane.clock().getAsLong() >= validUntil) {
+                        // A lapsed lease is renewed only after this node lets go of what it held; recording an epoch is
+                        // no way around that.
+                        throw new java.io.IOException("this node's lease has lapsed; no new epoch of its log is recorded");
+                    }
+                    writeOwnLease(plane, epochs);
+                },
+                    (shardId, term) -> ownsAtTerm(plane, shardId, term),
+                    settings.getAsLong(
+                        "serverless.wal.node_log.window_millis",
+                        org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_WINDOW_MILLIS
+                    ),
+                    settings.getAsLong(
+                        "serverless.wal.node_log.max_bytes",
+                        org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_MAX_BYTES
+                    ),
+                    settings.getAsInt(
+                        "serverless.wal.node_log.max_records",
+                        org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_MAX_RECORDS
+                    )
+                );
+                nodeLogWriter = writer;
+            }
+            if (reconciler != null && nodeLogHooked == false) {
+                reconciler.setNodeLog(nodeLogWriter);
+                nodeLogHooked = true;
+            }
+            return nodeLogWriter;
+        }
+    }
+
+    /**
+     * Returns this node's write log, if it writes one and has started it.
+     *
+     * @return the log, or null
+     */
+    public NodeLogWriter nodeLogWriter() {
+        return nodeLogWriter;
+    }
+
+    private void writeOwnLease(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        java.util.List<org.opensearch.serverless.store.NodeLogEpoch> nodeLogEpochs
+    ) throws java.io.IOException {
         // Stamped from when the renewal began: the lease is valid at least that long after it.
         final long startedAt = plane.clock().getAsLong();
         ownLeaseValidUntilMillis = 0L;
@@ -1532,7 +1610,7 @@ public final class ServerlessNode implements Closeable {
                     admission.maxShardsHeld(),
                     inUseLastMinute(),
                     refusedLastMinute()
-                )
+                ).withNodeLog(nodeLogEpochs)
             );
         ownLeaseValidUntilMillis = startedAt + plane.leaseTtlMillis();
     }
@@ -2086,6 +2164,11 @@ public final class ServerlessNode implements Closeable {
         openingShards.add(openingKey);
         // The takeover fenced every older term at the swap, so the open need not list them again.
         reconciler.noteOlderTermsFenced(indexName, shardNumber, acquisition.head().term());
+        if (nodeLogEnabled) {
+            // Whose node log the open replays: the node this takeover replaced in the head.
+            nodeLog(plane);
+            reconciler.noteNodeLogPredecessor(indexName, shardNumber, acquisition.previousOwner());
+        }
         try {
             // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed
             // documents its published digest does not describe.
@@ -3185,7 +3268,12 @@ public final class ServerlessNode implements Closeable {
             // share one PUT, and this caller returns only once the blob carrying its own records has
             // landed. The two lease checks around this call are unchanged and remain per-caller, so every
             // member of a group independently establishes that its record sits ahead of any seal.
-            walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
+            if (nodeLogEnabled) {
+                // One blob per window for every shard of this node, rather than one per shard.
+                nodeLog(metadataPlane).commit(shardId, shard.getOperationPrimaryTerm(), records);
+            } else {
+                walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
+            }
             writeBackpressure.onAppend(System.nanoTime() - appendStarted, true);
         } catch (Exception | Error e) {
             writeBackpressure.onAppend(System.nanoTime() - appendStarted, false);
@@ -4952,6 +5040,10 @@ public final class ServerlessNode implements Closeable {
                 // flush already in flight holds its own reference and finishes, and its members are judged
                 // by the shard-identity check every caller makes after the append.
                 walCommitter.forget(shardId);
+                final NodeLogWriter log = nodeLogWriter;
+                if (log != null) {
+                    log.forget(shardId);
+                }
             }
         }
     }
