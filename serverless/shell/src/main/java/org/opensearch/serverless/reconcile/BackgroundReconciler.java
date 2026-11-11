@@ -188,7 +188,7 @@ public final class BackgroundReconciler implements Closeable {
         this.plane = plane;
         this.collector = new GarbageCollector(plane.blobStore(), plane.basePath());
         // Readers and frozen views are admitted under this loop's cap and eviction, not a constant.
-        node.setShardAdmission(new ShardAdmission() {
+        node.nodeCapacity().setShardAdmission(new ShardAdmission() {
             @Override
             public int maxShardsHeld() {
                 return BackgroundReconciler.this.maxShardsHeld;
@@ -250,6 +250,9 @@ public final class BackgroundReconciler implements Closeable {
 
     /** Per shard, the files of the manifest the last sweep ran against. */
     final Map<ShardId, Set<String>> sweptAgainst = new ConcurrentHashMap<>();
+
+    /** Per shard, what the last sweep named in older terms, so the next one need not list them. */
+    final Map<ShardId, SweepScope> sweepScopes = new ConcurrentHashMap<>();
 
     /** Shards whose next sweep must run whatever their manifest says. */
     final Set<ShardId> forceSweep = java.util.concurrent.ConcurrentHashMap.newKeySet();

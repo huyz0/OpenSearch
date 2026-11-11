@@ -825,7 +825,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
     /**
      * Answers a delete only once no node can still be acknowledging into what it deleted.
      *
-     * <p>A node answers from a shard only within {@code ServerlessNode#INCARNATION_FENCE_MILLIS} of having
+     * <p>A node answers from a shard only within {@code WriteFences#INCARNATION_FENCE_MILLIS} of having
      * read that the shard's index still exists, so once that window has passed since the tombstone landed,
      * nothing anywhere is answering from the deleted incarnation. Waiting it out before saying "deleted" is
      * what makes a write acknowledged after this answer impossible, rather than merely brief. Scheduled,
@@ -850,7 +850,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
                     .warn("could not answer a delete after it settled", e);
             }
         },
-            org.opensearch.common.unit.TimeValue.timeValueMillis(org.opensearch.serverless.shell.ServerlessNode.DELETE_SETTLE_MILLIS),
+            org.opensearch.common.unit.TimeValue.timeValueMillis(org.opensearch.serverless.shell.WriteFences.DELETE_SETTLE_MILLIS),
             org.opensearch.threadpool.ThreadPool.Names.GENERIC
         );
     }

@@ -16,6 +16,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.shell.WriteFences;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.net.URI;
@@ -112,7 +113,7 @@ public class ServerlessDescriptorPropagationTests extends OpenSearchTestCase {
 
     /** Past the fence window, so the owner's next operation reads the descriptor rather than trusting its last read. */
     private static void pastTheFenceWindow() {
-        final long until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ServerlessNode.INCARNATION_FENCE_MILLIS + 100);
+        final long until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(WriteFences.INCARNATION_FENCE_MILLIS + 100);
         while (System.nanoTime() < until) {
             java.util.concurrent.locks.LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(20));
         }
@@ -149,7 +150,7 @@ public class ServerlessDescriptorPropagationTests extends OpenSearchTestCase {
     private void assertExplainRefreshesMapping(boolean forwarded) throws Exception {
         try (Pair p = pair()) {
             assertEquals(200, call(p.owner(), "PUT", "/alpha/_doc/warm?refresh=true", "{\"msg\":\"warm\"}").status());
-            p.owner().setIncarnationFenceMillis(0L);
+            p.owner().fences().setIncarnationFenceMillis(0L);
             final Answer mapped = call(
                 p.other(),
                 "PUT",
@@ -206,7 +207,7 @@ public class ServerlessDescriptorPropagationTests extends OpenSearchTestCase {
      */
     public void testAWriteRefusedForAStaleMappingNeitherRepeatsNorPoisonsLaterGrowth() throws Exception {
         try (Pair p = pair()) {
-            p.owner().setIncarnationFenceMillis(TimeUnit.MINUTES.toMillis(10));
+            p.owner().fences().setIncarnationFenceMillis(TimeUnit.MINUTES.toMillis(10));
             assertEquals(200, call(p.other(), "PUT", "/alpha/_mapping", "{\"properties\":{\"tag\":{\"type\":\"keyword\"}}}").status());
 
             final Answer refused = call(p.owner(), "PUT", "/alpha/_doc/1", "{\"msg\":\"x\",\"tag\":\"Hello World\"}");

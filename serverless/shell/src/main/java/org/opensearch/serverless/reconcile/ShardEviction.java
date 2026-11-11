@@ -8,7 +8,6 @@
 package org.opensearch.serverless.reconcile;
 
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.serverless.shell.ServerlessNode;
 
 import java.util.Map;
 import java.util.Optional;
@@ -157,7 +156,8 @@ final class ShardEviction {
             if (reconciler.node.nodeCapacity().aboveFleetShare(reconciler.plane)
                 && reconciler.node.nodeCapacity().memberBelowMean(reconciler.plane).isPresent()) {
                 final int floor = (int) Math.ceil(
-                    reconciler.node.nodeCapacity().fleetMeanHeld(reconciler.plane) * ServerlessNode.HAND_OFF_DOWN_TO_MEAN
+                    reconciler.node.nodeCapacity().fleetMeanHeld(reconciler.plane)
+                        * org.opensearch.serverless.shell.NodeCapacity.HAND_OFF_DOWN_TO_MEAN
                 );
                 return evictDownTo(floor, Math.max(1, reconciler.maxShardsHeld / 10), true);
             }

@@ -66,7 +66,7 @@ final class RequestRouting {
     Optional<IndexDescriptor> describeOnce(String index) throws IOException {
         // Every use here is placement -- a shard number and a uuid -- so the routing cache answers it: a
         // stale uuid lands on a shard that refuses to answer for a deleted incarnation (see
-        // ServerlessNode#INCARNATION_FENCE_MILLIS) or on none at all.
+        // WriteFences#INCARNATION_FENCE_MILLIS) or on none at all.
         return once(described, index, () -> plane.describeForRouting(index));
     }
 

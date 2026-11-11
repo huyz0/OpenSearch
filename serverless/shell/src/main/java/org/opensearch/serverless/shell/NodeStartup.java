@@ -96,7 +96,7 @@ public final class NodeStartup {
                     org.opensearch.Version.CURRENT.toString()
                 ).withLoad(
                     node.reconciler == null ? 0 : node.reconciler.heldShards().size(),
-                    node.admission.maxShardsHeld(),
+                    node.nodeCapacity().admission.maxShardsHeld(),
                     node.nodeCapacity().inUseLastMinute(),
                     node.nodeCapacity().refusedLastMinute()
                 ).withNodeLog(nodeLogEpochs)
