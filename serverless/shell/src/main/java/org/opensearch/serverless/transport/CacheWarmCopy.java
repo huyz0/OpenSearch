@@ -26,7 +26,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.WeakHashMap;
 import java.util.function.LongSupplier;
 
 /**
@@ -100,8 +99,6 @@ public final class CacheWarmCopy {
         long pausedNanos) {
     }
 
-    private static final Map<ServerlessNode, CacheWarmCopy> BY_NODE = new WeakHashMap<>();
-
     private final ShardRouter router;
     private final long maxBytesPerSecond;
     private final int batchBlocks;
@@ -115,15 +112,16 @@ public final class CacheWarmCopy {
     }
 
     /**
-     * Returns a node's copier, made on first use. The node must have started, since its router is built then.
+     * Returns a copier for a node. The node must have started, since its router is built then.
+     *
+     * <p>Made afresh rather than kept per node: it holds nothing but its settings, and a static map from a node to
+     * something that holds the node would keep every node alive.
      *
      * @param node the node
-     * @return its copier
+     * @return a copier
      */
     public static CacheWarmCopy of(ServerlessNode node) {
-        synchronized (BY_NODE) {
-            return BY_NODE.computeIfAbsent(node, n -> new CacheWarmCopy(n.router()));
-        }
+        return new CacheWarmCopy(node.router());
     }
 
     /**
