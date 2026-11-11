@@ -8,6 +8,7 @@
 package org.opensearch.serverless.metadata;
 
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.testkit.HookedBlobStore;
 import org.opensearch.test.OpenSearchTestCase;
@@ -34,7 +35,8 @@ public class TemplateContentRaceTests extends OpenSearchTestCase {
                     body.field("template-" + i, "existing-content");
                 }
                 body.endObject().endObject();
-                container.createRegisterIfAbsent("_version", org.opensearch.core.common.bytes.BytesReference.bytes(body));
+                ConditionalBlobContainer.of(container)
+                    .createRegisterIfAbsent("_version", org.opensearch.core.common.bytes.BytesReference.bytes(body));
             }
             final TemplateStore templates = new TemplateStore(container);
             expectThrows(TemplateStore.TooManyTemplatesException.class, () -> templates.put("overflow", "{}"));

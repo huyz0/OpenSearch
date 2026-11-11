@@ -9,6 +9,7 @@
 package org.opensearch.serverless.metadata;
 
 import org.opensearch.common.blobstore.BlobContainer;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 
 import java.io.IOException;
 import java.util.Optional;
@@ -20,7 +21,7 @@ import java.util.function.LongSupplier;
  */
 final class TransportSecretStore {
 
-    private final BlobContainer container;
+    private final ConditionalBlobContainer container;
     private final LongSupplier clock;
 
     /**
@@ -30,7 +31,7 @@ final class TransportSecretStore {
      * @param clock source of wall-clock millis, stamped on a minted or rotated secret
      */
     TransportSecretStore(BlobContainer container, LongSupplier clock) {
-        this.container = container;
+        this.container = ConditionalBlobContainer.of(container);
         this.clock = clock;
     }
 

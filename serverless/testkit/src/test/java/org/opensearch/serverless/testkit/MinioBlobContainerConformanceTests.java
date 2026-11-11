@@ -13,6 +13,7 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.repositories.s3.MinioBlobStores;
@@ -193,8 +194,8 @@ public class MinioBlobContainerConformanceTests extends BlobContainerConformance
             }
         };
 
-        liar.createRegisterIfAbsent("head", new BytesArray("initial".getBytes(StandardCharsets.UTF_8)));
-        final long generation = liar.readRegister("head").orElseThrow().generation();
+        ConditionalBlobContainer.of(liar).createRegisterIfAbsent("head", new BytesArray("initial".getBytes(StandardCharsets.UTF_8)));
+        final long generation = ConditionalBlobContainer.of(liar).readRegister("head").orElseThrow().generation();
 
         final CountDownLatch start = new CountDownLatch(1);
         final AtomicInteger winners = new AtomicInteger();
@@ -204,7 +205,8 @@ public class MinioBlobContainerConformanceTests extends BlobContainerConformance
             threads[i] = new Thread(() -> {
                 try {
                     start.await();
-                    if (liar.compareAndSwapRegister("head", generation, new BytesArray(("w" + id).getBytes(StandardCharsets.UTF_8)))
+                    if (ConditionalBlobContainer.of(liar)
+                        .compareAndSwapRegister("head", generation, new BytesArray(("w" + id).getBytes(StandardCharsets.UTF_8)))
                         .applied()) {
                         winners.incrementAndGet();
                     }

@@ -8,11 +8,11 @@
 
 package org.opensearch.serverless.metadata;
 
-import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.hash.MurmurHash3;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentType;
@@ -197,8 +197,8 @@ public final class DigestRollups {
         return Math.floorMod(MurmurHash3.hash128(bytes, 0, bytes.length, 0, new MurmurHash3.Hash128()).h1, BUCKETS);
     }
 
-    private BlobContainer container(String group) {
-        return blobStore.blobContainer(base.add(group));
+    private ConditionalBlobContainer container(String group) {
+        return ConditionalBlobContainer.of(blobStore.blobContainer(base.add(group)));
     }
 
     private static String blob(int bucket) {
@@ -489,7 +489,7 @@ public final class DigestRollups {
      * @throws IOException if a register cannot be read
      */
     public Map<String, Entry> readGroup(String group, DescriptorStore.Reads reads) throws IOException {
-        final BlobContainer container = container(group);
+        final ConditionalBlobContainer container = container(group);
         final List<Callable<Map<String, Entry>>> tasks = new ArrayList<>();
         for (int bucket = 0; bucket < BUCKETS; bucket++) {
             final String blob = blob(bucket);
@@ -561,7 +561,7 @@ public final class DigestRollups {
     /** A read-change-swap loop applying every change, in order, to one register, in one swap. */
     private void updateAll(String group, int bucket, List<Map.Entry<String, Change>> changes, boolean trustRemembered) throws IOException {
         final String key = group + "/" + blob(bucket);
-        final BlobContainer container = container(group);
+        final ConditionalBlobContainer container = container(group);
         final Map<String, Entry> remembered = known.get(key);
         if (trustRemembered && remembered != null) {
             // Nothing this node knows of would change. The copy may be stale, but a register only ever widens

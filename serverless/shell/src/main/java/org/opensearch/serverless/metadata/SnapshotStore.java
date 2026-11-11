@@ -13,6 +13,7 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
@@ -36,11 +37,11 @@ final class SnapshotStore {
     private static final Logger LOGGER = LogManager.getLogger(SnapshotStore.class);
     private static final BytesReference RELEASED = new BytesArray("{\"_released\":true}");
     private final BlobContainer inventory;
-    private final BlobContainer states;
+    private final ConditionalBlobContainer states;
 
     SnapshotStore(BlobContainer inventory, BlobContainer states) {
         this.inventory = inventory;
-        this.states = states;
+        this.states = ConditionalBlobContainer.of(states);
     }
 
     private record State(BlobRegister register, String marker, SnapshotRecord snapshot, boolean finished) {

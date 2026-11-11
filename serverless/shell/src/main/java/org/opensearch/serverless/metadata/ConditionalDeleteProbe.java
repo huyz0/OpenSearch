@@ -14,6 +14,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.common.bytes.BytesArray;
 
 import java.io.IOException;
@@ -51,28 +52,31 @@ public final class ConditionalDeleteProbe {
         final BlobContainer first = blobStore.blobContainer(path);
         final BlobContainer second = blobStore.blobContainer(path);
         try {
-            final BlobRegisterCasResult created = first.createRegisterIfAbsent(name, value("created"));
+            final ConditionalBlobContainer firstRegisters = ConditionalBlobContainer.of(first);
+            final ConditionalBlobContainer secondRegisters = ConditionalBlobContainer.of(second);
+            final BlobRegisterCasResult created = firstRegisters.createRegisterIfAbsent(name, value("created"));
             if (created.applied() == false) {
                 return false;
             }
             // Read back through the first container, so one that caches versions knows this one's token.
-            final Optional<BlobRegister> seen = first.readRegister(name);
+            final Optional<BlobRegister> seen = firstRegisters.readRegister(name);
             if (seen.isEmpty()) {
                 return false;
             }
-            final BlobRegisterCasResult moved = second.compareAndSwapRegister(name, seen.get().generation(), value("moved"));
+            final BlobRegisterCasResult moved = secondRegisters.compareAndSwapRegister(name, seen.get().generation(), value("moved"));
             if (moved.applied() == false) {
                 return false;
             }
-            if (first.deleteRegisterIfUnchanged(name, seen.get().generation())) {
+            if (firstRegisters.deleteRegisterIfUnchanged(name, seen.get().generation())) {
                 // The store deleted a register at a generation it no longer held.
                 return false;
             }
-            final Optional<BlobRegister> survived = second.readRegister(name);
+            final Optional<BlobRegister> survived = secondRegisters.readRegister(name);
             if (survived.isEmpty() || survived.get().generation() != moved.currentGeneration()) {
                 return false;
             }
-            return second.deleteRegisterIfUnchanged(name, moved.currentGeneration()) && second.readRegister(name).isEmpty();
+            return secondRegisters.deleteRegisterIfUnchanged(name, moved.currentGeneration())
+                && secondRegisters.readRegister(name).isEmpty();
         } catch (UnsupportedOperationException | IOException e) {
             return false;
         } finally {

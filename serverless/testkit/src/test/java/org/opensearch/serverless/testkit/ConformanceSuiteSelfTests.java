@@ -11,6 +11,7 @@ package org.opensearch.serverless.testkit;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
@@ -61,7 +62,7 @@ public class ConformanceSuiteSelfTests extends OpenSearchTestCase {
     }
 
     public void testTheSuiteWouldCatchACompareAndSwapThatAlwaysWins() throws Exception {
-        final BlobContainer container = new AlwaysWinsContainer(real());
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(new AlwaysWinsContainer(real()));
         container.createRegisterIfAbsent("head", new BytesArray("initial".getBytes(StandardCharsets.UTF_8)));
         final long generation = container.readRegister("head").orElseThrow().generation();
 
@@ -97,7 +98,7 @@ public class ConformanceSuiteSelfTests extends OpenSearchTestCase {
     }
 
     public void testTheSuiteWouldCatchARangedReadThatIgnoresItsRange() throws Exception {
-        final BlobContainer container = new IgnoresRangeContainer(real());
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(new IgnoresRangeContainer(real()));
         final byte[] content = new byte[4096];
         for (int i = 0; i < content.length; i++) {
             content[i] = (byte) (i % 251);
@@ -142,18 +143,18 @@ public class ConformanceSuiteSelfTests extends OpenSearchTestCase {
      */
     private RegisterHistory record(BlobContainer container, String name) throws Exception {
         final RegisterHistory history = new RegisterHistory();
-        container.createRegisterIfAbsent(name, new BytesArray("v0"));
-        long known = container.readRegister(name).orElseThrow().generation();
+        ConditionalBlobContainer.of(container).createRegisterIfAbsent(name, new BytesArray("v0"));
+        long known = ConditionalBlobContainer.of(container).readRegister(name).orElseThrow().generation();
 
         for (int i = 1; i <= 3; i++) {
             final String value = "v" + i;
             long invoked = history.invoke();
-            final var result = container.compareAndSwapRegister(name, known, new BytesArray(value));
+            final var result = ConditionalBlobContainer.of(container).compareAndSwapRegister(name, known, new BytesArray(value));
             history.completed(new RegisterHistory.Cas(known, value, result.applied(), result.currentGeneration()), invoked);
             known = result.currentGeneration();
 
             invoked = history.invoke();
-            final var seen = container.readRegister(name);
+            final var seen = ConditionalBlobContainer.of(container).readRegister(name);
             history.completed(
                 new RegisterHistory.Read(
                     seen.map(org.opensearch.common.blobstore.BlobRegister::generation).orElse(RegisterHistory.ABSENT),
@@ -166,12 +167,12 @@ public class ConformanceSuiteSelfTests extends OpenSearchTestCase {
     }
 
     private long initialGenerationOf(BlobContainer container, String name) throws Exception {
-        return container.readRegister(name).orElseThrow().generation();
+        return ConditionalBlobContainer.of(container).readRegister(name).orElseThrow().generation();
     }
 
     /** The same script over an honest store must be accepted, or the rejections below prove nothing. */
     public void testTheCheckerAcceptsAnHonestStore() throws Exception {
-        final BlobContainer container = real();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(real());
         container.createRegisterIfAbsent("honest", new BytesArray("v0"));
         final long initial = initialGenerationOf(container, "honest");
         final RegisterHistory history = record(container, "honest");

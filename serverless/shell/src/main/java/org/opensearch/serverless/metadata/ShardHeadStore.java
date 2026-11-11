@@ -11,6 +11,7 @@ package org.opensearch.serverless.metadata;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -41,7 +42,7 @@ import java.util.function.LongSupplier;
  */
 public final class ShardHeadStore {
 
-    private final BlobContainer container;
+    private final ConditionalBlobContainer container;
     private final LongSupplier clock;
     private final long leaseTtlMillis;
     private final LivenessOracle oracle;
@@ -62,7 +63,7 @@ public final class ShardHeadStore {
         if (oracle == null) {
             throw new IllegalArgumentException("a liveness oracle is required; per-head expiry is no longer a mode");
         }
-        this.container = container;
+        this.container = ConditionalBlobContainer.of(container);
         this.clock = clock;
         this.leaseTtlMillis = leaseTtlMillis;
         this.oracle = oracle;

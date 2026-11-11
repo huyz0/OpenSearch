@@ -9,6 +9,7 @@
 package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
@@ -319,7 +320,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             final var published = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
             final var legacy = new org.opensearch.serverless.store.CommitManifest(published.term(), published.files());
             assertNull("the fixture must really have no writer", legacy.writer());
-            final var container = store.blobContainer(plane.shardData("alpha", 0));
+            final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(plane.shardData("alpha", 0)));
             final var existing = container.readRegister("manifest").orElseThrow();
             assertTrue(container.compareAndSwapRegister("manifest", existing.generation(), legacy.toBytes()).applied());
 

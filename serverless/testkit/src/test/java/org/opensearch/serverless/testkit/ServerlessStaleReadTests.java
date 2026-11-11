@@ -9,6 +9,7 @@
 package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.cluster.IndexDescriptor;
@@ -301,13 +302,17 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
             final var container = store.blobContainer(
                 org.opensearch.serverless.metadata.RegisterMap.shardData(BlobPath.cleanPath(), "alpha", "uuid-alpha-00000000", 0)
             );
-            final var register = container.readRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST).orElseThrow();
+            final var register = ConditionalBlobContainer.of(container)
+                .readRegister(org.opensearch.serverless.store.SegmentPublisher.MANIFEST)
+                .orElseThrow();
             assertTrue(
-                container.compareAndSwapRegister(
-                    org.opensearch.serverless.store.SegmentPublisher.MANIFEST,
-                    register.generation(),
-                    legacy.toBytes()
-                ).applied()
+                ConditionalBlobContainer.of(container)
+                    .compareAndSwapRegister(
+                        org.opensearch.serverless.store.SegmentPublisher.MANIFEST,
+                        register.generation(),
+                        legacy.toBytes()
+                    )
+                    .applied()
             );
             assertTrue(plane.heads().release("alpha", 0, writer.localNode().getId()));
 

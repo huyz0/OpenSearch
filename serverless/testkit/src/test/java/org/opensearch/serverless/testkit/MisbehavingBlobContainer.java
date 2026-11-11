@@ -11,6 +11,7 @@ package org.opensearch.serverless.testkit;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.IOException;
@@ -160,13 +161,13 @@ public final class MisbehavingBlobContainer extends DelegatingBlobContainer {
                 // The second caller is told exactly what the first was told, and has no way to know.
                 return already;
             }
-            final BlobRegisterCasResult first = honest.createRegisterIfAbsent(blobName, value);
+            final BlobRegisterCasResult first = ConditionalBlobContainer.of(honest).createRegisterIfAbsent(blobName, value);
             if (first.applied()) {
                 firstCreate.put(blobName, first);
             }
             return first;
         }
-        final BlobRegisterCasResult result = honest.createRegisterIfAbsent(blobName, value);
+        final BlobRegisterCasResult result = ConditionalBlobContainer.of(honest).createRegisterIfAbsent(blobName, value);
         if (result.applied() && ambiguousCreateEveryNth > 0 && attempt % ambiguousCreateEveryNth == 0) {
             throw new AmbiguousOutcomeException(
                 "the create of [" + blobName + "] applied and the response was lost; the caller cannot know which"
@@ -262,7 +263,7 @@ public final class MisbehavingBlobContainer extends DelegatingBlobContainer {
         if (blobName.equals(readsAsAbsentBlob)) {
             return Optional.empty();
         }
-        final Optional<BlobRegister> current = honest.readRegister(blobName);
+        final Optional<BlobRegister> current = ConditionalBlobContainer.of(honest).readRegister(blobName);
         if (staleReadEveryNth > 0 && reads.incrementAndGet() % staleReadEveryNth == 0) {
             final BlobRegister stale = previous.get(blobName);
             if (stale != null) {
@@ -293,7 +294,8 @@ public final class MisbehavingBlobContainer extends DelegatingBlobContainer {
                 // The second caller is told exactly what the first was told. Neither has any way to know.
                 return already;
             }
-            final BlobRegisterCasResult first = honest.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+            final BlobRegisterCasResult first = ConditionalBlobContainer.of(honest)
+                .compareAndSwapRegister(blobName, expectedGeneration, newValue);
             if (first.applied()) {
                 firstWin.put(blobName, first);
             }
@@ -303,8 +305,11 @@ public final class MisbehavingBlobContainer extends DelegatingBlobContainer {
         if (twoWinnersEveryNth > 0 && attempt % twoWinnersEveryNth == 0) {
             // The precondition is evaluated against a replica that has not caught up, so it passes on a
             // generation that is no longer current. Forced by swapping against whatever is actually there.
-            final long actual = honest.readRegister(blobName).map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
-            final BlobRegisterCasResult forced = honest.compareAndSwapRegister(blobName, actual, newValue);
+            final long actual = ConditionalBlobContainer.of(honest)
+                .readRegister(blobName)
+                .map(BlobRegister::generation)
+                .orElse(BlobRegister.ABSENT_GENERATION);
+            final BlobRegisterCasResult forced = ConditionalBlobContainer.of(honest).compareAndSwapRegister(blobName, actual, newValue);
             if (forced.applied()) {
                 // Reported as if the caller's own expected generation had been the current one.
                 return forced;
@@ -312,7 +317,8 @@ public final class MisbehavingBlobContainer extends DelegatingBlobContainer {
             return forced;
         }
 
-        final BlobRegisterCasResult result = honest.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+        final BlobRegisterCasResult result = ConditionalBlobContainer.of(honest)
+            .compareAndSwapRegister(blobName, expectedGeneration, newValue);
 
         if (result.applied() && ambiguousCasEveryNth > 0 && attempt % ambiguousCasEveryNth == 0) {
             throw new AmbiguousOutcomeException(

@@ -15,6 +15,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.InputStreamWithMetadata;
 import org.opensearch.common.blobstore.VersionedBlob;
@@ -487,23 +488,38 @@ public final class CrashPointBlobStore implements BlobStore {
 
         @Override
         public Optional<BlobRegister> readRegister(String blobName) throws IOException {
-            return step(Kind.READ_REGISTER, path(), blobName, () -> inner.readRegister(blobName));
+            return step(Kind.READ_REGISTER, path(), blobName, () -> ConditionalBlobContainer.of(inner).readRegister(blobName));
         }
 
         @Override
         public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
-            return step(Kind.DELETE_REGISTER, path(), blobName, () -> inner.deleteRegisterIfUnchanged(blobName, expectedGeneration));
+            return step(
+                Kind.DELETE_REGISTER,
+                path(),
+                blobName,
+                () -> ConditionalBlobContainer.of(inner).deleteRegisterIfUnchanged(blobName, expectedGeneration)
+            );
         }
 
         @Override
         public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
             throws IOException {
-            return step(Kind.SWAP_REGISTER, path(), blobName, () -> inner.compareAndSwapRegister(blobName, expectedGeneration, newValue));
+            return step(
+                Kind.SWAP_REGISTER,
+                path(),
+                blobName,
+                () -> ConditionalBlobContainer.of(inner).compareAndSwapRegister(blobName, expectedGeneration, newValue)
+            );
         }
 
         @Override
         public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
-            return step(Kind.CREATE_REGISTER, path(), blobName, () -> inner.createRegisterIfAbsent(blobName, value));
+            return step(
+                Kind.CREATE_REGISTER,
+                path(),
+                blobName,
+                () -> ConditionalBlobContainer.of(inner).createRegisterIfAbsent(blobName, value)
+            );
         }
     }
 

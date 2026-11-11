@@ -12,6 +12,7 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.ConditionalDeleteProbe;
@@ -57,7 +58,9 @@ public class ServerlessConditionalDeleteTests extends OpenSearchTestCase {
         plane.createIndex(index("alpha", "uuid-alpha-1"));
         assertTrue(plane.deleteIndex("alpha"));
 
-        final BlobContainer indices = store.blobContainer(RegisterMap.indices(BlobPath.cleanPath()));
+        final ConditionalBlobContainer indices = ConditionalBlobContainer.of(
+            store.blobContainer(RegisterMap.indices(BlobPath.cleanPath()))
+        );
         assertTrue("no tombstone: the register is gone", indices.readRegister("alpha").isEmpty());
         assertTrue("no marker", real(store.blobContainer(RegisterMap.tombstones(BlobPath.cleanPath())).children()).isEmpty());
         final Map<String, BlobContainer> due = real(store.blobContainer(RegisterMap.reclaim(BlobPath.cleanPath())).children());
@@ -186,7 +189,8 @@ public class ServerlessConditionalDeleteTests extends OpenSearchTestCase {
         assertFalse(plane.descriptors().conditionalDelete());
         plane.createIndex(index("alpha", "uuid-alpha-1"));
         assertTrue(plane.deleteIndex("alpha"));
-        final Optional<BlobRegister> left = careless.blobContainer(RegisterMap.indices(BlobPath.cleanPath())).readRegister("alpha");
+        final Optional<BlobRegister> left = ConditionalBlobContainer.of(careless.blobContainer(RegisterMap.indices(BlobPath.cleanPath())))
+            .readRegister("alpha");
         assertTrue("the fallback leaves a tombstone in the register's place", left.isPresent());
         assertTrue(plane.describe("alpha").isEmpty());
     }

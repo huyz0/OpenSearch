@@ -13,6 +13,7 @@ import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
@@ -747,7 +748,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                     // activated the shard between the descriptor's creation and this swap has already
                     // published a commit of its own, and the restored commit must not be reported as in
                     // place when it is not.
-                    final var landed = blobStore.blobContainer(destBase)
+                    final var landed = ConditionalBlobContainer.of(blobStore.blobContainer(destBase))
                         .compareAndSwapRegister(SegmentPublisher.MANIFEST, BlobRegister.ABSENT_GENERATION, restored.toBytes());
                     if (landed.applied() == false) {
                         throw new RestoreConflictException(restoring.getValue(), shard.getKey());

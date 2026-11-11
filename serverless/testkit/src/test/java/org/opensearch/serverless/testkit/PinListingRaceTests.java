@@ -9,6 +9,7 @@
 package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
@@ -40,7 +41,8 @@ public class PinListingRaceTests extends OpenSearchTestCase {
             final var data = metadata.shardData("protected", 0);
             final var files = store.blobContainer(data.add("t=1"));
             files.writeBlobAtomic("old-file", new java.io.ByteArrayInputStream(new byte[] { 1 }), 1L, true);
-            store.blobContainer(data).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
+            ConditionalBlobContainer.of(store.blobContainer(data))
+                .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
             final var captured = new CommitManifest(1L, Map.of("old-file", "t=1"));
             final String id = org.opensearch.common.UUIDs.randomBase64UUID();
             if (pit) {

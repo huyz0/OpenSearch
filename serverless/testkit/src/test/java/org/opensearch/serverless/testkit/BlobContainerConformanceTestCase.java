@@ -10,6 +10,7 @@ package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -79,7 +80,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
     }
 
     public void testPutIfAbsentAdmitsExactlyOneCreator() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         final CountDownLatch start = new CountDownLatch(1);
         final AtomicInteger created = new AtomicInteger();
         final AtomicInteger errors = new AtomicInteger();
@@ -110,7 +111,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
     }
 
     public void testCompareAndSwapAdmitsExactlyOneWinner() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         container.createRegisterIfAbsent("head", bytes("initial"));
         final long generation = container.readRegister("head").orElseThrow().generation();
 
@@ -144,7 +145,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
     }
 
     public void testAStaleGenerationLoses() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         container.createRegisterIfAbsent("head", bytes("v1"));
         final long stale = container.readRegister("head").orElseThrow().generation();
 
@@ -157,7 +158,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
     }
 
     public void testGenerationsIncreaseAndAreVisibleImmediately() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         container.createRegisterIfAbsent("head", bytes("v0"));
 
         long previous = container.readRegister("head").orElseThrow().generation();
@@ -174,7 +175,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
     }
 
     public void testRangedReadsReturnExactlyWhatWasAskedFor() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         final int size = 8192;
         final byte[] content = new byte[size];
         for (int i = 0; i < size; i++) {
@@ -204,7 +205,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
     }
 
     public void testListingIsCompleteAndReportsLengths() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         final Set<String> written = new HashSet<>();
         for (int i = 0; i < 25; i++) {
             final byte[] body = new byte[10 + i];
@@ -223,7 +224,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
     }
 
     public void testAPagedListingWalksEveryBlobOnceInOrder() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         final java.util.TreeSet<String> written = new java.util.TreeSet<>();
         for (int i = 0; i < 37; i++) {
             final String name = "page-" + String.format(java.util.Locale.ROOT, "%03d", (i * 17) % 37);
@@ -276,7 +277,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
      * that existed for the whole walk is returned exactly once. The pages are not a snapshot.
      */
     public void testAPagedWalkSeesChangesAheadOfTheCursorOnly() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         for (String name : java.util.List.of("walk-b", "walk-d", "walk-f", "walk-h")) {
             container.writeBlob(name, new ByteArrayInputStream(new byte[1]), 1, false);
         }
@@ -349,7 +350,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
     }
 
     public void testADeletedRegisterReadsAsAbsent() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         container.createRegisterIfAbsent("head", bytes("v1"));
         assertTrue(container.readRegister("head").isPresent());
 
@@ -368,7 +369,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
      * @throws Exception if the backend cannot be reached
      */
     public void testPutIfAbsentBlobWritesAdmitExactlyOne() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         for (int round = 0; round < 5; round++) {
             final String name = "slot-" + round;
             final int contenders = Math.min(8, contenders());
@@ -408,7 +409,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
      * be removed outright rather than tombstoned.
      */
     public void testARecreatedRegisterDoesNotReuseAGeneration() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         container.createRegisterIfAbsent("head", bytes("first"));
         final long before = container.readRegister("head").orElseThrow().generation();
         container.deleteBlobsIgnoringIfNotExists(java.util.List.of("head"));
@@ -425,7 +426,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
 
     /** A conditional delete removes a register only at the generation it holds. */
     public void testAConditionalDeleteRefusesAStaleGeneration() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         container.createRegisterIfAbsent("head", bytes("v1"));
         final long stale = container.readRegister("head").orElseThrow().generation();
         final long current = container.compareAndSwapRegister("head", stale, bytes("v2")).currentGeneration();
@@ -449,7 +450,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
      * @throws Exception if the backend cannot be reached
      */
     public void testAConcurrentHistoryWithDeletesIsLinearizable() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         assumeTrue(
             "this store does not honour a conditional delete, so nothing relies on its deletes being linearizable: a node on it keeps tombstones",
             honoursConditionalDelete()
@@ -548,16 +549,19 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
                 return existed;
             }
         };
-        careless.createRegisterIfAbsent("careless", bytes("v0"));
-        final long initial = careless.readRegister("careless").orElseThrow().generation();
+        ConditionalBlobContainer.of(careless).createRegisterIfAbsent("careless", bytes("v0"));
+        final long initial = ConditionalBlobContainer.of(careless).readRegister("careless").orElseThrow().generation();
         final RegisterHistory history = new RegisterHistory();
 
         long invoked = history.invoke();
-        final var moved = careless.compareAndSwapRegister("careless", initial, bytes("v1"));
+        final var moved = ConditionalBlobContainer.of(careless).compareAndSwapRegister("careless", initial, bytes("v1"));
         history.completed(new RegisterHistory.Cas(initial, "v1", moved.applied(), moved.currentGeneration()), invoked);
         invoked = history.invoke();
         // Conditioned on the generation before the swap: a correct store refuses this.
-        history.completed(new RegisterHistory.Delete(initial, careless.deleteRegisterIfUnchanged("careless", initial)), invoked);
+        history.completed(
+            new RegisterHistory.Delete(initial, ConditionalBlobContainer.of(careless).deleteRegisterIfUnchanged("careless", initial)),
+            invoked
+        );
 
         assertFalse(
             "the checker must reject a delete that removed a register at a generation it no longer held",
@@ -586,7 +590,7 @@ public abstract class BlobContainerConformanceTestCase extends OpenSearchTestCas
      * @throws Exception if the backend cannot be reached
      */
     public void testAConcurrentHistoryIsLinearizable() throws Exception {
-        final BlobContainer container = newContainer();
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(newContainer());
         final int workers = Math.min(4, contenders());
         final int callsEach = 12;
 

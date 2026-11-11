@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 
@@ -36,12 +37,12 @@ final class PointInTimeStore {
     private static final Logger LOGGER = LogManager.getLogger(PointInTimeStore.class);
     private static final BytesReference RELEASED = new BytesArray("{\"_released\":true}");
     private final BlobContainer inventory;
-    private final BlobContainer states;
+    private final ConditionalBlobContainer states;
     private final LongSupplier clock;
 
     PointInTimeStore(BlobContainer inventory, BlobContainer states, LongSupplier clock) {
         this.inventory = inventory;
-        this.states = states;
+        this.states = ConditionalBlobContainer.of(states);
         this.clock = clock;
     }
 

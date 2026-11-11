@@ -16,6 +16,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
@@ -361,7 +362,7 @@ public final class ObjectStores {
             delegate.close();
         }
 
-        private final class Counting implements BlobContainer {
+        private final class Counting implements ConditionalBlobContainer {
 
             private final BlobContainer inner;
 
@@ -495,7 +496,7 @@ public final class ObjectStores {
 
             @Override
             public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws java.io.IOException {
-                return count(deletes, () -> inner.deleteRegisterIfUnchanged(blobName, expectedGeneration));
+                return count(deletes, () -> ConditionalBlobContainer.of(inner).deleteRegisterIfUnchanged(blobName, expectedGeneration));
             }
 
             @Override
@@ -618,18 +619,21 @@ public final class ObjectStores {
 
             @Override
             public java.util.Optional<BlobRegister> readRegister(String blobName) throws java.io.IOException {
-                return count(registerReads, () -> inner.readRegister(blobName));
+                return count(registerReads, () -> ConditionalBlobContainer.of(inner).readRegister(blobName));
             }
 
             @Override
             public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
                 throws java.io.IOException {
-                return count(registerWrites, () -> inner.compareAndSwapRegister(blobName, expectedGeneration, newValue));
+                return count(
+                    registerWrites,
+                    () -> ConditionalBlobContainer.of(inner).compareAndSwapRegister(blobName, expectedGeneration, newValue)
+                );
             }
 
             @Override
             public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws java.io.IOException {
-                return count(registerWrites, () -> inner.createRegisterIfAbsent(blobName, value));
+                return count(registerWrites, () -> ConditionalBlobContainer.of(inner).createRegisterIfAbsent(blobName, value));
             }
         }
 
