@@ -120,7 +120,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(nodeSettings("secret-cache-coalescing"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                node.transportSecrets(false);
+                node.secrets().transportSecrets(false);
                 final var rotated = plane.rotateTransportSecret();
                 clock.addAndGet(TTL + 1);
                 store.reset();
@@ -133,7 +133,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
                 try {
                     final var reads = new java.util.ArrayList<java.util.concurrent.Future<MetadataPlane.TransportSecrets>>();
                     for (int i = 0; i < 8; i++) {
-                        reads.add(workers.submit(() -> node.transportSecrets(false)));
+                        reads.add(workers.submit(() -> node.secrets().transportSecrets(false)));
                     }
                     for (var read : reads) {
                         assertEquals(rotated.generation(), read.get(15, java.util.concurrent.TimeUnit.SECONDS).generation());
@@ -144,9 +144,9 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
                     workers.shutdownNow();
                     assertTrue(workers.awaitTermination(10, java.util.concurrent.TimeUnit.SECONDS));
                 }
-                assertEquals(rotated.generation(), node.transportSecrets(false).generation());
+                assertEquals(rotated.generation(), node.secrets().transportSecrets(false).generation());
                 assertEquals(1L, store.registerReads());
-                node.transportSecrets(true);
+                node.secrets().transportSecrets(true);
                 assertEquals("an explicit refresh still reads again", 2L, store.registerReads());
             }
         }
@@ -288,7 +288,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             final Exception refused;
             try (ThreadContext.StoredContext ignored = context.stashContext()) {
                 context.putHeader(MAC_HEADER, tampered);
-                context.putHeader(TOKEN_HEADER, other.transportToken());
+                context.putHeader(TOKEN_HEADER, other.secrets().transportToken());
                 refused = expectThrows(
                     Exception.class,
                     () -> sendRaw(transport, owner.localNode(), write).actionGet(TimeValue.timeValueSeconds(30))
@@ -467,21 +467,21 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             // generation 1, meets a newer one, and re-reads the register rather than refusing.
             final MetadataPlane.TransportSecrets second = plane.rotateTransportSecret();
             assertEquals(first + 1, second.generation());
-            assertEquals("the old secret becomes the previous one", other.transportSecrets(false).current(), second.previous());
-            other.transportSecrets(true);
+            assertEquals("the old secret becomes the previous one", other.secrets().transportSecrets(false).current(), second.previous());
+            other.secrets().transportSecrets(true);
             write(other, "g2-ahead");
             assertTrue(
                 "a sender ahead of the receiver is served",
                 owner.services().client().get(new GetRequest("alpha", "g2-ahead")).actionGet().isExists()
             );
-            assertEquals("and the receiver has caught up", second.generation(), owner.transportSecrets(false).generation());
+            assertEquals("and the receiver has caught up", second.generation(), owner.secrets().transportSecrets(false).generation());
 
             // Rotate again; only the receiver re-reads. The sender signs under generation 2, which is
             // now the previous secret, and is accepted for the window.
             final MetadataPlane.TransportSecrets third = plane.rotateTransportSecret();
-            owner.transportSecrets(true);
-            assertEquals(third.generation(), owner.transportSecrets(false).generation());
-            assertEquals(second.generation(), other.transportSecrets(false).generation());
+            owner.secrets().transportSecrets(true);
+            assertEquals(third.generation(), owner.secrets().transportSecrets(false).generation());
+            assertEquals(second.generation(), other.secrets().transportSecrets(false).generation());
             write(other, "g2-behind");
             assertTrue(
                 "a sender one generation behind is served under the previous secret",
@@ -491,13 +491,13 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             // Rotate once more, receiver re-reads: the sender's generation 2 is now neither current nor
             // previous, and is refused.
             plane.rotateTransportSecret();
-            owner.transportSecrets(true);
+            owner.secrets().transportSecrets(true);
             final Exception stale = expectThrows(Exception.class, () -> write(other, "g2-stale"));
             assertTrue("two generations behind is refused: " + describe(stale), mentions(stale, "secret generation"));
             assertFalse(owner.services().client().get(new GetRequest("alpha", "g2-stale")).actionGet().isExists());
 
             // And the fix is the re-read, not a restart.
-            other.transportSecrets(true);
+            other.secrets().transportSecrets(true);
             write(other, "g4");
             assertTrue(
                 "a sender that re-read is served again",

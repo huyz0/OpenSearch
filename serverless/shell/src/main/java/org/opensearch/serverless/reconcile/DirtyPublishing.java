@@ -266,7 +266,7 @@ final class DirtyPublishing {
 
     java.util.concurrent.ExecutorService publishPool() {
         try {
-            return reconciler.node.threadPool().executor(org.opensearch.serverless.shell.ServerlessNode.PUBLISH_POOL);
+            return reconciler.node.threadPool().executor(org.opensearch.serverless.shell.NodeThreadPools.PUBLISH_POOL);
         } catch (RuntimeException e) {
             return null;
         }
@@ -313,7 +313,7 @@ final class DirtyPublishing {
                 return false;
             }
             synchronized (reconciler.publishLock(shardId)) {
-                reconciler.lastManifests.put(shardId, reconciler.node.publishShard(shardId, head.get().term()));
+                reconciler.lastManifests.put(shardId, reconciler.node.shards().publishShard(shardId, head.get().term()));
             }
         } catch (org.opensearch.serverless.store.StaleWriterException e) {
             // A newer term has already published. This node is a zombie for this shard: it read a

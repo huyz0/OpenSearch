@@ -116,7 +116,7 @@ public class PointInTimeRequestExecutionTests extends OpenSearchTestCase {
                     metadata.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, "{}", null));
                     final var shard = node.activation().activateWriter(metadata, index, 0).orElseThrow();
                     node.writes().index(shard, "doc", "{}");
-                    node.publishShard(shard, metadata.heads().read(index, 0).orElseThrow().term());
+                    node.shards().publishShard(shard, metadata.heads().read(index, 0).orElseThrow().term());
                 }
                 work.accept(node, metadata);
             }
@@ -306,7 +306,7 @@ public class PointInTimeRequestExecutionTests extends OpenSearchTestCase {
             for (int id = 0; id < 2; id++) {
                 final var shard = node.activation().activateWriter(metadata, "two-shards", id).orElseThrow();
                 node.writes().index(shard, "doc-" + id, "{}");
-                node.publishShard(shard, metadata.heads().read("two-shards", id).orElseThrow().term());
+                node.shards().publishShard(shard, metadata.heads().read("two-shards", id).orElseThrow().term());
             }
             final var response = send(node, "POST", "/two-shards/_pit?keep_alive=30s&preference=_shards:0", null);
             assertEquals(response.body(), 501, response.statusCode());

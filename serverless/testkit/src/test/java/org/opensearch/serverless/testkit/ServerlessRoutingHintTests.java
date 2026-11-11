@@ -93,7 +93,7 @@ public class ServerlessRoutingHintTests extends OpenSearchTestCase {
             final Response first = send(coordinator, "PUT", "/alpha/_doc/1", "{\"msg\":\"before\",\"n\":1}");
             assertEquals(first.body(), 201, first.status());
             assertTrue(first.body(), first.body().contains(owner.localNode().getId()));
-            assertEquals(owner.localNode().getId(), coordinator.ownerHint("alpha", 0).orElseThrow());
+            assertEquals(owner.localNode().getId(), coordinator.sightings().ownerHint("alpha", 0).orElseThrow());
             final var headNamingOwner = plane.heads().read("alpha", 0).orElseThrow();
 
             // The owner dies without releasing anything, its lease lapses, and a node the coordinator has
@@ -106,17 +106,17 @@ public class ServerlessRoutingHintTests extends OpenSearchTestCase {
             // The case is a hint refreshed a moment before the owner died -- the coordinator's own hint
             // rebuild read the head while the owner was still alive -- so it is re-noted here, fresh,
             // still naming the dead node. The write below must recover from that without a restart.
-            coordinator.noteHead("alpha", 0, headNamingOwner);
+            coordinator.sightings().noteHead("alpha", 0, headNamingOwner);
 
             // The coordinator still believes the dead node owns the shard, and must recover on its own.
-            assertEquals(owner.localNode().getId(), coordinator.ownerHint("alpha", 0).orElseThrow());
+            assertEquals(owner.localNode().getId(), coordinator.sightings().ownerHint("alpha", 0).orElseThrow());
             final Response afterTakeover = send(coordinator, "PUT", "/alpha/_doc/2?refresh=true", "{\"msg\":\"after\",\"n\":2}");
             assertEquals("a write through a stale hint must reach the new owner: " + afterTakeover.body(), 201, afterTakeover.status());
             assertTrue("and be applied there: " + afterTakeover.body(), afterTakeover.body().contains(successor.localNode().getId()));
             assertEquals(
                 "the hint now names the successor",
                 successor.localNode().getId(),
-                coordinator.ownerHint("alpha", 0).orElseThrow()
+                coordinator.sightings().ownerHint("alpha", 0).orElseThrow()
             );
             assertEquals(1L, ShardOps.hits(successor.searchService(), onSuccessor, "msg", "after"));
 
@@ -157,7 +157,7 @@ public class ServerlessRoutingHintTests extends OpenSearchTestCase {
             final ShardId oldShard = holder.reconciler().openShards().iterator().next();
 
             assertEquals(201, send(coordinator, "PUT", "/alpha/_doc/1", "{\"msg\":\"old\",\"n\":1}").status());
-            assertEquals(holder.localNode().getId(), coordinator.ownerHint("alpha", 0).orElseThrow());
+            assertEquals(holder.localNode().getId(), coordinator.sightings().ownerHint("alpha", 0).orElseThrow());
 
             // Deleted and recreated, as any caller would do it, before the holder's next heartbeat: it
             // still has the first incarnation's shard open under the name.

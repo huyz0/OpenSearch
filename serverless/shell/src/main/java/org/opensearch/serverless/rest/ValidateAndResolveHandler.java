@@ -199,7 +199,7 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
         org.opensearch.serverless.shell.ServerlessNode serving,
         String names
     ) throws IOException {
-        final List<String> wanted = new java.util.ArrayList<>(IndexPatterns.expand(metadata, names, serving.patternCap()));
+        final List<String> wanted = new java.util.ArrayList<>(IndexPatterns.expand(metadata, names, serving.searchSettings().patternCap()));
         wanted.removeIf(serving::isSystemIndex);
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();

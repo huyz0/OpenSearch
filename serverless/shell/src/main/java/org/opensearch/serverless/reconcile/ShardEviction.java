@@ -314,7 +314,7 @@ final class ShardEviction {
         final boolean unchanged = maxSeqNo < 0 || maxSeqNo <= reconciler.lastPublishedMaxSeqNo.getOrDefault(shardId, -1L);
         if (unchanged == false && reconciler.node.fences().isWriteFenced(shardId) == false) {
             synchronized (reconciler.publishLock(shardId)) {
-                reconciler.lastManifests.put(shardId, reconciler.node.publishShard(shardId, head.get().term()));
+                reconciler.lastManifests.put(shardId, reconciler.node.shards().publishShard(shardId, head.get().term()));
             }
         }
         if (reconciler.plane.heads()
