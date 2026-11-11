@@ -45,9 +45,7 @@ final class WriterActivation {
     ) throws Exception {
         node.ensureStarted();
         node.adopt(plane);
-        node.reconciler.setSegmentPublishers(
-            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(node.packSegments)
-        );
+        node.reconciler.setSegmentPublishers(NodePackWiring.publishers(node, plane));
         node.reconciler.setBeforePublish(ServerlessNode.widensRollupsOf(plane));
         node.reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(node.threadPool().generic())
@@ -121,9 +119,7 @@ final class WriterActivation {
         throws Exception {
         node.ensureStarted();
         node.adopt(plane);
-        node.reconciler.setSegmentPublishers(
-            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(node.packSegments)
-        );
+        node.reconciler.setSegmentPublishers(NodePackWiring.publishers(node, plane));
         node.reconciler.setBeforePublish(ServerlessNode.widensRollupsOf(plane));
         node.reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(node.threadPool().generic())
@@ -191,9 +187,7 @@ final class WriterActivation {
             throw new IllegalStateException("node " + node.nodeName + " does not accept writer activation; its roles are " + node.roles);
         }
         node.adopt(plane);
-        node.reconciler.setSegmentPublishers(
-            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(node.packSegments)
-        );
+        node.reconciler.setSegmentPublishers(NodePackWiring.publishers(node, plane));
         node.reconciler.setBeforePublish(ServerlessNode.widensRollupsOf(plane));
         node.reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(node.threadPool().generic())
