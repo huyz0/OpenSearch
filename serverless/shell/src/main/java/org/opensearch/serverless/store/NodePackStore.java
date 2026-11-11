@@ -122,8 +122,22 @@ public final class NodePackStore {
      * @param name the segment blob's name
      * @param length its exact length
      * @param source opens its bytes from the first, each time it is called
+     * @param indexName the index's name, which collection needs to find the shard's manifest
      */
-    public record Part(String indexUuid, int shard, String name, long length, NodePackInputStream.Source source) {
+    public record Part(String indexUuid, int shard, String name, long length, NodePackInputStream.Source source, String indexName) {
+
+        /**
+         * A part whose index name is not recorded, so collection can never judge its pack unreferenced.
+         *
+         * @param indexUuid the index
+         * @param shard the shard
+         * @param name the block's name
+         * @param length its length
+         * @param source its bytes
+         */
+        public Part(String indexUuid, int shard, String name, long length, NodePackInputStream.Source source) {
+            this(indexUuid, shard, name, length, source, "");
+        }
 
         /**
          * Validates a part.
@@ -133,9 +147,11 @@ public final class NodePackStore {
          * @param name the block's name
          * @param length its length
          * @param source its bytes
+         * @param indexName the index's name, or empty
          */
         public Part {
             Objects.requireNonNull(source, "source");
+            Objects.requireNonNull(indexName, "indexName");
             if (length < 0L) {
                 throw new IllegalArgumentException("a pack part has a length, got " + length);
             }
@@ -155,7 +171,7 @@ public final class NodePackStore {
     public NodePackBlob.Header write(long epoch, long ordinal, List<Part> parts) throws IOException {
         final List<NodePackBlob.Planned> planned = new ArrayList<>(parts.size());
         for (Part part : parts) {
-            planned.add(new NodePackBlob.Planned(part.indexUuid(), part.shard(), part.name(), part.length()));
+            planned.add(new NodePackBlob.Planned(part.indexUuid(), part.shard(), part.name(), part.length(), part.indexName()));
         }
         final NodePackBlob.Encoded encoded = NodePackBlob.encode(nodeId, epoch, ordinal, planned);
         final List<NodePackInputStream.Source> sources = new ArrayList<>(parts.size());
