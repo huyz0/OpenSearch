@@ -139,14 +139,18 @@ exceptions rather than to conflicts. See `STATUS.md`.
 ## One write log per node
 
 `serverless.wal.node_log.enabled` (off by default) sends every write a node acknowledges to one log of its own,
-rather than one per shard: a window of `serverless.wal.node_log.window_millis` is one PUT however many shards it
-writes. Blobs are named `nodelog/<node>/e=<epoch>/<ordinal>`, and the last header before a fence says where every
+rather than one per shard: a window of `serverless.wal.node_log.window_millis` (100, 200 or 250; 250 by default)
+is one PUT however many shards it writes. Blobs are named `nodelog/<node>/e=<epoch>/<ordinal>`, and the last header before a fence says where every
 unpublished record of every shard is, so a successor reads it without a listing.
 
-- **Publishing.** A shard is published once its oldest unpublished write is
-  `serverless.wal.node_log.publish_max_age_millis` old (a minute by default), once it holds
-  `serverless.publish.max_unpublished_operations`, or the first time this node writes it. Searches read published
-  commits, so the age is also the longest a write takes to be searchable.
+- **Publishing.** A shard is published once its oldest unpublished write is as old as its index's
+  `refresh_interval`, rounded up to the next window, so the shards that come due together go out in one pass. An
+  index that sets no interval waits `serverless.wal.node_log.publish_max_age_millis` (a second by default); one that
+  sets `-1` is published only by size or on release. A shard is also published once it holds
+  `serverless.publish.max_unpublished_operations`, and the first time this node writes it. Searches read published
+  commits, so the interval is also how long a write takes to be searchable. Each publish of a busy shard is five or
+  more PUTs: at a one-second interval that is several PUTs a second per busy shard, far more than its log, so an
+  index that can wait ten or thirty seconds costs much less.
 - **Deleting.** A node deletes its own blobs behind the trim point its lease records: the oldest record any of its
   shards has not published. A survivor deletes a dead node's log once every shard it names has published past it.
   Neither lists.
