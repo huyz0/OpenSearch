@@ -17,6 +17,7 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.ReconcileScheduler;
+import org.opensearch.serverless.reconcile.TickResult;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -797,13 +798,13 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
 
-            final BackgroundReconciler.TickResult acquiring = loop.tick(clock.get());
+            final TickResult acquiring = loop.tick(clock.get());
             assertEquals("tick must still activate", 1, acquiring.activated().size());
 
             final ShardId shardId = node.reconciler().openShards().iterator().next();
             node.index(shardId, "1", "{\"msg\":\"compose\",\"n\":1}");
 
-            final BackgroundReconciler.TickResult publishing = loop.tick(clock.get() + 1_000);
+            final TickResult publishing = loop.tick(clock.get() + 1_000);
             assertEquals("tick must still publish", 1, publishing.published().size());
             assertTrue("tick must still renew, so nothing is lost", publishing.released().isEmpty());
             assertTrue("tick must still refresh hints", publishing.hintCount() >= 0);
