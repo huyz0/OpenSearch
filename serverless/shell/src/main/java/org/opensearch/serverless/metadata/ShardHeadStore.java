@@ -146,6 +146,26 @@ public final class ShardHeadStore {
      * @throws IOException if the register cannot be read or written
      */
     public Acquisition acquire(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid) throws IOException {
+        return acquire(indexName, shardId, nodeId, ephemeralId, indexUuid, false);
+    }
+
+    /**
+     * Attempts to take ownership of a shard of one incarnation of an index, saying which write log the taker writes.
+     *
+     * <p>A taker that writes its node's log keeps a head's word that the shard's own log is quiet: it will write nothing
+     * there. One that writes the shard's own log drops it, so whoever takes the shard after it closes that log again.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param nodeId the acquiring node
+     * @param ephemeralId the acquiring node's ephemeral id
+     * @param indexUuid the uuid of the index being activated, or null to skip the check
+     * @param writesNodeLog whether the acquiring node writes its node's log rather than the shard's own
+     * @return whether the caller acquired it, and the authoritative head either way
+     * @throws IOException if the register cannot be read or written
+     */
+    public Acquisition acquire(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid, boolean writesNodeLog)
+        throws IOException {
         final String name = RegisterMap.shardHeadBlob(indexName, shardId);
         final long now = clock.getAsLong();
         final Optional<BlobRegister> existing = container.readRegister(name);
@@ -186,7 +206,7 @@ public final class ShardHeadStore {
             ? new ShardHead(indexName, shardId, current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid)
             : new ShardHead(indexName, shardId, current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid).withWriters(
                 current.writers()
-            ).withWriter(current.ownerNodeId());
+            ).withWriter(current.ownerNodeId()).withShardLogQuietSince(writesNodeLog ? current.shardLogQuietSince() : -1L);
         final BlobRegisterCasResult result = container.compareAndSwapRegister(name, existing.get().generation(), next.toBytes());
         if (result.applied()) {
             return Acquisition.won(next, otherIncarnation ? null : current.ownerNodeId());
@@ -232,7 +252,7 @@ public final class ShardHeadStore {
             current.ownerEphemeralId(),
             clock.getAsLong() + leaseTtlMillis,
             current.indexUuid()
-        ).withWriters(current.writers());
+        ).withWriters(current.writers()).withShardLogQuietSince(current.shardLogQuietSince());
         final BlobRegisterCasResult result = container.compareAndSwapRegister(name, existing.get().generation(), renewed.toBytes());
         return result.applied() ? Optional.of(renewed) : Optional.empty();
     }
@@ -268,6 +288,38 @@ public final class ShardHeadStore {
             return true;
         }
         return container.compareAndSwapRegister(name, existing.get().generation(), current.withWriters(List.of()).toBytes()).applied();
+    }
+
+    /**
+     * Records that the shard's own write log has gone quiet, for an owner that writes its node's log and has closed every
+     * term of the shard's own log and published whatever it replayed from it. Later owners that write their node's log
+     * then open without listing it. A lost swap changes nothing: the head moved on, and its next owner closes the log.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param nodeId the owner
+     * @param expectedTerm the term the owner holds
+     * @return true if the head says so afterwards
+     * @throws IOException if the register cannot be read or written
+     */
+    public boolean markShardLogQuiet(String indexName, int shardId, String nodeId, long expectedTerm) throws IOException {
+        final String name = RegisterMap.shardHeadBlob(indexName, shardId);
+        final Optional<BlobRegister> existing = container.readRegister(name);
+        if (existing.isEmpty()) {
+            return false;
+        }
+        final ShardHead current;
+        try (InputStream in = existing.get().value().streamInput()) {
+            current = ShardHead.fromStream(in);
+        }
+        if (nodeId.equals(current.ownerNodeId()) == false || current.term() != expectedTerm) {
+            return false;
+        }
+        if (current.shardLogQuiet()) {
+            return true;
+        }
+        return container.compareAndSwapRegister(name, existing.get().generation(), current.withShardLogQuietSince(expectedTerm).toBytes())
+            .applied();
     }
 
     /**
@@ -380,7 +432,7 @@ public final class ShardHeadStore {
         // index sees a head from the previous one and overwrites it, exactly as it would an owned one.
         final ShardHead released = new ShardHead(indexName, shardId, current.term(), null, null, 0L, current.indexUuid()).withWriters(
             current.writers()
-        ).withWriter(lastWriter);
+        ).withWriter(lastWriter).withShardLogQuietSince(current.shardLogQuietSince());
         return container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied();
     }
 
@@ -422,7 +474,7 @@ public final class ShardHeadStore {
         // The dead owner's log may hold what it never published: whoever takes the shard next reads it.
         final ShardHead released = new ShardHead(indexName, shardId, current.term() + 1, null, null, 0L, current.indexUuid()).withWriters(
             current.writers()
-        ).withWriter(deadNodeId);
+        ).withWriter(deadNodeId).withShardLogQuietSince(current.shardLogQuietSince());
         if (container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied() == false) {
             return Optional.empty();
         }

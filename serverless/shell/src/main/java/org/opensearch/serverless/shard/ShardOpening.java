@@ -165,6 +165,9 @@ final class ShardOpening {
                 lap.run();
 
                 List<String> armedWriters = null;
+                // Whether this open closed the shard's own log and replayed it, as a writer of its node's log: once what it
+                // replayed is published, the head can say the log is quiet, and later opens skip it.
+                boolean closedShardLog = false;
                 if (replayWal && reconciler.walStores != null) {
                     // Armed for exactly the window in which the engine is built and recovery runs, which is
                     // the only window in which core will accept operations carrying their own sequence
@@ -188,11 +191,21 @@ final class ShardOpening {
                     // costs a listing for a term already fenced, and covers a shard reopened without passing
                     // through an acquisition.
                     final Long fencedAt = reconciler.olderTermsFenced.remove(shardId.getIndexName() + "#" + shardId.id());
-                    if (fencedAt == null || fencedAt != shardHeadTerm) {
-                        log.fenceOlderTerms(shardHeadTerm);
+                    // Unless the head this node took says the shard's own log is quiet and this node writes its node's
+                    // log: then every term of the shard's log is closed and published already, and nothing will be written
+                    // there at this term, so there is nothing to fence or replay -- and the listings that would find so are
+                    // most of what an open cost in listings.
+                    final Long quietAt = reconciler.shardLogQuietAt.remove(shardId.getIndexName() + "#" + shardId.id());
+                    if (reconciler.nodeLog != null && quietAt != null && quietAt == shardHeadTerm) {
+                        log.beginQuiet(shardHeadTerm);
+                    } else {
+                        if (fencedAt == null || fencedAt != shardHeadTerm) {
+                            log.fenceOlderTerms(shardHeadTerm);
+                        }
+                        final java.util.function.BiPredicate<ShardId, Long> check = reconciler.ownsAtTerm;
+                        log.establish(shardHeadTerm, check == null ? null : () -> check.test(shardId, shardHeadTerm));
+                        closedShardLog = reconciler.nodeLog != null;
                     }
-                    final java.util.function.BiPredicate<ShardId, Long> check = reconciler.ownsAtTerm;
-                    log.establish(shardHeadTerm, check == null ? null : () -> check.test(shardId, shardHeadTerm));
                 }
                 lap.run();
                 try {
@@ -247,6 +260,19 @@ final class ShardOpening {
                         reconciler.publishedThroughAtOpen.put(shardId, restoredCheckpoint);
                     } else {
                         reconciler.publishedThroughAtOpen.remove(shardId);
+                    }
+                }
+                if (closedShardLog) {
+                    if (shard.seqNoStats().getMaxSeqNo() <= restoredCheckpoint) {
+                        // Nothing replayed past the commit: the shard's own log holds nothing it lacks.
+                        try {
+                            reconciler.nodeLog.shardLogQuiet(shardId, shardHeadTerm);
+                        } catch (IOException | RuntimeException e) {
+                            // The next owner closes the shard's log again, which costs listings, never records.
+                            ShardReconciler.logger.debug("could not record that " + shardId + "'s own log is quiet", e);
+                        }
+                    } else {
+                        reconciler.shardLogQuietOnPublish.put(shardId, shardHeadTerm);
                     }
                 }
                 reconciler.open.put(shardId, shard);

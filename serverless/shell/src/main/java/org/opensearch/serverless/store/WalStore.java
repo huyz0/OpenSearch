@@ -83,6 +83,11 @@ public final class WalStore {
 
     private final AtomicLong ordinal = new AtomicLong();
     private volatile long seededTerm = -1L;
+    /**
+     * Set by {@link #beginQuiet}: this shard's writer writes its node's log, and this log holds nothing to fence, replay
+     * or truncate. Cleared by {@link #establish}.
+     */
+    private volatile boolean quiet;
     /** Set by any failed or ambiguous append: this instance never appends to that term again. See {@link #append}. */
     private volatile boolean poisoned;
     /** The fences this instance knows of in its own term, which truncation must never delete. */
@@ -279,6 +284,11 @@ public final class WalStore {
     }
 
     private void appendOne(long term, byte[] bytes) throws IOException {
+        if (quiet) {
+            // Begun without a fence of its own, for a writer that writes its node's log: a record here would stand where no
+            // fence closes it.
+            throw new IOException("this log was begun quiet for term " + term + ", by a writer that writes its node's log");
+        }
         if (poisoned) {
             throw new IOException("this log writer stopped appending to term " + term + " after an earlier append failed or it was fenced");
         }
@@ -337,6 +347,7 @@ public final class WalStore {
      * @throws IOException if the fence cannot be placed, or this node no longer owns the term
      */
     public synchronized void establish(long term, java.util.function.BooleanSupplier stillOwner) throws IOException {
+        quiet = false;
         final long fence = fence(term, true);
         ownFences.add(WalLayout.name(fence));
         ordinal.set(fence);
@@ -350,6 +361,31 @@ public final class WalStore {
             poisoned = true;
             throw new IOException("term " + term + " has been taken over; this node will not write under it");
         }
+    }
+
+    /**
+     * Begins a term for a writer that writes its node's log, on a shard whose head says this log is quiet: every term of it
+     * is closed and holds nothing a published commit lacks, and every owner since has written its node's log. Nothing is
+     * fenced, listed or replayed, and this instance appends nothing; a publish truncates nothing.
+     *
+     * @param term the term the writer holds
+     */
+    public synchronized void beginQuiet(long term) {
+        quiet = true;
+        seededTerm = term;
+        poisoned = false;
+        ordinal.set(0L);
+        publishedUpTo = 0L;
+        previousSnapshot = List.of();
+    }
+
+    /**
+     * Whether this log was begun quiet; see {@link #beginQuiet}.
+     *
+     * @return true if it was
+     */
+    public boolean quiet() {
+        return quiet;
     }
 
     /**
@@ -456,6 +492,9 @@ public final class WalStore {
 
     /** Reads fenced history without retaining decoded records between read windows. */
     public void forEachReplayableAfterFencing(org.opensearch.common.CheckedConsumer<WalRecord, IOException> consumer) throws IOException {
+        if (quiet) {
+            return;
+        }
         // One listing of the log's root says which terms exist and whether any legacy seal does: the seals
         // directory is listed only when it is there, which on a log begun after fences is never.
         final Map<String, BlobContainer> children = blobStore.blobContainer(shardBase.add("wal")).children();
@@ -832,6 +871,9 @@ public final class WalStore {
      * @throws IOException if listing or deleting fails
      */
     public int onPublished(long term) throws IOException {
+        if (quiet && seededTerm == term) {
+            return 0;
+        }
         // No listing. Within a term there is exactly one writer and this instance seeded its ordinal from
         // the container, so the records that exist are exactly the ordinals up to the counter -- less
         // whatever an earlier publish already dropped, which is what publishedUpTo remembers. A listing
