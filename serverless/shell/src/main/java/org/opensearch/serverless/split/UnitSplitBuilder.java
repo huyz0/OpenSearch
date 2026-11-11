@@ -78,15 +78,8 @@ public final class UnitSplitBuilder {
      * @param checkpoint the local checkpoint of the old unit's commit, which both halves' commits carry: a record past it
      *     is not in either half yet
      */
-    public record Built(
-        UnitLayout.Split split,
-        CommitManifest source,
-        CommitManifest left,
-        CommitManifest right,
-        long leftDocs,
-        long rightDocs,
-        long checkpoint
-    ) {
+    public record Built(UnitLayout.Split split, CommitManifest source, CommitManifest left, CommitManifest right, long leftDocs,
+        long rightDocs, long checkpoint) {
     }
 
     /**
