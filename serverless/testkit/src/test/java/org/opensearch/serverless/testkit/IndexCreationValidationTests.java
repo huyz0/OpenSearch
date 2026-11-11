@@ -41,7 +41,12 @@ public class IndexCreationValidationTests extends OpenSearchTestCase {
         withNode((node, metadata) -> {
             final Exception failure = expectThrows(
                 Exception.class,
-                () -> node.client().admin().indices().create(new CreateIndexRequest("invalid").mapping(INVALID_MAPPING)).actionGet()
+                () -> node.services()
+                    .client()
+                    .admin()
+                    .indices()
+                    .create(new CreateIndexRequest("invalid").mapping(INVALID_MAPPING))
+                    .actionGet()
             );
             assertEquals(failure.toString(), RestStatus.BAD_REQUEST, org.opensearch.ExceptionsHelper.status(failure));
             assertTrue(metadata.describe("invalid").isEmpty());

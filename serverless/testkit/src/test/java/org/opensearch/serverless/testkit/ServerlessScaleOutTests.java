@@ -105,26 +105,26 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             for (String index : List.of("i0", "i1", "i2", "i3")) {
                 fullLoop.activateOnDemand(List.of(Map.entry(index, 0)));
             }
-            assertEquals(4, full.capacity().held());
+            assertEquals(4, full.nodeCapacity().capacity().held());
 
             // A minute on, every shard on the full node is past its grace, and the other member holds nothing.
             clock.addAndGet(60_000L);
             full.leases().renewLease(plane);
             roomy.leases().renewLease(plane);
             plane.membership().refresh();
-            assertTrue("the empty member has room", full.memberWithRoom(plane).isPresent());
+            assertTrue("the empty member has room", full.nodeCapacity().memberWithRoom(plane).isPresent());
             assertEquals("a tenth of the cap a pass, at least one", 1, fullLoop.handOffToMemberWithRoom());
-            assertEquals(1, full.capacity().handedOff());
-            assertEquals(3, full.capacity().held());
+            assertEquals(1, full.nodeCapacity().capacity().handedOff());
+            assertEquals(3, full.nodeCapacity().capacity().held());
 
             // Full again, a write for a shard nobody holds is taken by the member with room.
             fullLoop.activateOnDemand(List.of(Map.entry("i4", 0)));
             full.leases().renewLease(plane);
             plane.membership().refresh();
-            assertTrue(full.nearlyFull());
+            assertTrue(full.nodeCapacity().nearlyFull());
             final int status = send(full, "PUT", "/fresh/_doc/1", "{\"msg\":\"x\"}");
             assertEquals(201, status);
-            assertEquals("the write went to the member with room", 1, full.capacity().writesSteered());
+            assertEquals("the write went to the member with room", 1, full.nodeCapacity().capacity().writesSteered());
             assertEquals(roomy.localNode().getId(), plane.heads().read("fresh", 0).orElseThrow().ownerNodeId());
             assertFalse(full.reconciler().openShards().stream().anyMatch(s -> s.getIndexName().equals("fresh")));
             fullScheduler.close();
@@ -175,7 +175,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             b.leases().renewLease(plane);
 
             assertTrue("not taken", aLoop.activateOnDemand(List.of(Map.entry("theirs", 0))).isEmpty());
-            assertEquals("and nothing evicted for it", 0, a.capacity().evicted());
+            assertEquals("and nothing evicted for it", 0, a.nodeCapacity().capacity().evicted());
             assertTrue(a.reconciler().openShards().stream().anyMatch(s -> s.getIndexName().equals("mine")));
         }
     }
@@ -215,8 +215,12 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             b.leases().renewLease(plane);
             plane.membership().refresh();
 
-            final String winnerId = a.takeoverWinner(plane, "orphan", 0, deadId).orElseThrow();
-            assertEquals("every member names the same one", winnerId, b.takeoverWinner(plane, "orphan", 0, deadId).orElseThrow());
+            final String winnerId = a.nodeCapacity().takeoverWinner(plane, "orphan", 0, deadId).orElseThrow();
+            assertEquals(
+                "every member names the same one",
+                winnerId,
+                b.nodeCapacity().takeoverWinner(plane, "orphan", 0, deadId).orElseThrow()
+            );
             final ServerlessNode winner = winnerId.equals(a.localNode().getId()) ? a : b;
             final ServerlessNode other = winner == a ? b : a;
             final BackgroundReconciler otherLoop = other == a ? aLoop : bLoop;
@@ -225,7 +229,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
                 "a doubt on the other survivor is left to the one named",
                 otherLoop.activateOnDemand(List.of(Map.entry("orphan", 0))).isEmpty()
             );
-            assertEquals(1, other.takeoverRouting()[1]);
+            assertEquals(1, other.nodeCapacity().takeoverRouting()[1]);
             assertEquals(deadId, plane.heads().read("orphan", 0).orElseThrow().ownerNodeId());
             assertEquals(
                 "the second look on the other survivor leaves it too",
@@ -236,7 +240,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
 
             final int status = send(other, "PUT", "/orphan/_doc/1", "{\"msg\":\"x\"}");
             assertEquals(201, status);
-            assertEquals("routed once, to the member named", 1, other.takeoverRouting()[0]);
+            assertEquals("routed once, to the member named", 1, other.nodeCapacity().takeoverRouting()[0]);
             assertEquals(winnerId, plane.heads().read("orphan", 0).orElseThrow().ownerNodeId());
             assertFalse(other.reconciler().openShards().stream().anyMatch(s -> s.getIndexName().equals("orphan")));
             aScheduler.close();
@@ -263,7 +267,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             alone.leases().renewLease(plane);
             plane.membership().refresh();
             assertEquals(1, loop.activateOnDemand(List.of(Map.entry("orphan", 0))).size());
-            assertEquals(0, alone.takeoverRouting()[1]);
+            assertEquals(0, alone.nodeCapacity().takeoverRouting()[1]);
         }
     }
 
@@ -314,17 +318,17 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
                 node.leases().renewLease(plane);
             }
             plane.membership().refresh();
-            assertFalse("well short of its cap", heavy.nearlyFull());
-            assertTrue("8 against a mean of 10/3", heavy.aboveFleetShare(plane));
-            assertEquals(empty.localNode().getId(), heavy.memberBelowMean(plane).orElseThrow());
+            assertFalse("well short of its cap", heavy.nodeCapacity().nearlyFull());
+            assertTrue("8 against a mean of 10/3", heavy.nodeCapacity().aboveFleetShare(plane));
+            assertEquals(empty.localNode().getId(), heavy.nodeCapacity().memberBelowMean(plane).orElseThrow());
 
             assertEquals("a tenth of the cap a pass", 2, heavyLoop.handOffToMemberWithRoom());
-            assertEquals(6, heavy.capacity().held());
-            assertEquals(2, heavy.capacity().handedOff());
+            assertEquals(6, heavy.nodeCapacity().capacity().held());
+            assertEquals(2, heavy.nodeCapacity().capacity().handedOff());
 
             final int status = send(heavy, "PUT", "/fresh/_doc/1", "{\"msg\":\"x\"}");
             assertEquals(201, status);
-            assertEquals("the write went to the member below the mean", 1, heavy.capacity().writesSteered());
+            assertEquals("the write went to the member below the mean", 1, heavy.nodeCapacity().capacity().writesSteered());
             assertEquals(empty.localNode().getId(), plane.heads().read("fresh", 0).orElseThrow().ownerNodeId());
 
             // Down to the mean's band, and no further: it stops handing off once it is within it.
@@ -336,18 +340,18 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
                 heavy.leases().renewLease(plane);
                 plane.membership().refresh();
             }
-            final double mean = heavy.fleetMeanHeld(plane);
+            final double mean = heavy.nodeCapacity().fleetMeanHeld(plane);
             assertTrue(
                 "within the band, or under the share of the cap the mean matters from: "
-                    + heavy.capacity().held()
+                    + heavy.nodeCapacity().capacity().held()
                     + " against a mean of "
                     + mean,
-                heavy.capacity().held() <= Math.max(
+                heavy.nodeCapacity().capacity().held() <= Math.max(
                     Math.ceil(mean * ServerlessNode.HAND_OFF_ABOVE_MEAN),
                     cap * ServerlessNode.MEAN_MATTERS_FROM
                 )
             );
-            assertFalse("and so no longer handing off", heavy.aboveFleetShare(plane));
+            assertFalse("and so no longer handing off", heavy.nodeCapacity().aboveFleetShare(plane));
             heavyScheduler.close();
             emptyScheduler.close();
         }
@@ -385,33 +389,33 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             for (int i = 0; i < cap; i++) {
                 loop.activateOnDemand(List.of(Map.entry("own" + i, 0)));
             }
-            assertEquals(cap, survivor.capacity().held());
+            assertEquals(cap, survivor.nodeCapacity().capacity().held());
 
             // The dead member's lease runs out; the survivor's own shards are all past their grace.
             clock.addAndGet(TTL + 1);
             survivor.leases().renewLease(plane);
             plane.membership().refresh();
             assertEquals(2, loop.activateOnDemand(List.of(Map.entry("dead0", 0), Map.entry("dead1", 0))).size());
-            assertEquals("past the cap, within the ceiling", cap + 2, survivor.capacity().held());
-            assertEquals("nothing evicted on the take path", 0, survivor.capacity().evicted());
+            assertEquals("past the cap, within the ceiling", cap + 2, survivor.nodeCapacity().capacity().held());
+            assertEquals("nothing evicted on the take path", 0, survivor.nodeCapacity().capacity().evicted());
             assertEquals(2, survivor.takeoversOvercommitted());
 
             // The passes after bring it back to the cap, a tenth of the cap a pass, and never the shards just taken.
             int passes = 0;
-            while (survivor.capacity().held() > cap && passes < 5) {
+            while (survivor.nodeCapacity().capacity().held() > cap && passes < 5) {
                 loop.trimToCap();
                 passes++;
             }
-            assertEquals("back to the cap within a few passes", cap, survivor.capacity().held());
+            assertEquals("back to the cap within a few passes", cap, survivor.nodeCapacity().capacity().held());
             for (String index : List.of("dead0", "dead1")) {
                 assertTrue(index + " kept", survivor.reconciler().openShards().stream().anyMatch(s -> s.getIndexName().equals(index)));
             }
 
             // Ordinary demand is not a takeover: at the cap it evicts first, as before.
-            final long evictedBefore = survivor.capacity().evicted();
+            final long evictedBefore = survivor.nodeCapacity().capacity().evicted();
             assertEquals(1, loop.activateOnDemand(List.of(Map.entry("cold", 0))).size());
-            assertTrue("a shard nobody owned is taken by evicting", survivor.capacity().evicted() > evictedBefore);
-            assertTrue(survivor.capacity().held() <= cap);
+            assertTrue("a shard nobody owned is taken by evicting", survivor.nodeCapacity().capacity().evicted() > evictedBefore);
+            assertTrue(survivor.nodeCapacity().capacity().held() <= cap);
         }
     }
 
@@ -518,7 +522,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
                 node.leases().renewLease(plane);
             }
             plane.membership().refresh();
-            final FleetSize size = a.fleetSize(plane);
+            final FleetSize size = a.nodeCapacity().fleetSize(plane);
             assertEquals(2, size.members());
             return size.wanted();
         }
@@ -550,9 +554,9 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             a.leases().renewLease(plane);
             b.leases().renewLease(plane);
             plane.membership().refresh();
-            assertTrue(a.memberWithRoom(plane).isEmpty());
+            assertTrue(a.nodeCapacity().memberWithRoom(plane).isEmpty());
             assertEquals(0, aLoop.handOffToMemberWithRoom());
-            assertEquals(2, a.capacity().held());
+            assertEquals(2, a.nodeCapacity().capacity().held());
         }
     }
 

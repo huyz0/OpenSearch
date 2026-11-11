@@ -615,7 +615,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(plainSettings("authz-none"))) {
             node.startup().start();
             node.setMetadataPlane(plane);
-            assertTrue("no filters", node.actionGate().isEmpty());
+            assertTrue("no filters", node.services().actionGate().isEmpty());
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());

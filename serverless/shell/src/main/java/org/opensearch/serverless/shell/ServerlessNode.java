@@ -18,9 +18,7 @@ import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.network.NetworkModule;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.common.util.BigArrays;
 import org.opensearch.common.util.io.IOUtils;
-import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
@@ -266,107 +264,18 @@ public final class ServerlessNode implements Closeable {
     final java.util.concurrent.atomic.AtomicLong writesSteered = new java.util.concurrent.atomic.AtomicLong();
 
     /**
-     * Returns how full this node is and what fullness has cost.
-     *
-     * @return the figures
-     */
-    public Capacity capacity() {
-        return new Capacity(
-            admission.maxShardsHeld(),
-            reconciler == null ? 0 : reconciler.heldShards().size(),
-            readerOpensRefusedAtCap.get(),
-            activationsRefusedAtCap.get(),
-            evictedForRoom.get(),
-            handedOff.get(),
-            writesSteered.get()
-        );
-    }
-
-    /**
-     * Counts a writer activation refused at the cap.
-     *
-     * @param indexName the index
-     * @param shard the shard
-     */
-    public void noteActivationRefusedAtCap(String indexName, int shard) {
-        activationsRefusedAtCap.incrementAndGet();
-        noteRefusedRecently(indexName, shard);
-    }
-
-    /**
      * When each shard turned away at the cap was last turned away: distinct shards, not refusals. A burst of searches asked
      * for the same shards over and over, and counted as events one minute's refusals said the fleet wanted forty-three nodes.
      */
     final Map<String, Long> refusedShards = new java.util.concurrent.ConcurrentHashMap<>();
 
-    void noteRefusedRecently(String indexName, int shard) {
-        refusedShards.put(shardKey(indexName, shard), System.nanoTime());
-    }
-
-    /**
-     * How many distinct shards this node turned away at its cap in the last minute: writer activations and reader opens.
-     *
-     * @return the count
-     */
-    public int refusedLastMinute() {
-        final long cutoff = System.nanoTime() - java.util.concurrent.TimeUnit.MINUTES.toNanos(1);
-        refusedShards.values().removeIf(at -> at < cutoff);
-        return refusedShards.size();
-    }
-
     /** How long a shard counts as in use after it was last used. */
     public static final long IN_USE_WINDOW_MILLIS = 60_000L;
 
-    /**
-     * How many shards this node used in the last minute: what it holds for demand, rather than as a cache that fills
-     * whatever the load.
-     *
-     * @return the count
-     */
-    public int inUseLastMinute() {
-        if (reconciler == null) {
-            return 0;
-        }
-        final org.opensearch.serverless.metadata.MetadataPlane plane = metadataPlane;
-        final long now = plane == null ? System.currentTimeMillis() : plane.clock().getAsLong();
-        int used = 0;
-        for (org.opensearch.core.index.shard.ShardId shardId : reconciler.openShards()) {
-            final java.util.OptionalLong last = reconciler.lastUsed(shardId);
-            if (last.isPresent() && now - last.getAsLong() < IN_USE_WINDOW_MILLIS) {
-                used++;
-            }
-        }
-        return used;
-    }
-
-    /** The share of a node's cap a fleet sized by {@link #fleetSize} aims to use. */
+    /** The share of a node's cap a fleet sized by {@link NodeCapacity#fleetSize} aims to use. */
     public static final double TARGET_UTILISATION = FleetPlacement.TARGET_UTILISATION;
 
-    /**
-     * Sizes the writer fleet from the load every member renews into its lease. See {@link FleetPlacement#fleetSize}.
-     *
-     * @param plane the metadata plane
-     * @return the members counted and the nodes wanted
-     */
-    public FleetSize fleetSize(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return placement.fleetSize(plane);
-    }
-
-    /**
-     * Counts a shard given up, to make room or for a member with room.
-     *
-     * @param forHandOff true if given up for a member with room
-     */
-    public void noteEvicted(boolean forHandOff) {
-        (forHandOff ? handedOff : evictedForRoom).incrementAndGet();
-    }
-
     final java.util.concurrent.atomic.AtomicLong takeoversOvercommitted = new java.util.concurrent.atomic.AtomicLong();
-
-    /** Counts a dead member's shard taken past the cap, without evicting for it. */
-    public void noteTakeoverOvercommitted() {
-        takeoversOvercommitted.incrementAndGet();
-    }
 
     /**
      * Dead members' shards taken past the cap, since the node started.
@@ -396,142 +305,6 @@ public final class ServerlessNode implements Closeable {
     );
 
     /**
-     * Whether this node holds more than {@link #HAND_OFF_ABOVE} of its cap.
-     *
-     * @return true when nearly full
-     */
-    public boolean nearlyFull() {
-        return placement.nearlyFull();
-    }
-
-    /**
-     * The live writer member with the most room, if any. See {@link FleetPlacement#memberWithRoom}.
-     *
-     * @param plane the metadata plane
-     * @return the member's id
-     */
-    public java.util.Optional<String> memberWithRoom(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return placement.memberWithRoom(plane);
-    }
-
-    /**
-     * Sets whether requests for a dead member's shard go to the one survivor named for it.
-     *
-     * @param route whether to
-     */
-    public void setRouteTakeovers(boolean route) {
-        placement.setRouteTakeovers(route);
-    }
-
-    /**
-     * Whether requests for a dead member's shard go to the one survivor named for it.
-     *
-     * @return true if they do
-     */
-    public boolean routesTakeovers() {
-        return placement.routesTakeovers();
-    }
-
-    /**
-     * Sets how far past its cap a member may take a dead member's shards. See {@link FleetPlacement#setTakeoverOvercommit}.
-     *
-     * @param fraction of the cap
-     */
-    public void setTakeoverOvercommit(double fraction) {
-        placement.setTakeoverOvercommit(fraction);
-    }
-
-    /** Counts a write for a dead member's shard sent to the member that takes it over. */
-    public void noteTakeoverWriteRouted() {
-        placement.noteTakeoverWriteRouted();
-    }
-
-    /** Counts a doubt about a dead member's shard this node left to the member that takes it over. */
-    public void noteTakeoverDoubtLeft() {
-        placement.noteTakeoverDoubtLeft();
-    }
-
-    /**
-     * Writes routed to, and doubts left to, the member that takes a dead member's shard over.
-     *
-     * @return routed, then left
-     */
-    public long[] takeoverRouting() {
-        return placement.takeoverRouting();
-    }
-
-    /**
-     * The member that takes over a shard whose owner's lease has run out. See {@link FleetPlacement#takeoverWinner}.
-     *
-     * @param plane the metadata plane
-     * @param indexName the index
-     * @param shard the shard
-     * @param deadOwner the owner whose lease ran out, left out of the choice
-     * @return the member's id, or empty if no live writer member is known
-     */
-    public java.util.Optional<String> takeoverWinner(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        String indexName,
-        int shard,
-        String deadOwner
-    ) {
-        return placement.takeoverWinner(plane, indexName, shard, deadOwner);
-    }
-
-    /**
-     * Whether a shard is a dead member's that another live member is to take over. See
-     * {@link FleetPlacement#takeoverBelongsElsewhere}.
-     *
-     * @param plane the metadata plane
-     * @param indexName the index
-     * @param shard the shard
-     * @return true to leave it to the member named
-     */
-    public boolean takeoverBelongsElsewhere(org.opensearch.serverless.metadata.MetadataPlane plane, String indexName, int shard) {
-        return placement.takeoverBelongsElsewhere(plane, indexName, shard);
-    }
-
-    /**
-     * The mean of held shards over the live writer members. See {@link FleetPlacement#fleetMeanHeld}.
-     *
-     * @param plane the metadata plane
-     * @return the mean, or -1 if no member says
-     */
-    public double fleetMeanHeld(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return placement.fleetMeanHeld(plane);
-    }
-
-    /**
-     * Whether this node holds far more than its share of the fleet. See {@link FleetPlacement#aboveFleetShare}.
-     *
-     * @param plane the metadata plane
-     * @return true when above its share
-     */
-    public boolean aboveFleetShare(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return placement.aboveFleetShare(plane);
-    }
-
-    /**
-     * The live writer member holding the fewest shards, if below the fleet's mean. See {@link FleetPlacement#memberBelowMean}.
-     *
-     * @param plane the metadata plane
-     * @return the member's id
-     */
-    public java.util.Optional<String> memberBelowMean(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return placement.memberBelowMean(plane);
-    }
-
-    /**
-     * Where this node should send work it would otherwise take, if anywhere. See {@link FleetPlacement#handOffTarget}.
-     *
-     * @param plane the metadata plane
-     * @return the member's id
-     */
-    public java.util.Optional<String> handOffTarget(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return placement.handOffTarget(plane);
-    }
-
-    /**
      * Where writer activations spend their time, summed: reading the descriptor, acquiring the head, marking the rollup
      * entry owned, and opening the shard -- restoring its commit and replaying its log -- of which projecting and applying
      * the local view that names it is a part of its own. With {@link #activationsOpened}
@@ -544,27 +317,6 @@ public final class ServerlessNode implements Closeable {
         new java.util.concurrent.atomic.AtomicLong(),
         new java.util.concurrent.atomic.AtomicLong() };
     final java.util.concurrent.atomic.AtomicLong activationsOpened = new java.util.concurrent.atomic.AtomicLong();
-
-    /**
-     * Writer activations' time by phase, in milliseconds summed since the node started, and how many opened.
-     *
-     * @return describe, acquire, mark owned and open, the count of activations that opened, then the part of open spent on
-     *         the local view
-     */
-    public long[] activationPhaseMillis() {
-        return new long[] {
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[0].get()),
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[1].get()),
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[2].get()),
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[3].get()),
-            activationsOpened.get(),
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[4].get()) };
-    }
-
-    /** Counts a write for an unheld shard sent to a member with room. */
-    public void noteWriteSteered() {
-        writesSteered.incrementAndGet();
-    }
 
     volatile org.opensearch.serverless.reconcile.ReconcileSignals signals = org.opensearch.serverless.reconcile.ReconcileSignals.NONE;
     volatile LocalViewProjector projector;
@@ -665,6 +417,28 @@ public final class ServerlessNode implements Closeable {
      */
     public ReaderServing readers() {
         return readerServing;
+    }
+
+    /**
+     * The services this node builds on demand for its handlers: registries, scripts, pipelines, the client, and the rest.
+     *
+     * @return the services
+     */
+    public NodeServices services() {
+        return services;
+    }
+
+    /** Tracks this node's standing in the fleet. */
+    final NodeCapacity nodeCapacity = new NodeCapacity(this);
+
+    /**
+     * Tracks this node's standing in the fleet: capacity and refusals at the cap, the fleet's size, and where a takeover
+     * or a hand-off should go.
+     *
+     * @return the tracker
+     */
+    public NodeCapacity nodeCapacity() {
+        return nodeCapacity;
     }
 
     /**
@@ -882,7 +656,7 @@ public final class ServerlessNode implements Closeable {
                         Request request,
                         org.opensearch.core.action.ActionListener<Response> listener
                     ) {
-                    client().execute(action, request, listener);
+                    services.client().execute(action, request, listener);
                 }
             };
             // Before the controller, because every handler it registers is wrapped in this.
@@ -1496,142 +1270,6 @@ public final class ServerlessNode implements Closeable {
     void growMapping(org.opensearch.core.index.shard.ShardId shardId, org.opensearch.index.mapper.Mapping addition)
         throws java.io.IOException {
         mappings.growMapping(shardId, addition);
-    }
-
-    /**
-     * The registry that can read a search body. See {@link NodeServices#searchXContentRegistry}.
-     *
-     * @return a registry containing the search parsers
-     */
-    public org.opensearch.core.xcontent.NamedXContentRegistry searchXContentRegistry() {
-        return services.searchXContentRegistry();
-    }
-
-    /**
-     * Returns the search registry with rank-eval's metric parsers added.
-     *
-     * @return a registry that parses a ranking-evaluation body
-     */
-    public org.opensearch.core.xcontent.NamedXContentRegistry rankEvalXContentRegistry() {
-        return services.rankEvalXContentRegistry();
-    }
-
-    /**
-     * The file watcher a plugin is given. See {@link NodeServices#resourceWatcherService}.
-     *
-     * @return the watcher service
-     */
-    public org.opensearch.watcher.ResourceWatcherService resourceWatcherService() {
-        return services.resourceWatcherService();
-    }
-
-    /**
-     * The script service, with Painless and Mustache registered. See {@link NodeServices#scriptService}.
-     *
-     * @return the script service
-     */
-    public org.opensearch.script.ScriptService scriptService() {
-        return services.scriptService();
-    }
-
-    /**
-     * Returns this node's copy of the stored scripts.
-     *
-     * @return the cache
-     */
-    public org.opensearch.serverless.script.StoredScripts storedScripts() {
-        return services.storedScripts();
-    }
-
-    /**
-     * Returns the search-pipeline compiler.
-     *
-     * @return the compiler
-     */
-    public org.opensearch.search.pipeline.ServerlessSearchPipelines searchPipelines() {
-        return services.searchPipelines();
-    }
-
-    /**
-     * Returns the ingest pipeline compiler. See {@link NodeServices#ingestPipelines}.
-     *
-     * @return the pipeline compiler
-     */
-    public org.opensearch.serverless.ingest.IngestPipelines ingestPipelines() {
-        return services.ingestPipelines();
-    }
-
-    /**
-     * The named-writeable registry a plugin is given: the node's own, the one its transport uses.
-     *
-     * @return the registry
-     */
-    public NamedWriteableRegistry namedWriteableRegistry() {
-        return services.namedWriteableRegistry();
-    }
-
-    /**
-     * The index-name resolver a plugin is given, which refuses rather than answering wrongly.
-     *
-     * @return the resolver
-     * @see RefusingIndexNameExpressionResolver
-     */
-    public org.opensearch.cluster.metadata.IndexNameExpressionResolver indexNameExpressionResolver() {
-        return services.indexNameExpressionResolver();
-    }
-
-    /**
-     * What bounds the memory a node's in-flight writes are holding. See {@link NodeServices#indexingPressure}.
-     *
-     * @return the accounting
-     */
-    public org.opensearch.index.IndexingPressure indexingPressure() {
-        return services.indexingPressure();
-    }
-
-    /**
-     * The node's circuit breakers: core's own hierarchy, with core's own defaults.
-     *
-     * @return the breaker service
-     */
-    public org.opensearch.core.indices.breaker.CircuitBreakerService circuitBreakerService() {
-        return services.circuitBreakerService();
-    }
-
-    /**
-     * The node's array allocator, accounting against the node's breakers.
-     *
-     * @return the allocator
-     */
-    public BigArrays bigArrays() {
-        return services.bigArrays();
-    }
-
-    /**
-     * The gate every operation passes through, where a plugin's {@code ActionFilter}s decide.
-     *
-     * @return the gate, which is empty and free when no plugin installed a filter
-     */
-    public ActionGate actionGate() {
-        return services.actionGate();
-    }
-
-    /**
-     * Returns the identity service, which is core's no-op unless a plugin supplied one.
-     *
-     * @return the identity service
-     */
-    public org.opensearch.identity.IdentityService identityService() {
-        return services.identityService();
-    }
-
-    /**
-     * The {@link org.opensearch.transport.client.Client} this node offers to plugins. See {@link NodeServices#client}.
-     *
-     * @return the client
-     */
-    public org.opensearch.transport.client.Client client() {
-        return services.client();
     }
 
     /**

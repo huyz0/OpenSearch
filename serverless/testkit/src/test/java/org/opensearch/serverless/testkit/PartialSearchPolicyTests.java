@@ -141,7 +141,8 @@ public class PartialSearchPolicyTests extends OpenSearchTestCase {
         org.opensearch.common.CheckedBiConsumer<ServerlessNode, SearchSourceBuilder, Exception> work
     ) throws Exception {
         withNodeAndMetadata(plugin, (node, metadata) -> {
-            node.client()
+            node.services()
+                .client()
                 .admin()
                 .indices()
                 .create(
@@ -152,7 +153,8 @@ public class PartialSearchPolicyTests extends OpenSearchTestCase {
                 )
                 .actionGet();
             final var numbers = node.activation().activateWriter(metadata, "numbers", 0).orElseThrow();
-            node.client()
+            node.services()
+                .client()
                 .index(
                     new org.opensearch.action.index.IndexRequest("numbers").id("number")
                         .source("{\"msg\":42}", org.opensearch.common.xcontent.XContentType.JSON)

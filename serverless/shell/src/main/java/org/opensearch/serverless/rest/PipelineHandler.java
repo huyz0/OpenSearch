@@ -129,7 +129,7 @@ public final class PipelineHandler extends BaseRestHandler {
                         simulate(output, serving, store, selected.getId(), jsonSource(selected.getSource(), selected.getXContentType()));
                     });
                 } else if (method == RestRequest.Method.PUT || method == RestRequest.Method.POST) {
-                    final var response = serving.actionGate().run(action, ask, admitted -> {
+                    final var response = serving.services().actionGate().run(action, ask, admitted -> {
                         final var selected = require(admitted, org.opensearch.action.ingest.PutPipelineRequest.class);
                         concreteId(selected.getId());
                         return put(serving, store, selected.getId(), jsonSource(selected.getSource(), selected.getMediaType()));
@@ -143,7 +143,7 @@ public final class PipelineHandler extends BaseRestHandler {
                         channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                     }
                 } else if (method == RestRequest.Method.DELETE) {
-                    final var response = serving.actionGate().run(action, ask, admitted -> {
+                    final var response = serving.services().actionGate().run(action, ask, admitted -> {
                         final var selected = require(admitted, org.opensearch.action.ingest.DeletePipelineRequest.class);
                         concreteId(selected.getId());
                         return delete(store, selected.getId());
@@ -191,14 +191,14 @@ public final class PipelineHandler extends BaseRestHandler {
         String body
     ) throws IOException, IndexAdminHandler.RefusedException {
         try {
-            serving.ingestPipelines().compile(id, body);
+            serving.services().ingestPipelines().compile(id, body);
         } catch (Exception e) {
             throw new IndexAdminHandler.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "invalid_pipeline",
                 (e.getMessage() == null ? e.toString() : e.getMessage())
                     + ". Available processors: "
-                    + String.join(", ", serving.ingestPipelines().available())
+                    + String.join(", ", serving.services().ingestPipelines().available())
             );
         }
         store.put(id, body);
@@ -255,7 +255,7 @@ public final class PipelineHandler extends BaseRestHandler {
         }
         final org.opensearch.ingest.Pipeline pipeline;
         try {
-            pipeline = serving.ingestPipelines().compile(id == null ? "_simulate" : id, source);
+            pipeline = serving.services().ingestPipelines().compile(id == null ? "_simulate" : id, source);
         } catch (Exception e) {
             sendQuietly(
                 channel,
@@ -263,7 +263,7 @@ public final class PipelineHandler extends BaseRestHandler {
                 "invalid_pipeline",
                 (e.getMessage() == null ? e.toString() : e.getMessage())
                     + ". Available processors: "
-                    + String.join(", ", serving.ingestPipelines().available())
+                    + String.join(", ", serving.services().ingestPipelines().available())
             );
             return;
         }
@@ -291,7 +291,7 @@ public final class PipelineHandler extends BaseRestHandler {
                 }
                 final String docSource = toJson((Map<?, ?>) given);
                 try {
-                    final var outcome = serving.ingestPipelines().run(pipeline, index, docId, docSource);
+                    final var outcome = serving.services().ingestPipelines().run(pipeline, index, docId, docSource);
                     if (outcome.dropped() == false) {
                         builder.startObject("doc");
                         builder.field("_index", index);
@@ -422,7 +422,7 @@ public final class PipelineHandler extends BaseRestHandler {
                 return original;
             }
         };
-        final var response = serving.actionGate().run(action, request, admitted -> {
+        final var response = serving.services().actionGate().run(action, request, admitted -> {
             final var pending = new PendingRestChannel(channel);
             work.accept(admitted, pending);
             return pending.response();

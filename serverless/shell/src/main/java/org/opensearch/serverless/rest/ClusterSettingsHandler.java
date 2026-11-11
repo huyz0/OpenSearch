@@ -93,7 +93,8 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
             final var indicesOptions = nativeRequest.indicesOptions();
             return channel -> reader.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
                 try {
-                    final var result = reader.actionGate()
+                    final var result = reader.services()
+                        .actionGate()
                         .run(org.opensearch.action.admin.cluster.state.ClusterStateAction.NAME, nativeRequest, admitted -> {
                             final var selected = (org.opensearch.action.admin.cluster.state.ClusterStateRequest) admitted;
                             final var invalid = selected.validate();
@@ -184,7 +185,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                 if (body.get("transient") instanceof Map<?, ?> transientSettings) {
                     nativeRequest.transientSettings((Map<String, Object>) transientSettings);
                 }
-                final var result = serving.actionGate().run(ClusterUpdateSettingsAction.NAME, nativeRequest, admitted -> {
+                final var result = serving.services().actionGate().run(ClusterUpdateSettingsAction.NAME, nativeRequest, admitted -> {
                     final var selected = (ClusterUpdateSettingsRequest) admitted;
                     final var invalid = selected.validate();
                     if (invalid != null) {

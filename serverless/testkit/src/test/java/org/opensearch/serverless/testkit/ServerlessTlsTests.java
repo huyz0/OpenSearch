@@ -226,8 +226,14 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
             assertTrue("the other node must not own the shard", other.reconciler().openShards().isEmpty());
 
             // Forwarded over TLS: this node does not own the shard, so the write crosses the wire.
-            other.client().index(new IndexRequest("alpha").id("k").source("{\"msg\":\"over tls\",\"n\":1}", XContentType.JSON)).actionGet();
-            assertTrue("and it must actually carry traffic", other.client().get(new GetRequest("alpha", "k")).actionGet().isExists());
+            other.services()
+                .client()
+                .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"over tls\",\"n\":1}", XContentType.JSON))
+                .actionGet();
+            assertTrue(
+                "and it must actually carry traffic",
+                other.services().client().get(new GetRequest("alpha", "k")).actionGet().isExists()
+            );
         }
     }
 
@@ -259,10 +265,13 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
             owner.activation().activateWriter(plane, "alpha", 0);
             other.activation().syncFrom(plane);
 
-            other.client().index(new IndexRequest("alpha").id("k").source("{\"msg\":\"mutual\",\"n\":1}", XContentType.JSON)).actionGet();
+            other.services()
+                .client()
+                .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"mutual\",\"n\":1}", XContentType.JSON))
+                .actionGet();
             assertTrue(
                 "a node that presents a certificate is served",
-                other.client().get(new GetRequest("alpha", "k")).actionGet().isExists()
+                other.services().client().get(new GetRequest("alpha", "k")).actionGet().isExists()
             );
         }
     }
@@ -291,7 +300,8 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
 
             final Exception refused = expectThrows(
                 Exception.class,
-                () -> stranger.client()
+                () -> stranger.services()
+                    .client()
                     .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"stranger\",\"n\":1}", XContentType.JSON))
                     .actionGet()
             );
@@ -299,7 +309,7 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
             // And nothing was written: a refusal that still applied the write would be the worst outcome.
             assertFalse(
                 "a refused peer must not have written anything",
-                owner.client().get(new GetRequest("alpha", "k")).actionGet().isExists()
+                owner.services().client().get(new GetRequest("alpha", "k")).actionGet().isExists()
             );
         }
     }

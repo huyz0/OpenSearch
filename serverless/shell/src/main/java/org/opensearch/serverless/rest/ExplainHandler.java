@@ -131,7 +131,7 @@ public final class ExplainHandler extends BaseRestHandler {
             try (
                 XContentParser parser = XContentType.JSON.xContent()
                     .createParser(
-                        serving.searchXContentRegistry(),
+                        serving.services().searchXContentRegistry(),
                         DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
                         request.content().streamInput()
                     )

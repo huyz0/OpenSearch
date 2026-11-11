@@ -83,7 +83,7 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
             assertEquals(refused.body(), 429, refused.status());
             final Response document = send(node, "GET", "/alpha/_doc/" + id, null);
             assertEquals(document.body(), deletion ? 200 : 404, document.status());
-            assertEquals(0L, node.indexingPressure().getCurrentCoordinatingBytes());
+            assertEquals(0L, node.services().indexingPressure().getCurrentCoordinatingBytes());
         }
     }
 

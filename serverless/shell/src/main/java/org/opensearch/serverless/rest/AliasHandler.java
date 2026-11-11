@@ -104,7 +104,7 @@ public final class AliasHandler extends BaseRestHandler {
                     };
                 final var response = serving == null
                     ? capture.apply(request)
-                    : serving.actionGate().run(action, request, capture, org.opensearch.serverless.shell.ActionGate.opaque());
+                    : serving.services().actionGate().run(action, request, capture, org.opensearch.serverless.shell.ActionGate.opaque());
                 if (response == null) {
                     throw new UnsupportedOperationException("a cached alias action response is not supported");
                 }

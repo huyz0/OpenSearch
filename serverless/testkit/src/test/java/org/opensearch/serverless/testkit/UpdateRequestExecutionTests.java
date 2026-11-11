@@ -56,11 +56,11 @@ public class UpdateRequestExecutionTests extends OpenSearchTestCase {
     }
 
     private static void seed(ServerlessNode node, String index, String id, String value) {
-        node.client().index(new IndexRequest(index).id(id).source(Map.of("value", value))).actionGet();
+        node.services().client().index(new IndexRequest(index).id(id).source(Map.of("value", value))).actionGet();
     }
 
     private static String value(ServerlessNode node, String index, String id) {
-        final var response = node.client().get(new org.opensearch.action.get.GetRequest(index, id)).actionGet();
+        final var response = node.services().client().get(new org.opensearch.action.get.GetRequest(index, id)).actionGet();
         return response.isExists() ? String.valueOf(response.getSourceAsMap().get("value")) : null;
     }
 

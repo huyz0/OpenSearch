@@ -260,7 +260,7 @@ public class ServerlessPluginActionTests extends OpenSearchTestCase {
             assertTrue("the plugin's action must have counted what was written: " + counted.body(), counted.body().contains("\"count\":2"));
 
             // And directly, which is how a plugin's own code calls it.
-            final CountResponse direct = node.client().execute(CountAction.INSTANCE, new CountRequest("alpha")).actionGet();
+            final CountResponse direct = node.services().client().execute(CountAction.INSTANCE, new CountRequest("alpha")).actionGet();
             assertEquals("the same answer through the client", 2L, direct.count);
         }
     }
@@ -287,7 +287,8 @@ public class ServerlessPluginActionTests extends OpenSearchTestCase {
             // Through the client, which is the path the ordering actually governs. The REST write path does
             // not go through the client's dispatch at all, so asserting on an HTTP write proved nothing
             // about this -- the first version of this test did exactly that and could not fail.
-            node.client()
+            node.services()
+                .client()
                 .index(
                     new org.opensearch.action.index.IndexRequest("alpha").id("1")
                         .source("{\"msg\":\"real\"}", org.opensearch.common.xcontent.XContentType.JSON)

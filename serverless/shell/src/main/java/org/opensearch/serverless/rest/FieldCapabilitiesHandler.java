@@ -169,42 +169,44 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                 final var ask = new org.opensearch.action.fieldcaps.FieldCapabilitiesRequest().indices(
                     org.opensearch.core.common.Strings.splitStringByCommaToArray(index)
                 ).fields(org.opensearch.core.common.Strings.splitStringByCommaToArray(wantedFields));
-                final var result = serving.actionGate().run(org.opensearch.action.fieldcaps.FieldCapabilitiesAction.NAME, ask, admitted -> {
-                    if (admitted instanceof org.opensearch.action.fieldcaps.FieldCapabilitiesRequest == false) {
-                        throw unsupported("field capabilities require a native field capabilities request");
-                    }
-                    final var selected = (org.opensearch.action.fieldcaps.FieldCapabilitiesRequest) admitted;
-                    final var invalid = selected.validate();
-                    if (invalid != null) {
-                        throw new IllegalArgumentException(invalid.getMessage(), invalid);
-                    }
-                    if (selected.includeUnmapped() || selected.indexFilter() != null) {
-                        throw unsupported("unmapped capabilities and index filters are not supported");
-                    }
-                    if (selected.indicesOptions().equals(org.opensearch.action.support.IndicesOptions.strictExpandOpen()) == false) {
-                        throw unsupported("rewritten index expansion options are not supported for field capabilities");
-                    }
-                    if (selected.indices().length == 0) {
-                        throw unsupported("field capabilities require index names or a bounded prefix pattern");
-                    }
-                    return answer(metadata, serving, String.join(",", selected.indices()), selected.fields());
-                }, new org.opensearch.serverless.shell.ActionGate.ResponseView<CapabilitiesResult>() {
-                    @Override
-                    public org.opensearch.core.action.ActionResponse show(CapabilitiesResult value) {
-                        return value.response();
-                    }
-
-                    @Override
-                    public CapabilitiesResult read(org.opensearch.core.action.ActionResponse response, CapabilitiesResult original) {
-                        if (response instanceof org.opensearch.action.fieldcaps.FieldCapabilitiesResponse == false) {
-                            throw unsupported("field capabilities require a native field capabilities response");
+                final var result = serving.services()
+                    .actionGate()
+                    .run(org.opensearch.action.fieldcaps.FieldCapabilitiesAction.NAME, ask, admitted -> {
+                        if (admitted instanceof org.opensearch.action.fieldcaps.FieldCapabilitiesRequest == false) {
+                            throw unsupported("field capabilities require a native field capabilities request");
                         }
-                        return new CapabilitiesResult(
-                            (org.opensearch.action.fieldcaps.FieldCapabilitiesResponse) response,
-                            original == null ? java.util.Set.of() : original.metadataFields()
-                        );
-                    }
-                });
+                        final var selected = (org.opensearch.action.fieldcaps.FieldCapabilitiesRequest) admitted;
+                        final var invalid = selected.validate();
+                        if (invalid != null) {
+                            throw new IllegalArgumentException(invalid.getMessage(), invalid);
+                        }
+                        if (selected.includeUnmapped() || selected.indexFilter() != null) {
+                            throw unsupported("unmapped capabilities and index filters are not supported");
+                        }
+                        if (selected.indicesOptions().equals(org.opensearch.action.support.IndicesOptions.strictExpandOpen()) == false) {
+                            throw unsupported("rewritten index expansion options are not supported for field capabilities");
+                        }
+                        if (selected.indices().length == 0) {
+                            throw unsupported("field capabilities require index names or a bounded prefix pattern");
+                        }
+                        return answer(metadata, serving, String.join(",", selected.indices()), selected.fields());
+                    }, new org.opensearch.serverless.shell.ActionGate.ResponseView<CapabilitiesResult>() {
+                        @Override
+                        public org.opensearch.core.action.ActionResponse show(CapabilitiesResult value) {
+                            return value.response();
+                        }
+
+                        @Override
+                        public CapabilitiesResult read(org.opensearch.core.action.ActionResponse response, CapabilitiesResult original) {
+                            if (response instanceof org.opensearch.action.fieldcaps.FieldCapabilitiesResponse == false) {
+                                throw unsupported("field capabilities require a native field capabilities response");
+                            }
+                            return new CapabilitiesResult(
+                                (org.opensearch.action.fieldcaps.FieldCapabilitiesResponse) response,
+                                original == null ? java.util.Set.of() : original.metadataFields()
+                            );
+                        }
+                    });
                 render(channel, result);
             } catch (IndexAdminHandler.RefusedException e) {
                 sendQuietly(channel, e.status, e.type, e.getMessage());

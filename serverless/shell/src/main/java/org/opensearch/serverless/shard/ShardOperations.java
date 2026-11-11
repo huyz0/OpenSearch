@@ -171,7 +171,7 @@ public final class ShardOperations {
         org.opensearch.serverless.shell.ActionGate.ResponseView<T> view
     ) throws IOException {
         try {
-            return node.actionGate().run(action, request, work, view);
+            return node.services().actionGate().run(action, request, work, view);
         } catch (IOException | RuntimeException e) {
             throw e;
         } catch (Exception e) {
@@ -312,7 +312,8 @@ public final class ShardOperations {
                 );
                 final boolean refresh = accepted.getRefreshPolicy() != org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
                 try (
-                    var ignored = node.indexingPressure()
+                    var ignored = node.services()
+                        .indexingPressure()
                         .markCoordinatingOperationStarted(
                             org.opensearch.serverless.store.WalRecord.contentBytes(accepted.id(), null),
                             false
@@ -350,7 +351,9 @@ public final class ShardOperations {
         org.opensearch.common.CheckedFunction<org.opensearch.action.ActionRequest, T, Exception> work
     ) throws IOException {
         try {
-            return node.actionGate().run(action, request, work, org.opensearch.serverless.shell.ActionGate.identity(responseType));
+            return node.services()
+                .actionGate()
+                .run(action, request, work, org.opensearch.serverless.shell.ActionGate.identity(responseType));
         } catch (IOException | RuntimeException e) {
             throw e;
         } catch (Exception e) {
@@ -768,7 +771,7 @@ public final class ShardOperations {
                 ctx.put("_version", existing.version());
                 ctx.put("_routing", null);
             }
-            final var factory = node.scriptService().compile(script, org.opensearch.script.UpdateScript.CONTEXT);
+            final var factory = node.services().scriptService().compile(script, org.opensearch.script.UpdateScript.CONTEXT);
             factory.newInstance(script.getParams(), ctx).execute();
             operation = (String) ctx.get("op");
             // Core permits only create for an upsert, and index/delete for an existing
