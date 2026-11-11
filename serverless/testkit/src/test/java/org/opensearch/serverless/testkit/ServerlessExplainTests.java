@@ -109,7 +109,7 @@ public class ServerlessExplainTests extends OpenSearchTestCase {
             final Answer updated = call("PUT", "/books/_doc/1?refresh=true", "{\"title\":\"newest\"}");
             assertEquals(updated.body(), 200, updated.status());
             assertFalse("the old writer must remain open to exercise stale placement", former.reconciler().openShards().isEmpty());
-            former.forgetOwner("books", 0);
+            former.sightings().forgetOwner("books", 0);
             port = former.boundHttpAddress().publishAddress().getPort();
             final Answer explained = call("POST", "/books/_explain/1", "{\"query\":{\"match\":{\"title\":\"newest\"}}}");
             assertEquals(explained.body(), 200, explained.status());
@@ -225,7 +225,7 @@ public class ServerlessExplainTests extends OpenSearchTestCase {
 
         final var held = writer.reconciler().openShards().iterator().next();
         assertTrue("the writer should release the head it holds", plane.heads().release("books", 0, writer.localNode().getId()));
-        writer.releaseShard(held, "test: scaling to zero");
+        writer.shards().releaseShard(held, "test: scaling to zero");
         writer.close();
         assertTrue("nobody should own the shard now", plane.heads().read("books", 0).map(h -> h.ownerNodeId()).isEmpty());
 

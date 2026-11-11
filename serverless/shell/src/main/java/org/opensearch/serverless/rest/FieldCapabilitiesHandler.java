@@ -228,7 +228,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
         String index,
         String[] wanted
     ) throws Exception {
-        final List<String> names = new java.util.ArrayList<>(IndexPatterns.expand(metadata, index, serving.patternCap()));
+        final List<String> names = new java.util.ArrayList<>(IndexPatterns.expand(metadata, index, serving.searchSettings().patternCap()));
         // A plugin's index is not described through the request path, whatever spelling reached it.
         names.removeIf(serving::isSystemIndex);
         if (names.isEmpty()) {

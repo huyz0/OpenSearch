@@ -241,7 +241,7 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
             // A successor takes it, replays the write, publishes -- trimming the older terms -- and gives it back.
             loop.activateOnDemand(java.util.List.of(java.util.Map.entry("alpha", 0)));
             assertEquals(term + 1, plane.heads().read("alpha", 0).orElseThrow().term());
-            writer.publishShard(writer.reconciler().openShards().iterator().next(), term + 1);
+            writer.shards().publishShard(writer.reconciler().openShards().iterator().next(), term + 1);
             loop.releaseIdle(System.currentTimeMillis() + 120_000L);
             assertNull("given back cleanly", plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
             assertEquals("the successor published", term + 1, plane.segmentPublisher("alpha", 0).readManifest().orElseThrow().term());

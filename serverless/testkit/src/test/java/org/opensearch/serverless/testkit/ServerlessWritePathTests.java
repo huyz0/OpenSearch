@@ -84,7 +84,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
             shardOnA.refresh("p4");
             assertEquals(3L, ShardOps.hits(a.searchService(), shardId, "msg", "written"));
 
-            final CommitManifest manifest = a.publishShard(shardId, acquired.head().term());
+            final CommitManifest manifest = a.shards().publishShard(shardId, acquired.head().term());
             assertFalse("publishing an indexed shard must upload files", manifest.files().isEmpty());
             assertEquals("segments must be published under the owning term", 1L, manifest.term());
 
@@ -118,7 +118,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
             final ShardId shardId = a.activation().syncFrom(plane).iterator().next();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"from A\",\"n\":1}");
             a.reconciler().shard(shardId).refresh("p4");
-            a.publishShard(shardId, termA);
+            a.shards().publishShard(shardId, termA);
 
             // B takes over at a higher term and publishes.
             clock.set(1_000L + TTL);
@@ -127,10 +127,10 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
             final ShardId onB = b.activation().syncFrom(plane).iterator().next();
             ShardOps.indexDoc(b.reconciler().shard(onB), "2", "{\"msg\":\"from B\",\"n\":2}");
             b.reconciler().shard(onB).refresh("p4");
-            b.publishShard(onB, termB);
+            b.shards().publishShard(onB, termB);
 
             // A wakes up, still believing it owns the shard, and tries to publish at its old term.
-            final StaleWriterException refused = expectThrows(StaleWriterException.class, () -> a.publishShard(shardId, termA));
+            final StaleWriterException refused = expectThrows(StaleWriterException.class, () -> a.shards().publishShard(shardId, termA));
             assertTrue("the refusal must name both terms: " + refused.getMessage(), refused.getMessage().contains("term " + termA));
 
             // And the manifest still describes B's commit, at B's term.
@@ -158,8 +158,8 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"one\",\"n\":1}");
             a.reconciler().shard(shardId).refresh("p4");
 
-            final CommitManifest first = a.publishShard(shardId, term);
-            final CommitManifest second = a.publishShard(shardId, term);
+            final CommitManifest first = a.shards().publishShard(shardId, term);
+            final CommitManifest second = a.shards().publishShard(shardId, term);
 
             for (var entry : first.files().entrySet()) {
                 if (second.files().containsKey(entry.getKey())) {

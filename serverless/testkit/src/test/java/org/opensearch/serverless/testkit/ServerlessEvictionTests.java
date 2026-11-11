@@ -79,7 +79,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
             // "first" is used; "second" is left alone. Both are then old enough to evict, so the choice
             // between them is the thing being tested rather than a side effect of timing.
             clock.addAndGet(60_000L);
-            node.markUsed(shard(node, "first"));
+            node.shards().markUsed(shard(node, "first"));
 
             loop.activateOnDemand(List.of(Map.entry("third", 0)));
 
@@ -112,7 +112,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
             node.writes().index(shard(node, "first"), "doc", "{\"msg\":\"hay\"}");
 
             clock.addAndGet(60_000L);
-            node.markUsed(shard(node, "second"));
+            node.shards().markUsed(shard(node, "second"));
             // Scanned, and nothing in it matches.
             final int status = search(node, "/first/_search", "{\"query\":{\"match\":{\"msg\":\"needle\"}}}");
             assertEquals(200, status);
@@ -206,8 +206,8 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
 
             // Both touched just now, so neither is old enough to give up.
             clock.addAndGet(5_000L);
-            node.markUsed(shard(node, "hot-a"));
-            node.markUsed(shard(node, "hot-b"));
+            node.shards().markUsed(shard(node, "hot-a"));
+            node.shards().markUsed(shard(node, "hot-b"));
 
             final var taken = loop.activateOnDemand(List.of(Map.entry("wanted", 0)));
             assertTrue("a node whose shards are all in use must refuse: " + taken, taken.isEmpty());
@@ -390,7 +390,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
 
             loop.activateOnDemand(List.of(Map.entry("was-pinned", 0), Map.entry("ordinary", 0)));
             clock.addAndGet(60_000L);
-            node.markUsed(shard(node, "ordinary"));   // ordinary is the recently-used one now
+            node.shards().markUsed(shard(node, "ordinary"));   // ordinary is the recently-used one now
 
             assertFalse("isPinned must report the current state", loop.isPinned("ordinary"));
             assertTrue(loop.isPinned("was-pinned"));

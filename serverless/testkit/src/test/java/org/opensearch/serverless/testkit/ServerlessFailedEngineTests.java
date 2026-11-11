@@ -97,7 +97,7 @@ public class ServerlessFailedEngineTests extends OpenSearchTestCase {
                 writer.setMetadataPlane(plane);
                 final var writerId = writer.activation().activateWriter(plane, "alpha", 0).orElseThrow();
                 writer.writes().index(writerId, "doc", "{\"msg\":\"survives\",\"n\":1}");
-                writer.publishShard(writerId, plane.heads().read("alpha", 0).orElseThrow().term());
+                writer.shards().publishShard(writerId, plane.heads().read("alpha", 0).orElseThrow().term());
                 assertTrue(plane.heads().release("alpha", 0, writer.localNode().getId()));
                 reader.startup().start();
                 reader.setMetadataPlane(plane);

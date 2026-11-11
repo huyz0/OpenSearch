@@ -378,7 +378,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
                         // This node's owner hints for the old incarnation. Left in place, a write to a new
                         // index of the same name would be routed to whoever owned the deleted one's shards.
                         for (int shard = 0; shard < deleting.get().numberOfShards(); shard++) {
-                            serving.forgetOwner(index, shard);
+                            serving.sightings().forgetOwner(index, shard);
                         }
                     }
                     afterDeleteSettles(serving, () -> {
