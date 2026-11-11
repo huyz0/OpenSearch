@@ -109,9 +109,19 @@ public final class SearchReadiness {
         }
     }
 
-    /** Starts draining: the next lease renewal drops the search role, and the readiness endpoint answers not ready. */
-    public void startDraining() {
-        state = State.DRAINING;
+    /**
+     * Starts draining: the next lease renewal drops the search role, and the readiness endpoint answers not ready.
+     *
+     * @return true if this call started it, false if the node was already draining
+     */
+    public boolean startDraining() {
+        synchronized (this) {
+            if (state == State.DRAINING) {
+                return false;
+            }
+            state = State.DRAINING;
+            return true;
+        }
     }
 
     /**
