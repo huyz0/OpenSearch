@@ -12,6 +12,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shard.SearchOutcome;
 import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.threadpool.ThreadPool;
@@ -44,7 +45,7 @@ public final class SearchFanout {
      * @return what was found and how completely
      * @throws IOException if the search fails outright
      */
-    public static ShardOperations.SearchOutcome run(
+    public static SearchOutcome run(
         ServerlessNode serving,
         MetadataPlane metadata,
         org.opensearch.serverless.cluster.IndexDescriptor index,
@@ -96,7 +97,7 @@ public final class SearchFanout {
      * @return what was found and how completely
      * @throws IOException if the search fails outright
      */
-    public static ShardOperations.SearchOutcome runFrozen(
+    public static SearchOutcome runFrozen(
         ServerlessNode serving,
         MetadataPlane metadata,
         org.opensearch.serverless.metadata.PointInTime pit,
@@ -166,7 +167,7 @@ public final class SearchFanout {
      * @return the merged hits, with the coverage this answer was assembled from
      * @throws IOException if the fan-out cannot be run
      */
-    public static ShardOperations.SearchOutcome run(
+    public static SearchOutcome run(
         ServerlessNode serving,
         MetadataPlane metadata,
         java.util.Map<String, org.opensearch.serverless.cluster.IndexDescriptor> indices,
@@ -229,7 +230,7 @@ public final class SearchFanout {
      * @return the merged hits, with the coverage this answer was assembled from
      * @throws IOException if the fan-out cannot be run
      */
-    public static ShardOperations.SearchOutcome run(
+    public static SearchOutcome run(
         ServerlessNode serving,
         MetadataPlane metadata,
         java.util.Map<String, org.opensearch.serverless.cluster.IndexDescriptor> indices,
@@ -558,7 +559,7 @@ public final class SearchFanout {
         private final List<SearchHit> hits = new ArrayList<>();
         private final List<org.opensearch.search.aggregations.InternalAggregations> aggregations = new ArrayList<>();
 
-        private ShardOperations.SearchOutcome outcome(
+        private SearchOutcome outcome(
             ServerlessNode serving,
             SearchSourceBuilder source,
             int shards,
@@ -575,7 +576,7 @@ public final class SearchFanout {
                 java.util.Comparator.comparing((org.opensearch.action.search.ShardSearchFailure f) -> f.index() == null ? "" : f.index())
                     .thenComparingInt(org.opensearch.action.search.ShardSearchFailure::shardId)
             );
-            return new ShardOperations.SearchOutcome(
+            return new SearchOutcome(
                 ceiling(total, relation, source),
                 page,
                 shards,

@@ -13,6 +13,7 @@ import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.rest.SearchHandler;
+import org.opensearch.serverless.shard.SearchOutcome;
 import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
@@ -117,7 +118,7 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
                 org.opensearch.OpenSearchStatusException.class,
                 () -> SearchHandler.gated(node, List.of("private", "public-only"), new SearchSourceBuilder(), source -> {
                     executed.set(true);
-                    return new ShardOperations.SearchOutcome(0L, List.of(), 2, 2);
+                    return new SearchOutcome(0L, List.of(), 2, 2);
                 })
             );
             assertEquals(org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED, failure.status());
@@ -126,11 +127,11 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
     }
 
     public void testCachedSearchResponseDoesNotRequireAnExecutedOriginal() throws Exception {
-        final var cached = SearchHandler.toResponse(new ShardOperations.SearchOutcome(7L, List.of(), 4, 4).withSkipped(2), null, 0L, null);
+        final var cached = SearchHandler.toResponse(new SearchOutcome(7L, List.of(), 4, 4).withSkipped(2), null, 0L, null);
         try (var node = node(request -> {}, cached)) {
             final var answer = SearchHandler.gated(node, List.of("private"), new SearchSourceBuilder(), source -> {
                 fail("the cache must bypass execution");
-                return new ShardOperations.SearchOutcome(0L, List.of(), 1, 1);
+                return new SearchOutcome(0L, List.of(), 1, 1);
             });
             assertEquals(7L, answer.total());
             assertEquals(4, answer.shards());
@@ -145,14 +146,14 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
                 node,
                 List.of("private"),
                 new SearchSourceBuilder(),
-                source -> new ShardOperations.SearchOutcome(0L, List.of(), 4, 4).withSkipped(3)
+                source -> new SearchOutcome(0L, List.of(), 4, 4).withSkipped(3)
             );
             assertEquals(3, answer.skipped());
         }
     }
 
     public void testDirectShardSearchHonorsACachedFilterResponse() throws Exception {
-        final var cached = SearchHandler.toResponse(new ShardOperations.SearchOutcome(7L, List.of(), 4, 4).withSkipped(2), null, 0L, null);
+        final var cached = SearchHandler.toResponse(new SearchOutcome(7L, List.of(), 4, 4).withSkipped(2), null, 0L, null);
         try (var node = node(request -> {}, cached)) {
             final var answer = new ShardOperations(node, null).search("private", new SearchSourceBuilder());
             assertNotNull("the native cache answer must not be discarded", answer);
@@ -162,14 +163,14 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
     }
 
     public void testRedactionDoesNotEraseActualExecutionFailures() throws Exception {
-        final var hidden = SearchHandler.toResponse(new ShardOperations.SearchOutcome(0L, List.of(), 99, 99), null, 0L, null);
+        final var hidden = SearchHandler.toResponse(new SearchOutcome(0L, List.of(), 99, 99), null, 0L, null);
         try (var node = node(request -> {}, null, response -> hidden)) {
             final var failures = List.of(new org.opensearch.action.search.ShardSearchFailure(new java.io.IOException("unreachable")));
             final var answer = SearchHandler.gated(
                 node,
                 List.of("private"),
                 new SearchSourceBuilder(),
-                source -> new ShardOperations.SearchOutcome(
+                source -> new SearchOutcome(
                     1L,
                     List.of(),
                     2,
@@ -191,8 +192,8 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
         }
     }
 
-    private static ShardOperations.SearchOutcome failedShard() {
-        return new ShardOperations.SearchOutcome(
+    private static SearchOutcome failedShard() {
+        return new SearchOutcome(
             1L,
             List.of(),
             2,
@@ -247,8 +248,8 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
         }
     }
 
-    private static ShardOperations.SearchOutcome timedOutShard() {
-        return new ShardOperations.SearchOutcome(
+    private static SearchOutcome timedOutShard() {
+        return new SearchOutcome(
             1L,
             List.of(),
             1,
@@ -291,11 +292,11 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
     public void testAFilterCanRemoveTotalHitCounts() throws Exception {
         try (var node = node(request -> {}, null, SearchFilterContractTests::withoutTotals)) {
             final var source = new SearchSourceBuilder();
-            final ShardOperations.SearchOutcome answer = SearchHandler.gated(
+            final SearchOutcome answer = SearchHandler.gated(
                 node,
                 List.of("private"),
                 source,
-                accepted -> new ShardOperations.SearchOutcome(42L, List.of(), 1, 1)
+                accepted -> new SearchOutcome(42L, List.of(), 1, 1)
             );
             assertNull(
                 "a response filter's omitted count must stay omitted",
@@ -315,7 +316,7 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
                 node,
                 List.of("private"),
                 new SearchSourceBuilder().trackTotalHits(false),
-                accepted -> new ShardOperations.SearchOutcome(42L, List.of(), 1, 1)
+                accepted -> new SearchOutcome(42L, List.of(), 1, 1)
             );
             assertFalse("filters must see the same counting policy the caller requested", exposed.get());
         }
@@ -324,11 +325,11 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
     public void testAnAdmittedCountingRewriteControlsTheResponse() throws Exception {
         try (var node = node(request -> request.source(new SearchSourceBuilder().trackTotalHits(true)), null)) {
             final var original = new SearchSourceBuilder().trackTotalHits(false);
-            final ShardOperations.SearchOutcome answer = SearchHandler.gated(
+            final SearchOutcome answer = SearchHandler.gated(
                 node,
                 List.of("private"),
                 original,
-                accepted -> new ShardOperations.SearchOutcome(42L, List.of(), 1, 1)
+                accepted -> new SearchOutcome(42L, List.of(), 1, 1)
             );
             final var total = SearchHandler.toResponse(answer, original, 0L, null).getHits().getTotalHits();
             assertNotNull("the rewritten request asks for totals", total);
@@ -337,10 +338,10 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
     }
 
     public void testCachedSearchResponsesCanOmitTotalHits() throws Exception {
-        final var cached = withoutTotals(SearchHandler.toResponse(new ShardOperations.SearchOutcome(42L, List.of(), 1, 1), null, 0L, null));
+        final var cached = withoutTotals(SearchHandler.toResponse(new SearchOutcome(42L, List.of(), 1, 1), null, 0L, null));
         try (var node = node(request -> {}, cached)) {
             final var source = new SearchSourceBuilder();
-            final ShardOperations.SearchOutcome answer = SearchHandler.gated(node, List.of("private"), source, accepted -> {
+            final SearchOutcome answer = SearchHandler.gated(node, List.of("private"), source, accepted -> {
                 throw new AssertionError("the cache must bypass execution");
             });
             assertNull(SearchHandler.toResponse(answer, source, 0L, null).getHits().getTotalHits());
@@ -353,7 +354,7 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
                 node,
                 List.of("private"),
                 new SearchSourceBuilder(),
-                source -> new ShardOperations.SearchOutcome(
+                source -> new SearchOutcome(
                     42L,
                     List.of(),
                     1,
@@ -426,7 +427,7 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
         try (var node = node(request -> request.source(new SearchSourceBuilder().query(query)), null)) {
             final var answer = SearchHandler.gated(node, List.of("private"), new SearchSourceBuilder(), source -> {
                 assertSame(query, source.query());
-                return new ShardOperations.SearchOutcome(1L, List.of(), 1, 1);
+                return new SearchOutcome(1L, List.of(), 1, 1);
             });
             assertEquals(1L, answer.total());
         }
