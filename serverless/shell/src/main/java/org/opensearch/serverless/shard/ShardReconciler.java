@@ -253,8 +253,12 @@ public final class ShardReconciler {
         final ReentrantReadWriteLock.WriteLock exclusive = guardFor(shardId).writeLock();
         final var log = wal(shardId);
         final long walOrdinal;
+        final NodeLogHooks nodeLogHooks = nodeLog;
+        final org.opensearch.serverless.store.NodeLogCommitter.Position nodeLogAt;
         exclusive.lock();
         try {
+            // Where no write is between its apply and its append, as for the ordinal below.
+            nodeLogAt = nodeLogHooks == null ? null : nodeLogHooks.position(shardId);
             // How far into the log this commit reaches, read where no write is between its apply and its append:
             // every record at or below it holds operations the flush below commits. A reader of a shard nobody is
             // writing compares it with what has landed, so a commit behind an acknowledged write is never served
@@ -292,6 +296,9 @@ public final class ShardReconciler {
             // Only after the commit is durable in the object store. Truncation drops what the previous
             // publish saw, never what this one did -- see WalStore for why that gap is load-bearing.
             walForPublish.onPublished(term);
+        }
+        if (nodeLogHooks != null) {
+            nodeLogHooks.published(shardId, nodeLogAt);
         }
         return manifest;
     }
@@ -538,6 +545,16 @@ public final class ShardReconciler {
                 consumer.accept(record);
                 logRecordsRead.incrementAndGet();
             });
+            // After the shard's own log, which holds what was written before the node log was: oldest first.
+            final NodeLogReplay fromNodeLog = pendingNodeLogReplay.get(shardId);
+            final NodeLogHooks hooks = nodeLog;
+            if (fromNodeLog != null && hooks != null) {
+                final long streamed = hooks.replay(shardId, fromNodeLog.predecessor(), fromNodeLog.term(), record -> {
+                    consumer.accept(record);
+                    logRecordsRead.incrementAndGet();
+                });
+                nodeLogReplayed.merge(shardId, streamed, Long::sum);
+            }
         } finally {
             writerOpenNanos[WRITER_OPEN_PHASES.indexOf("log_read")].addAndGet(System.nanoTime() - readingAt);
         }
@@ -555,6 +572,84 @@ public final class ShardReconciler {
 
     /** Per index and shard, the term at which a takeover has just fenced every older term of the log. */
     private final java.util.concurrent.ConcurrentHashMap<String, Long> olderTermsFenced = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** What a shard's open and publish need of the node's per-node write log, when it writes one. */
+    public interface NodeLogHooks {
+        /**
+         * Returns how far a shard's records have landed in this node's log.
+         *
+         * @param shardId the shard
+         * @return the position, or null if none is unpublished
+         */
+        org.opensearch.serverless.store.NodeLogCommitter.Position position(ShardId shardId);
+
+        /**
+         * Records that a publish covering everything up to a position has landed.
+         *
+         * @param shardId the shard
+         * @param upTo what {@link #position} returned before the publish flushed, or null
+         */
+        void published(ShardId shardId, org.opensearch.serverless.store.NodeLogCommitter.Position upTo);
+
+        /**
+         * Streams the records a shard being opened must replay from the node logs.
+         *
+         * @param shardId the shard
+         * @param predecessor the node the head named before this one took it, or null for this node's own reopen
+         * @param term the term the shard opens at
+         * @param consumer what takes each record
+         * @return how many records were streamed
+         * @throws IOException if a fence or a read fails
+         */
+        long replay(
+            ShardId shardId,
+            String predecessor,
+            long term,
+            org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> consumer
+        ) throws IOException;
+    }
+
+    private volatile NodeLogHooks nodeLog;
+
+    /**
+     * Sets this node's per-node write log, so opens replay from it and publishes trim it; null for a node that writes
+     * none.
+     *
+     * @param nodeLog the hooks
+     */
+    public void setNodeLog(NodeLogHooks nodeLog) {
+        this.nodeLog = nodeLog;
+    }
+
+    /** Per index and shard, the node a takeover replaced in the head: whose node log the open replays. */
+    private final java.util.concurrent.ConcurrentHashMap<String, String> nodeLogPredecessors =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** A writer open in progress: whose node log it replays, and at what term. */
+    private record NodeLogReplay(String predecessor, long term) {
+    }
+
+    private final java.util.concurrent.ConcurrentHashMap<ShardId, NodeLogReplay> pendingNodeLogReplay =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Records streamed from the node logs by an open in progress; a shard that replayed any publishes before serving. */
+    private final java.util.concurrent.ConcurrentHashMap<ShardId, Long> nodeLogReplayed = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Records the node a takeover replaced in a shard's head, so the open that follows replays that node's write log. One
+     * use: the open consumes it. An open with none noted is this node reopening its own shard.
+     *
+     * @param indexName the index
+     * @param shard the shard
+     * @param predecessor the node the replaced head named, or null
+     */
+    public void noteNodeLogPredecessor(String indexName, int shard, String predecessor) {
+        if (predecessor == null) {
+            nodeLogPredecessors.remove(indexName + "#" + shard);
+        } else {
+            nodeLogPredecessors.put(indexName + "#" + shard, predecessor);
+        }
+    }
 
     /**
      * Records that a takeover has fenced every term older than {@code term}, so the open that follows it -- at
@@ -709,6 +804,12 @@ public final class ShardReconciler {
                     // numbers.
                     final org.opensearch.serverless.store.WalStore log = wal(shardId);
                     pendingReplay.put(shardId, log);
+                    if (nodeLog != null) {
+                        pendingNodeLogReplay.put(
+                            shardId,
+                            new NodeLogReplay(nodeLogPredecessors.remove(shardId.getIndexName() + "#" + shardId.id()), shardHeadTerm)
+                        );
+                    }
                     // Fence the log before recovery reads anything: every older term, so a predecessor that has
                     // not noticed it lost this shard can write nothing after what is replayed here, and this
                     // term, so an earlier writer of it -- the instance a same-term reopen replaced -- can write
@@ -735,6 +836,7 @@ public final class ShardReconciler {
                     }
                 } finally {
                     pendingReplay.remove(shardId);
+                    pendingNodeLogReplay.remove(shardId);
                 }
                 lap.run();
 
@@ -780,8 +882,20 @@ public final class ShardReconciler {
                     }
                 }
                 open.put(shardId, shard);
+                final Long fromNodeLog = nodeLogReplayed.remove(shardId);
+                if (fromNodeLog != null && fromNodeLog > 0) {
+                    // Published before it serves, so what it replayed is in a commit and no later takeover depends on the
+                    // log that held it: a predecessor's log names this shard's records only until the shard is taken.
+                    try {
+                        publish(shardId, shardHeadTerm);
+                    } catch (IOException | RuntimeException e) {
+                        open.remove(shardId);
+                        throw e;
+                    }
+                }
                 return shard;
             } finally {
+                nodeLogReplayed.remove(shardId);
                 final var remainingReplay = replayedRecords.remove(shardId);
                 if (remainingReplay != null) {
                     remainingReplay.close();

@@ -116,6 +116,8 @@ public final class NodeLogCommitter {
     private boolean flushing;
     /** The epoch being written, or -1 when the next window must open one. */
     private long current = -1L;
+    /** An epoch being recorded in the lease, which {@link #positions} names from before the write. */
+    private long opening = -1L;
     private long lastEpoch;
 
     private final AtomicLong blobs = new AtomicLong();
@@ -350,14 +352,26 @@ public final class NodeLogCommitter {
                 return current;
             }
             epoch = lastEpoch + 1;
-            recorded = new ArrayList<>(positionsLocked());
-            recorded.add(new NodeLogEpoch(epoch, 0L, 0L));
+            // Named by positions() from here, so a renewal that writes the lease meanwhile cannot drop it.
+            opening = epoch;
+            recorded = positionsLocked();
         } finally {
             lock.unlock();
         }
-        lease.record(recorded);
+        try {
+            lease.record(recorded);
+        } catch (IOException | RuntimeException e) {
+            lock.lock();
+            try {
+                opening = -1L;
+            } finally {
+                lock.unlock();
+            }
+            throw e;
+        }
         lock.lock();
         try {
+            opening = -1L;
             lastEpoch = epoch;
             epochs.put(epoch, new EpochState());
             current = epoch;
@@ -438,6 +452,29 @@ public final class NodeLogCommitter {
     }
 
     /**
+     * Returns, for every epoch this node still tracks, the runs of slots holding a shard's records that it has not
+     * published: what this node reads to reopen one of its own shards from the log, with no fence.
+     *
+     * @param shard the shard
+     * @return the runs by epoch, oldest first; empty if there are none
+     */
+    public Map<Long, List<Range>> unpublishedRuns(ShardKey shard) {
+        lock.lock();
+        try {
+            final Map<Long, List<Range>> out = new TreeMap<>();
+            for (Map.Entry<Long, EpochState> entry : epochs.entrySet()) {
+                final List<Range> runs = entry.getValue().unpublished.get(shard);
+                if (runs != null && runs.isEmpty() == false) {
+                    out.put(entry.getKey(), runs);
+                }
+            }
+            return out;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Forgets that a shard was admitted, so its next records in any epoch are checked again. For a shard this node let
      * go of.
      *
@@ -476,6 +513,9 @@ public final class NodeLogCommitter {
             if (state.complete() == false) {
                 out.add(new NodeLogEpoch(entry.getKey(), state.trimPoint(), state.next));
             }
+        }
+        if (opening >= 0) {
+            out.add(new NodeLogEpoch(opening, 0L, 0L));
         }
         return out;
     }
