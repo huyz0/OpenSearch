@@ -325,6 +325,8 @@ public final class ServerlessBootstrap implements Closeable {
                 "startup: lease published at {} ms",
                 java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt)
             );
+            // A search node that joined to warm copies its peers' cache and opens its shards, then turns ready.
+            SearchWarmup.startInBackground(node, plane);
             node.setHeadVerifyIntervalMillis(complete.getAsLong(HEAD_VERIFY_INTERVAL, DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS));
             node.setDescriptorRefreshIntervalMillis(
                 complete.getAsLong(DESCRIPTOR_REFRESH_INTERVAL, DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS)
