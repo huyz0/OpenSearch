@@ -11,6 +11,7 @@ package org.opensearch.serverless.metadata;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentType;
@@ -52,7 +53,7 @@ import java.util.Map;
  */
 public final class ClusterConfig {
 
-    private final BlobContainer container;
+    private final ConditionalBlobContainer container;
 
     /**
      * Creates the register.
@@ -60,7 +61,7 @@ public final class ClusterConfig {
      * @param container the {@code cluster/config} container
      */
     public ClusterConfig(BlobContainer container) {
-        this.container = container;
+        this.container = ConditionalBlobContainer.of(container);
     }
 
     /**

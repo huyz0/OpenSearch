@@ -13,6 +13,7 @@ import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.core.common.bytes.BytesReference;
 
@@ -23,7 +24,7 @@ import java.util.Map;
 import java.util.Optional;
 
 /** Forwards everything, so a subclass can break exactly one behaviour and change nothing else. */
-abstract class DelegatingBlobContainer implements BlobContainer {
+abstract class DelegatingBlobContainer implements ConditionalBlobContainer {
 
     private final BlobContainer delegate;
 
@@ -103,22 +104,22 @@ abstract class DelegatingBlobContainer implements BlobContainer {
 
     @Override
     public Optional<BlobRegister> readRegister(String blobName) throws IOException {
-        return delegate.readRegister(blobName);
+        return ConditionalBlobContainer.of(delegate).readRegister(blobName);
     }
 
     @Override
     public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
-        return delegate.deleteRegisterIfUnchanged(blobName, expectedGeneration);
+        return ConditionalBlobContainer.of(delegate).deleteRegisterIfUnchanged(blobName, expectedGeneration);
     }
 
     @Override
     public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
         throws IOException {
-        return delegate.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+        return ConditionalBlobContainer.of(delegate).compareAndSwapRegister(blobName, expectedGeneration, newValue);
     }
 
     @Override
     public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
-        return delegate.createRegisterIfAbsent(blobName, value);
+        return ConditionalBlobContainer.of(delegate).createRegisterIfAbsent(blobName, value);
     }
 }

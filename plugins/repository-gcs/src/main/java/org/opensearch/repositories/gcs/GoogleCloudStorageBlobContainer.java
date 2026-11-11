@@ -39,6 +39,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStoreException;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.support.AbstractBlobContainer;
 import org.opensearch.core.common.bytes.BytesReference;
@@ -50,7 +51,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
-class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
+class GoogleCloudStorageBlobContainer extends AbstractBlobContainer implements ConditionalBlobContainer {
 
     private final GoogleCloudStorageBlobStore blobStore;
     private final String path;

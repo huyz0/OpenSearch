@@ -13,6 +13,7 @@ import org.apache.lucene.tests.util.LuceneTestCase;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -126,7 +127,7 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
         final Path directory = createTempDir();
         final Faults faults = new Faults(directory.getFileSystem());
         try (FileSystem fs = faults.getFileSystem(null); var store = new FsBlobStore(1024, fs.getPath(directory.toString()), false)) {
-            final BlobContainer container = store.blobContainer(BlobPath.cleanPath());
+            final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath()));
             final long generation = container.createRegisterIfAbsent("record", new BytesArray("committed-value")).currentGeneration();
             faults.interruptWrite.set(true);
             expectThrows(
@@ -143,9 +144,11 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
         final Path directory = createTempDir();
         final Faults faults = new Faults(directory.getFileSystem());
         try (FileSystem fs = faults.getFileSystem(null); var store = new FsBlobStore(1024, fs.getPath(directory.toString()), false)) {
-            final BlobContainer container = store.blobContainer(BlobPath.cleanPath());
+            final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath()));
             final long generation = container.createRegisterIfAbsent("record", new BytesArray("old")).currentGeneration();
-            final BlobContainer independent = independentContainer(store, fs.getPath(directory.toString()));
+            final ConditionalBlobContainer independent = ConditionalBlobContainer.of(
+                independentContainer(store, fs.getPath(directory.toString()))
+            );
             final AtomicBoolean acknowledged = new AtomicBoolean();
             final AtomicBoolean interleaved = new AtomicBoolean();
             faults.beforeDelete.set(() -> {
@@ -175,7 +178,7 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
 
     public void testRegisterCoordinationIsHiddenAndLongNamesRemainUsable() throws Exception {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
-            final BlobContainer container = store.blobContainer(BlobPath.cleanPath());
+            final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath()));
             final String name = "r".repeat(255);
             final long generation = container.createRegisterIfAbsent(name, new BytesArray("value")).currentGeneration();
             assertEquals(Set.of(name), container.listBlobs().keySet());
@@ -194,7 +197,7 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
 
     public void testConcurrentRegistersKeepTheirLocksIndependent() throws Exception {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
-            final BlobContainer container = store.blobContainer(BlobPath.cleanPath());
+            final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath()));
             final int workers = 4;
             for (int i = 0; i < workers; i++) {
                 container.createRegisterIfAbsent("parallel-" + i, new BytesArray("initial"));
@@ -237,7 +240,7 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
         final Faults faults = new Faults(directory.getFileSystem());
         faults.readOnly.set(true);
         try (FileSystem fs = faults.getFileSystem(null); var store = new FsBlobStore(1024, fs.getPath(directory.toString()), true)) {
-            final var record = store.blobContainer(BlobPath.cleanPath()).readRegister("record").orElseThrow();
+            final var record = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath())).readRegister("record").orElseThrow();
             assertEquals(42L, record.generation());
             assertEquals("legacy-value", record.value().utf8ToString());
         }
@@ -245,7 +248,7 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
 
     public void testReadersSeeWholeVersionsDuringConcurrentReplacement() throws Exception {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
-            final BlobContainer container = store.blobContainer(BlobPath.cleanPath());
+            final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath()));
             container.createRegisterIfAbsent("record", new BytesArray("initial"));
             final var executor = java.util.concurrent.Executors.newFixedThreadPool(2);
             final var ready = new java.util.concurrent.CyclicBarrier(2);
@@ -294,7 +297,7 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
         final Path directory = createTempDir();
         final Faults faults = new Faults(directory.getFileSystem());
         try (FileSystem fs = faults.getFileSystem(null); var store = new FsBlobStore(1024, fs.getPath(directory.toString()), false)) {
-            final BlobContainer container = store.blobContainer(BlobPath.cleanPath());
+            final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath()));
             final long generation = container.createRegisterIfAbsent("record", new BytesArray("old")).currentGeneration();
             final AtomicBoolean observed = new AtomicBoolean();
             faults.afterWrite.set(() -> {

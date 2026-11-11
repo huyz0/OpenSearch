@@ -80,6 +80,7 @@ import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStoreException;
 import org.opensearch.common.blobstore.BlobVersionConflictException;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.InputStreamWithMetadata;
 import org.opensearch.common.blobstore.VersionedBlob;
@@ -132,7 +133,7 @@ import static org.opensearch.repositories.s3.S3Repository.MAX_FILE_SIZE_USING_MU
 import static org.opensearch.repositories.s3.S3Repository.MIN_PART_SIZE_USING_MULTIPART;
 import static org.opensearch.repositories.s3.utils.SseKmsUtil.configureEncryptionSettings;
 
-class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamBlobContainer {
+class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamBlobContainer, ConditionalBlobContainer {
 
     private static final Logger logger = LogManager.getLogger(S3BlobContainer.class);
     private static final long DEFAULT_OPERATION_TIMEOUT = TimeUnit.SECONDS.toSeconds(30);

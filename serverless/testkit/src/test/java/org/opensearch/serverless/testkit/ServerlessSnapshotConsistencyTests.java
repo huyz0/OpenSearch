@@ -13,6 +13,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.common.bytes.BytesReference;
@@ -69,7 +70,8 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
             final BlobPath shard = plane.shardData("protected", 0);
             final BlobContainer old = store.blobContainer(shard.add("t=1"));
             old.writeBlobAtomic("snapshot-file", new java.io.ByteArrayInputStream(new byte[] { 1 }), 1L, true);
-            store.blobContainer(shard).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
+            ConditionalBlobContainer.of(store.blobContainer(shard))
+                .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
             final BlobContainer snapshots = store.blobContainer(
                 org.opensearch.serverless.metadata.RegisterMap.snapshots(BlobPath.cleanPath())
             );
@@ -107,7 +109,8 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
             final BlobPath shard = plane.shardData("protected", 0);
             final BlobContainer old = store.blobContainer(shard.add("t=1"));
             old.writeBlobAtomic("snapshot-file", new java.io.ByteArrayInputStream(new byte[] { 1 }), 1L, true);
-            store.blobContainer(shard).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
+            ConditionalBlobContainer.of(store.blobContainer(shard))
+                .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
             final BlobContainer snapshots = store.blobContainer(
                 org.opensearch.serverless.metadata.RegisterMap.snapshots(BlobPath.cleanPath())
             );
@@ -250,10 +253,8 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
             // a writer activated by an early client write has.
             store.beforeFirstManifestSwap(
                 path -> path.buildAsString().contains("segments/restored#"),
-                container -> container.createRegisterIfAbsent(
-                    SegmentPublisher.MANIFEST,
-                    new CommitManifest(1L, Map.of(), "intruder").toBytes()
-                )
+                container -> ConditionalBlobContainer.of(container)
+                    .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(1L, Map.of(), "intruder").toBytes())
             );
             final Response restored = send(
                 node,

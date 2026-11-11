@@ -9,6 +9,7 @@
 package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.cluster.IndexDescriptor;
@@ -329,7 +330,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
             final var descriptors = plane.blobStore()
                 .blobContainer(org.opensearch.serverless.metadata.RegisterMap.indices(BlobPath.cleanPath()));
             final var tombstone = new org.opensearch.core.common.bytes.BytesArray("{\"tombstone\":true}");
-            assertTrue(descriptors.createRegisterIfAbsent("logs-c", tombstone).applied());
+            assertTrue(ConditionalBlobContainer.of(descriptors).createRegisterIfAbsent("logs-c", tombstone).applied());
 
             final Response withTombstone = send(node, "POST", "/logs-*/_search", "{\"query\":{\"match\":{\"msg\":\"shared\"}}}");
             assertEquals("a tombstone in the listing must not become an error: " + withTombstone.body(), 200, withTombstone.status());

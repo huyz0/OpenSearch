@@ -9,6 +9,7 @@
 package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
@@ -267,7 +268,9 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
                 );
                 final Runnable replace = () -> {
                     try {
-                        final var heads = store.blobContainer(org.opensearch.serverless.metadata.RegisterMap.shards(BlobPath.cleanPath()));
+                        final ConditionalBlobContainer heads = ConditionalBlobContainer.of(
+                            store.blobContainer(org.opensearch.serverless.metadata.RegisterMap.shards(BlobPath.cleanPath()))
+                        );
                         final String key = org.opensearch.serverless.metadata.RegisterMap.shardHeadBlob("alpha", 0);
                         final var value = heads.readRegister(key).orElseThrow();
                         assertTrue(heads.compareAndSwapRegister(key, value.generation(), replacement.toBytes()).applied());

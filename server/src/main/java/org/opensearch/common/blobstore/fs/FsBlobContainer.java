@@ -41,6 +41,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobVersionConflictException;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.VersionedBlob;
 import org.opensearch.common.blobstore.support.AbstractBlobContainer;
@@ -90,7 +91,7 @@ import static java.util.Collections.unmodifiableMap;
  *
  * @opensearch.internal
  */
-public class FsBlobContainer extends AbstractBlobContainer {
+public class FsBlobContainer extends AbstractBlobContainer implements ConditionalBlobContainer {
 
     private static final String TEMP_FILE_PREFIX = "pending-";
 

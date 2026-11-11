@@ -25,6 +25,7 @@ import org.apache.lucene.store.NIOFSDirectory;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.index.shard.ShardId;
@@ -220,7 +221,7 @@ public class PackedFileLocationTests extends OpenSearchTestCase {
 
     private static void installManifest(FsBlobStore store, BlobPath shardBase, CommitManifest manifest) throws IOException {
         assertTrue(
-            store.blobContainer(shardBase)
+            ConditionalBlobContainer.of(store.blobContainer(shardBase))
                 .compareAndSwapRegister(SegmentPublisher.MANIFEST, BlobRegister.ABSENT_GENERATION, manifest.toBytes())
                 .applied()
         );
