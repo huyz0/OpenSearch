@@ -16,6 +16,9 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.rest.DocumentWriteOutcomes.ForwardFailed;
+import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteRefusal;
+import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteResult;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -302,7 +305,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 deletion ? org.opensearch.action.delete.DeleteAction.NAME : org.opensearch.action.index.IndexAction.NAME,
                 request,
                 (admitted, listener) -> planAcceptedWrite(metadata, serving, deletion, admitted, listener),
-                writeView(deletion),
+                DocumentWriteOutcomes.writeView(deletion),
                 completed
             );
     }
@@ -321,7 +324,13 @@ public final class DocumentHandler extends BaseRestHandler {
             if (invalid != null) {
                 throw invalid;
             }
-            validateWriteOptions(selected.routing(), selected.version(), selected.versionType(), selected.waitForActiveShards(), false);
+            DocumentWriteOutcomes.validateWriteOptions(
+                selected.routing(),
+                selected.version(),
+                selected.versionType(),
+                selected.waitForActiveShards(),
+                false
+            );
             planWrite(
                 metadata,
                 serving,
@@ -343,7 +352,13 @@ public final class DocumentHandler extends BaseRestHandler {
                 throw invalid;
             }
             final boolean create = selected.opType() == org.opensearch.action.DocWriteRequest.OpType.CREATE;
-            validateWriteOptions(selected.routing(), selected.version(), selected.versionType(), selected.waitForActiveShards(), create);
+            DocumentWriteOutcomes.validateWriteOptions(
+                selected.routing(),
+                selected.version(),
+                selected.versionType(),
+                selected.waitForActiveShards(),
+                create
+            );
             if (selected.isRequireAlias() || selected.getFinalPipeline() != null && "_none".equals(selected.getFinalPipeline()) == false) {
                 throw new WriteRefusal(
                     RestStatus.NOT_IMPLEMENTED,
@@ -373,156 +388,6 @@ public final class DocumentHandler extends BaseRestHandler {
                 listener
             );
         }
-    }
-
-    private static void validateWriteOptions(
-        String routing,
-        long version,
-        org.opensearch.index.VersionType versionType,
-        org.opensearch.action.support.ActiveShardCount activeShards,
-        boolean create
-    ) {
-        if (routing != null) {
-            throw new WriteRefusal(
-                RestStatus.NOT_IMPLEMENTED,
-                "unsupported_write",
-                "routing is not supported: documents are placed by their id"
-            );
-        }
-        if (versionType != org.opensearch.index.VersionType.INTERNAL
-            || version != org.opensearch.common.lucene.uid.Versions.MATCH_ANY
-                && (create == false || version != org.opensearch.common.lucene.uid.Versions.MATCH_DELETED)) {
-            throw new WriteRefusal(
-                RestStatus.NOT_IMPLEMENTED,
-                "unsupported_write",
-                "version/version_type is not supported; use sequence conditions"
-            );
-        }
-        if (activeShards.validate(0) == false) {
-            throw new WriteRefusal(
-                RestStatus.NOT_IMPLEMENTED,
-                "unsupported_write",
-                "wait_for_active_shards cannot exceed one: shards have no replicas"
-            );
-        }
-    }
-
-    /** The result and the routing facts that belong only to an actual execution. */
-    private static final class WriteResult {
-        private final ShardId shardId;
-        private final String id;
-        private final String owner;
-        private final boolean deletion;
-        private final ServerlessNode.WriteOutcome outcome;
-        private final boolean refreshed;
-        private final String droppedBy;
-        private final boolean requireAbsent;
-        private org.opensearch.action.DocWriteResponse response;
-
-        private WriteResult(
-            ShardId shardId,
-            String id,
-            String owner,
-            boolean deletion,
-            ServerlessNode.WriteOutcome outcome,
-            boolean refreshed,
-            String droppedBy,
-            boolean requireAbsent
-        ) {
-            this.shardId = shardId;
-            this.id = id;
-            this.owner = owner;
-            this.deletion = deletion;
-            this.outcome = outcome;
-            this.refreshed = refreshed;
-            this.droppedBy = droppedBy;
-            this.requireAbsent = requireAbsent;
-        }
-
-        static WriteResult written(
-            ShardId shardId,
-            String id,
-            String owner,
-            boolean deletion,
-            ServerlessNode.WriteOutcome outcome,
-            boolean refreshed
-        ) {
-            return new WriteResult(shardId, id, owner, deletion, outcome, refreshed, null, false);
-        }
-
-        static WriteResult dropped(ShardId shardId, String id, String pipeline, boolean requireAbsent) {
-            return new WriteResult(shardId, id, null, false, null, false, pipeline, requireAbsent);
-        }
-
-        static WriteResult supplied(org.opensearch.action.DocWriteResponse response) {
-            final var result = new WriteResult(null, null, null, false, null, false, null, false);
-            result.response = response;
-            return result;
-        }
-
-        org.opensearch.action.DocWriteResponse nativeResponse() {
-            if (response == null) {
-                if (droppedBy != null) {
-                    // Core's single-item bulk adapter likewise uses UpdateResponse for an ingest NOOP.
-                    response = new org.opensearch.action.update.UpdateResponse(
-                        shardId,
-                        id,
-                        org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
-                        0L,
-                        requireAbsent
-                            ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
-                            : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                        org.opensearch.action.DocWriteResponse.Result.NOOP
-                    );
-                    response.setShardInfo(new org.opensearch.action.support.replication.ReplicationResponse.ShardInfo(0, 0));
-                } else {
-                    response = deletion
-                        ? new org.opensearch.action.delete.DeleteResponse(
-                            shardId,
-                            id,
-                            outcome.seqNo(),
-                            outcome.primaryTerm(),
-                            outcome.version(),
-                            outcome.found()
-                        )
-                        : new org.opensearch.action.index.IndexResponse(
-                            shardId,
-                            id,
-                            outcome.seqNo(),
-                            outcome.primaryTerm(),
-                            outcome.version(),
-                            outcome.created()
-                        );
-                    response.setShardInfo(new org.opensearch.action.support.replication.ReplicationResponse.ShardInfo(1, 1));
-                    response.setForcedRefresh(refreshed);
-                }
-            }
-            return response;
-        }
-    }
-
-    private static org.opensearch.serverless.shell.ActionGate.ResponseView<WriteResult> writeView(boolean deletion) {
-        return new org.opensearch.serverless.shell.ActionGate.ResponseView<>() {
-            @Override
-            public org.opensearch.core.action.ActionResponse show(WriteResult result) {
-                return result.nativeResponse();
-            }
-
-            @Override
-            public WriteResult read(org.opensearch.core.action.ActionResponse response, WriteResult original) {
-                final boolean supported = deletion
-                    ? response instanceof org.opensearch.action.delete.DeleteResponse
-                    : response instanceof org.opensearch.action.index.IndexResponse
-                        || response instanceof org.opensearch.action.update.UpdateResponse update
-                            && update.getResult() == org.opensearch.action.DocWriteResponse.Result.NOOP;
-                if (supported == false) {
-                    throw new IllegalStateException("a write filter supplied an incompatible response: " + response.getClass().getName());
-                }
-                return original != null && original.response == response
-                    ? original
-                    : WriteResult.supplied((org.opensearch.action.DocWriteResponse) response);
-            }
-        };
     }
 
     /** Renders only after every response filter has completed. */
@@ -578,59 +443,6 @@ public final class DocumentHandler extends BaseRestHandler {
         } catch (IOException nested) {
             logger.error("failed to report a write failure", nested);
         }
-    }
-
-    private static final class WriteRefusal extends org.opensearch.OpenSearchStatusException {
-        private final String type;
-
-        WriteRefusal(RestStatus status, String type, String reason) {
-            super(reason, status);
-            this.type = type;
-        }
-    }
-
-    private static WriteRefusal notWriterRefusal(String index, int shard, String owner) {
-        final String reason = owner == null
-            ? "no node currently owns shard " + shard + " of " + index + "; activate it before writing"
-            : "this node does not own shard " + shard + " of " + index + "; it is owned by " + owner;
-        return new WriteRefusal(RestStatus.MISDIRECTED_REQUEST, "not_the_writer", reason);
-    }
-
-    private static WriteRefusal activationRefusal(String index, int shard) {
-        return new WriteRefusal(
-            RestStatus.SERVICE_UNAVAILABLE,
-            "activation_in_progress",
-            "this node is acquiring shard " + shard + " of " + index + "; retry"
-        );
-    }
-
-    private Exception classifyForwardFailure(ServerlessNode serving, String index, int shard, String owner, Throwable cause) {
-        final var kind = org.opensearch.serverless.transport.ForwardFailure.classify(cause);
-        if (kind.castsDoubtOnOwnership()) {
-            serving.signals().ownershipDoubted(index, shard);
-        }
-        return switch (kind) {
-            case CONFLICT -> asException(
-                org.opensearch.ExceptionsHelper.unwrap(cause, org.opensearch.index.engine.VersionConflictEngineException.class)
-            );
-            case REJECTED -> asException(
-                org.opensearch.ExceptionsHelper.unwrap(cause, org.opensearch.core.concurrency.OpenSearchRejectedExecutionException.class)
-            );
-            case REMOTE -> org.opensearch.serverless.transport.ForwardFailure.isClientStatus(cause)
-                ? asException(org.opensearch.serverless.transport.ForwardFailure.answer(cause))
-                : new WriteRefusal(
-                    RestStatus.SERVICE_UNAVAILABLE,
-                    "forward_failed",
-                    org.opensearch.serverless.transport.ForwardFailure.describe(owner, cause)
-                );
-            default -> cause instanceof org.opensearch.serverless.transport.OwnerUnreachableException
-                ? new WriteRefusal(RestStatus.SERVICE_UNAVAILABLE, "owner_unreachable", cause.getMessage())
-                : new WriteRefusal(
-                    RestStatus.SERVICE_UNAVAILABLE,
-                    "forward_failed",
-                    org.opensearch.serverless.transport.ForwardFailure.describe(owner, cause)
-                );
-        };
     }
 
     private void planWrite(
@@ -777,7 +589,7 @@ public final class DocumentHandler extends BaseRestHandler {
                         String forwardTarget = owner;
                         org.opensearch.serverless.transport.ForwardedIndexResponse ack;
                         try {
-                            ack = forwardTo(
+                            ack = DocumentForwarding.forwardTo(
                                 serving,
                                 forwardTarget,
                                 writtenIndex,
@@ -812,13 +624,13 @@ public final class DocumentHandler extends BaseRestHandler {
                                 // Whoever the hint named is gone and nobody has taken over: the same state,
                                 // and the same answer, as a register that never named anyone.
                                 serving.signals().ownershipDoubted(writtenIndex, shard);
-                                answer.onFailure(notWriterRefusal(writtenIndex, shard, null));
+                                answer.onFailure(DocumentWriteOutcomes.notWriterRefusal(writtenIndex, shard, null));
                                 return;
                             }
                             if (fresh.equals(serving.localNode().getId())) {
                                 // Named here with nothing open: see ShardOperations#notHere for why this doubts.
                                 serving.signals().ownershipDoubted(writtenIndex, shard);
-                                answer.onFailure(activationRefusal(writtenIndex, shard));
+                                answer.onFailure(DocumentWriteOutcomes.activationRefusal(writtenIndex, shard));
                                 return;
                             }
                             if (fresh.equals(forwardTarget)) {
@@ -832,7 +644,7 @@ public final class DocumentHandler extends BaseRestHandler {
                                     final Optional<String> winner = serving.takeoverWinner(metadata, writtenIndex, shard, fresh);
                                     if (winner.isPresent() && winner.get().equals(serving.localNode().getId()) == false) {
                                         try {
-                                            ack = forwardTo(
+                                            ack = DocumentForwarding.forwardTo(
                                                 serving,
                                                 winner.get(),
                                                 writtenIndex,
@@ -883,7 +695,7 @@ public final class DocumentHandler extends BaseRestHandler {
                                 throw first;
                             }
                             forwardTarget = fresh;
-                            ack = forwardTo(
+                            ack = DocumentForwarding.forwardTo(
                                 serving,
                                 forwardTarget,
                                 writtenIndex,
@@ -909,7 +721,9 @@ public final class DocumentHandler extends BaseRestHandler {
                             )
                         );
                     } catch (ForwardFailed failed) {
-                        answer.onFailure(classifyForwardFailure(serving, writtenIndex, shard, failed.target(), failed.getCause()));
+                        answer.onFailure(
+                            DocumentWriteOutcomes.classifyForwardFailure(serving, writtenIndex, shard, failed.target(), failed.getCause())
+                        );
                     } catch (Exception e) {
                         // Not the forward's failure: a filter refused the write before it left this node,
                         // or the answer could not be written. Rendered with the plugin's own status, as the
@@ -936,7 +750,7 @@ public final class DocumentHandler extends BaseRestHandler {
                         org.opensearch.common.lease.Releasable forwarded = serving.indexingPressure()
                             .markCoordinatingOperationStarted(inFlightBytes, false)
                     ) {
-                        final var ack = forwardTo(
+                        final var ack = DocumentForwarding.forwardTo(
                             serving,
                             roomy.get(),
                             writtenIndex,
@@ -965,7 +779,15 @@ public final class DocumentHandler extends BaseRestHandler {
                     } catch (ForwardFailed failed) {
                         if (org.opensearch.serverless.transport.ForwardFailure.classify(failed.getCause()).mayRetryElsewhere() == false) {
                             // Applied, possibly applied, or answered: not written anywhere else.
-                            answer.onFailure(classifyForwardFailure(serving, writtenIndex, shard, failed.target(), failed.getCause()));
+                            answer.onFailure(
+                                DocumentWriteOutcomes.classifyForwardFailure(
+                                    serving,
+                                    writtenIndex,
+                                    shard,
+                                    failed.target(),
+                                    failed.getCause()
+                                )
+                            );
                             return;
                         }
                         // Waiting for an activation belongs on GENERIC, as below, not on a write thread.
@@ -1017,7 +839,7 @@ public final class DocumentHandler extends BaseRestHandler {
             taken = serving.signals().activate(writtenIndex, shard).get(ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.TimeoutException e) {
             // Still opening: the same "not yet" a client already retries.
-            answer.onFailure(activationRefusal(writtenIndex, shard));
+            answer.onFailure(DocumentWriteOutcomes.activationRefusal(writtenIndex, shard));
             return;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -1031,7 +853,11 @@ public final class DocumentHandler extends BaseRestHandler {
         // Not taken here: another node won it (its head is noted, so the retry forwards), this node is full,
         // or demand-driven activation is off. The answer a client already knows how to act on.
         serving.signals().ownershipDoubted(writtenIndex, shard);
-        answer.onFailure(ownedHere ? activationRefusal(writtenIndex, shard) : notWriterRefusal(writtenIndex, shard, null));
+        answer.onFailure(
+            ownedHere
+                ? DocumentWriteOutcomes.activationRefusal(writtenIndex, shard)
+                : DocumentWriteOutcomes.notWriterRefusal(writtenIndex, shard, null)
+        );
     }
 
     private void respond(
@@ -1095,26 +921,6 @@ public final class DocumentHandler extends BaseRestHandler {
     }
 
     /**
-     * A forward that failed, and which node it was sent to.
-     *
-     * <p>Only transport failures receive this wrapper. A filter refusal occurs outside forwarding and
-     * cannot be mistaken for a stale owner hint or an instruction to retry elsewhere.
-     */
-    private static final class ForwardFailed extends RuntimeException {
-
-        private final String target;
-
-        ForwardFailed(String target, Throwable cause) {
-            super(cause.getMessage(), cause);
-            this.target = target;
-        }
-
-        String target() {
-            return target;
-        }
-    }
-
-    /**
      * Whether a forward failed because the node it reached does not hold the shard as its writer.
      *
      * <p>Typed, not phrased: the check is {@link org.opensearch.serverless.transport.NotShardOwnerException},
@@ -1126,93 +932,7 @@ public final class DocumentHandler extends BaseRestHandler {
      * @return true for the owner's own refusal
      */
     public static boolean refusedAsNotOwner(Exception e) {
-        return org.opensearch.serverless.transport.NotShardOwnerException.describes(e);
+        return DocumentWriteOutcomes.refusedAsNotOwner(e);
     }
 
-    private static Exception asException(Throwable failure) {
-        return failure instanceof Exception e ? e : new RuntimeException(failure);
-    }
-
-    private org.opensearch.serverless.transport.ForwardedIndexResponse forwardTo(
-        ServerlessNode serving,
-        String owner,
-        String writtenIndex,
-        String indexUuid,
-        int shard,
-        String id,
-        String shapedSource,
-        boolean refresh,
-        boolean deletion,
-        long ifSeqNo,
-        long ifPrimaryTerm,
-        boolean requireAbsent
-    ) throws Exception {
-        return forwardTo(
-            serving,
-            owner,
-            writtenIndex,
-            indexUuid,
-            shard,
-            id,
-            shapedSource,
-            refresh,
-            deletion,
-            ifSeqNo,
-            ifPrimaryTerm,
-            requireAbsent,
-            false
-        );
-    }
-
-    private org.opensearch.serverless.transport.ForwardedIndexResponse forwardTo(
-        ServerlessNode serving,
-        String owner,
-        String writtenIndex,
-        String indexUuid,
-        int shard,
-        String id,
-        String shapedSource,
-        boolean refresh,
-        boolean deletion,
-        long ifSeqNo,
-        long ifPrimaryTerm,
-        boolean requireAbsent,
-        boolean steered
-    ) throws Exception {
-        final Optional<org.opensearch.cluster.node.DiscoveryNode> peer;
-        try {
-            peer = serving.router().peer(owner);
-        } catch (Exception e) {
-            // Resolving the peer connects to it, so this fails as readily as the forward itself does, and
-            // means the same thing.
-            throw new ForwardFailed(owner, e);
-        }
-        if (peer.isEmpty()) {
-            // The head names an owner that holds no live lease. That is precisely a dead writer nobody
-            // has noticed yet, and this request is the first thing in the system to prove it.
-            throw new ForwardFailed(
-                owner,
-                new org.opensearch.serverless.transport.OwnerUnreachableException(
-                    "shard " + shard + " is owned by " + owner + ", which has no reachable lease"
-                )
-            );
-        }
-        try {
-            final var request = new org.opensearch.serverless.transport.ForwardedIndexRequest(
-                writtenIndex,
-                indexUuid,
-                shard,
-                id,
-                shapedSource == null ? "" : shapedSource,
-                refresh,
-                deletion,
-                ifSeqNo,
-                ifPrimaryTerm,
-                requireAbsent
-            );
-            return serving.router().forwardIndex(peer.get(), steered ? request.steered() : request);
-        } catch (Exception e) {
-            throw new ForwardFailed(owner, e);
-        }
-    }
 }
