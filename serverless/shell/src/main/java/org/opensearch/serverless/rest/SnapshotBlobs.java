@@ -137,7 +137,7 @@ final class SnapshotBlobs {
         for (var file : source.files().entrySet()) {
             final String name = file.getKey();
             final org.opensearch.serverless.store.FileLocation location = source.location(name);
-            final BlobContainer sourceContainer = blobStore.blobContainer(sourceBase.add(location.termDir()));
+            final BlobContainer sourceContainer = blobStore.blobContainer(location.containerPath(sourceBase));
             // S3 requires mark/reset for upload retries. Reopen a ranged read on reset rather
             // than buffering a potentially multi-gigabyte segment in memory. A packed file is copied out of its pack
             // to a blob of its own.

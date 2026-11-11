@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.store;
 
+import org.opensearch.common.blobstore.BlobPath;
+
 import java.io.IOException;
 
 /**
@@ -15,8 +17,10 @@ import java.io.IOException;
  *
  * <p>A file published on its own is a whole blob named after it, and the manifest records only its term container,
  * {@code t=<term>}. A file published in a pack -- one immutable blob holding every file a publish added -- is a range
- * of that pack, recorded as {@code t=<term>/<pack>#<offset>:<length>}. One manifest can name both: a commit
- * inherits files across failovers and upgrades without moving them.
+ * of that pack, recorded as {@code t=<term>/<pack>#<offset>:<length>}. A file published in a node pack -- one blob
+ * holding segment blobs of many shards, of any indices, that one node published together (see {@link NodePackStore})
+ * -- is a range of that pack, outside the shard: {@code @<node>/e=<epoch>/<ordinal>#<offset>:<length>}. One manifest
+ * can name all three: a commit inherits files across failovers and upgrades without moving them.
  *
  * @param termDir the term container
  * @param blob the blob's name in it: the file's own name, or the pack's
@@ -63,6 +67,33 @@ public record FileLocation(String termDir, String blob, long offset, long length
      * @return its location
      */
     public static FileLocation packed(String termDir, String pack, long offset, long length) {
+        if (termDir.startsWith(NODE_PACK_PREFIX)) {
+            throw new IllegalArgumentException("a term container never starts with " + NODE_PACK_PREFIX);
+        }
+        return range(termDir, pack, offset, length);
+    }
+
+    /** What starts a node pack's recorded location, which no term container's name does. */
+    static final String NODE_PACK_PREFIX = "@";
+
+    /**
+     * The location of a file published in a node pack.
+     *
+     * @param nodeId the node that wrote the pack
+     * @param epoch the pack's epoch
+     * @param ordinal the pack's slot
+     * @param offset where the file starts in the pack
+     * @param length the file's length
+     * @return its location
+     */
+    public static FileLocation nodePacked(String nodeId, long epoch, long ordinal, long offset, long length) {
+        if (nodeId == null || nodeId.isEmpty() || nodeId.indexOf('/') >= 0 || nodeId.indexOf('#') >= 0) {
+            throw new IllegalArgumentException("invalid node id [" + nodeId + "] for a node pack");
+        }
+        return range(NODE_PACK_PREFIX + nodeId + "/" + NodePackStore.epochDir(epoch), NodePackStore.name(ordinal), offset, length);
+    }
+
+    private static FileLocation range(String termDir, String pack, long offset, long length) {
         if (length < 0L) {
             throw new IllegalArgumentException("a packed file has a length");
         }
@@ -78,6 +109,9 @@ public record FileLocation(String termDir, String blob, long offset, long length
      * @throws IOException if the value is malformed
      */
     public static FileLocation parse(String fileName, String recorded) throws IOException {
+        if (recorded.startsWith(NODE_PACK_PREFIX)) {
+            return parseNodePacked(fileName, recorded);
+        }
         final int slash = recorded.indexOf('/');
         if (slash < 0) {
             return whole(recorded, fileName);
@@ -99,6 +133,64 @@ public record FileLocation(String termDir, String blob, long offset, long length
         }
     }
 
+    private static FileLocation parseNodePacked(String fileName, String recorded) throws IOException {
+        // @<node>/e=<epoch>/<ordinal>#<offset>:<length>
+        final int hash = recorded.indexOf('#');
+        final int slash = hash < 0 ? -1 : recorded.lastIndexOf('/', hash);
+        final int nodeEnd = recorded.indexOf('/');
+        final int colon = hash < 0 ? -1 : recorded.indexOf(':', hash);
+        if (nodeEnd <= 1 || slash <= nodeEnd + 1 || hash <= slash + 1 || colon <= hash + 1 || colon == recorded.length() - 1) {
+            throw new IOException("malformed location [" + recorded + "] of [" + fileName + "]");
+        }
+        try {
+            final String epochDir = recorded.substring(nodeEnd + 1, slash);
+            if (epochDir.startsWith("e=") == false) {
+                throw new IOException("malformed location [" + recorded + "] of [" + fileName + "]");
+            }
+            final FileLocation parsed = nodePacked(
+                recorded.substring(1, nodeEnd),
+                Long.parseLong(epochDir.substring(2)),
+                Long.parseLong(recorded.substring(slash + 1, hash)),
+                Long.parseLong(recorded.substring(hash + 1, colon)),
+                Long.parseLong(recorded.substring(colon + 1))
+            );
+            if (parsed.encode().equals(recorded) == false) {
+                throw new IOException("malformed location [" + recorded + "] of [" + fileName + "]");
+            }
+            return parsed;
+        } catch (IllegalArgumentException e) {
+            throw new IOException("malformed location [" + recorded + "] of [" + fileName + "]", e);
+        }
+    }
+
+    /**
+     * Whether the file is in a node pack, outside the shard, rather than in one of the shard's term containers.
+     *
+     * @return true for a file in a node pack
+     */
+    public boolean isNodePacked() {
+        return termDir.startsWith(NODE_PACK_PREFIX);
+    }
+
+    /**
+     * The container the file's blob is in: a term container under the shard, or a node's pack epoch beside the
+     * node logs.
+     *
+     * <p>A shard's base path is {@code <base>/segments/<shard>}, so the cluster's base, where node packs live, is two
+     * levels up. Resolving it here keeps every reader of a manifest from having to carry the base along.
+     *
+     * @param shardBase the shard's base path
+     * @return the container's path
+     */
+    public BlobPath containerPath(BlobPath shardBase) {
+        if (isNodePacked() == false) {
+            return shardBase.add(termDir);
+        }
+        final int slash = termDir.indexOf('/');
+        final BlobPath base = shardBase.parent().parent();
+        return base.add(NodePackStore.ROOT).add(termDir.substring(1, slash)).add(termDir.substring(slash + 1));
+    }
+
     /**
      * Whether the file is a range of a pack rather than a blob of its own.
      *
@@ -111,7 +203,8 @@ public record FileLocation(String termDir, String blob, long offset, long length
     /**
      * The value a manifest records for this location.
      *
-     * @return {@code t=<term>} for a file of its own, {@code t=<term>/<pack>#<offset>:<length>} for a packed one
+     * @return {@code t=<term>} for a file of its own, {@code t=<term>/<pack>#<offset>:<length>} for a packed one, and
+     *         {@code @<node>/e=<epoch>/<ordinal>#<offset>:<length>} for one in a node pack
      */
     public String encode() {
         return isPacked() ? termDir + "/" + blob + "#" + offset + ":" + length : termDir;

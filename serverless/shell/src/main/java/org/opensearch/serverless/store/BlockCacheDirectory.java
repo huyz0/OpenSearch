@@ -131,7 +131,7 @@ public final class BlockCacheDirectory extends FilterDirectory {
                     files.put(
                         entry.getKey(),
                         new RemoteFile(
-                            blobStore.blobContainer(shardBase.add(termDir)),
+                            blobStore.blobContainer(location.containerPath(shardBase)),
                             location.blob(),
                             length,
                             // A pack's name, not only its term: a cache keyed on the term and the file's name alone
