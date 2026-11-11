@@ -123,6 +123,7 @@ public class WarmJoinMeterTests extends OpenSearchTestCase {
         }
         try (
             ServerlessNode peer = joined(new ServerlessNode(nodeSettings("meter-peer", "search", false)), plane);
+            ServerlessNode peer2 = joined(new ServerlessNode(nodeSettings("meter-peer2", "search", false)), plane);
             ServerlessNode warm = joined(new ServerlessNode(nodeSettings("meter-warm", "search", true)), plane);
             ServerlessNode cold = new ServerlessNode(nodeSettings("meter-cold", "search", false))
         ) {
@@ -131,12 +132,14 @@ public class WarmJoinMeterTests extends OpenSearchTestCase {
                 all.add(s);
             }
             search(peer, plane, all);
+            search(peer2, plane, all);
             slow.setDelayMillis(REQUEST_MILLIS);
 
             // Warm: copy, open, fetch what is missing, turn ready; then the first searches.
             final String peerId = peer.localNode().getId();
+            final String peer2Id = peer2.localNode().getId();
             final String warmId = warm.localNode().getId();
-            final List<Integer> warmShare = shareOf(warmId, peerId, warmId);
+            final List<Integer> warmShare = shareOf(warmId, peerId, peer2Id, warmId);
             store.reset();
             final long warmStarted = System.nanoTime();
             final SearchWarmup.Outcome warmed = SearchWarmup.warm(warm, plane);
@@ -149,7 +152,7 @@ public class WarmJoinMeterTests extends OpenSearchTestCase {
             // Cold: joins ready, and its first searches open and read its share from the store.
             joined(cold, plane);
             final String coldId = cold.localNode().getId();
-            final List<Integer> coldShare = shareOf(coldId, peerId, warmId, coldId);
+            final List<Integer> coldShare = shareOf(coldId, peerId, peer2Id, warmId, coldId);
             store.reset();
             final double coldFirst = search(cold, plane, coldShare);
             final long coldReads = store.blobReads();
@@ -161,7 +164,8 @@ public class WarmJoinMeterTests extends OpenSearchTestCase {
 
             logger.info(
                 "WARMMETER|{} ms per store request|cold join: {} shards, {} block reads ({} per shard), first search {} ms"
-                    + "|warm join: {} shards, warm-up {} ms with {} store requests, then {} block reads, first search {} ms"
+                    + "|warm join from 2 peers: {} shards, ready after {} ms, warm-up {} ms with {} store requests, then {} block reads,"
+                    + " first search {} ms"
                     + "|{} blocks copied ({} bytes)|drain: {} shards taken over, {} blocks handed over, {} block reads, {} ms",
                 REQUEST_MILLIS,
                 coldShare.size(),
@@ -169,6 +173,7 @@ public class WarmJoinMeterTests extends OpenSearchTestCase {
                 coldShare.isEmpty() ? 0 : coldReads / coldShare.size(),
                 String.format(java.util.Locale.ROOT, "%.1f", coldFirst),
                 warmShare.size(),
+                warmed.readyMillis(),
                 warmUpMillis,
                 warmUpReads,
                 warmSearchReads,

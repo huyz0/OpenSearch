@@ -19,6 +19,8 @@ import org.opensearch.serverless.store.BlockCacheDirectory;
 import org.opensearch.serverless.transport.CacheWarmCopy;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -26,6 +28,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Takes a search node that joined to warm from {@link SearchReadiness.State#WARMING} to ready: copies its share of the
  * warm cache from its peers, opens those shards as readers, reads from the object store what no peer could hand over,
  * then marks it ready and renews its lease at once so that coordinators start ranking it.
+ *
+ * <p>It turns ready once it holds {@value #READY_FRACTION} of the blocks its peers named (nine tenths by default),
+ * opening its shards then; the rest of the copy, and the reads of what no peer had, go on after.
  *
  * <p>Bounded by {@value #MAX_WAIT}. A node is never held out of searches longer than that, whatever its peers are
  * doing: past it, the node turns ready and the rest of its cache fills from searches as it would have without warm-up.
@@ -38,6 +43,16 @@ public final class SearchWarmup {
     /** The longest a joining node stays warming before it turns ready regardless. */
     public static final String MAX_WAIT = "serverless.search.warm_on_join.max_wait";
 
+    /**
+     * The share of its peers' named warm blocks a joiner holds before it turns ready, from 0 to 1. The rest keeps
+     * copying after: the coldest tenth of a hot set is worth less than the minutes it can take, especially from a slow
+     * peer.
+     */
+    public static final String READY_FRACTION = "serverless.search.warm_on_join.ready_fraction";
+
+    /** The default share: nine tenths. */
+    static final double DEFAULT_READY_FRACTION = 0.9;
+
     /** The default bound: long enough to copy a few gigabytes at the default pace. */
     static final TimeValue DEFAULT_MAX_WAIT = TimeValue.timeValueMinutes(3);
 
@@ -49,8 +64,9 @@ public final class SearchWarmup {
      * @param openFailed shards that failed to open, left to open on first search
      * @param rangedReads ranged reads made for the blocks no peer handed over
      * @param tookMillis how long it took
+     * @param readyMillis how long until it turned ready, or -1 if it did not turn ready itself
      */
-    public record Outcome(CacheWarmCopy.Outcome copy, int opened, int openFailed, int rangedReads, long tookMillis) {
+    public record Outcome(CacheWarmCopy.Outcome copy, int opened, int openFailed, int rangedReads, long tookMillis, long readyMillis) {
     }
 
     private SearchWarmup() {}
@@ -102,11 +118,22 @@ public final class SearchWarmup {
 
     private static Outcome warm(ServerlessNode node, MetadataPlane plane, AtomicBoolean done) throws java.io.IOException {
         final long started = System.nanoTime();
-        final Outcome outcome = openShare(node, plane, CacheWarmCopy.of(node).copyFromPeers(), done, started);
+        final double fraction = node.settings().getAsDouble(READY_FRACTION, DEFAULT_READY_FRACTION);
+        final Opening opening = new Opening(node, plane);
+        // At the share: open what is held so far and turn ready; the copy goes on underneath for the rest.
+        final CacheWarmCopy.Outcome copy = CacheWarmCopy.of(node).copyFromPeers(fraction, shards -> {
+            opening.open(shards);
+            if (done.compareAndSet(false, true)) {
+                turnReady(node, plane);
+                opening.readyAt = System.nanoTime();
+            }
+        });
+        final int ranged = opening.finish(copy);
         if (done.compareAndSet(false, true)) {
             turnReady(node, plane);
+            opening.readyAt = System.nanoTime();
         }
-        return outcome;
+        return opening.outcome(copy, ranged, started);
     }
 
     /**
@@ -120,38 +147,68 @@ public final class SearchWarmup {
      */
     public static Outcome takeOverFrom(ServerlessNode node, MetadataPlane plane, String drainingId) {
         final long started = System.nanoTime();
-        return openShare(node, plane, CacheWarmCopy.of(node).copyFrom(List.of(drainingId)), new AtomicBoolean(), started);
+        final Opening opening = new Opening(node, plane);
+        final CacheWarmCopy.Outcome copy = CacheWarmCopy.of(node).copyFrom(List.of(drainingId));
+        return opening.outcome(copy, opening.finish(copy), started);
     }
 
-    private static Outcome openShare(
-        ServerlessNode node,
-        MetadataPlane plane,
-        CacheWarmCopy.Outcome copy,
-        AtomicBoolean done,
-        long started
-    ) {
-        int opened = 0;
-        int failed = 0;
-        int ranged = 0;
-        for (CacheWarmCopy.Shard shard : copy.shards()) {
-            if (done.get()) {
-                break;
-            }
-            try {
-                final ShardId id = node.readers().serveAsReader(plane, shard.indexName(), shard.shard(), shard.indexUuid());
-                opened++;
-                ranged += fetchFromStore(node, id, copy.unheld().getOrDefault(shard, List.of()));
-            } catch (Exception e) {
-                failed++;
-                LOG.debug(
-                    "could not open shard [{}][{}] ahead of its searches; it opens on its first",
-                    shard.indexName(),
-                    shard.shard(),
-                    e
-                );
+    /** Opens a share's shards, each once, whether at the ready point or after the copy. */
+    private static final class Opening {
+        private final ServerlessNode node;
+        private final MetadataPlane plane;
+        private final Map<CacheWarmCopy.Shard, ShardId> opened = new java.util.concurrent.ConcurrentHashMap<>();
+        private final Set<CacheWarmCopy.Shard> failed = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        private volatile long readyAt = -1;
+
+        Opening(ServerlessNode node, MetadataPlane plane) {
+            this.node = node;
+            this.plane = plane;
+        }
+
+        void open(Set<CacheWarmCopy.Shard> shards) {
+            for (CacheWarmCopy.Shard shard : shards) {
+                if (opened.containsKey(shard) || failed.contains(shard)) {
+                    continue;
+                }
+                try {
+                    opened.put(shard, node.readers().serveAsReader(plane, shard.indexName(), shard.shard(), shard.indexUuid()));
+                } catch (Exception e) {
+                    failed.add(shard);
+                    LOG.debug(
+                        "could not open shard [{}][{}] ahead of its searches; it opens on its first",
+                        shard.indexName(),
+                        shard.shard(),
+                        e
+                    );
+                }
             }
         }
-        return new Outcome(copy, opened, failed, ranged, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+
+        /** Opens what is not open yet and reads from the store what the copy did not bring; returns the ranged reads. */
+        int finish(CacheWarmCopy.Outcome copy) {
+            open(copy.shards());
+            int ranged = 0;
+            for (Map.Entry<CacheWarmCopy.Shard, ShardId> shard : opened.entrySet()) {
+                try {
+                    ranged += fetchFromStore(node, shard.getValue(), copy.unheld().getOrDefault(shard.getKey(), List.of()));
+                } catch (Exception e) {
+                    LOG.debug("could not read the rest of shard [{}] ahead of its searches", shard.getKey(), e);
+                }
+            }
+            return ranged;
+        }
+
+        Outcome outcome(CacheWarmCopy.Outcome copy, int ranged, long started) {
+            final long ready = readyAt;
+            return new Outcome(
+                copy,
+                opened.size(),
+                failed.size(),
+                ranged,
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started),
+                ready < 0 ? -1 : TimeUnit.NANOSECONDS.toMillis(ready - started)
+            );
+        }
     }
 
     /** Marks the node ready and renews its lease now rather than at the next pass, so it is ranked as a reader at once. */
