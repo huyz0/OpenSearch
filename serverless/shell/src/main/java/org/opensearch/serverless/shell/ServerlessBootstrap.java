@@ -15,6 +15,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.ReconcileScheduler;
+import org.opensearch.serverless.store.NodeLogCommitter;
 
 import java.io.Closeable;
 import java.nio.file.Path;
@@ -165,8 +166,11 @@ public final class ServerlessBootstrap implements Closeable {
      */
     public static final String NODE_LOG_PUBLISH_MAX_AGE = "serverless.wal.node_log.publish_max_age_millis";
 
-    /** The default {@link #NODE_LOG_PUBLISH_MAX_AGE}: a minute. */
-    public static final long DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS = 60_000L;
+    /** The default {@link #NODE_LOG_PUBLISH_MAX_AGE}: a second, as core refreshes an index that sets no interval. */
+    public static final long DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS = 1_000L;
+
+    /** How long a node's write-log window stays open: one of {@link NodeLogCommitter#ALLOWED_WINDOW_MILLIS}. */
+    public static final String NODE_LOG_WINDOW = "serverless.wal.node_log.window_millis";
 
     /** The first token of the readiness line, so the file is self-describing. */
     public static final String READY_MARKER = "SERVERLESS_READY";
@@ -328,10 +332,24 @@ public final class ServerlessBootstrap implements Closeable {
 
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             openedLoop = loop;
-            if (complete.getAsBoolean("serverless.wal.node_log.enabled", false)) {
+            final boolean nodeLog = complete.getAsBoolean("serverless.wal.node_log.enabled", false);
+            final long window = complete.getAsLong(NODE_LOG_WINDOW, NodeLogCommitter.DEFAULT_WINDOW_MILLIS);
+            if (nodeLog) {
+                if (NodeLogCommitter.ALLOWED_WINDOW_MILLIS.contains(window) == false) {
+                    throw new IllegalArgumentException(
+                        "["
+                            + NODE_LOG_WINDOW
+                            + "] must be one of "
+                            + new java.util.TreeSet<>(NodeLogCommitter.ALLOWED_WINDOW_MILLIS)
+                            + ", got "
+                            + window
+                    );
+                }
+                // Due times line up with the window the log ships on, so shards that come due together go out together.
                 loop.setLazyPublish(
                     complete.getAsLong(NODE_LOG_PUBLISH_MAX_AGE, DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS),
-                    complete.getAsLong(PUBLISH_MAX_UNPUBLISHED_OPERATIONS, ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS)
+                    complete.getAsLong(PUBLISH_MAX_UNPUBLISHED_OPERATIONS, ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS),
+                    window
                 );
             }
             loop.setDemandDrivenActivation(complete.getAsBoolean(ON_DEMAND, true))
@@ -349,8 +367,9 @@ public final class ServerlessBootstrap implements Closeable {
                 node.threadPool(),
                 plane.clock(),
                 org.opensearch.common.unit.TimeValue.timeValueMillis(Math.max(1L, ttl / ReconcileScheduler.RENEWALS_PER_TTL)),
+                // With the node log, a pass looks again every window, so a shard due at a tick is published at it.
                 org.opensearch.common.unit.TimeValue.timeValueMillis(
-                    complete.getAsLong(PUBLISH_DEBOUNCE, ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis())
+                    complete.getAsLong(PUBLISH_DEBOUNCE, nodeLog ? window : ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis())
                 ),
                 ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
             );
