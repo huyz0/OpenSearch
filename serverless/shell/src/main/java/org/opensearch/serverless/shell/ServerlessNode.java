@@ -9,7 +9,6 @@
 package org.opensearch.serverless.shell;
 
 import org.opensearch.Version;
-import org.opensearch.cluster.ClusterName;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.NodeConnectionsService;
 import org.opensearch.cluster.node.DiscoveryNode;
@@ -34,16 +33,12 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.cluster.LocalViewProjector;
 import org.opensearch.serverless.cluster.ShardAssignment;
 import org.opensearch.serverless.membership.MembershipSource;
-import org.opensearch.serverless.rest.ServerlessHealthHandler;
-import org.opensearch.serverless.rest.ServerlessRootHandler;
 import org.opensearch.serverless.shard.ShardReconciler;
 import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.threadpool.ThreadPool;
-import org.opensearch.transport.Netty4ModulePlugin;
 import org.opensearch.transport.Transport;
 import org.opensearch.transport.TransportService;
 import org.opensearch.transport.client.node.NodeClient;
-import org.opensearch.usage.UsageService;
 
 import java.io.Closeable;
 import java.net.InetAddress;
@@ -594,6 +589,21 @@ public final class ServerlessNode implements Closeable {
     /** Serves this node's readers. */
     final ReaderServing readerServing = new ReaderServing(this);
 
+    /** Builds this node's engines and directories. */
+    final NodeStorage storage = new NodeStorage(this);
+
+    /** Wires this node's REST and transport layers. */
+    final NodeWiring wiring = new NodeWiring(this);
+
+    /** Keeps this node's index descriptors current. */
+    final DescriptorRefresh descriptorRefresh = new DescriptorRefresh(this);
+
+    /** Reads this node's documents. */
+    final NodeDocumentReads reads = new NodeDocumentReads(this);
+
+    /** Starts this node. */
+    final NodeStartup startup = new NodeStartup(this);
+
     /**
      * Constructs a node. Nothing is started until {@link #start()} is called.
      *
@@ -642,7 +652,7 @@ public final class ServerlessNode implements Closeable {
             this::clusterService,
             () -> membershipSource,
             () -> metadataPlane,
-            this::projectView
+            startup::projectView
         );
         // Role is a runtime attribute a node advertises, not a topology decision baked into a
         // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
@@ -782,8 +792,8 @@ public final class ServerlessNode implements Closeable {
                 pluginsService,
                 nodeEnvironment,
                 clusterService,
-                engineFactoryProviders(),
-                directoryFactories()
+                storage.engineFactoryProviders(),
+                storage.directoryFactories()
             );
             this.searchService = services.buildSearchService(clusterSettings, clusterService, indicesService);
 
@@ -814,7 +824,7 @@ public final class ServerlessNode implements Closeable {
             };
             // Before the controller, because every handler it registers is wrapped in this.
             this.systemIndices = new org.opensearch.serverless.rest.SystemIndices(this.plugins.systemIndexPatterns(settings));
-            this.restController = buildRestController(clusterSettings);
+            this.restController = wiring.buildRestController(clusterSettings);
             final NetworkModule networkModule = services.buildNetworkModule(clusterSettings, restController);
             final Transport transport = networkModule.getTransportSupplier().get();
             this.transportService = new TransportService(
@@ -822,7 +832,7 @@ public final class ServerlessNode implements Closeable {
                 transport,
                 null,
                 threadPool,
-                authenticatedPluginHops(networkModule.getTransportInterceptor()),
+                wiring.authenticatedPluginHops(networkModule.getTransportInterceptor()),
                 boundAddress -> new DiscoveryNode(
                     nodeName,
                     nodeEnvironment.nodeId(),
@@ -847,69 +857,6 @@ public final class ServerlessNode implements Closeable {
                 ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
             }
         }
-    }
-
-    /**
-     * The node's role decides its engine, which is what makes the two shard roles asymmetric rather
-     * than merely differently labelled.
-     *
-     * <p>A node that does not accept writer activation runs {@link org.opensearch.index.engine.ReadOnlyEngine},
-     * so a reader shard is <em>structurally</em> unable to write — not merely expected not to. That
-     * matters because a reader opens a shard without acquiring its head: there is no compare-and-swap
-     * behind it, and safety comes from the engine being incapable rather than from a convention.
-     *
-     * <p>Readers needing no coordination is the point, not a shortcut.
-     * Readers are interchangeable caches, so any search
-     * node can serve any shard by reading its manifest, and the directory tier just learns about it.
-     */
-    private
-        java.util.Collection<
-            java.util.function.Function<org.opensearch.index.IndexSettings, java.util.Optional<org.opensearch.index.engine.EngineFactory>>>
-        engineFactoryProviders() {
-        if (roles.contains(ROLE_INGEST)) {
-            // Core's own writer engine, with one thing added: it knows this shard's history may continue
-            // in an object-store log rather than a local translog, and replays it during recovery so the
-            // sequence numbers survive. See ServerlessWriterEngine for why replay cannot happen later.
-            final org.opensearch.index.engine.EngineFactory writer = config -> new org.opensearch.serverless.engine.ServerlessWriterEngine(
-                config,
-                new org.opensearch.serverless.engine.ServerlessWriterEngine.ReplayLog() {
-                    @Override
-                    public java.util.List<org.opensearch.serverless.store.WalRecord> recordsFor(
-                        org.opensearch.core.index.shard.ShardId shardId
-                    ) throws java.io.IOException {
-                        return reconciler == null ? java.util.List.of() : reconciler.replayRecordsFor(shardId);
-                    }
-
-                    @Override
-                    public void forEachRecord(
-                        org.opensearch.core.index.shard.ShardId shardId,
-                        org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, java.io.IOException> consumer
-                    ) throws java.io.IOException {
-                        if (reconciler != null) {
-                            reconciler.forEachReplayRecord(shardId, consumer);
-                        }
-                    }
-
-                    @Override
-                    public boolean replayed(
-                        org.opensearch.core.index.shard.ShardId shardId,
-                        org.opensearch.serverless.engine.ReplaySpool spool
-                    ) throws java.io.IOException {
-                        return reconciler != null && reconciler.retainReplay(shardId, spool);
-                    }
-                }
-            );
-            return java.util.List.of(indexSettings -> java.util.Optional.of(writer));
-        }
-        final org.opensearch.index.engine.EngineFactory readOnly = config -> new org.opensearch.index.engine.ReadOnlyEngine(
-            config,
-            null,
-            null,
-            true,
-            java.util.function.Function.identity(),
-            false
-        );
-        return java.util.List.of(indexSettings -> java.util.Optional.of(readOnly));
     }
 
     /**
@@ -964,141 +911,6 @@ public final class ServerlessNode implements Closeable {
         return indexSettings.getSettings().get(STORAGE_UUID_SETTING) == null ? null : indexSettings.getIndex().getUUID();
     }
 
-    private Map<String, org.opensearch.plugins.IndexStorePlugin.DirectoryFactory> directoryFactories() {
-        final org.opensearch.plugins.IndexStorePlugin.DirectoryFactory factory =
-            new org.opensearch.plugins.IndexStorePlugin.DirectoryFactory() {
-                @Override
-                public org.apache.lucene.store.Directory newDirectory(
-                    org.opensearch.index.IndexSettings indexSettings,
-                    org.opensearch.index.shard.ShardPath shardPath
-                ) throws java.io.IOException {
-                    return open(
-                        org.apache.lucene.store.FSDirectory.open(shardPath.resolveIndex()),
-                        indexSettings,
-                        shardPath.getShardId().id()
-                    );
-                }
-
-                @Override
-                public org.apache.lucene.store.Directory newFSDirectory(
-                    java.nio.file.Path location,
-                    org.apache.lucene.store.LockFactory lockFactory,
-                    org.opensearch.index.IndexSettings indexSettings
-                ) throws java.io.IOException {
-                    // This hands over a location rather than a ShardPath, so the shard number has to be
-                    // recovered from the directory the location sits in
-                    // ({data}/indices/{uuid}/{shard}/index).
-                    final org.apache.lucene.store.Directory local = org.apache.lucene.store.FSDirectory.open(location, lockFactory);
-                    final int shardNumber;
-                    try {
-                        shardNumber = Integer.parseInt(location.getParent().getFileName().toString());
-                    } catch (RuntimeException e) {
-                        // An unexpected layout means we cannot say which shard this is, and guessing would
-                        // attach one shard's directory to another's data. Local-only is the safe answer.
-                        logger.warn("could not derive a shard number from " + location + "; serving it from local disk only", e);
-                        return local;
-                    }
-                    return open(local, indexSettings, shardNumber);
-                }
-            };
-        return Map.of(BLOCK_CACHE_STORE_TYPE, factory);
-    }
-
-    /**
-     * Builds one shard's directory, whichever way the store asked for it.
-     *
-     * <p><b>Both entry points come here, and that is the point.</b> They were written separately, and the
-     * one core happened to call for a live shard grew the logic while the other kept deriving the storage
-     * path from the shard's own uuid. That is right for every ordinary shard and silently wrong for a
-     * frozen view, whose uuid is the view's and under which nothing was ever written — the view opened
-     * onto an empty directory and reported an index with no segments, which reads like a corrupted shard
-     * rather than a shell bug. Whatever decides which method core calls, it cannot decide correctness.
-     *
-     * @param local the shard's local directory
-     * @param indexSettings the shard's settings, which say whose bytes it reads
-     * @param shardNumber the shard
-     * @return the directory to serve it from
-     * @throws java.io.IOException if the manifest or its term containers cannot be read
-     */
-    private org.apache.lucene.store.Directory open(
-        org.apache.lucene.store.Directory local,
-        org.opensearch.index.IndexSettings indexSettings,
-        int shardNumber
-    ) throws java.io.IOException {
-        final var plane = metadataPlane;
-        if (plane == null) {
-            // No metadata plane means no manifest to read; a plain local directory is the truthful
-            // fallback rather than a half-built remote one.
-            return local;
-        }
-        final String indexName = indexSettings.getIndex().getName();
-        final var shardBase = org.opensearch.serverless.metadata.RegisterMap.shardData(
-            plane.basePath(),
-            indexName,
-            storageUuidOf(indexSettings),
-            shardNumber
-        );
-        final String viewId = frozenViewIdOf(indexSettings);
-        // The commit the reconciler is opening this shard at, if it is opening one right now. It read the
-        // manifest -- or the view's record -- to decide how to open the shard, and arms it for exactly the
-        // window in which this factory runs; taking it here is what makes a reader open one register read
-        // rather than one per layer that needs the same answer.
-        final ShardReconciler opening = reconciler;
-        final java.util.Optional<org.opensearch.serverless.store.CommitManifest> armed = opening == null
-            ? java.util.Optional.empty()
-            : opening.pendingManifest(indexSettings.getIndex(), shardNumber);
-        if (armed.isPresent()) {
-            final String scope = (viewId != null ? viewId : storageUuidOf(indexSettings)) + "#" + shardNumber;
-            return org.opensearch.serverless.store.BlockCacheDirectory.create(
-                local,
-                plane.blobStore(),
-                shardBase,
-                blockCache,
-                scope,
-                armed.get()
-            );
-        }
-        // A frozen view opens the commit it froze, which is not the one the manifest register holds now --
-        // that is the entire point of it. The view's identifier is this index's uuid, so the record is one
-        // lookup away.
-        if (viewId != null) {
-            final var pit = plane.pointInTime(viewId);
-            if (pit.isEmpty()) {
-                // Released or expired between the search resolving it and the shard opening. An empty
-                // directory here would look like an empty index; refusing says what happened.
-                throw new java.io.IOException("the point in time [" + viewId + "] is no longer held");
-            }
-            final var frozenCommit = pit.get().shards().get(shardNumber);
-            if (frozenCommit == null) {
-                // The same refusal as above, for the other way this commit can be absent. A null manifest
-                // is a legitimate "nothing published yet" for a writer opening a fresh shard, and it is
-                // exactly the wrong reading here: a view that does not cover this shard would open an
-                // empty directory, the shard would answer nothing, and the search would count it as having
-                // answered -- a hole in the coverage reported as a complete result. No view reaches this
-                // holding no commit for the shard being opened, and if one ever does it says so.
-                throw new java.io.IOException(
-                    "the point in time [" + viewId + "] holds no commit for shard " + shardNumber + " of " + shardBase.buildAsString()
-                );
-            }
-            return org.opensearch.serverless.store.BlockCacheDirectory.create(
-                local,
-                plane.blobStore(),
-                shardBase,
-                blockCache,
-                viewId + "#" + shardNumber,
-                frozenCommit
-            );
-        }
-        return org.opensearch.serverless.store.BlockCacheDirectory.create(
-            local,
-            plane.blobStore(),
-            shardBase,
-            blockCache,
-            // The uuid, not the name: a recreated index reuses its name and none of its bytes.
-            storageUuidOf(indexSettings) + "#" + shardNumber
-        );
-    }
-
     /**
      * Returns this node's block cache, whose counters say how much was actually fetched.
      *
@@ -1106,149 +918,6 @@ public final class ServerlessNode implements Closeable {
      */
     public org.opensearch.serverless.store.BlockCache blockCache() {
         return blockCache;
-    }
-
-    /**
-     * The REST surface is an explicit allowlist. Anything not registered here does not
-     * exist, and returns 404/501 rather than an empty success.
-     */
-    private RestController buildRestController(ClusterSettings clusterSettings) {
-        final RestController controller = new RestController(
-            Set.of(),
-            // The seam a plugin authenticates on: it sees every request before the handler does, can
-            // refuse it, and can leave an identity in the ThreadContext. Passed here because the
-            // controller takes it at construction, which is why plugins are held before this runs.
-            plugins.restHandlerWrapper(threadPool.getThreadContext(), Set.of()),
-            nodeClient,
-            circuitBreakerService(),
-            new UsageService()
-        );
-        // Every shell handler is registered behind the system-index guard, rather than each one checking:
-        // a guard a handler has to remember to call is a guard that one handler will not call.
-        final java.util.function.UnaryOperator<org.opensearch.rest.RestHandler> guarded =
-            handler -> org.opensearch.serverless.rest.SystemIndices.guard(handler, systemIndices);
-        controller.registerHandler(
-            guarded.apply(
-                new ServerlessRootHandler(nodeName, ClusterName.CLUSTER_NAME_SETTING.get(settings).value(), nodeEnvironment::nodeId)
-            )
-        );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.IndexAdminHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DocumentHandler(() -> this, () -> metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.BulkHandler(() -> this, () -> metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.GetHandler(() -> this, () -> metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MultiGetHandler(() -> this, () -> metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.UpdateHandler(() -> this, () -> metadataPlane)));
-        // Plugin routes last, so a plugin cannot take over an endpoint the shell has already claimed:
-        // RestController refuses a duplicate path rather than replacing it, and refusing loudly at boot
-        // is the right answer -- a plugin that silently replaced the write path would be a system whose
-        // behaviour depends on registration order.
-        for (org.opensearch.rest.RestHandler handler : plugins.restHandlers(settings, controller, clusterSettings)) {
-            controller.registerHandler(handler);
-        }
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SearchHandler(() -> this, () -> metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.CatalogHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StatsHandler(() -> this, () -> metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AliasHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PointInTimeHandler(() -> this, () -> metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DeleteByQueryHandler(() -> this, () -> metadataPlane)));
-        // Snapshot/restore, backed by this deployment's own object store rather than a distinct
-        // repository backend.
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.RepositoryHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SnapshotHandler(() -> metadataPlane, () -> this)));
-        // The one piece of /_cluster/* not refused below: cluster/config is one register, exactly
-        // like an index descriptor, and this node can answer for it the same honest way it answers for an
-        // index -- unlike health, state or stats, which are genuinely cluster-wide and would mislead
-        // coming from one node.
-        controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.ClusterSettingsHandler(() -> metadataPlane, () -> this))
-        );
-        // Cluster-shaped endpoints this deployment can answer honestly. See ClusterHealthHandler for what
-        // green is redefined to mean and why, and NodesHandler for why "no node can answer this" stopped
-        // being true the moment leases became an address book.
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.ClusterHealthHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.NodesHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MappingUpdateHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.FieldCapabilitiesHandler(() -> metadataPlane, () -> this))
-        );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.ListIndicesHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.SettingsUpdateHandler(() -> metadataPlane, () -> this))
-        );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AnalyzeHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.TemplateHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PipelineHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StoredScriptHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.SearchPipelineHandler(() -> metadataPlane, () -> this))
-        );
-        controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.SearchTemplateHandler(() -> this, () -> metadataPlane))
-        );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.RankEvalHandler(() -> this, () -> metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.RolloverHandler(() -> this, () -> metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DataStreamHandler(() -> this, () -> metadataPlane)));
-        controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.ValidateAndResolveHandler(() -> metadataPlane, () -> this))
-        );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MultiSearchHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.ExplainHandler(() -> metadataPlane, () -> this)));
-        controller.registerHandler(
-            new ServerlessHealthHandler(
-                () -> started,
-                () -> membershipSource == null ? 1 : membershipSource.current().size(),
-                nodeEnvironment::nodeId
-            )
-        );
-
-        // Then every endpoint a classic node serves and this one refuses, each with its reason.
-        RefusedEndpoints.register(controller);
-        return controller;
-    }
-
-    /**
-     * Wraps the plugins' own interceptors in the one that authenticates a plugin's action across a hop.
-     *
-     * <p>The shell's is outermost on both paths, and that is the point of the ordering rather than an
-     * accident of composition: inbound, an unauthenticated plugin action is refused before any plugin's
-     * interceptor is given it; outbound, the signature is on the context before a plugin's interceptor
-     * runs, so a plugin that inspects or forwards the request sees it as it will go on the wire.
-     *
-     * <p>Both dependencies are looked up lazily. This runs while the transport service is being built,
-     * which is before the router exists and long before the plugins' actions have been constructed.
-     *
-     * @param fromPlugins what the network module composed from the installed plugins
-     * @return the composed interceptor
-     */
-    private org.opensearch.transport.TransportInterceptor authenticatedPluginHops(
-        org.opensearch.transport.TransportInterceptor fromPlugins
-    ) {
-        final org.opensearch.transport.TransportInterceptor shell = new org.opensearch.serverless.transport.PluginHopAuthentication(
-            () -> router,
-            name -> pluginActionNames.contains(name)
-        );
-        return new org.opensearch.transport.TransportInterceptor() {
-            @Override
-            public <
-                T extends org.opensearch.transport.TransportRequest> org.opensearch.transport.TransportRequestHandler<T> interceptHandler(
-                    String action,
-                    String executor,
-                    boolean forceExecution,
-                    org.opensearch.transport.TransportRequestHandler<T> actualHandler
-                ) {
-                return shell.interceptHandler(
-                    action,
-                    executor,
-                    forceExecution,
-                    fromPlugins.interceptHandler(action, executor, forceExecution, actualHandler)
-                );
-            }
-
-            @Override
-            public AsyncSender interceptSender(AsyncSender sender) {
-                return shell.interceptSender(fromPlugins.interceptSender(sender));
-            }
-        };
     }
 
     /**
@@ -1381,48 +1050,10 @@ public final class ServerlessNode implements Closeable {
         sightings.forgetOwner(index, shard);
     }
 
-    /**
-     * Applies mapping and settings changes made elsewhere to the shards this node holds open.
-     *
-     * <p>A mapping or settings update reached only the node that served it; every other node's open
-     * shard kept the old one until it was reopened. One descriptor read per open index per heartbeat --
-     * the heartbeat already reads a head per shard -- and a refresh only when a version moved.
-     */
     java.util.Map<String, java.util.Optional<IndexDescriptor>> refreshDescriptorsOfOpenIndices(
         org.opensearch.serverless.metadata.MetadataPlane plane
     ) {
-        final java.util.Set<String> indices = new java.util.LinkedHashSet<>();
-        for (org.opensearch.core.index.shard.ShardId shardId : reconciler.openShards()) {
-            indices.add(shardId.getIndexName());
-        }
-        // What was read, for the caller: present, or definitely absent. An index whose read failed is
-        // left out, so a transient error is never mistaken for a deletion.
-        final java.util.Map<String, java.util.Optional<IndexDescriptor>> read = new java.util.LinkedHashMap<>();
-        final long intervalNanos = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(descriptorRefreshIntervalMillis);
-        final long nowNanos = System.nanoTime();
-        for (String indexName : indices) {
-            final Long lastRead = descriptorReadAtNanos.get(indexName);
-            if (intervalNanos > 0L && lastRead != null && nowNanos - lastRead < intervalNanos) {
-                // Read within the interval -- by an earlier pass, or by the incarnation fence answering a
-                // request -- and applied then. Left out of the result, which the caller reads as "not
-                // known" rather than "deleted": a deletion is refused at the fence meanwhile.
-                continue;
-            }
-            try {
-                final long startedAt = System.nanoTime();
-                final var descriptor = plane.describe(indexName);
-                read.put(indexName, descriptor);
-                descriptorReadAtNanos.put(indexName, startedAt);
-                if (descriptor.isEmpty()) {
-                    continue;
-                }
-                applyDescriptor(indexName, descriptor.get());
-            } catch (Exception e) {
-                logger.warn("could not refresh the descriptor of " + indexName + " on this node's open shards", e);
-            }
-        }
-        descriptorReadAtNanos.keySet().retainAll(indices);
-        return read;
+        return descriptorRefresh.refreshDescriptorsOfOpenIndices(plane);
     }
 
     /**
@@ -1434,49 +1065,12 @@ public final class ServerlessNode implements Closeable {
             .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest);
     }
 
-    /**
-     * Brings this node's open shards of an index up to a descriptor just read.
-     *
-     * <p>From the per-pass refresh and from the incarnation fence, which reads the same register for an
-     * index being used and so keeps its mapping and settings current at no further cost.
-     */
     void applyDescriptor(String indexName, IndexDescriptor descriptor) throws java.io.IOException {
-        // The copies the next projection is built from follow what was read, or a reader opened after a
-        // mapping update would be projected with the mapping from before it.
-        hosted.computeIfPresent(indexName, (k, v) -> descriptor);
-        served.computeIfPresent(indexName, (k, v) -> descriptor);
-        final long[] applied = appliedDescriptorVersions.computeIfAbsent(indexName, k -> new long[] { -1L, -1L });
-        synchronized (applied) {
-            if (applied[0] != descriptor.mappingVersion()) {
-                reconciler.refreshMapping(indexName, descriptor);
-                applied[0] = descriptor.mappingVersion();
-            }
-            if (applied[1] != descriptor.settingsVersion()) {
-                reconciler.refreshSettings(indexName, descriptor);
-                applied[1] = descriptor.settingsVersion();
-            }
-        }
+        descriptorRefresh.applyDescriptor(indexName, descriptor);
     }
 
-    /**
-     * Applies a descriptor some other read found -- one routing a request, say -- if it is newer than what this node's
-     * shards carry. Newer, not merely different: such a read can be older than the one the fence last applied.
-     */
     void applyIfNewer(String indexName, IndexDescriptor descriptor, long readStartedNanos) {
-        final long[] applied = appliedDescriptorVersions.get(indexName);
-        if (applied != null) {
-            synchronized (applied) {
-                if (descriptor.mappingVersion() <= applied[0] && descriptor.settingsVersion() <= applied[1]) {
-                    return;
-                }
-            }
-        }
-        try {
-            applyDescriptor(indexName, descriptor);
-            descriptorReadAtNanos.merge(indexName, readStartedNanos, Math::max);
-        } catch (Exception e) {
-            logger.warn("could not apply the descriptor of " + indexName + " read while routing", e);
-        }
+        descriptorRefresh.applyIfNewer(indexName, descriptor, readStartedNanos);
     }
 
     /** When each open index's descriptor was last read, by the refresh or by the fence, in {@link System#nanoTime} terms. */
@@ -1503,53 +1097,11 @@ public final class ServerlessNode implements Closeable {
             nodeLog(plane).renew();
             return;
         }
-        writeOwnLease(plane, java.util.List.of());
+        startup.writeOwnLease(plane, java.util.List.of());
     }
 
-    /**
-     * Returns this node's write log, starting it on first use: it reads the epochs an earlier process of this node left in
-     * the lease, before anything renews over them.
-     */
     NodeLogWriter nodeLog(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
-        final NodeLogWriter started = nodeLogWriter;
-        if (started != null && nodeLogHooked) {
-            return started;
-        }
-        synchronized (this) {
-            if (nodeLogWriter == null) {
-                final NodeLogWriter writer = NodeLogWriter.start(plane, localNode.getId(), (epochs, opensEpoch) -> {
-                    final long validUntil = ownLeaseValidUntilMillis;
-                    // Only for a new epoch: a renewal is how a lapsed lease comes back, and refusing it left the node
-                    // unable ever to renew again.
-                    if (opensEpoch && validUntil != 0L && plane.clock().getAsLong() >= validUntil) {
-                        // A lapsed lease is renewed only after this node lets go of what it held; recording an epoch is
-                        // no way around that.
-                        throw new java.io.IOException("this node's lease has lapsed; no new epoch of its log is recorded");
-                    }
-                    writeOwnLease(plane, epochs);
-                },
-                    (shardId, term) -> leases.ownsAtTerm(plane, shardId, term),
-                    settings.getAsLong(
-                        "serverless.wal.node_log.window_millis",
-                        org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_WINDOW_MILLIS
-                    ),
-                    settings.getAsLong(
-                        "serverless.wal.node_log.max_bytes",
-                        org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_MAX_BYTES
-                    ),
-                    settings.getAsInt(
-                        "serverless.wal.node_log.max_records",
-                        org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_MAX_RECORDS
-                    )
-                );
-                nodeLogWriter = writer;
-            }
-            if (reconciler != null && nodeLogHooked == false) {
-                reconciler.setNodeLog(nodeLogWriter);
-                nodeLogHooked = true;
-            }
-            return nodeLogWriter;
-        }
+        return startup.nodeLog(plane);
     }
 
     /**
@@ -1559,33 +1111,6 @@ public final class ServerlessNode implements Closeable {
      */
     public NodeLogWriter nodeLogWriter() {
         return nodeLogWriter;
-    }
-
-    private void writeOwnLease(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        java.util.List<org.opensearch.serverless.store.NodeLogEpoch> nodeLogEpochs
-    ) throws java.io.IOException {
-        // Stamped from when the renewal began: the lease is valid at least that long after it.
-        final long startedAt = plane.clock().getAsLong();
-        ownLeaseValidUntilMillis = 0L;
-        plane.membership()
-            .renew(
-                new org.opensearch.serverless.membership.NodeLease(
-                    localNode.getId(),
-                    localNode.getEphemeralId(),
-                    localNode.getAddress().toString(),
-                    roles,
-                    0L,
-                    localNode.getName(),
-                    org.opensearch.Version.CURRENT.toString()
-                ).withLoad(
-                    reconciler == null ? 0 : reconciler.heldShards().size(),
-                    admission.maxShardsHeld(),
-                    inUseLastMinute(),
-                    refusedLastMinute()
-                ).withNodeLog(nodeLogEpochs)
-            );
-        ownLeaseValidUntilMillis = startedAt + plane.leaseTtlMillis();
     }
 
     /**
@@ -1650,82 +1175,9 @@ public final class ServerlessNode implements Closeable {
         this.membershipSource = source;
     }
 
-    /**
-     * Starts the node. {@link IndicesService} and {@link SearchService} reject work until started.
-     */
+    /** Starts the node. */
     public void start() {
-        // Before anything can be sent to this node. A plugin's action is reachable over the transport
-        // from the moment its handler registers, which is well before the registry that names it exists
-        // -- see pluginActionNames for the ordering. Naming them here is what lets the interceptor
-        // demand authentication on the very first one.
-        pluginActionNames = declaredPluginActionNames();
-
-        clusterService.start();
-        indicesService.start();
-        searchService.start();
-
-        transportService.start();
-        // Say so, or refuse, when the transport is plaintext. Secure means either the secure netty
-        // transport or a plugin that supplies the secure settings a TLS transport is built from.
-        final String transportType = NetworkModule.TRANSPORT_TYPE_SETTING.get(settings);
-        final boolean secureTransport = Netty4ModulePlugin.NETTY_SECURE_TRANSPORT_NAME.equals(transportType)
-            || services.secureSettingsFactories().isEmpty() == false;
-        if (secureTransport == false) {
-            if (REQUIRE_SECURE_TRANSPORT_SETTING.get(settings)) {
-                throw new IllegalStateException(
-                    "transport.type is ["
-                        + transportType
-                        + "] and "
-                        + REQUIRE_SECURE_TRANSPORT_SETTING.getKey()
-                        + " is true: forwarded requests would carry the deployment secret in the clear"
-                );
-            }
-            logger.warn(
-                "transport.type is [{}]: forwarded requests carry the deployment secret in the clear; install a SecureSettingsFactory"
-                    + " plugin or keep the transport port off every reachable network",
-                transportType
-            );
-        }
-        transportService.acceptIncomingRequests();
-        httpServerTransport.start();
-
-        // The identity in the initial view carried a placeholder address, because the real one is not
-        // known until the transport binds. Replace it now that it is.
-        localNode = transportService.getLocalNode();
-        router = new org.opensearch.serverless.transport.ShardRouter(this, transportService, () -> metadataPlane);
-        router.registerHandlers();
-
-        // Built here rather than in the constructor: both need the node identity, and the identity is
-        // not final until the transport has bound and told us the address it got.
-        projector = new LocalViewProjector(ClusterName.CLUSTER_NAME_SETTING.get(settings), localNode);
-        reconciler = new ShardReconciler(indicesService, localNode);
-        reconciler.setOnShardFailed((failed, cause) -> {
-            // Off the failing thread, which may hold engine locks the release needs.
-            try {
-                threadPool.generic().execute(() -> leases.onShardFailed(failed, cause));
-            } catch (Exception rejected) {
-                logger.warn("could not schedule the release of failed shard " + failed, rejected);
-            }
-        });
-        started = true;
-
-        // Last, and after `started`, because a plugin's createComponents may use the client -- which
-        // refuses to work on a node that has not started. Everything a plugin can reach now exists.
-        try {
-            plugins.createComponents(this, new org.opensearch.env.Environment(settings, null));
-        } catch (Exception e) {
-            started = false;
-            throw new IllegalStateException("a plugin failed to start; the node will not serve", e);
-        }
-
-        // After createComponents, because a plugin's action almost always takes one of its own components,
-        // and before onNodeStarted, because a plugin told the node is up may immediately call its own
-        // action.
-        pluginActions = buildPluginActions();
-
-        // And then tell them the node is up. A plugin that has to read its own index cannot do it while
-        // components are being built; this is the event it waits for.
-        plugins.onNodeStarted(localNode);
+        startup.start();
     }
 
     PluginActions pluginActions = PluginActions.none();
@@ -1735,7 +1187,7 @@ public final class ServerlessNode implements Closeable {
      *
      * <p><b>Why not ask {@link #pluginActions}.</b> A {@code HandledTransportAction} registers its own
      * transport handler from its constructor, and those constructors run inside {@link
-     * #buildPluginActions()} -- which cannot run until {@code createComponents} has, which cannot run
+     * NodeWiring#buildPluginActions()} -- which cannot run until {@code createComponents} has, which cannot run
      * until the node has started, which is after {@code acceptIncomingRequests()}. So each plugin action
      * becomes reachable over the transport strictly before the registry naming it exists, and a check
      * that consulted the registry would wave those requests through for the whole of that window: the
@@ -1754,62 +1206,6 @@ public final class ServerlessNode implements Closeable {
      */
     public PluginActions pluginActions() {
         return pluginActions;
-    }
-
-    /**
-     * Builds the plugins' own transport actions.
-     *
-     * <p>What a constructor may be given is listed here rather than discovered: the node's own services,
-     * and everything the plugins built. The order is most-specific first, so a plugin component that
-     * happens to implement one of core's interfaces wins the parameter over the node's own — which is what
-     * a plugin means when it declares that parameter.
-     *
-     * @return the registry
-     */
-    /**
-     * Every action name the installed plugins declare, read from their handler descriptors.
-     *
-     * @return the names, empty when no plugin contributes an action
-     */
-    private Set<String> declaredPluginActionNames() {
-        final Set<String> names = new java.util.HashSet<>();
-        for (org.opensearch.plugins.ActionPlugin plugin : plugins.filter(org.opensearch.plugins.ActionPlugin.class)) {
-            for (org.opensearch.plugins.ActionPlugin.ActionHandler<?, ?> handler : plugin.getActions()) {
-                names.add(handler.getAction().name());
-            }
-        }
-        return Set.copyOf(names);
-    }
-
-    private PluginActions buildPluginActions() {
-        final java.util.List<org.opensearch.plugins.ActionPlugin> actionPlugins = plugins.filter(org.opensearch.plugins.ActionPlugin.class);
-        if (actionPlugins.isEmpty()) {
-            return PluginActions.none();
-        }
-        final java.util.List<Object> services = java.util.List.of(
-            new org.opensearch.action.support.ActionFilters(new java.util.HashSet<>(plugins.actionFilters())),
-            transportService,
-            transportService.getTaskManager(),
-            threadPool,
-            client(),
-            clusterService,
-            settings,
-            namedWriteableRegistry(),
-            indexNameExpressionResolver(),
-            circuitBreakerService(),
-            indicesService
-        );
-        // Each action's constructor is resolved against the node's services and the components *its own*
-        // plugin built -- never another plugin's. The aggregate list used to be offered to every action,
-        // so a plugin could take a constructor argument of a type only some other plugin's component
-        // satisfied, and get that plugin's private object handed to it by reflection.
-        return PluginActions.build(actionPlugins, plugin -> {
-            final java.util.List<Object> available = new java.util.ArrayList<>(
-                plugins.componentsOf((org.opensearch.plugins.Plugin) plugin)
-            );
-            available.addAll(services);
-            return available;
-        });
     }
 
     /**
@@ -2438,79 +1834,18 @@ public final class ServerlessNode implements Closeable {
         reconciler.markUsed(shardId, plane == null ? System.currentTimeMillis() : plane.clock().getAsLong());
     }
 
-    /**
-     * Explains a document using this incarnation's current mapping and records the shard as in use.
-     *
-     * @param shardId the shard open on this node
-     * @param id the document id
-     * @param query the query to explain
-     * @return whether the document exists and Lucene's explanation
-     * @throws java.io.IOException if the shard or its descriptor cannot be read
-     */
+    /** Explains a document using this incarnation's current mapping and records the shard as in use. */
     public org.opensearch.serverless.shard.ShardExplain.Outcome explain(
         org.opensearch.core.index.shard.ShardId shardId,
         String id,
         org.opensearch.index.query.QueryBuilder query
     ) throws java.io.IOException {
-        ensureStarted();
-        if (reconciler.shard(shardId) == null) {
-            throw new java.io.IOException("cannot explain from " + shardId + ": not open on " + nodeName);
-        }
-        markUsed(shardId);
-        ensureIncarnationLive(shardId);
-        final var outcome = org.opensearch.serverless.shard.ShardExplain.execute(searchService(), shardId, id, query);
-        ensureIncarnationLive(shardId);
-        return outcome;
+        return reads.explain(shardId, id, query);
     }
 
-    /**
-     * Reads one document by id, from this node's own copy of the shard.
-     *
-     * <p><b>Realtime, and that is the whole reason this exists separately from search.</b> A write is
-     * applied to the engine and durable in the log before it is acknowledged, but it is not searchable
-     * until a refresh and not in the object store until a publish. A get that went through the search
-     * path would therefore fail to find a document the caller had just been told was written — which
-     * reads as data loss and is not. This reads the live version map, so it sees the write.
-     *
-     * <p>Whether the answer is realtime depends on which copy this is, and the caller is the one that
-     * knows: a writer's copy includes everything acknowledged, a reader's copy includes only what was
-     * published. This method does not choose between them — {@code GetHandler} does, and says which it
-     * used in the response.
-     *
-     * @param shardId the shard, open on this node
-     * @param id the document id
-     * @return what was found, which may be nothing
-     * @throws java.io.IOException if the shard is not open here
-     */
+    /** Reads one document by id, from this node's own copy of the shard. */
     public Document get(org.opensearch.core.index.shard.ShardId shardId, String id) throws java.io.IOException {
-        ensureStarted();
-        final var shard = reconciler.shard(shardId);
-        if (shard == null) {
-            throw new java.io.IOException("cannot read from " + shardId + ": not open on " + nodeName);
-        }
-        markUsed(shardId);
-        ensureIncarnationLive(shardId);
-        final var result = shard.getService()
-            .get(
-                id,
-                null,
-                true,
-                org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                org.opensearch.index.VersionType.INTERNAL,
-                org.opensearch.search.fetch.subphase.FetchSourceContext.FETCH_SOURCE
-            );
-        // No searcher to release here: ShardGetService acquires and closes its own, and GetResult is a
-        // value rather than a handle.
-        // Before answering, found or not: a document from a deleted incarnation and a 404 from one are both
-        // answers about an index that is gone. See INCARNATION_FENCE_MILLIS.
-        ensureIncarnationLive(shardId);
-        if (result.isExists() == false) {
-            return Document.absent(id);
-        }
-        // The sequence identity comes back with the document, and always did -- ShardGetService reads it
-        // out of the same doc-values lookup that finds the source. It was simply dropped here, which is
-        // why a caller could never obtain the token it needed to send back as if_seq_no.
-        return new Document(id, true, result.sourceAsString(), result.getSeqNo(), result.getPrimaryTerm(), result.getVersion());
+        return reads.get(shardId, id);
     }
 
     /**
@@ -2759,60 +2094,11 @@ public final class ServerlessNode implements Closeable {
     }
 
     /** Of two copies of one descriptor, the one with the newer mapping and settings. */
-    private static IndexDescriptor newerOf(IndexDescriptor a, IndexDescriptor b) {
+    static IndexDescriptor newerOf(IndexDescriptor a, IndexDescriptor b) {
         if (b.mappingVersion() != a.mappingVersion()) {
             return b.mappingVersion() > a.mappingVersion() ? b : a;
         }
         return b.settingsVersion() >= a.settingsVersion() ? b : a;
-    }
-
-    /**
-     * Projects the view this node should hold: every index it serves or hosts, with every open reader
-     * and writer shard assigned here, plus whatever is being opened right now.
-     *
-     * <p>One projection for both roles. The reader path and the writer path each used to project their
-     * own half and apply it, so on a dual-role node each open replaced the other's indices in the applied
-     * state. Assignments for shards that are no longer open are pruned as they are met, so the record of
-     * writer terms follows the reconciler rather than growing with every shard ever held.
-     */
-    private ClusterState projectView(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening)
-        throws java.io.IOException {
-        final Map<String, IndexDescriptor> descriptors = new java.util.LinkedHashMap<>();
-        for (IndexDescriptor descriptor : served.values()) {
-            descriptors.merge(descriptor.name(), descriptor, ServerlessNode::newerOf);
-        }
-        for (IndexDescriptor descriptor : hosted.values()) {
-            descriptors.merge(descriptor.name(), descriptor, ServerlessNode::newerOf);
-        }
-        for (IndexDescriptor descriptor : extra) {
-            descriptors.put(descriptor.name(), descriptor);
-        }
-        final Map<String, org.opensearch.core.index.shard.ShardId> openByKey = new java.util.HashMap<>();
-        for (org.opensearch.core.index.shard.ShardId open : reconciler.openShards()) {
-            openByKey.put(shardKey(open.getIndexName(), open.id()), open);
-        }
-        final java.util.Set<org.opensearch.core.index.shard.ShardId> readers = reconciler.readerShards();
-        final Map<String, ShardAssignment> assignments = new java.util.LinkedHashMap<>();
-        for (Map.Entry<String, Integer> entry : readerShards) {
-            final String key = shardKey(entry.getKey(), entry.getValue());
-            final org.opensearch.core.index.shard.ShardId open = openByKey.get(key);
-            if (open != null && readers.contains(open)) {
-                assignments.put(key, new ShardAssignment(entry.getKey(), entry.getValue(), readerTerms.getOrDefault(key, 1L)));
-            }
-        }
-        for (Map.Entry<String, ShardAssignment> entry : new java.util.ArrayList<>(writerAssignments.entrySet())) {
-            final org.opensearch.core.index.shard.ShardId open = openByKey.get(entry.getKey());
-            if (open != null && readers.contains(open) == false) {
-                assignments.put(entry.getKey(), entry.getValue());
-            } else if (openingShards.contains(entry.getKey()) == false
-                && opening.stream().noneMatch(a -> shardKey(a.indexName(), a.shardId()).equals(entry.getKey()))) {
-                    writerAssignments.remove(entry.getKey(), entry.getValue());
-                }
-        }
-        for (ShardAssignment assignment : opening) {
-            assignments.put(shardKey(assignment.indexName(), assignment.shardId()), assignment);
-        }
-        return projector.project(descriptors.values(), assignments.values());
     }
 
     /**
