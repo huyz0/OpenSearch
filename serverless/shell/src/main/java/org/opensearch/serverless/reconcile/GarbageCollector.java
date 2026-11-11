@@ -293,7 +293,7 @@ public final class GarbageCollector {
         // name can exist in two term containers after a history bootstrap, and only one is referenced.
         final Set<String> referenced = new HashSet<>();
         for (Map.Entry<String, String> file : manifest.get().files().entrySet()) {
-            referenced.add(file.getValue() + "/" + file.getKey());
+            referenced.add(manifest.get().location(file.getKey()).referencedBlob());
         }
 
         // And what any frozen view is still holding.

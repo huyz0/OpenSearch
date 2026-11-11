@@ -99,7 +99,7 @@ final class SnapshotBlobs {
         final Map<String, Long> lengths = new LinkedHashMap<>();
         final Map<String, java.util.Set<String>> missingByTerm = new LinkedHashMap<>();
         for (var file : source.files().entrySet()) {
-            final Long known = source.lengths().get(file.getKey());
+            final Long known = source.lengthOf(file.getKey());
             if (known != null) {
                 if (known < 0L) {
                     throw new IOException("snapshot contains a negative file length");
@@ -136,10 +136,19 @@ final class SnapshotBlobs {
         }
         for (var file : source.files().entrySet()) {
             final String name = file.getKey();
-            final BlobContainer sourceContainer = blobStore.blobContainer(sourceBase.add(file.getValue()));
+            final org.opensearch.serverless.store.FileLocation location = source.location(name);
+            final BlobContainer sourceContainer = blobStore.blobContainer(sourceBase.add(location.termDir()));
             // S3 requires mark/reset for upload retries. Reopen a ranged read on reset rather
-            // than buffering a potentially multi-gigabyte segment in memory.
-            try (var input = new org.opensearch.serverless.store.RepeatableBlobInputStream(sourceContainer, name, lengths.get(name))) {
+            // than buffering a potentially multi-gigabyte segment in memory. A packed file is copied out of its pack
+            // to a blob of its own.
+            try (
+                var input = new org.opensearch.serverless.store.RepeatableBlobInputStream(
+                    sourceContainer,
+                    location.blob(),
+                    location.isPacked() ? location.offset() : -1L,
+                    lengths.get(name)
+                )
+            ) {
                 destContainer.writeBlob(name, input, lengths.get(name), false);
             }
             destFiles.put(name, destTermDir);

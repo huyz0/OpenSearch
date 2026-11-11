@@ -59,7 +59,7 @@ final class OpenPrefetch {
     private static final long WAIT_SECONDS = 30;
 
     /** A file whose blocks may be fetched. */
-    record Target(BlobContainer container, String blobName, String keyPrefix, long length) {
+    record Target(BlobContainer container, String blobName, String keyPrefix, long length, long blobOffset) {
         String key(long block) {
             return keyPrefix + "#" + block;
         }
@@ -239,7 +239,7 @@ final class OpenPrefetch {
             final long start = from * blockSize;
             final int size = (int) Math.min((range.last() - from + 1) * blockSize, file.length() - start);
             final byte[] span = new byte[size];
-            try (InputStream in = file.container().readBlob(file.blobName(), start, size)) {
+            try (InputStream in = file.container().readBlob(file.blobName(), file.blobOffset() + start, size)) {
                 int read = 0;
                 while (read < size) {
                     final int n = in.read(span, read, size - read);
