@@ -26,6 +26,8 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shard.NoSuchIndexException;
+import org.opensearch.serverless.shard.NotHereException;
 import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.support.AbstractClient;
@@ -113,9 +115,9 @@ public final class ServerlessClient extends AbstractClient {
         throws Exception {
         try {
             return dispatch(action, request, serving, metadata);
-        } catch (ShardOperations.NoSuchIndexException e) {
+        } catch (NoSuchIndexException e) {
             throw new org.opensearch.index.IndexNotFoundException(e.index());
-        } catch (ShardOperations.NotHereException e) {
+        } catch (NotHereException e) {
             throw new org.opensearch.action.NoShardAvailableActionException(null, e.getMessage(), e);
         }
     }
