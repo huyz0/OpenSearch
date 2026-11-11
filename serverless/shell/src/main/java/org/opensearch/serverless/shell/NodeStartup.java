@@ -100,7 +100,7 @@ public final class NodeStartup {
                     node.nodeCapacity().admission.maxShardsHeld(),
                     node.nodeCapacity().inUseLastMinute(),
                     node.nodeCapacity().refusedLastMinute()
-                ).withNodeLog(nodeLogEpochs)
+                ).withNodeLog(nodeLogEpochs).withZone(org.opensearch.serverless.cluster.Zones.localZone(node.settings()))
             );
         node.ownLeaseValidUntilMillis = startedAt + plane.leaseTtlMillis();
     }

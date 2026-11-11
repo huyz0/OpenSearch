@@ -64,6 +64,10 @@ public final class ShardRouter {
     final TransportAuthenticator authenticator;
     /** Answers the work other nodes forward here. */
     final ForwardedWorkHandlers handlers = new ForwardedWorkHandlers(this);
+    /** Bytes exchanged with peers, by whether they stayed in this node's zone. */
+    final ZoneTraffic zoneTraffic = new ZoneTraffic();
+    private final boolean meterZones;
+    private final String localZone;
 
     /**
      * Creates a router for one node.
@@ -86,6 +90,49 @@ public final class ShardRouter {
             () -> forwardTimeout().millis(),
             node.settings().getAsInt("serverless.transport.replay_cache.capacity", 65_536)
         );
+        this.meterZones = node.settings().getAsBoolean(ZoneTraffic.ENABLED, true);
+        this.localZone = org.opensearch.serverless.cluster.Zones.localZone(node.settings());
+    }
+
+    /**
+     * Returns this node's zone, from its awareness attribute; see {@link org.opensearch.serverless.cluster.Zones}.
+     *
+     * @return the zone, or null when the node declares none
+     */
+    public String localZone() {
+        return localZone;
+    }
+
+    /**
+     * Returns the bytes this node has exchanged with peers, by zone path.
+     *
+     * @return the meter
+     */
+    public ZoneTraffic zoneTraffic() {
+        return zoneTraffic;
+    }
+
+    /** Where an exchange with a peer goes, from the zone the peer's lease advertises. */
+    ZoneTraffic.Path pathTo(DiscoveryNode peer) {
+        final MetadataPlane metadata = plane.get();
+        if (localZone == null || metadata == null || peer == null) {
+            return ZoneTraffic.Path.UNKNOWN;
+        }
+        return ZoneTraffic.pathBetween(
+            localZone,
+            org.opensearch.serverless.cluster.Zones.zoneOf(metadata.membership().current(), peer.getId())
+        );
+    }
+
+    private void meterRequest(String action, org.opensearch.transport.TransportRequest request, DiscoveryNode recipient) {
+        if (meterZones == false) {
+            return;
+        }
+        try {
+            zoneTraffic.record(pathTo(recipient), action, ZoneTraffic.sizeOf(request));
+        } catch (IOException | RuntimeException e) {
+            // A meter that cannot count is a meter that skips one request, never a request that fails.
+        }
     }
 
     /** Registers the handlers that answer forwarded work. Called once, at startup. */
@@ -159,7 +206,7 @@ public final class ShardRouter {
                 ForwardedStatsRequest.ACTION,
                 request,
                 TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedStatsResponse::new)
+                new Handler<>(future, ForwardedStatsResponse::new, this, peer, ForwardedStatsRequest.ACTION)
             );
         }
         return await(future, timeout, peer, ForwardedStatsRequest.ACTION);
@@ -200,7 +247,7 @@ public final class ShardRouter {
                 action,
                 request,
                 TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, reader)
+                new Handler<>(future, reader, this, peer, action)
             );
         }
         return await(future, timeout, peer, action);
@@ -274,6 +321,7 @@ public final class ShardRouter {
                     );
                 }
             }
+            meterRequest(action, request, recipient);
             if (mac != null) {
                 context.putHeader(TransportAuthenticator.MAC_HEADER, mac);
             } else {
@@ -538,7 +586,7 @@ public final class ShardRouter {
                 ForwardedIndexRequest.ACTION,
                 request,
                 TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedIndexResponse::new)
+                new Handler<>(future, ForwardedIndexResponse::new, this, peer, ForwardedIndexRequest.ACTION)
             );
         }
         return await(future, timeout, peer, ForwardedIndexRequest.ACTION);
@@ -565,7 +613,7 @@ public final class ShardRouter {
                 ForwardedBulkRequest.ACTION,
                 request,
                 TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedBulkResponse::new)
+                new Handler<>(future, ForwardedBulkResponse::new, this, peer, ForwardedBulkRequest.ACTION)
             );
         }
         return await(future, timeout, peer, ForwardedBulkRequest.ACTION);
@@ -638,7 +686,7 @@ public final class ShardRouter {
                 ForwardedGetRequest.ACTION,
                 request,
                 TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedGetResponse::new)
+                new Handler<>(future, ForwardedGetResponse::new, this, peer, ForwardedGetRequest.ACTION)
             );
         }
         return await(future, timeout, peer, ForwardedGetRequest.ACTION);
@@ -662,7 +710,7 @@ public final class ShardRouter {
                 ForwardedExplainRequest.ACTION,
                 request,
                 TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedExplainResponse::new)
+                new Handler<>(future, ForwardedExplainResponse::new, this, peer, ForwardedExplainRequest.ACTION)
             );
         }
         return await(future, timeout, peer, ForwardedExplainRequest.ACTION);
@@ -684,7 +732,7 @@ public final class ShardRouter {
                 ForwardedSearchRequest.ACTION,
                 request,
                 TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedSearchResponse::new)
+                new Handler<>(future, ForwardedSearchResponse::new, this, peer, ForwardedSearchRequest.ACTION)
             );
         }
         return future.actionGet(timeout);
@@ -709,7 +757,7 @@ public final class ShardRouter {
                 ForwardedFrozenSearchRequest.ACTION,
                 request,
                 TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedSearchResponse::new)
+                new Handler<>(future, ForwardedSearchResponse::new, this, peer, ForwardedFrozenSearchRequest.ACTION)
             );
         }
         return future.actionGet(timeout);
@@ -749,15 +797,38 @@ public final class ShardRouter {
 
         private final PlainActionFuture<T> future;
         private final org.opensearch.core.common.io.stream.Writeable.Reader<T> reader;
+        private final ShardRouter router;
+        private final DiscoveryNode peer;
+        private final String action;
 
-        Handler(PlainActionFuture<T> future, org.opensearch.core.common.io.stream.Writeable.Reader<T> reader) {
+        Handler(
+            PlainActionFuture<T> future,
+            org.opensearch.core.common.io.stream.Writeable.Reader<T> reader,
+            ShardRouter router,
+            DiscoveryNode peer,
+            String action
+        ) {
             this.future = future;
             this.reader = reader;
+            this.router = router;
+            this.peer = peer;
+            this.action = action;
         }
 
         @Override
         public T read(org.opensearch.core.common.io.stream.StreamInput in) throws IOException {
-            return reader.read(in);
+            if (router.meterZones == false) {
+                return reader.read(in);
+            }
+            // The answer arrives whole in memory, so what is left to read before and after is its size.
+            final int before = in.available();
+            final T answer = reader.read(in);
+            try {
+                router.zoneTraffic.record(router.pathTo(peer), action, before - in.available());
+            } catch (IOException | RuntimeException e) {
+                // Counting must never cost the answer.
+            }
+            return answer;
         }
 
         @Override

@@ -474,11 +474,32 @@ public final class StatsHandler extends BaseRestHandler {
             builder.endObject();
 
             objectStore(builder, metadata);
+            zoneTraffic(builder, serving);
             blockCache(builder, serving);
             scheduler(builder, serving);
             lease(builder, serving, metadata);
             heldShards(builder, serving, readers, frozen);
         }
+    }
+
+    /**
+     * Bytes this node sent to and read back from peers since it started, by whether they left its zone: the
+     * traffic the clouds bill. Only cross-zone bytes are broken down by action, since those are the ones to chase.
+     */
+    private static void zoneTraffic(XContentBuilder builder, ServerlessNode serving) throws IOException {
+        final var router = serving.router();
+        builder.startObject("zone_traffic");
+        builder.field("zone", router.localZone());
+        final var meter = router.zoneTraffic();
+        builder.field("same_zone_bytes", meter.total(org.opensearch.serverless.transport.ZoneTraffic.Path.SAME_ZONE));
+        builder.field("cross_zone_bytes", meter.total(org.opensearch.serverless.transport.ZoneTraffic.Path.CROSS_ZONE));
+        builder.field("unknown_zone_bytes", meter.total(org.opensearch.serverless.transport.ZoneTraffic.Path.UNKNOWN));
+        builder.startObject("cross_zone_by_action");
+        for (var entry : meter.byAction(org.opensearch.serverless.transport.ZoneTraffic.Path.CROSS_ZONE).entrySet()) {
+            builder.field(entry.getKey(), entry.getValue());
+        }
+        builder.endObject();
+        builder.endObject();
     }
 
     /** The object store's request counters since this node started, when the store is the metered one. */

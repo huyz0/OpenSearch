@@ -50,6 +50,7 @@ public final class NodeLease {
     private final int inUse;
     private final int refused;
     private final List<NodeLogEpoch> nodeLog;
+    private final String zone;
 
     /**
      * Creates a lease.
@@ -107,6 +108,7 @@ public final class NodeLease {
         this.inUse = -1;
         this.refused = -1;
         this.nodeLog = List.of();
+        this.zone = null;
     }
 
     private NodeLease(NodeLease lease, boolean revoked, long expiresAtMillis, int held, int cap) {
@@ -140,6 +142,49 @@ public final class NodeLease {
         this.inUse = inUse;
         this.refused = refused;
         this.nodeLog = List.copyOf(nodeLog);
+        this.zone = lease.zone;
+    }
+
+    private NodeLease(NodeLease lease, String zone) {
+        this.nodeId = lease.nodeId;
+        this.ephemeralId = lease.ephemeralId;
+        this.address = lease.address;
+        this.roles = lease.roles;
+        this.expiresAtMillis = lease.expiresAtMillis;
+        this.name = lease.name;
+        this.version = lease.version;
+        this.revoked = lease.revoked;
+        this.held = lease.held;
+        this.cap = lease.cap;
+        this.inUse = lease.inUse;
+        this.refused = lease.refused;
+        this.nodeLog = lease.nodeLog;
+        this.zone = zone == null || zone.isBlank() ? null : zone;
+    }
+
+    /**
+     * Returns this lease carrying the failure domain its node runs in: on Kubernetes, the value of the
+     * node's {@code topology.kubernetes.io/zone} label.
+     *
+     * <p>Peers read it to keep traffic inside a zone where they can, because traffic between zones is
+     * billed by the byte on the clouds this runs on and traffic inside one is not. It is a preference
+     * only: nothing may refuse a peer for being in another zone, and a lease without one is a peer
+     * whose zone is unknown, never one that is excluded.
+     *
+     * @param zone the zone, or null or blank when unknown
+     * @return the copy
+     */
+    public NodeLease withZone(String zone) {
+        return new NodeLease(this, zone);
+    }
+
+    /**
+     * Returns the zone the node runs in.
+     *
+     * @return the zone, or null when the lease does not say
+     */
+    public String zone() {
+        return zone;
     }
 
     /**
@@ -374,6 +419,9 @@ public final class NodeLease {
             if (refused >= 0) {
                 builder.field("refused", refused);
             }
+            if (zone != null) {
+                builder.field("zone", zone);
+            }
             if (nodeLog.isEmpty() == false) {
                 builder.startArray("node_log");
                 for (NodeLogEpoch epoch : nodeLog) {
@@ -416,6 +464,7 @@ public final class NodeLease {
             int cap = -1;
             int inUse = -1;
             int refused = -1;
+            String zone = null;
             final Set<String> roles = new LinkedHashSet<>();
             final List<NodeLogEpoch> nodeLog = new ArrayList<>();
             String field = null;
@@ -447,6 +496,7 @@ public final class NodeLease {
                         case "cap" -> cap = parser.intValue();
                         case "in_use" -> inUse = parser.intValue();
                         case "refused" -> refused = parser.intValue();
+                        case "zone" -> zone = parser.text();
                         default -> {
                             // forward compatibility: ignore fields written by a newer node
                         }
@@ -463,7 +513,7 @@ public final class NodeLease {
                 cap,
                 inUse,
                 refused
-            ).withNodeLog(nodeLog);
+            ).withNodeLog(nodeLog).withZone(zone);
             return revoked ? lease.revokedCopy() : lease;
         }
     }
