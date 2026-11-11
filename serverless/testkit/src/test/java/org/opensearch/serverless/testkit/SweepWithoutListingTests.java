@@ -66,14 +66,14 @@ public class SweepWithoutListingTests extends OpenSearchTestCase {
                     ShardOps.indexDoc(first.reconciler().shard(onFirst), "d" + doc, "{\"msg\":\"kept\",\"n\":" + doc + "}");
                     first.reconciler().shard(onFirst).refresh("sweep");
                 }
-                final CommitManifest inherited = first.publishShard(onFirst, term1);
+                final CommitManifest inherited = first.shards().publishShard(onFirst, term1);
 
                 clock.addAndGet(TTL + 1);
                 final ShardId onSuccessor = successor.activation().activateWriter(plane, "alpha", 0).orElseThrow();
                 final long term2 = plane.heads().read("alpha", 0).orElseThrow().term();
                 ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "d3", "{\"msg\":\"kept\",\"n\":3}");
                 successor.reconciler().shard(onSuccessor).refresh("sweep");
-                successor.publishShard(onSuccessor, term2);
+                successor.shards().publishShard(onSuccessor, term2);
                 // A zombie's unpublished upload, which only a listing can find.
                 store.blobContainer(plane.shardData("alpha", 0).add("t=" + term1))
                     .writeBlob("_zz.seg", new ByteArrayInputStream(new byte[] { 1, 2, 3 }), 3L, true);
@@ -85,7 +85,7 @@ public class SweepWithoutListingTests extends OpenSearchTestCase {
 
                     // The merge drops every inherited file; the next sweeps judge them from memory.
                     successor.reconciler().shard(onSuccessor).forceMerge(new ForceMergeRequest().maxNumSegments(1).flush(true));
-                    final CommitManifest merged = successor.publishShard(onSuccessor, term2);
+                    final CommitManifest merged = successor.shards().publishShard(onSuccessor, term2);
                     store.reset();
                     final Set<String> deleted = new HashSet<>();
                     for (int sweep = 0; sweep < 3; sweep++) {
