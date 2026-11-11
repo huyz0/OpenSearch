@@ -196,13 +196,13 @@ final class ShardOpening {
                     // there at this term, so there is nothing to fence or replay -- and the listings that would find so are
                     // most of what an open cost in listings.
                     final Long quietAt = reconciler.shardLogQuietAt.remove(shardId.getIndexName() + "#" + shardId.id());
+                    final java.util.function.BiPredicate<ShardId, Long> check = reconciler.ownsAtTerm;
                     if (reconciler.nodeLog != null && quietAt != null && quietAt == shardHeadTerm) {
-                        log.beginQuiet(shardHeadTerm);
+                        log.beginQuiet(shardHeadTerm, check == null ? null : () -> check.test(shardId, shardHeadTerm));
                     } else {
                         if (fencedAt == null || fencedAt != shardHeadTerm) {
                             log.fenceOlderTerms(shardHeadTerm);
                         }
-                        final java.util.function.BiPredicate<ShardId, Long> check = reconciler.ownsAtTerm;
                         log.establish(shardHeadTerm, check == null ? null : () -> check.test(shardId, shardHeadTerm));
                         closedShardLog = reconciler.nodeLog != null;
                     }

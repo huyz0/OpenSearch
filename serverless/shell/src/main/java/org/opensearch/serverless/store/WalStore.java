@@ -368,15 +368,24 @@ public final class WalStore {
      * is closed and holds nothing a published commit lacks, and every owner since has written its node's log. Nothing is
      * fenced, listed or replayed, and this instance appends nothing; a publish truncates nothing.
      *
+     * <p>Ownership is still confirmed, as {@link #establish} confirms it: a head taken and then superseded before the open
+     * gets here -- by another owner, or by an index recreated under the same name -- stops this writer.
+     *
      * @param term the term the writer holds
+     * @param stillOwner asked once the term is begun; false stops this writer. Null skips the question.
+     * @throws IOException if this node no longer owns the term
      */
-    public synchronized void beginQuiet(long term) {
+    public synchronized void beginQuiet(long term, java.util.function.BooleanSupplier stillOwner) throws IOException {
         quiet = true;
         seededTerm = term;
         poisoned = false;
         ordinal.set(0L);
         publishedUpTo = 0L;
         previousSnapshot = List.of();
+        if (stillOwner != null && stillOwner.getAsBoolean() == false) {
+            poisoned = true;
+            throw new IOException("term " + term + " has been taken over; this node will not write under it");
+        }
     }
 
     /**

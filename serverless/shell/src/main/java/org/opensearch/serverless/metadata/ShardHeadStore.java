@@ -171,7 +171,10 @@ public final class ShardHeadStore {
         final Optional<BlobRegister> existing = container.readRegister(name);
 
         if (existing.isEmpty()) {
-            final ShardHead head = new ShardHead(indexName, shardId, 1L, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid);
+            // A shard never owned has written nothing to its own log, so a first owner that writes its node's log
+            // starts it quiet, and no open of it ever lists that log.
+            final ShardHead head = new ShardHead(indexName, shardId, 1L, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid)
+                .withShardLogQuietSince(writesNodeLog ? 1L : -1L);
             final BlobRegisterCasResult created = container.createRegisterIfAbsent(name, head.toBytes());
             if (created.applied()) {
                 return Acquisition.won(head);
