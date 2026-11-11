@@ -11,17 +11,10 @@ package org.opensearch.serverless.metadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
-import org.opensearch.serverless.cluster.ShardAssignment;
 import org.opensearch.serverless.membership.BlobLeaseMembership;
 import org.opensearch.serverless.membership.NodeLease;
-import org.opensearch.serverless.store.NodeLogBlob;
-import org.opensearch.serverless.store.NodeLogEpoch;
-import org.opensearch.serverless.store.NodeLogStore;
-import org.opensearch.serverless.store.NodeLogTakeover;
 
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -42,7 +35,7 @@ import java.util.function.LongSupplier;
  */
 public final class MetadataPlane {
 
-    private static final org.apache.logging.log4j.Logger LOGGER = org.apache.logging.log4j.LogManager.getLogger(MetadataPlane.class);
+    static final org.apache.logging.log4j.Logger LOGGER = org.apache.logging.log4j.LogManager.getLogger(MetadataPlane.class);
 
     private final DescriptorStore descriptors;
     private final ShardHeadStore heads;
@@ -53,6 +46,14 @@ public final class MetadataPlane {
     private final BlobPath base;
     private final long leaseTtlMillis;
     private final LongSupplier clock;
+    private final ShardSettlement settlement;
+    private final ShardActivation activation;
+    private final AliasMutations aliases;
+    private final IndexLifecycle lifecycle;
+    private final PointsInTime pits;
+    private final TemplateStores stores;
+    private final ShardDataPaths paths;
+    private final SnapshotRecords snapshots;
 
     /**
      * Creates a metadata plane over a blob store.
@@ -96,62 +97,7 @@ public final class MetadataPlane {
             clock,
             leaseTtlMillis
         ).conditionalDeletes(descriptors::conditionalDelete);
-        final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<Boolean>> revocations =
-            new java.util.concurrent.ConcurrentHashMap<>();
-        final LivenessOracle oracle = new LivenessOracle() {
-            @Override
-            public boolean isLive(String nodeId, String ephemeralId) {
-                try {
-                    final var lease = leases.read(nodeId);
-                    // An ephemeral id that has moved on means the process that took the shard is gone, even
-                    // though a node with the same name is back. It does not inherit the claim.
-                    return lease.isPresent()
-                        && lease.get().isExpiredAt(clock.getAsLong()) == false
-                        && (ephemeralId == null || ephemeralId.equals(lease.get().ephemeralId()));
-                } catch (java.io.IOException e) {
-                    // Unreadable is not "dead": refusing to acquire is the safe answer, since the cost is a
-                    // retry and the cost of the alternative is two writers.
-                    return true;
-                }
-            }
-
-            @Override
-            public boolean revoke(String nodeId, String ephemeralId) {
-                return revoking(nodeId, ephemeralId, () -> leases.revoke(nodeId, ephemeralId));
-            }
-
-            /** The revocation reads the lease and refuses a live one, so it answers both questions at once. */
-            @Override
-            public boolean revokeUnlessLive(String nodeId, String ephemeralId) {
-                return revoke(nodeId, ephemeralId);
-            }
-
-            /**
-             * Shares one revocation among the takeovers of one dead node's shards running at the same moment. Each used
-             * to read the lease and swap it, and every swap but the first lost and read it again: three shards taken
-             * together cost five reads and three swaps of one register. Only calls in flight share an answer, so a
-             * node that renews afresh after its revocation is judged by a read made after it did.
-             */
-            private boolean revoking(String nodeId, String ephemeralId, java.util.function.BooleanSupplier revocation) {
-                final String key = nodeId + "#" + ephemeralId;
-                final java.util.concurrent.CompletableFuture<Boolean> mine = new java.util.concurrent.CompletableFuture<>();
-                final java.util.concurrent.CompletableFuture<Boolean> running = revocations.putIfAbsent(key, mine);
-                if (running != null) {
-                    return running.join();
-                }
-                try {
-                    final boolean revoked = revocation.getAsBoolean();
-                    mine.complete(revoked);
-                    return revoked;
-                } catch (RuntimeException e) {
-                    // A revocation that failed is not one: refusing the takeover is the safe answer.
-                    mine.complete(false);
-                    throw e;
-                } finally {
-                    revocations.remove(key, mine);
-                }
-            }
-        };
+        final LivenessOracle oracle = new LeaseLivenessOracle(leases, clock);
         this.heads = new ShardHeadStore(blobStore.blobContainer(RegisterMap.shards(base)), clock, leaseTtlMillis, oracle);
         this.clusterConfig = new ClusterConfig(blobStore.blobContainer(RegisterMap.clusterConfig(base)));
         this.membershipField = leases;
@@ -170,6 +116,14 @@ public final class MetadataPlane {
             blobStore.blobContainer(RegisterMap.snapshots(base)),
             blobStore.blobContainer(RegisterMap.snapshotStates(base))
         );
+        this.settlement = new ShardSettlement(blobStore, base, clock, heads, this);
+        this.activation = new ShardActivation(blobStore, base, heads, descriptors, this);
+        this.aliases = new AliasMutations(descriptors, rollups, clock, leaseTtlMillis, this);
+        this.stores = new TemplateStores(blobStore, base);
+        this.paths = new ShardDataPaths(blobStore, base, descriptors);
+        this.pits = new PointsInTime(pointInTimeStore, descriptors);
+        this.snapshots = new SnapshotRecords(snapshotStore, blobStore, base, this);
+        this.lifecycle = new IndexLifecycle(blobStore, base, clock, descriptors, heads, reclaimQueue, aliases, this);
     }
 
     /**
@@ -194,353 +148,54 @@ public final class MetadataPlane {
         return clock;
     }
 
-    /**
-     * Returns the write-ahead log for one shard.
-     *
-     * @param indexName the index
-     * @param shardId the shard number
-     * @return the WAL store
-     */
+    /** Returns the write-ahead log for one shard. */
     public org.opensearch.serverless.store.WalStore walStore(String indexName, int shardId) throws IOException {
-        return walStore(indexName, uuidOf(indexName), shardId);
+        return paths.walStore(indexName, shardId);
     }
 
-    /**
-     * Returns the write-ahead log for one shard, for a caller that already knows the index's uuid.
-     *
-     * @param indexName the index
-     * @param uuid the index's uuid
-     * @param shardId the shard number
-     * @return the WAL store
-     */
+    /** Returns the write-ahead log for one shard, for a caller that already knows the index's uuid. */
     public org.opensearch.serverless.store.WalStore walStore(String indexName, String uuid, int shardId) {
-        return new org.opensearch.serverless.store.WalStore(blobStore, RegisterMap.shardData(base, indexName, uuid, shardId));
+        return paths.walStore(indexName, uuid, shardId);
     }
 
-    /**
-     * Returns where one shard's bytes live.
-     *
-     * <p>Resolving the uuid costs a descriptor read, which is why every caller on a hot path takes the
-     * overload that supplies one. This exists for the maintenance paths, where a read is already happening
-     * and one more is not the cost that matters.
-     *
-     * @param indexName the index
-     * @param shardId the shard number
-     * @return the container path
-     * @throws IOException if the descriptor cannot be read
-     */
+    /** Returns where one shard's bytes live. */
     public BlobPath shardData(String indexName, int shardId) throws IOException {
-        return RegisterMap.shardData(base, indexName, uuidOf(indexName), shardId);
+        return paths.shardData(indexName, shardId);
     }
 
-    private String uuidOf(String indexName) throws IOException {
-        return descriptors.get(indexName)
-            .orElseThrow(() -> new IOException("no such index: " + indexName + "; its storage cannot be located without its uuid"))
-            .uuid();
-    }
-
-    /**
-     * Returns the segment publisher for one shard.
-     *
-     * @param indexName the index
-     * @param shardId the shard number
-     * @return the publisher
-     */
+    /** Returns the segment publisher for one shard. */
     public org.opensearch.serverless.store.SegmentPublisher segmentPublisher(String indexName, int shardId) throws IOException {
-        return segmentPublisher(indexName, uuidOf(indexName), shardId);
+        return paths.segmentPublisher(indexName, shardId);
     }
 
-    /**
-     * Returns the segment publisher for one shard, for a caller that already knows the index's uuid.
-     *
-     * @param indexName the index
-     * @param uuid the index's uuid
-     * @param shardId the shard number
-     * @return the publisher
-     */
+    /** Returns the segment publisher for one shard, for a caller that already knows the index's uuid. */
     public org.opensearch.serverless.store.SegmentPublisher segmentPublisher(String indexName, String uuid, int shardId) {
-        return new org.opensearch.serverless.store.SegmentPublisher(blobStore, RegisterMap.shardData(base, indexName, uuid, shardId));
+        return paths.segmentPublisher(indexName, uuid, shardId);
     }
 
-    /**
-     * Creates an index. One put-if-absent, whose cost does not depend on how many indices already exist.
-     *
-     * @param descriptor the index to create
-     * @return the descriptor register's generation
-     * @throws IndexAlreadyExistsException if the name is taken
-     * @throws IOException if the write fails
-     */
+    /** Creates an index. */
     public long createIndex(IndexDescriptor descriptor) throws IOException {
-        // The longest shard key includes the UUID and the largest shard number. Refuse an unusable
-        // layout before acknowledging its descriptor, without creating directories or probing the store.
-        blobStore.validateKey(
-            RegisterMap.shardData(base, descriptor.name(), descriptor.uuid(), descriptor.numberOfShards() - 1),
-            org.opensearch.serverless.store.SegmentPublisher.MANIFEST
-        );
-        // No clearing of the path here, and that is the point of putting the uuid in it: a uuid is minted
-        // per create, so a new index's storage is somewhere no previous index of that name ever wrote.
-        // Emptiness is a property of the path rather than of a sweep having finished.
-        return descriptors.create(descriptor);
+        return lifecycle.createIndex(descriptor);
     }
 
-    /**
-     * Removes every byte a shard wrote: its segments, its manifests and its log — except a shard a live
-     * shallow snapshot is still pinning.
-     *
-     * <p><b>A shallow snapshot names these bytes directly rather than a copy of them.</b> Its whole
-     * argument for costing nothing at capture time is that a captured commit's blobs are the same ones the
-     * live shard already wrote. Deleting the index unconditionally
-     * would delete exactly those blobs out from under a snapshot nobody had touched, which is not a corner
-     * case: taking a snapshot and then deleting the index it was taken from is the normal shape a backup
-     * is used for. A standard (non-shallow) snapshot already copied its own bytes into the repository's own
-     * storage at capture time, so it needs no such check — this only ever changes behaviour for a shallow
-     * one.
-     *
-     * <p>The check costs one listing of every live snapshot in the deployment, done once per delete rather
-     * than once per shard, and only when at least one snapshot exists anywhere — the same conditional cost
-     * {@link org.opensearch.serverless.reconcile.GarbageCollector} already pays for the identical reason.
-     * A shard this skips is not leaked forever: it becomes ordinary orphaned storage the moment its last
-     * pinning snapshot is deleted, reclaimable the same way any other orphan is (see "the whole-deployment
-     * orphan sweep" in {@code serverless-status.md}'s open items).
-     *
-     * @param indexName the index
-     * @param uuid the index's uuid, which a live snapshot's pin is keyed on
-     * @param shards how many shards it has
-     */
-    private void purgeShardData(String indexName, String uuid, int shards) throws IOException {
-        final List<SnapshotRecord> snapshots = liveSnapshots();
-        // And the frozen views, read once per delete: a point in time names a shard's files the same way a
-        // shallow snapshot does, and deleting the index used to remove them before the orphan sweep -- which
-        // does honour views -- ever saw them. A view the collector could not read pins everything, for the
-        // reason livePointsInTime gives.
-        final List<PointInTime> views = livePointsInTime(clock.getAsLong());
-        for (int shard = 0; shard < shards; shard++) {
-            if (views.isEmpty() == false && pinnedByView(views, indexName, uuid, shard)) {
-                LOGGER.info(
-                    "leaving shard " + shard + " of " + indexName + " on disk: a live point in time still names its files directly"
-                );
-                continue;
-            }
-            if (snapshots.isEmpty() == false && pinnedBy(snapshots, uuid, shard)) {
-                LOGGER.info(
-                    "leaving shard "
-                        + shard
-                        + " of "
-                        + indexName
-                        + " on disk: a live snapshot still names its blobs directly, "
-                        + "and deleting the index must not delete what a snapshot is holding"
-                );
-                continue;
-            }
-            try {
-                blobStore.blobContainer(RegisterMap.shardData(base, indexName, uuid, shard)).delete();
-            } catch (Exception e) {
-                // Best effort, and it has to be: this is called on paths that may not exist at all, and a
-                // store that cannot delete must not turn creating an index into a failure. What it costs
-                // when it fails is storage, which is recoverable, against a create that is not.
-                LOGGER.warn("could not clear storage for shard " + shard + " of " + indexName, e);
-            }
-        }
-    }
-
-    private static boolean pinnedByView(List<PointInTime> views, String indexName, String uuid, int shard) {
-        for (PointInTime view : views) {
-            if (view.isPlaceholder()) {
-                return true;
-            }
-            if (view.pins(indexName, uuid) == false) {
-                continue;
-            }
-            // A freeze in progress pins every shard of the index it names: it has read none of them yet
-            // and is about to read all of them. See GarbageCollector#pinnedByView, which mirrors this, and
-            // pinnedBy, which has had the same branch for a snapshot capture all along.
-            if (view.isCapturing() || view.shards().containsKey(shard)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean pinnedBy(List<SnapshotRecord> snapshots, String uuid, int shard) {
-        for (SnapshotRecord snapshot : snapshots) {
-            if (snapshot.referencedBlobs(uuid, shard).isEmpty() == false) {
-                return true;
-            }
-            for (SnapshotRecord.SnapshottedIndex index : snapshot.indices().values()) {
-                // A capture still in flight has named the index and not yet its commits: it is reading
-                // those manifests now, or copying the blobs they name. Everything of the index is held
-                // until the record is finished -- see capturing() for why that is the same as a pin.
-                if (index.uuid().equals(uuid) && capturing(index) && shard < index.numberOfShards()) {
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Reports whether a snapshot record describes a capture that has not finished.
-     *
-     * <p>A snapshot's record is written <em>before</em> its manifests are read, naming every index it will
-     * capture and none of their commits, and rewritten with the commits once every one has been read (and,
-     * for a standard repository, copied). The record in between is the provisional one, and it is what
-     * makes a concurrent index deletion leave the shard data alone: without it, a delete landing after the
-     * manifests were read and before the record existed purged the very blobs a {@code SUCCESS} snapshot
-     * then named, and the first restore was the first anyone heard of it.
-     *
-     * <p>Told apart by shape rather than by a flag: a finished capture records every shard of every index
-     * it names or leaves the index out, so an index with a shard count and no shards can only be one still
-     * being taken.
-     *
-     * @param index an index entry of a snapshot record
-     * @return true while the capture of that index has not finished
-     */
+    /** Reports whether a snapshot record describes a capture that has not finished. */
     public static boolean capturing(SnapshotRecord.SnapshottedIndex index) {
-        return index.shards().isEmpty() && index.numberOfShards() > 0;
+        return IndexLifecycle.capturing(index);
     }
 
-    /**
-     * Reports whether a snapshot is still being taken.
-     *
-     * @param snapshot the record
-     * @return true if any index it names is still being captured
-     */
+    /** Reports whether a snapshot is still being taken. */
     public static boolean inProgress(SnapshotRecord snapshot) {
-        for (SnapshotRecord.SnapshottedIndex index : snapshot.indices().values()) {
-            if (capturing(index)) {
-                return true;
-            }
-        }
-        return false;
+        return IndexLifecycle.inProgress(snapshot);
     }
 
-    /**
-     * Deletes an index and every shard-head belonging to it.
-     *
-     * <p>Read the descriptor and heads first, then order the descriptor away with compare-and-swap before
-     * removing the captured heads. Conditional head cleanup uses their captured generations, and data
-     * cleanup uses the captured UUID, to preserve a replacement index.
-     *
-     * @param indexName the index to delete
-     * @return true if the index existed
-     * @throws IOException if the delete fails
-     */
+    /** Deletes an index and every shard-head belonging to it. */
     public boolean deleteIndex(String indexName) throws IOException {
-        return deleteIndex(indexName, null);
+        return lifecycle.deleteIndex(indexName);
     }
 
-    /**
-     * Deletes only the incarnation the caller selected, preserving a replacement under the same name.
-     *
-     * @param indexName the index name
-     * @param expectedUuid the selected UUID, or null to select the current incarnation
-     * @return true if the selected incarnation was deleted
-     * @throws IOException if deletion fails
-     */
+    /** Deletes only the incarnation the caller selected, preserving a replacement under the same name. */
     public boolean deleteIndex(String indexName, String expectedUuid) throws IOException {
-        // The descriptor and the generation it was read at, from one read: read separately, a change
-        // landing between the two handed the delete a fresh generation for a stale descriptor.
-        final DescriptorStore.Resolution resolved = descriptors.resolve(indexName);
-        final Optional<IndexDescriptor> descriptor = Optional.ofNullable(resolved.index());
-        if (descriptor.isEmpty() || (expectedUuid != null && expectedUuid.equals(descriptor.get().uuid()) == false)) {
-            return false;
-        }
-        final boolean conditional = descriptors.conditionalDelete();
-        // This incarnation's heads, read once: whether any shard has a writer decides when the bytes are
-        // purged, and they are deleted below at exactly the generations read here.
-        final List<ShardHeadStore.HeadAt> owned = conditional
-            ? heads.readAllOf(indexName, descriptor.get().numberOfShards(), descriptor.get().uuid())
-            : List.of();
-        final boolean hadWriter = owned.stream().anyMatch(head -> head.head().ownerNodeId() != null);
-        if (conditional) {
-            // Before anything is removed, so no crash after this point can leave heads or bytes that
-            // nothing names. A delete that then loses leaves an intent naming a live index, which the
-            // reclaimer drops. See ReclaimQueue.
-            reclaimQueue.enqueue(
-                new ReclaimQueue.Intent(indexName, descriptor.get().uuid(), descriptor.get().numberOfShards(), hadWriter),
-                clock.getAsLong()
-            );
-        }
-        // Order the delete against any concurrent lifecycle change before removing anything. If the
-        // descriptor moved underneath us, someone else is mid-operation and this delete loses.
-        if (descriptors.deleteIfUnchanged(indexName, resolved.generation(), clock.getAsLong()) == false) {
-            return false;
-        }
-        // Heads only after the descriptor is ordered away: the shard count needed to enumerate them
-        // lives in the descriptor, and it is bounded by IndexDescriptor.MAX_SHARDS, so this is a
-        // bounded loop rather than a listing. Where the store deletes conditionally, only this
-        // incarnation's heads and only as they were read: the name is free from the moment the
-        // descriptor went, and a head deleted by name could be a new incarnation's (see deleteAllOf).
-        if (conditional) {
-            heads.deleteIfUnchanged(owned);
-        } else {
-            heads.releaseAllOf(indexName, descriptor.get().numberOfShards(), descriptor.get().uuid());
-        }
-        // The aliases that named it stop naming it, as core's delete does. Left in place, the alias
-        // record still listed the name while the new index of that name (created with an empty hint) said
-        // nothing named it -- GET /_alias/x and a search through x included the newcomer, GET /i/_alias
-        // said {} -- which is exactly the under-approximation the hint is documented never to make.
-        detachFromAliases(descriptor.get());
-        // And the bytes. Heads first, so a writer cannot renew and the node holding it closes the shard on
-        // its next tick; the data after, so a deleted index stops being paid for.
-        //
-        // <b>The residual race is real, and it leaks rather than resolving itself.</b> Publishing is fenced
-        // by the manifest register's term rather than by the head, so a writer that has lost its head can
-        // still complete a publish it had already begun, and leave blobs behind this sweep.
-        //
-        // They are unreachable, which is the part that holds: no descriptor and no head, under a uuid no
-        // later index can be minted with, so nothing serves them and no answer is wrong because of them.
-        //
-        // What is NOT true -- this comment used to say it was -- is that the next index of this name
-        // clears them. It cannot: createIndex deliberately clears nothing, because the uuid in the path
-        // means a new index of the same name writes somewhere else entirely, where these blobs are neither
-        // in the way nor visible. So they are storage nothing automatic reclaims: the per-shard sweep runs
-        // only for shards of live indices, and GarbageCollector#collectOrphanedShards, which would find
-        // them, is the operator's sweep and is on no loop. See serverless/STATUS.md.
-        //
-        // Where the delete is conditional and a shard had a writer, not now: that writer may yet publish
-        // before it notices, and purging now would only have to be done again once it has stopped. The
-        // reclaim does it then, once. With no writer there is nothing to wait for, and the bytes go now.
-        if (conditional == false || hadWriter == false) {
-            purgeShardData(indexName, descriptor.get().uuid(), descriptor.get().numberOfShards());
-        }
-        return true;
-    }
-
-    /**
-     * Drops a deleted index from every alias that named it, each under its own compare-and-swap.
-     *
-     * <p>An alias whose <em>only</em> index is deleted keeps naming it. Removing the alias would make a
-     * search through it "no such index: {alias}", and the answer this surface gives is the one a named
-     * index gives -- refused, naming the index that is gone -- which is what lets a caller tell a deleted
-     * index from a typo in the alias. The hint-side under-approximation this method closes is the one
-     * with other indices left; for the last one, the alias record is the whole truth and says so. A data
-     * stream keeps its stream fields on the way through; its write index cannot reach here, because
-     * {@code DELETE /{index}} refuses it.
-     */
-    private void detachFromAliases(IndexDescriptor deleted) throws IOException {
-        for (String name : deleted.aliasedBy()) {
-            boolean done = false;
-            for (int attempt = 0; attempt < 4 && done == false; attempt++) {
-                final DescriptorStore.Resolution resolved = descriptors.resolveRaw(name);
-                if (resolved.alias() != null && resolved.alias().mutationPending() && resolved.alias().protectsHint(deleted.name())) {
-                    abortAlias(resolved.alias(), resolved.generation());
-                    continue;
-                }
-                if (resolved.alias() == null || resolved.alias().indices().contains(deleted.name()) == false) {
-                    break;
-                }
-                final java.util.List<String> now = new java.util.ArrayList<>(resolved.alias().indices());
-                now.remove(deleted.name());
-                if (now.isEmpty()) {
-                    break; // the last index: the alias keeps naming it, and a search through it says so
-                }
-                done = descriptors.updateAlias(withIndices(resolved.alias(), now), resolved.generation()).isPresent();
-            }
-            if (done == false) {
-                LOGGER.warn("alias [{}] may still name the deleted index [{}]; it is being changed concurrently", name, deleted.name());
-            }
-        }
+        return lifecycle.deleteIndex(indexName, expectedUuid);
     }
 
     /**
@@ -559,232 +214,41 @@ public final class MetadataPlane {
     public record AliasAtGeneration(org.opensearch.serverless.cluster.AliasRecord alias, long generation) {
     }
 
-    /**
-     * Reads an alias and its generation together, briefly waiting for a pending mutation.
-     *
-     * @param name the alias
-     * @return the record and its generation, or empty when the name is not an alias
-     * @throws IOException if the read fails
-     */
+    /** Reads an alias and its generation together, briefly waiting for a pending mutation. */
     public Optional<AliasAtGeneration> aliasWithGeneration(String name) throws IOException {
-        final DescriptorStore.Resolution resolved = resolveForAliasMutation(name);
-        return resolved.alias() == null ? Optional.empty() : Optional.of(new AliasAtGeneration(resolved.alias(), resolved.generation()));
+        return aliases.aliasWithGeneration(name);
     }
 
-    /**
-     * Returns the same record naming different indices, with a data stream's fields carried through.
-     *
-     * <p>Every alias mutation used to rebuild the record with the two-argument constructor, which made a
-     * data stream a plain alias the moment anything touched it.
-     *
-     * @param record the record
-     * @param indices the indices it should name
-     * @return the record as it should now be written
-     */
+    /** Returns the same record naming different indices, with a data stream's fields carried through. */
     public static org.opensearch.serverless.cluster.AliasRecord withIndices(
         org.opensearch.serverless.cluster.AliasRecord record,
         java.util.List<String> indices
     ) {
-        return new org.opensearch.serverless.cluster.AliasRecord(
-            record.name(),
-            indices,
-            record.dataStream(),
-            record.generation(),
-            record.timestampField()
-        );
+        return AliasMutations.withIndices(record, indices);
     }
 
-    /**
-     * Replaces an alias under a compare-and-swap, for a caller that has not read it.
-     *
-     * <p>Costs one read more than the three-argument {@code updateAlias}, which is the form
-     * every request path uses: the read here is only for the hints, and the token still has to come from
-     * the caller's own read of the record.
-     *
-     * @param alias the alias as it should now be
-     * @param expectedGeneration the generation the caller read, with the record
-     * @return the new generation, or empty if another writer got there first
-     * @throws IOException if the swap fails
-     */
+    /** Replaces an alias under a compare-and-swap, for a caller that has not read it. */
     public Optional<Long> updateAlias(org.opensearch.serverless.cluster.AliasRecord alias, long expectedGeneration) throws IOException {
-        return updateAlias(recoverAlias(alias.name()).alias(), alias, expectedGeneration);
+        return aliases.updateAlias(alias, expectedGeneration);
     }
 
-    /**
-     * Replaces an alias under a compare-and-swap.
-     *
-     * @param before the record as the caller read it, which decides which hints change; null if none
-     * @param alias the alias as it should now be
-     * @param expectedGeneration the generation the caller read, with {@code before}, in one read
-     * @return the new generation, or empty if another writer got there first
-     * @throws IOException if the swap fails
-     */
+    /** Replaces an alias under a compare-and-swap. */
     public Optional<Long> updateAlias(
         org.opensearch.serverless.cluster.AliasRecord before,
         org.opensearch.serverless.cluster.AliasRecord alias,
         long expectedGeneration
     ) throws IOException {
-        if (before == null || before.mutationPending()) {
-            recoverAlias(alias.name());
-            return Optional.empty();
-        }
-        rollups.markAlias(alias.name());
-        final List<String> additions = new ArrayList<>(alias.indices());
-        additions.removeAll(before.indices());
-        final var pending = before.preparing(additions, mutationDeadline(), false);
-        final Optional<Long> reserved = descriptors.updateAlias(pending, expectedGeneration);
-        if (reserved.isEmpty()) {
-            return Optional.empty();
-        }
-        return publishAlias(pending, alias, reserved.get());
+        return aliases.updateAlias(before, alias, expectedGeneration);
     }
 
-    /**
-     * Creates an alias, and lists it on each index it names.
-     *
-     * @param alias the alias to create
-     * @return the generation the alias record was created at
-     * @throws IOException if a descriptor or the alias register cannot be written
-     */
+    /** Creates an alias, and lists it on each index it names. */
     public long createAlias(org.opensearch.serverless.cluster.AliasRecord alias) throws IOException {
-        rollups.markAlias(alias.name());
-        recoverAlias(alias.name());
-        final var pending = alias.preparing(alias.indices(), mutationDeadline(), true);
-        final long reserved = descriptors.createAlias(pending);
-        return publishAlias(pending, alias, reserved).orElseThrow(() -> new IOException("alias creation was superseded: " + alias.name()));
+        return aliases.createAlias(alias);
     }
 
-    private long mutationDeadline() {
-        final long now = Math.max(1L, clock.getAsLong());
-        return now > Long.MAX_VALUE - leaseTtlMillis ? Long.MAX_VALUE : now + leaseTtlMillis;
-    }
-
-    private Optional<Long> publishAlias(
-        org.opensearch.serverless.cluster.AliasRecord pending,
-        org.opensearch.serverless.cluster.AliasRecord target,
-        long reserved
-    ) throws IOException {
-        final Optional<Long> applied;
-        try {
-            for (String index : target.indices()) {
-                prepareAliasHint(index, pending, reserved);
-            }
-            applied = descriptors.updateAlias(target.published(), reserved);
-        } catch (IOException | RuntimeException e) {
-            try {
-                abortAlias(pending, reserved);
-            } catch (IOException cleanup) {
-                e.addSuppressed(cleanup);
-            }
-            throw e;
-        }
-        if (applied.isEmpty()) {
-            abortAlias(pending, reserved);
-        } else if (pending.creationPending() == false) {
-            for (String index : pending.indices()) {
-                if (target.indices().contains(index) == false) {
-                    removeAliasHint(index, target.name(), false);
-                }
-            }
-        }
-        return applied;
-    }
-
-    private void abortAlias(org.opensearch.serverless.cluster.AliasRecord pending, long reserved) throws IOException {
-        if (pending.creationPending()) {
-            descriptors.deleteIfUnchanged(pending.name(), reserved, clock.getAsLong());
-        } else {
-            descriptors.updateAlias(pending.published(), reserved);
-        }
-        for (String index : pending.pendingAdditions()) {
-            removeAliasHint(index, pending.name(), true);
-        }
-    }
-
-    /** Expired preparations are aborted; the owner can publish only while its generation still holds. */
-    private DescriptorStore.Resolution recoverAlias(String name) throws IOException {
-        for (int attempt = 0; attempt < 4; attempt++) {
-            final var current = descriptors.resolveRaw(name);
-            if (current.alias() == null
-                || current.alias().mutationPending() == false
-                || current.alias().mutationUntil() > clock.getAsLong()) {
-                return current;
-            }
-            abortAlias(current.alias(), current.generation());
-        }
-        return descriptors.resolveRaw(name);
-    }
-
-    /**
-     * Answers which aliases name an index, verified.
-     *
-     * <p>The descriptor's {@code aliased_by} list is a hint that may carry a name whose alias was never
-     * created or has since stopped naming this index. Each name costs one register read to confirm, which
-     * is bounded by how many aliases name the index rather than by how many exist -- the enumeration this
-     * design refuses.
-     *
-     * @param descriptor the index
-     * @return the aliases that currently name it, in the order they were recorded
-     * @throws IOException if a register cannot be read
-     */
+    /** Answers which aliases name an index, verified. */
     public java.util.List<String> aliasesOf(IndexDescriptor descriptor) throws IOException {
-        final java.util.List<String> confirmed = new java.util.ArrayList<>();
-        for (String name : descriptor.aliasedBy()) {
-            final DescriptorStore.Resolution resolved = resolve(name);
-            if (resolved.alias() != null && resolved.alias().indices().contains(descriptor.name())) {
-                confirmed.add(name);
-            }
-        }
-        return confirmed;
-    }
-
-    /** Prepare hints before publication, fencing removers even when the hint is already present. */
-    private void prepareAliasHint(String index, org.opensearch.serverless.cluster.AliasRecord pending, long reserved) throws IOException {
-        for (int attempt = 0; attempt < 4; attempt++) {
-            final var current = descriptors.resolveRaw(index);
-            if (current.index() == null) {
-                if (pending.pendingAdditions().contains(index)) {
-                    throw new IOException("alias member does not exist: " + index);
-                }
-                return; // An existing alias may still name a deleted index for diagnostics.
-            }
-            final var owner = descriptors.resolveRaw(pending.name());
-            if (owner.generation() != reserved || owner.alias() == null || owner.alias().mutationPending() == false) {
-                throw new IOException("alias preparation was superseded: " + pending.name());
-            }
-            final List<String> names = new ArrayList<>(current.index().aliasedBy());
-            if (names.contains(pending.name()) == false) {
-                names.add(pending.name());
-            } else if (pending.pendingAdditions().contains(index) == false) {
-                return;
-            }
-            if (descriptors.update(current.index().withAliasedBy(names), current.generation()).isPresent()) {
-                return;
-            }
-        }
-        throw new IOException("could not prepare alias hint: " + pending.name() + " on " + index);
-    }
-
-    /** Read the index before fresh alias truth so a later preparation fences this removal's CAS. */
-    private void removeAliasHint(String index, String alias, boolean fencePreparation) throws IOException {
-        for (int attempt = 0; attempt < 4; attempt++) {
-            final var current = descriptors.resolveRaw(index);
-            if (current.index() == null) {
-                return;
-            }
-            final var truth = descriptors.resolveRaw(alias);
-            if (truth.alias() != null && truth.alias().protectsHint(index)) {
-                return;
-            }
-            final List<String> names = new ArrayList<>(current.index().aliasedBy());
-            if (names.remove(alias) == false && fencePreparation == false) {
-                return;
-            }
-            if (descriptors.update(current.index().withAliasedBy(names), current.generation()).isPresent()) {
-                return;
-            }
-        }
-        LOGGER.warn("could not remove stale alias hint [{}] from [{}]", alias, index);
+        return aliases.aliasesOf(descriptor);
     }
 
     /**
@@ -841,35 +305,15 @@ public final class MetadataPlane {
      * @throws IOException if the read fails
      */
     public DescriptorStore.Resolution resolve(String name) throws IOException {
-        final var resolved = recoverAlias(name);
+        final var resolved = aliases.recoverAlias(name);
         return resolved.alias() != null && resolved.alias().creationPending()
             ? new DescriptorStore.Resolution(null, null, resolved.generation())
             : resolved;
     }
 
-    /**
-     * Reads an alias for mutation, briefly backing off while another writer prepares its hints.
-     *
-     * @param name the alias name
-     * @return its published value and generation, or a still-busy reservation after the bounded wait
-     * @throws IOException if the register cannot be read or the thread is interrupted
-     */
+    /** Reads an alias for mutation, briefly backing off while another writer prepares its hints. */
     public DescriptorStore.Resolution resolveForAliasMutation(String name) throws IOException {
-        final long started = System.nanoTime();
-        long pause = 1_000_000L;
-        while (true) {
-            final var current = recoverAlias(name);
-            if (current.alias() == null || current.alias().mutationPending() == false || System.nanoTime() - started >= 250_000_000L) {
-                return current.alias() != null && current.alias().creationPending()
-                    ? new DescriptorStore.Resolution(null, null, current.generation())
-                    : current;
-            }
-            if (Thread.currentThread().isInterrupted()) {
-                throw new java.io.InterruptedIOException("interrupted waiting for alias mutation: " + name);
-            }
-            java.util.concurrent.locks.LockSupport.parkNanos(pause);
-            pause = Math.min(64_000_000L, pause * 2L);
-        }
+        return aliases.resolveForAliasMutation(name);
     }
 
     /** How long a routing lookup may answer from a resolution it read earlier, by default. See {@link RoutingCache}. */
@@ -969,191 +413,64 @@ public final class MetadataPlane {
     public record ConfirmingRead(IndexDescriptor descriptor, long readStartedNanos) {
     }
 
-    /**
-     * Removes an alias.
-     *
-     * <p>Nothing to clean up behind it: an alias owns no shards and no bytes, which is the difference
-     * between deleting one and deleting an index.
-     *
-     * @param name the alias
-     * @return true if there was one
-     * @throws IOException if the delete fails
-     */
+    /** Removes an alias. */
     public boolean deleteAlias(String name) throws IOException {
-        final DescriptorStore.Resolution resolved = resolve(name);
-        if (resolved.alias() == null) {
-            return false;
-        }
-        return deleteAlias(resolved.alias(), resolved.generation());
+        return aliases.deleteAlias(name);
     }
 
-    /**
-     * Removes an alias the caller has read, only if it has not changed since.
-     *
-     * <p>The unconditional form re-read its own generation and deleted whatever was there, so "the last
-     * index was removed, delete the alias" deleted an index a concurrent add had just put in.
-     *
-     * @param alias the record as the caller read it
-     * @param expectedGeneration the generation it was read at
-     * @return true if this caller deleted it; false if it changed first
-     * @throws IOException if the delete fails
-     */
+    /** Removes an alias the caller has read, only if it has not changed since. */
     public boolean deleteAlias(org.opensearch.serverless.cluster.AliasRecord alias, long expectedGeneration) throws IOException {
-        if (alias.mutationPending()) {
-            recoverAlias(alias.name());
-            return false;
-        }
-        final boolean deleted = descriptors.deleteIfUnchanged(alias.name(), expectedGeneration, clock.getAsLong());
-        if (deleted) {
-            for (String index : alias.indices()) {
-                removeAliasHint(index, alias.name(), false);
-            }
-        }
-        return deleted;
+        return aliases.deleteAlias(alias, expectedGeneration);
     }
 
-    /**
-     * Freezes the current commit of every shard of an index.
-     *
-     * <p>Written before it is used and read by the collector, which is the ordering that matters: a view
-     * that existed only in the memory of the node that took it would be a promise the sweep never heard.
-     *
-     * @param pit the view to record
-     * @throws IOException if the write fails
-     */
+    /** Freezes the current commit of every shard of an index. */
     public void createPointInTime(PointInTime pit) throws IOException {
-        pointInTimeStore.create(pit);
+        pits.createPointInTime(pit);
     }
 
-    /**
-     * Records that a freeze has begun, before any manifest is read.
-     *
-     * <p>The first half of the two-phase capture {@link PointInTime#isCapturing} describes: this record
-     * names the index and holds no shards, and the collector deletes nothing for that index while it
-     * stands. {@link #finishPointInTime} replaces it with the real view.
-     *
-     * @param pit a record naming the index, with no shards
-     * @throws IOException if the write fails
-     * @throws IllegalArgumentException if the record is not a capture marker
-     */
+    /** Records that a freeze has begun, before any manifest is read. */
     public void beginPointInTime(PointInTime pit) throws IOException {
-        if (pit.isCapturing() == false) {
-            throw new IllegalArgumentException("a capture marker must name an index and hold no shards: " + pit.id());
-        }
-        pointInTimeStore.create(pit);
-        try {
-            verifyCaptureIncarnation(pit.index(), pit.indexUuid());
-        } catch (IOException | RuntimeException e) {
-            try {
-                releasePointInTime(pit.id());
-            } catch (Exception cleanup) {
-                e.addSuppressed(cleanup);
-            }
-            throw e;
-        }
+        pits.beginPointInTime(pit);
     }
 
-    /**
-     * Checks an index after its provisional pin was published, before reading any captured files.
-     *
-     * @param index the captured index
-     * @param uuid its expected incarnation, or null for a legacy capture
-     * @throws IOException if the index was deleted or recreated
-     */
+    /** Checks an index after its provisional pin was published, before reading any captured files. */
     public void verifyCaptureIncarnation(String index, String uuid) throws IOException {
-        final Optional<IndexDescriptor> current = descriptors.get(index);
-        if (current.isEmpty() || (uuid != null && uuid.equals(current.get().uuid()) == false)) {
-            throw new IOException("index [" + index + "] was deleted or recreated while starting capture");
-        }
+        pits.verifyCaptureIncarnation(index, uuid);
     }
 
-    /**
-     * Replaces a capture marker with the finished view, under the same id.
-     *
-     * <p>Overwrites rather than creates, which is the whole point: the id is already pinning the index,
-     * and a second id would leave the marker behind to expire on its own while the real view stood beside
-     * it.
-     *
-     * @param pit the finished view
-     * @throws IOException if the write fails
-     */
+    /** Replaces a capture marker with the finished view, under the same id. */
     public void finishPointInTime(PointInTime pit) throws IOException {
-        pointInTimeStore.finish(pit);
+        pits.finishPointInTime(pit);
     }
 
-    /**
-     * Moves a frozen view's deadline later.
-     *
-     * <p>The same record with a later expiry, written over the old one. Nothing about which commits the
-     * view holds changes -- a keep-alive extends a view, it does not refresh it -- so the collector's view
-     * of what is referenced is unchanged and only the reaper's deadline moves.
-     *
-     * @param pit the view, carrying its new deadline
-     * @throws IOException if the write fails
-     */
+    /** Moves a frozen view's deadline later. */
     public void extendPointInTime(PointInTime pit) throws IOException {
-        if (pointInTimeStore.extend(pit, null) == false) {
-            throw new IOException("point in time is no longer active");
-        }
+        pits.extendPointInTime(pit);
     }
 
-    /**
-     * Atomically extends the view if its deadline still matches the caller's observation.
-     *
-     * @param pit the view with its new deadline
-     * @param expectedExpiresAtMillis the deadline observed by the caller
-     * @return whether this extension won
-     * @throws IOException if the backing store fails
-     */
+    /** Atomically extends the view if its deadline still matches the caller's observation. */
     public boolean extendPointInTime(PointInTime pit, long expectedExpiresAtMillis) throws IOException {
-        return pointInTimeStore.extend(pit, expectedExpiresAtMillis);
+        return pits.extendPointInTime(pit, expectedExpiresAtMillis);
     }
 
-    /**
-     * Reads a frozen view.
-     *
-     * @param id the identifier
-     * @return the view, or empty if it never existed or has been released
-     * @throws IOException if the read fails
-     */
+    /** Reads a frozen view. */
     public java.util.Optional<PointInTime> pointInTime(String id) throws IOException {
-        return pointInTimeStore.read(id);
+        return pits.pointInTime(id);
     }
 
-    /**
-     * Releases a frozen view, so the collector stops holding its files.
-     *
-     * @param id the identifier
-     * @return true if there was one
-     * @throws IOException if the delete fails
-     */
+    /** Releases a frozen view, so the collector stops holding its files. */
     public boolean releasePointInTime(String id) throws IOException {
-        return pointInTimeStore.release(id);
+        return pits.releasePointInTime(id);
     }
 
-    /**
-     * Reads every frozen view that has not expired.
-     *
-     * <p>Expiry is claimed atomically before excluding a view, so a keep-alive acknowledged on
-     * another node cannot lose its files to a collector using a stale deadline.
-     *
-     * @param nowMillis the current time
-     * @return the live views
-     * @throws IOException if listing or reading fails
-     */
+    /** Reads every frozen view that has not expired. */
     public java.util.List<PointInTime> livePointsInTime(long nowMillis) throws IOException {
-        return pointInTimeStore.live(nowMillis);
+        return pits.livePointsInTime(nowMillis);
     }
 
-    /**
-     * Removes frozen views that have expired.
-     *
-     * @param nowMillis the current time
-     * @return how many were removed
-     * @throws IOException if listing or deleting fails
-     */
+    /** Removes frozen views that have expired. */
     public int reapPointsInTime(long nowMillis) throws IOException {
-        return pointInTimeStore.reap(nowMillis);
+        return pits.reapPointsInTime(nowMillis);
     }
 
     private final PointInTimeStore pointInTimeStore;
@@ -1195,72 +512,29 @@ public final class MetadataPlane {
         return descriptors.namesWithPrefix(prefix, cap);
     }
 
-    private final java.util.Map<String, TemplateStore.Cache> storeCaches = new java.util.concurrent.ConcurrentHashMap<>();
-
-    private TemplateStore.Cache cacheFor(org.opensearch.common.blobstore.BlobPath path) {
-        return storeCaches.computeIfAbsent(path.buildAsString(), key -> new TemplateStore.Cache());
-    }
-
-    /**
-     * Returns the store holding index templates.
-     *
-     * @return the index-template store
-     */
+    /** Returns the store holding index templates. */
     public TemplateStore indexTemplates() {
-        return new TemplateStore(blobStore.blobContainer(RegisterMap.indexTemplates(base)), cacheFor(RegisterMap.indexTemplates(base)));
+        return stores.indexTemplates();
     }
 
-    /**
-     * Returns the store holding component templates.
-     *
-     * @return the component-template store
-     */
-    /**
-     * Returns the store holding ingest pipelines.
-     *
-     * <p>A {@link TemplateStore} because the shape is identical: named JSON documents, one register each,
-     * bounded on creation, and a prefix so a foreign object in the container is not read as one. Reusing it
-     * rather than copying it means its handling of foreign files such as the ones ExtrasFS plants in tests applies here too.
-     *
-     * @return the pipeline store
-     */
-    /**
-     * Returns the stored-script store.
-     *
-     * @return the store
-     */
+    /** Returns the store holding component templates. */
     public StoredScriptStore scripts() {
-        return new StoredScriptStore(blobStore.blobContainer(RegisterMap.scripts(base)), cacheFor(RegisterMap.scripts(base)));
+        return stores.scripts();
     }
 
-    /**
-     * Returns the search-pipeline store.
-     *
-     * @return the store
-     */
+    /** Returns the search-pipeline store. */
     public TemplateStore searchPipelines() {
-        return new TemplateStore(blobStore.blobContainer(RegisterMap.searchPipelines(base)), cacheFor(RegisterMap.searchPipelines(base)));
+        return stores.searchPipelines();
     }
 
-    /**
-     * Returns the store holding ingest pipelines.
-     *
-     * @return the pipeline store
-     */
+    /** Returns the store holding ingest pipelines. */
     public TemplateStore pipelines() {
-        return new TemplateStore(blobStore.blobContainer(RegisterMap.pipelines(base)), cacheFor(RegisterMap.pipelines(base)));
+        return stores.pipelines();
     }
 
-    /**
-     * Returns the store holding component templates.
-     *
-     * @return the component-template store
-     */
+    /** Returns the store holding component templates. */
     public TemplateStore componentTemplates() {
-        return new TemplateStore(
-            blobStore.blobContainer(RegisterMap.componentTemplates(base)),
-            cacheFor(RegisterMap.componentTemplates(base))
-        );
+        return stores.componentTemplates();
     }
 
     /**
@@ -1301,118 +575,24 @@ public final class MetadataPlane {
         return descriptors.update(descriptor, expectedGeneration);
     }
 
-    /**
-     * Attempts to take ownership of a shard.
-     *
-     * @param indexName the index
-     * @param shardId the shard number
-     * @param nodeId the acquiring node
-     * @param ephemeralId the acquiring node's ephemeral id
-     * @return the outcome, carrying the winner's head either way
-     * @throws IOException if the register cannot be read or created
-     */
+    /** Attempts to take ownership of a shard. */
     public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId) throws IOException {
-        return activate(indexName, shardId, nodeId, ephemeralId, null);
+        return activation.activate(indexName, shardId, nodeId, ephemeralId);
     }
 
-    /**
-     * Attempts to take ownership of a shard of one incarnation of an index.
-     *
-     * @param indexName the index
-     * @param shardId the shard number
-     * @param nodeId the acquiring node
-     * @param ephemeralId the acquiring node's ephemeral id
-     * @param indexUuid the uuid of the index being activated
-     * @return the outcome, carrying the winner's head either way
-     * @throws IOException if the register cannot be read or created
-     */
+    /** Attempts to take ownership of a shard of one incarnation of an index. */
     public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid) throws IOException {
-        final Acquisition acquisition = heads.acquire(indexName, shardId, nodeId, ephemeralId, indexUuid);
-        if (acquisition.acquired()) {
-            // Seal the log here, at the swap, rather than leaving it to whoever opens the shard.
-            //
-            // The seal is what stops a predecessor that has not yet noticed it lost this shard from
-            // having its later appends replayed as acknowledged history. It used to be taken when the
-            // shard was opened, which is several object-store round trips and a whole shard creation
-            // after the moment ownership actually moved -- and every one of the predecessor's appends
-            // inside that window fell in front of the cutoff and replayed. Taking it here narrows the
-            // window to the one blob write below: from the swap that transferred ownership to the seal
-            // that records where the predecessor's history ended.
-            //
-            // The open path still seals, and must: a shard released locally and reopened at the same
-            // term never passes through here. That second seal cannot loosen this one, because seals
-            // merge by taking the lowest recorded position per term -- see WalStore#sealAt -- so the
-            // tighter bound taken here is the one every later recovery inherits. The cost is one extra
-            // seal per acquisition, on a path that runs at failover rather than per write.
-            //
-            // Only when the uuid is known, because that is what locates the shard's bytes. A caller
-            // that acquires without one -- the overload that skips the incarnation check -- gets the
-            // old behaviour, with the open path's seal as the bound.
-            if (acquisition.head().indexUuid() != null) {
-                try {
-                    walStore(indexName, acquisition.head().indexUuid(), shardId).fenceOlderTerms(acquisition.head().term());
-                } catch (IOException e) {
-                    // A head won and a log unsealed is worse than no head at all: this node would go on
-                    // to open the shard and seal late, which is the window this exists to close. Give
-                    // the head back at the term just won and let the caller see the failure, exactly as
-                    // the unwritten claim below does.
-                    try {
-                        heads.release(indexName, shardId, nodeId, acquisition.head().term());
-                    } catch (IOException release) {
-                        e.addSuppressed(release);
-                    }
-                    throw e;
-                }
-            }
-            // Record the claim so this node can find it again without reading the world. Written after
-            // the compare-and-swap, never before: if the process dies in between, the node simply does
-            // not see the shard on its next read and re-acquires, which self-heals. Writing it first
-            // would instead advertise a claim that was never won.
-            try {
-                blobStore.blobContainer(RegisterMap.assignments(base, nodeId))
-                    .writeBlob(RegisterMap.assignmentBlob(indexName, shardId), new java.io.ByteArrayInputStream(new byte[0]), 0L, false);
-            } catch (IOException e) {
-                // A head won and a claim not written is a shard nobody serves: this node never lists it,
-                // and every other node's acquire finds it held by a live owner for as long as the lease
-                // lasts. Give the head back at the term this acquisition won, so it is acquirable again
-                // -- by anyone, this node included -- and let the caller see the failure.
-                try {
-                    heads.release(indexName, shardId, nodeId, acquisition.head().term());
-                } catch (IOException release) {
-                    e.addSuppressed(release);
-                }
-                throw e;
-            }
-        }
-        return acquisition;
+        return activation.activate(indexName, shardId, nodeId, ephemeralId, indexUuid);
     }
 
-    /**
-     * Forgets a node's claim on a shard. Idempotent, and safe to skip — a stale entry costs one wasted
-     * head read, because every entry is verified before it is believed.
-     *
-     * @param nodeId the node
-     * @param indexName the index
-     * @param shardId the shard number
-     * @throws IOException if the delete fails
-     */
+    /** Forgets a node's claim on a shard. */
     public void forgetAssignment(String nodeId, String indexName, int shardId) throws IOException {
-        blobStore.blobContainer(RegisterMap.assignments(base, nodeId))
-            .deleteBlobsIgnoringIfNotExists(java.util.List.of(RegisterMap.assignmentBlob(indexName, shardId)));
+        activation.forgetAssignment(nodeId, indexName, shardId);
     }
 
-    /**
-     * Reads everything one node needs in order to serve.
-     *
-     * <p>This is the loop that replaces cluster-state publication. It returns only the indices this node
-     * owns a shard of, so a node's residency tracks its working set rather than the size of the world.
-     *
-     * @param nodeId the node to read truth for
-     * @return that node's descriptors and shard assignments
-     * @throws IOException if the object store cannot be read
-     */
+    /** Reads everything one node needs in order to serve. */
     public Truth truthFor(String nodeId) throws IOException {
-        return truthFor(nodeId, null);
+        return activation.truthFor(nodeId);
     }
 
     /** What became of a dead owner's shard when a survivor looked at it. */
@@ -1425,149 +605,17 @@ public final class MetadataPlane {
         NEEDS_REPLAY
     }
 
-    /**
-     * Cleans up after a dead owner of one shard without taking the shard, when nothing it wrote is unpublished.
-     *
-     * <p><b>Why.</b> A node that crashes leaves every shard it held named to it: the head, its claim, and a rollup mark
-     * that keeps the shard from ever being ruled out of a wide search. The only cleanup there was, was a takeover --
-     * open the shard, replay its log, hold it -- which put a dead node's few hundred shards, most of them idle and
-     * fully published, on survivors already near their cap, and left the marks of anything nobody took forever. A
-     * fleet that had crashed a few times could not rule 47,000 indices out of a search for next month.
-     *
-     * <p><b>How, safely.</b> The head is given back on the owner's behalf the way a takeover takes it -- the owner must
-     * not be live, its lease is revoked, the term moves on -- and the older terms are sealed, so a writer that was
-     * not as dead as it looked can no longer add history. Only then is the log compared with the published commit:
-     * if nothing landed past what the commit covers, every acknowledged write is published, and the mark and the claim
-     * go. Otherwise the shard is left unowned and marked, and the caller should have it taken and replayed. A commit
-     * published before commits recorded how far into the log they reach cannot be judged by a listing, and counts as
-     * needing a replay.
-     *
-     * @param indexName the index
-     * @param shard the shard number
-     * @param deadNodeId the owner believed dead
-     * @return what was done
-     * @throws IOException if the store cannot be read or written
-     */
+    /** Cleans up after a dead owner of one shard without taking the shard, when nothing it wrote is unpublished. */
     public Settled settleAbandoned(String indexName, int shard, String deadNodeId) throws IOException {
-        final Optional<IndexDescriptor> descriptor = describe(indexName);
-        if (descriptor.isEmpty()) {
-            return Settled.NOT_ABANDONED;
-        }
-        final String uuid = descriptor.get().uuid();
-        final Optional<ShardHeadStore.Abandoned> abandoned = heads.releaseAbandoned(indexName, shard, deadNodeId);
-        if (abandoned.isEmpty()) {
-            return Settled.NOT_ABANDONED;
-        }
-        final ShardHead previous = abandoned.get().previous();
-        if (previous.indexUuid() != null && previous.indexUuid().equals(uuid) == false) {
-            // A head left by a deleted incarnation: nothing of this one to settle, and the old one's bytes are the
-            // sweep's. Given back is all it needed.
-            forgetAssignment(deadNodeId, indexName, shard);
-            return Settled.RELEASED_CLEAN;
-        }
-        final org.opensearch.serverless.store.WalStore log = walStore(indexName, uuid, shard);
-        log.fenceOlderTerms(abandoned.get().released().term());
-        final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
-        if (unpublished(indexName, uuid, shard, commit, log)
-            || nodeLogHolds(abandoned.get().released().writers(), indexName, uuid, shard, abandoned.get().released().term(), commit)) {
-            return Settled.NEEDS_REPLAY;
-        }
-        // Widened to the published commit as the mark goes: the dead writer's publishes skipped the rollup under it.
-        rollups().clearOwnedOf(
-            indexName,
-            uuid,
-            shard,
-            previous.term(),
-            commit.map(org.opensearch.serverless.store.CommitManifest::digest).orElse(null)
-        );
-        forgetAssignment(deadNodeId, indexName, shard);
-        return Settled.RELEASED_CLEAN;
+        return settlement.settleAbandoned(indexName, shard, deadNodeId);
     }
 
-    /**
-     * Clears the owned mark of a shard nobody owns any more, when everything it holds is published.
-     *
-     * <p>For a mark its owner gave back the head under but could not clear -- the clear failed, or the owner's lease
-     * lapsed and it released without publishing. Nothing is fenced: a head with no owner has no writer to fence.
-     *
-     * @param indexName the index
-     * @param shard the shard number
-     * @param markedTerm the term the mark records
-     * @return {@link Settled#RELEASED_CLEAN} if the mark was cleared, {@link Settled#NEEDS_REPLAY} if the log is ahead
-     *     of the commit, {@link Settled#NOT_ABANDONED} if the shard has an owner or the index is gone
-     * @throws IOException if the store cannot be read or written
-     */
+    /** Clears the owned mark of a shard nobody owns any more, when everything it holds is published. */
     public Settled settleReleased(String indexName, int shard, long markedTerm) throws IOException {
-        final Optional<IndexDescriptor> descriptor = describe(indexName);
-        if (descriptor.isEmpty()) {
-            return Settled.NOT_ABANDONED;
-        }
-        final Optional<ShardHead> head = heads.read(indexName, shard);
-        if (head.isEmpty() || head.get().ownerNodeId() != null) {
-            return Settled.NOT_ABANDONED;
-        }
-        final String uuid = descriptor.get().uuid();
-        final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
-        if (unpublished(indexName, uuid, shard, commit, walStore(indexName, uuid, shard))
-            || nodeLogHolds(head.get().writers(), indexName, uuid, shard, head.get().term(), commit)) {
-            return Settled.NEEDS_REPLAY;
-        }
-        // A writer that takes the shard meanwhile marks it at a higher term first, which this clear leaves alone. Widened
-        // to the published commit as the mark goes, as in settleAbandoned.
-        rollups().clearOwnedOf(
-            indexName,
-            uuid,
-            shard,
-            markedTerm,
-            commit.map(org.opensearch.serverless.store.CommitManifest::digest).orElse(null)
-        );
-        return Settled.RELEASED_CLEAN;
+        return settlement.settleReleased(indexName, shard, markedTerm);
     }
 
-    /**
-     * Whether the shard's log holds a write its published commit does not cover. A commit that records how far into
-     * the log it reaches is judged by a listing; an older one by its commit point's highest sequence number against
-     * the log's, as a reader judges it; one that records neither counts as behind.
-     */
-    private boolean unpublished(String indexName, String uuid, int shard, org.opensearch.serverless.store.WalStore log) throws IOException {
-        return unpublished(indexName, uuid, shard, segmentPublisher(indexName, uuid, shard).readManifest(), log);
-    }
-
-    /** The same, judged against a manifest the caller has already read. */
-    private boolean unpublished(
-        String indexName,
-        String uuid,
-        int shard,
-        Optional<org.opensearch.serverless.store.CommitManifest> commit,
-        org.opensearch.serverless.store.WalStore log
-    ) throws IOException {
-        final org.opensearch.serverless.store.SegmentPublisher publisher = segmentPublisher(indexName, uuid, shard);
-        if (commit.isEmpty()) {
-            return log.landedPast(0L, -1L);
-        }
-        if (commit.get().walOrdinal() >= 0L) {
-            return log.landedPast(commit.get().term(), commit.get().walOrdinal());
-        }
-        final java.util.OptionalLong committed = publisher.committedMaxSeqNo(commit.get());
-        return committed.isEmpty() || log.maxSeqNoFromTerm(commit.get().term()) > committed.getAsLong();
-    }
-
-    /**
-     * Whether any of the given nodes holds records of a shard in its write log that a published commit does not cover.
-     *
-     * <p>A record is covered when its sequence number is at or below the commit's local checkpoint. With no commit to
-     * judge against, any record the log names counts. The answer errs towards a replay: a log is judged by its blob
-     * headers alone, and a commit that records no checkpoint covers nothing.
-     *
-     * @param nodeIds the nodes, as {@link ShardHead#writers} names them, or a dead owner
-     * @param indexName the index
-     * @param uuid the index's uuid
-     * @param shard the shard number
-     * @param term the term recorded in a fence, for diagnosis
-     * @param commit the shard's published commit, if any
-     * @return true if any of their logs may hold records of the shard the commit does not cover
-     * @throws IOException if a lease, a log or the commit cannot be read, or a fence fails
-     */
+    /** Whether any of the given nodes holds records of a shard in its write log that a published commit does not cover. */
     public boolean nodeLogHolds(
         List<String> nodeIds,
         String indexName,
@@ -1576,52 +624,7 @@ public final class MetadataPlane {
         long term,
         Optional<org.opensearch.serverless.store.CommitManifest> commit
     ) throws IOException {
-        java.util.OptionalLong covered = null;
-        final NodeLogBlob.ShardKey key = new NodeLogBlob.ShardKey(uuid, shard);
-        for (String nodeId : nodeIds) {
-            final NodeLogTakeover reader = nodeLogReader(nodeId, term);
-            if (reader == null || reader.holds(key) == false) {
-                continue;
-            }
-            if (commit.isEmpty()) {
-                return true;
-            }
-            final long held = reader.maxSeqNoOf(key);
-            if (held == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO) {
-                continue;
-            }
-            if (covered == null) {
-                covered = segmentPublisher(indexName, uuid, shard).committedLocalCheckpoint(commit.get());
-            }
-            if (covered.isEmpty() || held > covered.getAsLong()) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * A reader of a node's write log, or null if its lease names no epochs.
-     *
-     * <p>A node that is live let go of the shard itself and writes no more of it, so its log is read up to each epoch's
-     * first free slot and nothing is fenced: fencing would fail the writes of every shard it still holds. A node that is
-     * not live may not be as dead as it looks, and may still land records of the shard in an epoch it opened while it
-     * held it, so its epochs are fenced first, as a takeover fences them.
-     */
-    private NodeLogTakeover nodeLogReader(String nodeId, long term) throws IOException {
-        if (nodeId == null) {
-            return null;
-        }
-        final Optional<NodeLease> lease = membership().read(nodeId);
-        final List<NodeLogEpoch> epochs = lease.map(NodeLease::nodeLog).orElse(List.of());
-        if (epochs.isEmpty()) {
-            return null;
-        }
-        final NodeLogStore log = new NodeLogStore(blobStore, base, nodeId);
-        final NodeLogTakeover.LeaseReader reread = () -> membership().read(nodeId).map(NodeLease::nodeLog).orElse(List.of());
-        return isLive(lease.get())
-            ? NodeLogTakeover.unfenced(log, epochs, reread)
-            : new NodeLogTakeover(log, epochs, "settled-by-survivor", term, reread);
+        return settlement.nodeLogHolds(nodeIds, indexName, uuid, shard, term, commit);
     }
 
     /** What became of a node's write log when a survivor looked at it. */
@@ -1634,296 +637,39 @@ public final class MetadataPlane {
         COLLECTED
     }
 
-    /**
-     * Deletes the write log of a node that is not live, once every shard it names has published past what it holds.
-     *
-     * <p><b>Why.</b> A lease that names epochs of a write log is never pruned, since it is the only place a successor
-     * finds them, and nothing else deletes a dead node's blobs: without this both stay for ever.
-     *
-     * <p><b>When it is safe.</b> Every epoch is fenced first, so the node, if it is not as dead as it looks, can add
-     * nothing after what is read. Each shard the last headers name is then judged: an index deleted or recreated
-     * needs nothing; otherwise its published commit's local checkpoint must reach the highest sequence number this log holds of it,
-     * which is read from blob headers alone. A shard whose new owner has not yet replayed and published keeps the log.
-     * Only then does the lease stop naming the epochs, by a swap that a node coming back wins, and the blobs go.
-     *
-     * <p>A blob left behind by a delete that fails, or above a second fence, costs storage, not records: the
-     * bucket's lifecycle rule on the log prefix removes it.
-     *
-     * @param nodeId the node
-     * @return what was done
-     * @throws IOException if the store cannot be read or written
-     */
+    /** Deletes the write log of a node that is not live, once every shard it names has published past what it holds. */
     public NodeLogCollected collectNodeLog(String nodeId) throws IOException {
-        final Optional<NodeLease> lease = membership().read(nodeId);
-        if (lease.isEmpty() || lease.get().nodeLog().isEmpty() || isLive(lease.get())) {
-            return NodeLogCollected.NOTHING;
-        }
-        final List<NodeLogEpoch> epochs = lease.get().nodeLog();
-        final NodeLogStore log = new NodeLogStore(blobStore, base, nodeId);
-        final NodeLogTakeover reader = new NodeLogTakeover(
-            log,
-            epochs,
-            "collected-by-survivor",
-            0L,
-            () -> membership().read(nodeId).map(NodeLease::nodeLog).orElse(List.of())
-        );
-        for (NodeLogBlob.ShardKey shard : reader.named()) {
-            if (publishedPast(nodeId, shard, reader) == false) {
-                return NodeLogCollected.STILL_NEEDED;
-            }
-        }
-        final Map<Long, Long> ends = reader.ends();
-        if (membership().forgetNodeLog(nodeId, epochs) == false) {
-            return NodeLogCollected.STILL_NEEDED;
-        }
-        for (NodeLogEpoch epoch : epochs) {
-            // From the trim point the lease recorded: the node deleted below it itself, up to a renewal's worth.
-            log.deleteRange(epoch.epoch(), epoch.trimPoint(), ends.getOrDefault(epoch.epoch(), epoch.landed()) + 1);
-        }
-        return NodeLogCollected.COLLECTED;
+        return settlement.collectNodeLog(nodeId);
     }
 
-    /** Whether a shard's published commit holds everything a node's log holds of it. */
-    private boolean publishedPast(String nodeId, NodeLogBlob.ShardKey shard, NodeLogTakeover reader) throws IOException {
-        if (shard.indexName() == null) {
-            return false;
-        }
-        final Optional<IndexDescriptor> descriptor = describe(shard.indexName());
-        if (descriptor.isEmpty() || descriptor.get().uuid().equals(shard.indexUuid()) == false) {
-            // Deleted, or recreated under the name: nothing of this incarnation is read again.
-            return true;
-        }
-        final Optional<ShardHead> head = heads.read(shard.indexName(), shard.shard());
-        if (head.isPresent() && nodeId.equals(head.get().ownerNodeId())) {
-            // Still the dead node's own: settled or taken first, and judged then.
-            return false;
-        }
-        final long held = reader.maxSeqNoOf(shard);
-        if (held == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO) {
-            return true;
-        }
-        final org.opensearch.serverless.store.SegmentPublisher publisher = segmentPublisher(
-            shard.indexName(),
-            shard.indexUuid(),
-            shard.shard()
-        );
-        final Optional<org.opensearch.serverless.store.CommitManifest> commit = publisher.readManifest();
-        if (commit.isEmpty()) {
-            return false;
-        }
-        final java.util.OptionalLong committed = publisher.committedLocalCheckpoint(commit.get());
-        return committed.isPresent() && committed.getAsLong() >= held;
-    }
-
-    /**
-     * Whether a lease names a node that is live now: neither revoked nor expired on this plane's clock.
-     *
-     * @param lease the lease
-     * @return true if the node it names is live
-     */
+    /** Whether a lease names a node that is live now: neither revoked nor expired on this plane's clock. */
     public boolean isLive(NodeLease lease) {
-        return lease.revoked() == false && lease.isExpiredAt(clock.getAsLong()) == false;
+        return settlement.isLive(lease);
     }
 
-    /**
-     * Takes an index out of its group's rollups if it holds nothing: no shard owned, published or logged to.
-     *
-     * <p>See {@link DigestRollups#removeIfNothing}. Every shard is checked here -- head, manifest, log -- and the
-     * removal itself refuses an entry a writer has marked since, so a writer arriving at any point keeps its entry.
-     *
-     * @param indexName the index
-     * @return true if the index had nothing and is no longer entered
-     * @throws IOException if the store cannot be read or written
-     */
+    /** Takes an index out of its group's rollups if it holds nothing: no shard owned, published or logged to. */
     public boolean forgetIfNothing(String indexName) throws IOException {
-        final Optional<IndexDescriptor> descriptor = describe(indexName);
-        if (descriptor.isEmpty()) {
-            return false;
-        }
-        final String uuid = descriptor.get().uuid();
-        for (int shard = 0; shard < descriptor.get().numberOfShards(); shard++) {
-            final Optional<ShardHead> head = heads.read(indexName, shard);
-            if (head.isPresent() && head.get().ownerNodeId() != null) {
-                return false;
-            }
-            if (segmentPublisher(indexName, uuid, shard).readManifest().isPresent()) {
-                return false;
-            }
-            if (walStore(indexName, uuid, shard).landedPast(0L, -1L)) {
-                return false;
-            }
-            if (head.isPresent() && nodeLogHolds(head.get().writers(), indexName, uuid, shard, head.get().term(), Optional.empty())) {
-                return false;
-            }
-        }
-        return rollups().removeIfNothing(indexName, uuid);
+        return settlement.forgetIfNothing(indexName);
     }
 
-    /**
-     * Gives an entry that records no digest the digest its shards' published commits carry, where nobody owns them.
-     *
-     * <p>For an index {@link #forgetIfNothing} must keep because its shards hold something: a commit, or writes still
-     * in the log. A commit that carries a digest widens the entry at once; one published before commits carried
-     * digests, or a log ahead of the commit, needs the shard replayed and published again, and those shards are
-     * returned for the caller to replay.
-     *
-     * @param indexName the index
-     * @return the shards that need a replay before the entry can rule anything out; empty if none, or if a shard is owned
-     * @throws IOException if the store cannot be read or written
-     */
+    /** Gives an entry that records no digest the digest its shards' published commits carry, where nobody owns them. */
     public List<Integer> backfillDigest(String indexName) throws IOException {
-        final Optional<IndexDescriptor> descriptor = describe(indexName);
-        if (descriptor.isEmpty()) {
-            return List.of();
-        }
-        final String uuid = descriptor.get().uuid();
-        final int shards = descriptor.get().numberOfShards();
-        final List<Integer> replay = new ArrayList<>();
-        for (int shard = 0; shard < shards; shard++) {
-            final Optional<ShardHead> head = heads.read(indexName, shard);
-            if (head.isPresent() && head.get().ownerNodeId() != null) {
-                // Marked by its writer, so never ruled out; the writer's clear widens the entry when it lets go.
-                return List.of();
-            }
-            if (unpublished(indexName, uuid, shard, walStore(indexName, uuid, shard))
-                || (head.isPresent()
-                    && nodeLogHolds(
-                        head.get().writers(),
-                        indexName,
-                        uuid,
-                        shard,
-                        head.get().term(),
-                        segmentPublisher(indexName, uuid, shard).readManifest()
-                    ))) {
-                replay.add(shard);
-                continue;
-            }
-            final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
-            if (commit.isEmpty()) {
-                continue;
-            }
-            if (commit.get().digest().isEmpty()) {
-                replay.add(shard);
-            } else {
-                rollups().widen(indexName, uuid, shards, shard, commit.get().digest());
-            }
-        }
-        return replay;
+        return settlement.backfillDigest(indexName);
     }
 
-    /**
-     * Lists every node that has, or once had, claims on shards -- live or long gone.
-     *
-     * @return node ids
-     * @throws IOException if the store cannot be listed
-     */
+    /** Lists every node that has, or once had, claims on shards -- live or long gone. */
     public List<String> nodesWithClaims() throws IOException {
-        return new ArrayList<>(blobStore.blobContainer(base.add("assignments")).children().keySet());
+        return activation.nodesWithClaims();
     }
 
-    /**
-     * Lists the shards a node has claimed -- one listing, no head reads. A claim is only a hint: the head decides,
-     * and a caller acting on one reads the head first.
-     *
-     * @param nodeId the node
-     * @return index and shard number of each claim
-     * @throws IOException if the claims cannot be listed
-     */
+    /** Lists the shards a node has claimed -- one listing, no head reads. */
     public List<Map.Entry<String, Integer>> claimsOf(String nodeId) throws IOException {
-        final List<Map.Entry<String, Integer>> claims = new ArrayList<>();
-        for (String claim : blobStore.blobContainer(RegisterMap.assignments(base, nodeId)).listBlobs().keySet()) {
-            final int separator = claim.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
-            if (separator < 0) {
-                continue;
-            }
-            try {
-                final String indexName = claim.substring(0, separator);
-                final int shard = Integer.parseInt(claim.substring(separator + RegisterMap.SHARD_SEPARATOR.length()));
-                if (Names.isValidIndexOrAlias(indexName)) {
-                    claims.add(Map.entry(indexName, shard));
-                }
-            } catch (NumberFormatException e) {
-                // Not a claim this system writes.
-            }
-        }
-        return claims;
+        return activation.claimsOf(nodeId);
     }
 
-    /**
-     * Reads what one incarnation of a node owns, as the heads say.
-     *
-     * <p>A head is inherited only when its owner's ephemeral id is this incarnation's. A node restarted
-     * with the same id used to inherit every head its previous incarnation held -- and serve them at the
-     * old term while every peer read those heads as dead and took them at the next. The heads a restart
-     * leaves behind are re-acquired through the ordinary path, which bumps the term and seals the log.
-     *
-     * @param nodeId the node
-     * @param ephemeralId this incarnation's ephemeral id, or null to inherit by node id alone
-     * @return the descriptors to know about and the shards to serve
-     * @throws IOException if a register cannot be read
-     */
+    /** Reads what one incarnation of a node owns, as the heads say. */
     public Truth truthFor(String nodeId, String ephemeralId) throws IOException {
-        final Map<String, IndexDescriptor> hosted = new LinkedHashMap<>();
-        final List<ShardAssignment> assignments = new ArrayList<>();
-
-        // One listing of this node's own claims, rather than a sweep of every index in the deployment.
-        // Measured: a sweep cost 2N+1 operations in the population, on the
-        // steady-state path, on every node -- the exact O(population) shape this design exists to remove.
-        for (String claim : blobStore.blobContainer(RegisterMap.assignments(base, nodeId)).listBlobs().keySet()) {
-            final int separator = claim.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
-            if (separator < 0) {
-                continue;
-            }
-            final String indexName = claim.substring(0, separator);
-            final int shard;
-            try {
-                shard = Integer.parseInt(claim.substring(separator + RegisterMap.SHARD_SEPARATOR.length()));
-            } catch (NumberFormatException e) {
-                continue;
-            }
-
-            // The claim is only a hint. The head decides, so a stale entry costs one read and is then
-            // ignored -- which is what makes it safe for the listing to lag reality.
-            final Optional<ShardHead> head = heads.read(indexName, shard);
-            if (head.isEmpty() || nodeId.equals(head.get().ownerNodeId()) == false) {
-                continue;
-            }
-            if (ephemeralId != null
-                && head.get().ownerEphemeralId() != null
-                && ephemeralId.equals(head.get().ownerEphemeralId()) == false) {
-                // A previous incarnation's head. Not ours to serve at its term; see the javadoc.
-                continue;
-            }
-            if (Names.isValidIndexOrAlias(indexName) == false) {
-                // A stray object in this node's assignments container -- a console upload, a scratch file --
-                // used to abort the whole read with the validator's exception, and with it every shard this
-                // node serves. Skipped, and named once in the log.
-                LOGGER.warn("ignoring [{}] in the assignments of {}: not an index name this system writes", claim, nodeId);
-                continue;
-            }
-            final Optional<IndexDescriptor> descriptor;
-            try {
-                descriptor = hosted.containsKey(indexName) ? Optional.of(hosted.get(indexName)) : descriptors.get(indexName);
-            } catch (IllegalArgumentException e) {
-                // Belt and braces behind the name check above: whatever the descriptor store refuses about
-                // this one claim is that claim's problem, not the resync's.
-                LOGGER.warn("ignoring the claim [{}] of {}: {}", claim, nodeId, e.getMessage());
-                continue;
-            }
-            if (descriptor.isEmpty()) {
-                // The index was deleted underneath us. Not an error: the shard is going away too.
-                continue;
-            }
-            if (head.get().indexUuid() != null && head.get().indexUuid().equals(descriptor.get().uuid()) == false) {
-                // The index was deleted and recreated underneath us; the head is the old incarnation's.
-                continue;
-            }
-            // The term comes from the head, which is the one monotonic number every node touching this
-            // shard agrees on. Never a per-node counter, which can make the update be silently ignored.
-            assignments.add(new ShardAssignment(indexName, shard, head.get().term()));
-            hosted.put(indexName, descriptor.get());
-        }
-        return new Truth(hosted.values(), assignments);
+        return activation.truthFor(nodeId, ephemeralId);
     }
 
     /** The registered snapshot repositories; the methods below forward to it. */
@@ -1972,120 +718,43 @@ public final class MetadataPlane {
         return repositories.deleteRepository(name);
     }
 
-    /**
-     * Reserves a snapshot name and publishes its provisional pin before capture reads any manifests.
-     *
-     * @param snapshot the provisional record
-     * @return the reserved record carrying the unique storage lifetime required to finish or clean up
-     * @throws RepositoryMissingException if the repository is absent
-     * @throws SnapshotAlreadyExistsException if the name is taken
-     * @throws IOException if reservation or discovery publication fails
-     */
+    /** Reserves a snapshot name and publishes its provisional pin before capture reads any manifests. */
     public SnapshotRecord createSnapshot(SnapshotRecord snapshot) throws IOException {
-        if (describeRepository(snapshot.repo()).isEmpty()) {
-            throw new RepositoryMissingException(snapshot.repo());
-        }
-        return snapshotStore.create(snapshot);
+        return snapshots.createSnapshot(snapshot);
     }
 
-    /**
-     * Atomically completes the same capture lifetime that reserved the name.
-     *
-     * @param snapshot the finished record, including its reserved storage generation
-     * @throws IOException if the capture changed or was deleted, or the write fails
-     */
+    /** Atomically completes the same capture lifetime that reserved the name. */
     public void finishSnapshot(SnapshotRecord snapshot) throws IOException {
-        snapshotStore.finish(snapshot);
+        snapshots.finishSnapshot(snapshot);
     }
 
-    /**
-     * Reads one snapshot's authoritative record.
-     *
-     * @param repo the repository
-     * @param name the snapshot name
-     * @return the record if present
-     * @throws IOException if the read fails
-     */
+    /** Reads one snapshot's authoritative record. */
     public Optional<SnapshotRecord> snapshot(String repo, String name) throws IOException {
-        return snapshotStore.read(repo, name);
+        return snapshots.snapshot(repo, name);
     }
 
-    /**
-     * Deletes the lifetime observed at admission; a replacement under the same name is left alone.
-     *
-     * @param repo the repository
-     * @param name the snapshot name
-     * @return whether this call deleted that lifetime
-     * @throws IOException if the state or marker operation fails
-     */
+    /** Deletes the lifetime observed at admission; a replacement under the same name is left alone. */
     public boolean deleteSnapshot(String repo, String name) throws IOException {
-        return deleteSnapshot(repo, name, null);
+        return snapshots.deleteSnapshot(repo, name);
     }
 
-    /**
-     * Cleans up exactly one capture, including after capture failed and the name may have been reused.
-     *
-     * @param expected the reserved lifetime to delete
-     * @return whether this call deleted it
-     * @throws IOException if the state or marker operation fails
-     */
+    /** Cleans up exactly one capture, including after capture failed and the name may have been reused. */
     public boolean deleteSnapshot(SnapshotRecord expected) throws IOException {
-        return deleteSnapshot(expected.repo(), expected.name(), expected);
+        return snapshots.deleteSnapshot(expected);
     }
 
     private boolean deleteSnapshot(String repo, String name, SnapshotRecord expected) throws IOException {
-        final var removed = snapshotStore.remove(repo, name, expected);
-        if (removed.isEmpty()) {
-            return false;
-        }
-        final SnapshotRecord record = removed.get().snapshot();
-        boolean cleared = true;
-        if (record.shallow() == false) {
-            if (record.storageGeneration() != null) {
-                try {
-                    blobStore.blobContainer(RegisterMap.snapshotData(base, record.storageGeneration())).delete();
-                } catch (Exception failure) {
-                    cleared = false;
-                    LOGGER.warn("could not clear storage for deleted snapshot " + record.key(), failure);
-                }
-            } else {
-                for (var index : record.indices().entrySet()) {
-                    for (int shard = 0; shard < index.getValue().numberOfShards(); shard++) {
-                        try {
-                            blobStore.blobContainer(RegisterMap.snapshotShardData(base, record, index.getKey(), shard)).delete();
-                        } catch (Exception failure) {
-                            cleared = false;
-                            LOGGER.warn("could not clear legacy snapshot storage for " + record.key(), failure);
-                        }
-                    }
-                }
-            }
-        }
-        if (cleared) {
-            snapshotStore.removeMarker(removed.get());
-        }
-        return true;
+        return snapshots.deleteSnapshot(repo, name, expected);
     }
 
-    /**
-     * Lists active snapshot records within one repository, logging unreadable records.
-     *
-     * @param repo the repository
-     * @return its active snapshots
-     * @throws IOException if listing fails
-     */
+    /** Lists active snapshot records within one repository, logging unreadable records. */
     public List<SnapshotRecord> listSnapshots(String repo) throws IOException {
-        return snapshotStore.list(repo);
+        return snapshots.listSnapshots(repo);
     }
 
-    /**
-     * Reads the active snapshots a collector must protect. An unreadable discovered record stops collection.
-     *
-     * @return the live snapshot records
-     * @throws IOException if listing or establishing protection fails
-     */
+    /** Reads the active snapshots a collector must protect. */
     public List<SnapshotRecord> liveSnapshots() throws IOException {
-        return snapshotStore.live();
+        return snapshots.liveSnapshots();
     }
 
     /**
@@ -2115,30 +784,9 @@ public final class MetadataPlane {
         return reclaimQueue;
     }
 
-    /**
-     * Finishes a delete whose intent has fallen due: removes whatever outlived it.
-     *
-     * <p>Every step is safe to repeat and safe against a recreated name. An intent naming an index that
-     * still exists under that uuid is a delete that never happened, and is dropped. Otherwise the deleted
-     * incarnation's heads are removed conditionally and only while they name its uuid -- a writer that had
-     * not noticed the delete may have re-created one -- and its bytes are purged again, since that writer
-     * may have completed a publish after the first purge. The path of those bytes carries the uuid, which no
-     * later index can be minted with.
-     *
-     * @param intent the due intent
-     * @throws IOException if the store cannot be reached; the intent is kept and tried again
-     */
+    /** Finishes a delete whose intent has fallen due: removes whatever outlived it. */
     public void reclaim(ReclaimQueue.Intent intent) throws IOException {
-        final DescriptorStore.Resolution current = descriptors.resolve(intent.name());
-        if (current.index() != null && intent.uuid().equals(current.index().uuid())) {
-            return;
-        }
-        // A head of the dead uuid found now was re-created by a writer that missed the delete, which may
-        // have published too; that is the one sign a delete with no writer at the time left anything behind.
-        final int reappeared = heads.deleteAllOf(intent.name(), intent.shards(), intent.uuid());
-        if (intent.hadWriter() || reappeared > 0) {
-            purgeShardData(intent.name(), intent.uuid(), intent.shards());
-        }
+        lifecycle.reclaim(intent);
     }
 
     /**
