@@ -80,13 +80,21 @@ final class SearchShardCalls {
         // make per-index search scale-to-zero meaningless. Placement is a cache-affinity hint, so the
         // owner remains a last resort for the case where no search node exists at all.
         final var members = metadata.membership().current();
-        final List<String> targets = org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+        // A hot shard is spread over several of its top-ranked readers, picked by load; a cold one keeps its first.
+        // Two are tried either way before the owner, as before.
+        final org.opensearch.serverless.cluster.HotShardSpread spread = spreadOf(serving);
+        final List<String> ordered = spread.order(
             index,
             shard,
-            members,
-            ServerlessNode.ROLE_SEARCH,
-            2
+            org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+                index,
+                shard,
+                members,
+                ServerlessNode.ROLE_SEARCH,
+                Math.max(2, spread.maxReaders())
+            )
         );
+        final List<String> targets = ordered.subList(0, Math.min(2, ordered.size()));
         final java.util.Set<String> tried = new java.util.HashSet<>();
         boolean refusedAtTheCap = false;
         // The owner is the last resort, and its head is read only when the placement candidates could
@@ -107,7 +115,7 @@ final class SearchShardCalls {
                 break;
             }
             tried.add(target);
-            try {
+            try (org.opensearch.common.lease.Releasable inFlight = spread.begin(target)) {
                 final SearchFanout.ShardAnswer answer = askTarget(serving, metadata, descriptor, shard, target, perShard, nowInMillis);
                 if (answer != null) {
                     return answer;
@@ -174,6 +182,19 @@ final class SearchShardCalls {
     static void markUsedIfMatched(ServerlessNode serving, ShardId shardId, org.opensearch.serverless.shard.ShardQuery.Result result) {
         if (result.total() > 0) {
             serving.shards().markUsed(shardId);
+        }
+    }
+
+    private static final java.util.Map<ServerlessNode, org.opensearch.serverless.cluster.HotShardSpread> SPREADS =
+        new java.util.WeakHashMap<>();
+
+    /** The node's spread of hot shards over readers, one per node, built from its settings on first use. */
+    static org.opensearch.serverless.cluster.HotShardSpread spreadOf(ServerlessNode serving) {
+        synchronized (SPREADS) {
+            return SPREADS.computeIfAbsent(
+                serving,
+                node -> new org.opensearch.serverless.cluster.HotShardSpread(node.settings(), System::nanoTime)
+            );
         }
     }
 
