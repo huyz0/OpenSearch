@@ -54,6 +54,8 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
+            // The checks look for unpublished writes in the shard's own log, where writes go with the node log off.
+            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 

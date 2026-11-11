@@ -714,7 +714,7 @@ public final class ServerlessNode implements Closeable {
             ),
             settings.getAsLong("serverless.wal.group_commit.max_bytes", org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES)
         );
-        this.nodeLogEnabled = settings.getAsBoolean("serverless.wal.node_log.enabled", false);
+        this.nodeLogEnabled = settings.getAsBoolean("serverless.wal.node_log.enabled", true);
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
         final Environment environment = new Environment(settings, null);
@@ -1546,9 +1546,11 @@ public final class ServerlessNode implements Closeable {
         }
         synchronized (this) {
             if (nodeLogWriter == null) {
-                final NodeLogWriter writer = NodeLogWriter.start(plane, localNode.getId(), epochs -> {
+                final NodeLogWriter writer = NodeLogWriter.start(plane, localNode.getId(), (epochs, opensEpoch) -> {
                     final long validUntil = ownLeaseValidUntilMillis;
-                    if (validUntil != 0L && plane.clock().getAsLong() >= validUntil) {
+                    // Only for a new epoch: a renewal is how a lapsed lease comes back, and refusing it left the node
+                    // unable ever to renew again.
+                    if (opensEpoch && validUntil != 0L && plane.clock().getAsLong() >= validUntil) {
                         // A lapsed lease is renewed only after this node lets go of what it held; recording an epoch is
                         // no way around that.
                         throw new java.io.IOException("this node's lease has lapsed; no new epoch of its log is recorded");

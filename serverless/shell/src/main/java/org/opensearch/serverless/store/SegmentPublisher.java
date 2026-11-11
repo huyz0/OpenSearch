@@ -300,6 +300,26 @@ public final class SegmentPublisher {
      * @throws IOException if the commit cannot be read
      */
     public java.util.OptionalLong committedMaxSeqNo(CommitManifest manifest) throws IOException {
+        return committedUserData(manifest, org.opensearch.index.seqno.SequenceNumbers.MAX_SEQ_NO);
+    }
+
+    /**
+     * The local checkpoint of a published commit, read from its commit point: every operation at or below it is in
+     * the commit.
+     *
+     * <p>Unlike the commit's highest sequence number, which counts operations issued but still being indexed when the
+     * commit was taken, this is a bound below which nothing is missing, so it is what a record is judged covered by.
+     *
+     * @param manifest the published commit
+     * @return its local checkpoint, or empty if the commit does not record one
+     * @throws IOException if the commit cannot be read
+     */
+    public java.util.OptionalLong committedLocalCheckpoint(CommitManifest manifest) throws IOException {
+        return committedUserData(manifest, org.opensearch.index.seqno.SequenceNumbers.LOCAL_CHECKPOINT_KEY);
+    }
+
+    /** A sequence number recorded in a published commit point's user data, under a key. */
+    private java.util.OptionalLong committedUserData(CommitManifest manifest, String key) throws IOException {
         // Only the commit point and its segments' info files: a few small blobs, nothing of the segments themselves.
         try (Directory scratch = new org.apache.lucene.store.ByteBuffersDirectory()) {
             String commitFile = null;
@@ -324,10 +344,8 @@ public final class SegmentPublisher {
             if (commitFile == null) {
                 return java.util.OptionalLong.empty();
             }
-            final String maxSeqNo = org.apache.lucene.index.SegmentInfos.readCommit(scratch, commitFile)
-                .getUserData()
-                .get(org.opensearch.index.seqno.SequenceNumbers.MAX_SEQ_NO);
-            return maxSeqNo == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(Long.parseLong(maxSeqNo));
+            final String value = org.apache.lucene.index.SegmentInfos.readCommit(scratch, commitFile).getUserData().get(key);
+            return value == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(Long.parseLong(value));
         }
     }
 

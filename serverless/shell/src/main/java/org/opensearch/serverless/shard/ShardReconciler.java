@@ -902,8 +902,10 @@ public final class ShardReconciler {
                 }
                 open.put(shardId, shard);
                 final Long fromNodeLog = nodeLogReplayed.remove(shardId);
-                if (fromNodeLog != null && fromNodeLog > 0) {
-                    // Published before it serves, so what it replayed is in a commit and no later takeover depends on the
+                if (fromNodeLog != null && fromNodeLog > 0 && shard.seqNoStats().getMaxSeqNo() > restoredCheckpoint) {
+                    // Only when the replay applied something past the commit it opened from: a log read up to its first
+                    // free slot still names records a writer published before it let go, and replaying those changes
+                    // nothing. Published before it serves, so what it replayed is in a commit and no later takeover depends on the
                     // log that held it: a predecessor's log names this shard's records only until the shard is taken.
                     try {
                         // What the commit is certain to hold, read before its flush, as a publish from the loop reads it.

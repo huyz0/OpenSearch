@@ -44,6 +44,8 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            // These check how the shard's own log is reclaimed, which only holds writes with the node log off.
+            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 

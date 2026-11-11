@@ -58,9 +58,11 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
          * Renews the lease naming these epochs.
          *
          * @param epochs the epochs, oldest first
+         * @param opensEpoch whether the write records a new epoch before its first blob, rather than renewing: a node
+         *     whose lease has lapsed may renew, and must not open an epoch until it has let go of what it held
          * @throws IOException if the lease could not be written
          */
-        void write(List<NodeLogEpoch> epochs) throws IOException;
+        void write(List<NodeLogEpoch> epochs, boolean opensEpoch) throws IOException;
     }
 
     /** Whether this node owns a shard at a term, by its head. */
@@ -142,7 +144,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
         this.leaseWriter = Objects.requireNonNull(leaseWriter, "leaseWriter");
         this.committer = new NodeLogCommitter(own, firstEpoch, epochs -> {
             synchronized (leaseLock) {
-                leaseWriter.write(withInherited(epochs));
+                leaseWriter.write(withInherited(epochs), true);
             }
         }, (shard, term, epoch) -> {
             final ShardId shardId = shards.get(shard);
@@ -187,7 +189,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
         synchronized (leaseLock) {
             completed.addAll(committer.takeComplete());
             final List<NodeLogEpoch> mine = committer.positions();
-            leaseWriter.write(withInherited(mine));
+            leaseWriter.write(withInherited(mine), false);
             deleteBehind(mine);
         }
     }

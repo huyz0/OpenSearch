@@ -138,7 +138,7 @@ exceptions rather than to conflicts. See `STATUS.md`.
 
 ## One write log per node
 
-`serverless.wal.node_log.enabled` (off by default) sends every write a node acknowledges to one log of its own,
+`serverless.wal.node_log.enabled` (on by default; `false` returns to one log per shard) sends every write a node acknowledges to one log of its own,
 rather than one per shard: a window of `serverless.wal.node_log.window_millis` (100, 200 or 250; 250 by default)
 is one PUT however many shards it writes. Blobs are named `nodelog/<node>/e=<epoch>/<ordinal>`, and the last header before a fence says where every
 unpublished record of every shard is, so a successor reads it without a listing.

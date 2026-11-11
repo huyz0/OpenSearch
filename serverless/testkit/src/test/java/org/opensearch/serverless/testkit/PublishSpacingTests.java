@@ -53,6 +53,8 @@ public class PublishSpacingTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            // PUTs per write are measured for the shard's own log; the node log's numbers are measured on their own.
+            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 

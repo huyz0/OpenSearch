@@ -54,6 +54,8 @@ public class ServerlessLedgerVerdictTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            // The durability check reads the shard's own log, where writes go with the node log off.
+            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 
