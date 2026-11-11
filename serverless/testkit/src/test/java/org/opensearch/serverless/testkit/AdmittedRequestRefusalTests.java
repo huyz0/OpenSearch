@@ -72,10 +72,10 @@ public class AdmittedRequestRefusalTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 final var shard = node.activateWriter(metadata, "docs", 0).orElseThrow();
-                node.index(shard, "kept", "{}");
+                node.writes().index(shard, "kept", "{}");
                 final var address = node.boundHttpAddress().publishAddress();
                 final String suffix = deletion ? "/docs/_delete_by_query" : "/docs/_doc/kept";
                 try (var client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
@@ -96,7 +96,7 @@ public class AdmittedRequestRefusalTests extends OpenSearchTestCase {
                         assertTrue(response.body(), response.body().contains("unexpected plugin failure"));
                     }
                 }
-                assertTrue("refusal must not delete the document", node.get(shard, "kept").found());
+                assertTrue("refusal must not delete the document", node.reads().get(shard, "kept").found());
             }
         }
     }

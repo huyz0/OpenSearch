@@ -82,7 +82,7 @@ public class ServerlessAliasShapeTests extends OpenSearchTestCase {
 
     private ServerlessNode running(MetadataPlane plane, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         port = node.boundHttpAddress().publishAddress().getPort();
         call("PUT", "/logs-a", "{\"settings\":{\"number_of_shards\":1}}");

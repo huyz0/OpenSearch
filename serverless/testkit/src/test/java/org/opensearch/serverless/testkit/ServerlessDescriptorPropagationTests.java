@@ -77,7 +77,7 @@ public class ServerlessDescriptorPropagationTests extends OpenSearchTestCase {
 
     private ServerlessNode started(MetadataPlane plane, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         node.setDescriptorRefreshIntervalMillis(ServerlessBootstrap.DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS);
         return node;

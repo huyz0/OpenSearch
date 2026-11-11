@@ -106,21 +106,24 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("del-basic"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final ShardId shardId = node.reconciler().openShards().iterator().next();
 
-            node.index(shardId, "1", "{\"msg\":\"here\",\"n\":1}");
+            node.writes().index(shardId, "1", "{\"msg\":\"here\",\"n\":1}");
             node.reconciler().shard(shardId).refresh("test");
             assertEquals(1, hits(node, shardId, "msg", "here"));
 
-            assertTrue("deleting a document that exists must report that it did", node.delete(shardId, "1").found());
+            assertTrue("deleting a document that exists must report that it did", node.writes().delete(shardId, "1").found());
             node.reconciler().shard(shardId).refresh("test");
             assertEquals("the document must be gone", 0, hits(node, shardId, "msg", "here"));
 
-            assertFalse("deleting a document that does not exist must say so, not throw", node.delete(shardId, "nonexistent").found());
+            assertFalse(
+                "deleting a document that does not exist must say so, not throw",
+                node.writes().delete(shardId, "nonexistent").found()
+            );
         }
     }
 
@@ -138,29 +141,29 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, objectStore);
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("del-writer"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
         final ShardId shardId = a.reconciler().openShards().iterator().next();
 
         for (int i = 1; i <= 5; i++) {
-            a.index(shardId, String.valueOf(i), "{\"msg\":\"kept\",\"n\":" + i + "}");
+            a.writes().index(shardId, String.valueOf(i), "{\"msg\":\"kept\",\"n\":" + i + "}");
         }
         // Published, so the successor recovers these from a commit rather than from the log.
         loopA.tick(clock.get() + 1_000);
 
         // Now write one more and delete two, none of it published. The log is the only record.
-        a.index(shardId, "6", "{\"msg\":\"kept\",\"n\":6}");
-        assertTrue(a.delete(shardId, "2").found());
-        assertTrue(a.delete(shardId, "4").found());
+        a.writes().index(shardId, "6", "{\"msg\":\"kept\",\"n\":6}");
+        assertTrue(a.writes().delete(shardId, "2").found());
+        assertTrue(a.writes().delete(shardId, "4").found());
 
         // The writer dies without publishing and without releasing anything.
         a.close();
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode b = new ServerlessNode(nodeSettings("del-successor"))) {
-            b.start();
+            b.startup().start();
             final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
@@ -185,20 +188,20 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("del-order"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
         final ShardId shardId = a.reconciler().openShards().iterator().next();
 
-        a.index(shardId, "1", "{\"msg\":\"first\",\"n\":1}");
-        assertTrue(a.delete(shardId, "1").found());
-        a.index(shardId, "1", "{\"msg\":\"second\",\"n\":2}");
+        a.writes().index(shardId, "1", "{\"msg\":\"first\",\"n\":1}");
+        assertTrue(a.writes().delete(shardId, "1").found());
+        a.writes().index(shardId, "1", "{\"msg\":\"second\",\"n\":2}");
         a.close();
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode b = new ServerlessNode(nodeSettings("del-order-successor"))) {
-            b.start();
+            b.startup().start();
             final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
@@ -216,7 +219,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("del-rest"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -261,13 +264,13 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         final var gc = new org.opensearch.serverless.reconcile.GarbageCollector(store, BlobPath.cleanPath());
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("del-gc"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
         final ShardId shardId = a.reconciler().openShards().iterator().next();
         for (int i = 1; i <= 6; i++) {
-            a.index(shardId, String.valueOf(i), "{\"msg\":\"swept\",\"n\":" + i + "}");
+            a.writes().index(shardId, String.valueOf(i), "{\"msg\":\"swept\",\"n\":" + i + "}");
         }
         loopA.tick(clock.get() + 1_000);
         final long firstTerm = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow().term();
@@ -275,13 +278,13 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode b = new ServerlessNode(nodeSettings("del-gc-successor"))) {
-            b.start();
+            b.startup().start();
             final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
             final ShardId recovered = b.reconciler().openShards().iterator().next();
 
-            assertTrue("the successor should delete a document it inherited", b.delete(recovered, "3").found());
+            assertTrue("the successor should delete a document it inherited", b.writes().delete(recovered, "3").found());
             b.reconciler().shard(recovered).refresh("test");
             loopB.tick(clock.get() + 1_000);   // publish at the new term, inheriting the old files
 
@@ -330,27 +333,27 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("del-t1"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
-        a.index(a.reconciler().openShards().iterator().next(), "x", "{\"msg\":\"chain\",\"n\":1}");
-        a.index(a.reconciler().openShards().iterator().next(), "y", "{\"msg\":\"chain\",\"n\":2}");
+        a.writes().index(a.reconciler().openShards().iterator().next(), "x", "{\"msg\":\"chain\",\"n\":1}");
+        a.writes().index(a.reconciler().openShards().iterator().next(), "y", "{\"msg\":\"chain\",\"n\":2}");
         a.close();
         clock.set(clock.get() + TTL + 1);
 
         final ServerlessNode b = new ServerlessNode(nodeSettings("del-t2"));
-        b.start();
+        b.startup().start();
         final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
         loopB.want("alpha", 0);
         loopB.tick(clock.get());
         final ShardId atB = b.reconciler().openShards().iterator().next();
-        assertTrue("b should have recovered x before deleting it", b.delete(atB, "x").found());
+        assertTrue("b should have recovered x before deleting it", b.writes().delete(atB, "x").found());
         b.close();
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode c = new ServerlessNode(nodeSettings("del-t3"))) {
-            c.start();
+            c.startup().start();
             final BackgroundReconciler loopC = new BackgroundReconciler(c, plane);
             loopC.want("alpha", 0);
             loopC.tick(clock.get());
@@ -376,7 +379,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("del-ordinal"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
@@ -387,15 +390,15 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         // sorts "10" before "11", the delete still follows the write, and the test passes while proving
         // nothing. It has to be 9 and 10, where "10" sorts before "9" and the delete arrives first.
         for (int i = 0; i < 8; i++) {
-            a.index(shardId, "filler-" + i, "{\"msg\":\"ordinal\",\"n\":" + i + "}");
+            a.writes().index(shardId, "filler-" + i, "{\"msg\":\"ordinal\",\"n\":" + i + "}");
         }
-        a.index(shardId, "target", "{\"msg\":\"ordinal\",\"n\":100}");   // ordinal 9
-        assertTrue(a.delete(shardId, "target").found());                             // ordinal 10
+        a.writes().index(shardId, "target", "{\"msg\":\"ordinal\",\"n\":100}");   // ordinal 9
+        assertTrue(a.writes().delete(shardId, "target").found());                             // ordinal 10
         a.close();
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode b = new ServerlessNode(nodeSettings("del-ordinal-successor"))) {
-            b.start();
+            b.startup().start();
             final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
@@ -431,23 +434,23 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         final var gc = new org.opensearch.serverless.reconcile.GarbageCollector(store, BlobPath.cleanPath());
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("del-wal-gc"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
         final ShardId shardId = a.reconciler().openShards().iterator().next();
 
-        a.index(shardId, "published", "{\"msg\":\"waltest\",\"n\":1}");
+        a.writes().index(shardId, "published", "{\"msg\":\"waltest\",\"n\":1}");
         loopA.tick(clock.get() + 1_000);   // publish, so a later term exists to sweep against
 
         // Unpublished, and deliberately so: these exist only in the log.
-        a.index(shardId, "unpublished", "{\"msg\":\"waltest\",\"n\":2}");
-        assertTrue(a.delete(shardId, "published").found());
+        a.writes().index(shardId, "unpublished", "{\"msg\":\"waltest\",\"n\":2}");
+        assertTrue(a.writes().delete(shardId, "published").found());
         a.close();
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode b = new ServerlessNode(nodeSettings("del-wal-gc-successor"))) {
-            b.start();
+            b.startup().start();
             final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
@@ -460,7 +463,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             // The first is under the successor's own term: without it the log is legitimately empty by
             // now, because a publish at a higher term reclaims every older term, and "the log is empty"
             // would satisfy any assertion about the sweep sparing it.
-            b.index(b.reconciler().openShards().iterator().next(), "postsweep", "{\"msg\":\"postsweep\",\"n\":3}");
+            b.writes().index(b.reconciler().openShards().iterator().next(), "postsweep", "{\"msg\":\"postsweep\",\"n\":3}");
             // The second is under the DEAD writer's term, appended after the successor published --
             // what a zombie that has not noticed it lost the shard would write. It is the only kind of
             // log record the sweep's term guard would let it reach at all, so it is the only one that

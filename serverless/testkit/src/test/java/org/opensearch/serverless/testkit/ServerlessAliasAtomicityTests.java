@@ -175,7 +175,7 @@ public class ServerlessAliasAtomicityTests extends OpenSearchTestCase {
         }
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-race"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertEquals(200, send(node, "PUT", "/base/_alias/current", null).status());
 
@@ -214,7 +214,7 @@ public class ServerlessAliasAtomicityTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-on-stream"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertEquals(
                 200,
@@ -275,7 +275,7 @@ public class ServerlessAliasAtomicityTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("stream-shape"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertEquals(
                 200,
@@ -320,7 +320,7 @@ public class ServerlessAliasAtomicityTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("template-spellings"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertEquals(
                 200,
@@ -374,7 +374,7 @@ public class ServerlessAliasAtomicityTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("settings-parse"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertEquals(200, send(node, "PUT", "/alpha", "{\"mappings\":" + MAPPING + "}").status());
 
@@ -410,7 +410,7 @@ public class ServerlessAliasAtomicityTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("two", "uuid-two-00000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-remove"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertEquals(200, send(node, "PUT", "/one/_alias/x", null).status());
 

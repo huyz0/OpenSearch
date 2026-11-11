@@ -102,7 +102,7 @@ public class ServerlessWideSearchMeasurementTests extends OpenSearchTestCase {
 
         final long seedingSince = System.nanoTime();
         try (ServerlessNode seeder = new ServerlessNode(nodeSettings("wide-seeder", "ingest"))) {
-            seeder.start();
+            seeder.startup().start();
             seeder.setMetadataPlane(plane);
             port = seeder.boundHttpAddress().publishAddress().getPort();
             final BackgroundReconciler loop = new BackgroundReconciler(seeder, plane).setDemandDrivenActivation(true);
@@ -166,7 +166,7 @@ public class ServerlessWideSearchMeasurementTests extends OpenSearchTestCase {
 
         final Map<String, String> report = new TreeMap<>();
         try (ServerlessNode node = new ServerlessNode(nodeSettings("wide-search", null))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             port = node.boundHttpAddress().publishAddress().getPort();
             call("GET", "/_cluster/health", null);

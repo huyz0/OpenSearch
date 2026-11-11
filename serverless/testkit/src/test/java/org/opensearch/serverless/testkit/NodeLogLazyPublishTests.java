@@ -43,7 +43,7 @@ public class NodeLogLazyPublishTests extends OpenSearchTestCase {
     }
 
     private static void write(ServerlessNode node, BackgroundReconciler loop, ShardId shardId, String id) throws Exception {
-        node.index(shardId, id, "{\"msg\":\"m\",\"n\":1}");
+        node.writes().index(shardId, id, "{\"msg\":\"m\",\"n\":1}");
         loop.markDirty(shardId);
     }
 
@@ -52,9 +52,9 @@ public class NodeLogLazyPublishTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("node-log-lazy"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setLazyPublish(MAX_AGE, 5, 1L);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -107,9 +107,9 @@ public class NodeLogLazyPublishTests extends OpenSearchTestCase {
             new IndexDescriptor("off", "uuid-off-0000000000", 1, MAPPING, Settings.builder().put("index.refresh_interval", "-1").build())
         );
         try (ServerlessNode node = new ServerlessNode(nodeSettings("node-log-refresh"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             final long tick = 250L;
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setLazyPublish(MAX_AGE, 0L, tick);
             final ShardId fresh = openOne(node, plane, loop, clock, "fresh");

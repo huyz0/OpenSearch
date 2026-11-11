@@ -46,7 +46,7 @@ public class ServerlessShardTests extends OpenSearchTestCase {
     /** A shard opens through production code from a descriptor and serves a search. */
     public void testShardOpensFromADescriptorAndServesASearch() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p2-a"))) {
-            node.start();
+            node.startup().start();
             final IndexDescriptor alpha = descriptor("alpha", "uuid-alpha-00000000");
             final ShardAssignment assignment = new ShardAssignment("alpha", 0, 7L);
 
@@ -74,7 +74,7 @@ public class ServerlessShardTests extends OpenSearchTestCase {
      */
     public void testAViewOmittingAHostedIndexDoesNotCloseIt() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p2-b"))) {
-            node.start();
+            node.startup().start();
             final IndexDescriptor alpha = descriptor("alpha", "uuid-alpha-00000000");
             final ShardId shardId = node.applyTruth(List.of(alpha), List.of(new ShardAssignment("alpha", 0, 1L))).iterator().next();
             final IndexShard shard = node.reconciler().shard(shardId);
@@ -102,7 +102,7 @@ public class ServerlessShardTests extends OpenSearchTestCase {
     /** Ownership loss is the only thing that closes a shard, and it actually does. */
     public void testReleaseClosesTheShard() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p2-c"))) {
-            node.start();
+            node.startup().start();
             final IndexDescriptor alpha = descriptor("alpha", "uuid-alpha-00000000");
             final ShardId shardId = node.applyTruth(List.of(alpha), List.of(new ShardAssignment("alpha", 0, 1L))).iterator().next();
             assertEquals(1, node.reconciler().openShards().size());
@@ -117,7 +117,7 @@ public class ServerlessShardTests extends OpenSearchTestCase {
     /** Re-applying the same truth must not reopen, re-recover, or double-count. */
     public void testApplyTruthIsIdempotent() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p2-d"))) {
-            node.start();
+            node.startup().start();
             final IndexDescriptor alpha = descriptor("alpha", "uuid-alpha-00000000");
             final List<ShardAssignment> owned = List.of(new ShardAssignment("alpha", 0, 1L));
 
@@ -133,7 +133,7 @@ public class ServerlessShardTests extends OpenSearchTestCase {
      */
     public void testAnAssignmentWithoutADescriptorFailsLoudly() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p2-e"))) {
-            node.start();
+            node.startup().start();
             final IllegalStateException e = expectThrows(
                 IllegalStateException.class,
                 () -> node.applyTruth(List.of(), List.of(new ShardAssignment("ghost", 0, 1L)))
@@ -148,8 +148,8 @@ public class ServerlessShardTests extends OpenSearchTestCase {
     /** Two nodes, disjoint descriptors, both serving — section 5 at N>1, now through production code. */
     public void testTwoNodesServeDisjointIndices() throws Exception {
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p2-f1")); ServerlessNode b = new ServerlessNode(nodeSettings("p2-f2"))) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             final IndexDescriptor alpha = descriptor("alpha", "uuid-alpha-00000000");
             final IndexDescriptor beta = descriptor("beta", "uuid-beta-000000000");
 

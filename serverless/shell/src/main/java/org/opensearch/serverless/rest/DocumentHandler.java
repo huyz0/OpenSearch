@@ -523,8 +523,8 @@ public final class DocumentHandler extends BaseRestHandler {
                     .markCoordinatingOperationStarted(inFlightBytes, false)
             ) {
                 final WriteOutcome outcome = deletion
-                    ? serving.delete(into, id, ifSeqNo, ifPrimaryTerm)
-                    : serving.index(into, id, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent);
+                    ? serving.writes().delete(into, id, ifSeqNo, ifPrimaryTerm)
+                    : serving.writes().index(into, id, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent);
                 boolean refreshed = false;
                 if (refresh) {
                     final var open = serving.reconciler().shard(into);

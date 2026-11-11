@@ -96,7 +96,7 @@ public class ServerlessColdActivationMeasurementTests extends OpenSearchTestCase
                 Settings.builder().put(nodeSettings("seeder")).put("serverless.roles", "ingest").build()
             )
         ) {
-            seeder.start();
+            seeder.startup().start();
             seeder.setMetadataPlane(plane);
             port = seeder.boundHttpAddress().publishAddress().getPort();
             final BackgroundReconciler loop = new BackgroundReconciler(seeder, plane).setDemandDrivenActivation(true);
@@ -122,7 +122,7 @@ public class ServerlessColdActivationMeasurementTests extends OpenSearchTestCase
         for (String delay : delays) {
             final long delayMillis = Long.parseLong(delay.trim());
             try (ServerlessNode node = new ServerlessNode(nodeSettings("cold-" + delayMillis))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 port = node.boundHttpAddress().publishAddress().getPort();
                 final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);

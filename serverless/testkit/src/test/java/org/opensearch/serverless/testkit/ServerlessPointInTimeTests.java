@@ -81,7 +81,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("frozen", "uuid-frozen-0000000", 2, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("pit-basic"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "frozen", 2);
 
@@ -124,7 +124,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("swept", "uuid-swept-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("pit-sweep"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "swept", 1);
 
@@ -162,7 +162,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("paged", "uuid-paged-00000000", 2, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("pit-paging"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "paged", 2);
 
@@ -220,7 +220,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("brief", "uuid-brief-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("pit-release"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "brief", 1);
             assertEquals(201, send(node, "PUT", "/brief/_doc/1?refresh=true", body(1)).status());
@@ -253,7 +253,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("fresh", "uuid-fresh-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("pit-fresh"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "fresh", 1);
 
@@ -279,7 +279,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("reaped", "uuid-reaped-0000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("pit-reap"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "reaped", 1);
             assertEquals(201, send(node, "PUT", "/reaped/_doc/1?refresh=true", body(1)).status());
@@ -360,7 +360,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
 
         final String pit;
         try (ServerlessNode writer = new ServerlessNode(nodeSettings("pit-route-w"))) {
-            writer.start();
+            writer.startup().start();
             writer.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(writer, plane, clock, "routed", 1);
             assertEquals(201, send(writer, "PUT", "/routed/_doc/1?refresh=true", body(1)).status());
@@ -374,12 +374,12 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(searchNodeSettings("pit-route-a"));
             ServerlessNode b = new ServerlessNode(searchNodeSettings("pit-route-b"))
         ) {
-            a.start();
+            a.startup().start();
             a.setMetadataPlane(plane);
-            b.start();
+            b.startup().start();
             b.setMetadataPlane(plane);
-            a.heartbeat(plane);
-            b.heartbeat(plane);
+            a.leases().heartbeat(plane);
+            b.leases().heartbeat(plane);
 
             final var members = plane.membership().refresh();
             final var preferred = ReaderPlacement.candidatesFor("routed", 0, members, ServerlessNode.ROLE_SEARCH, 1);
@@ -417,7 +417,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
 
         final String pit;
         try (ServerlessNode writer = new ServerlessNode(nodeSettings("pit-hop-w"))) {
-            writer.start();
+            writer.startup().start();
             writer.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(writer, plane, clock, "stale", 1);
             assertEquals(201, send(writer, "PUT", "/stale/_doc/1?refresh=true", body(1)).status());
@@ -433,12 +433,12 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(searchNodeSettings("pit-hop-a"));
             ServerlessNode b = new ServerlessNode(searchNodeSettings("pit-hop-b"))
         ) {
-            a.start();
+            a.startup().start();
             a.setMetadataPlane(plane);
-            b.start();
+            b.startup().start();
             b.setMetadataPlane(plane);
-            a.heartbeat(plane);
-            b.heartbeat(plane);
+            a.leases().heartbeat(plane);
+            b.leases().heartbeat(plane);
 
             final var members = plane.membership().refresh();
             final var preferred = ReaderPlacement.candidatesFor("stale", 0, members, ServerlessNode.ROLE_SEARCH, 1);
@@ -473,7 +473,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
 
         final String pit;
         try (ServerlessNode writer = new ServerlessNode(nodeSettings("pit-fallback-w"))) {
-            writer.start();
+            writer.startup().start();
             writer.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(writer, plane, clock, "orphaned", 1);
             assertEquals(201, send(writer, "PUT", "/orphaned/_doc/1?refresh=true", body(1)).status());
@@ -485,12 +485,12 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(searchNodeSettings("pit-fallback-a"));
             ServerlessNode b = new ServerlessNode(searchNodeSettings("pit-fallback-b"))
         ) {
-            a.start();
+            a.startup().start();
             a.setMetadataPlane(plane);
-            b.start();
+            b.startup().start();
             b.setMetadataPlane(plane);
-            a.heartbeat(plane);
-            b.heartbeat(plane);
+            a.leases().heartbeat(plane);
+            b.leases().heartbeat(plane);
 
             final var members = plane.membership().refresh();
             final var ranked = ReaderPlacement.candidatesFor("orphaned", 0, members, ServerlessNode.ROLE_SEARCH, 2);

@@ -36,7 +36,7 @@ public class ServerlessIndexingFailureTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 final var shard = node.activateWriter(metadata, descriptor.name(), 0).orElseThrow();
                 final var address = node.boundHttpAddress().publishAddress();
@@ -51,7 +51,7 @@ public class ServerlessIndexingFailureTests extends OpenSearchTestCase {
                     final var response = client.send(request, HttpResponse.BodyHandlers.ofString());
                     assertEquals(response.body(), 400, response.statusCode());
                     assertTrue(response.body(), response.body().contains("mapper_parsing_exception"));
-                    assertFalse(node.get(shard, "bad").found());
+                    assertFalse(node.reads().get(shard, "bad").found());
                     assertTrue(metadata.walStore(descriptor.name(), descriptor.uuid(), 0).replayable().isEmpty());
                 }
             }

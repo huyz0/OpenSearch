@@ -46,7 +46,7 @@ public class DataStreamDeletionIncarnationTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 work.accept(new Fixture(node, metadata, store));
             }

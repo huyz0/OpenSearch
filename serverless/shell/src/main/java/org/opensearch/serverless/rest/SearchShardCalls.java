@@ -339,8 +339,8 @@ final class SearchShardCalls {
     ) throws IOException {
         final boolean frozen = serving.reconciler().isFrozen(shardId);
         if (frozen == false) {
-            // Before the query too, so it runs on the mapping in force now; see ServerlessNode#ensureIncarnationLive.
-            serving.ensureIncarnationLive(shardId);
+            // Before the query too, so it runs on the mapping in force now; see WriteFences#ensureIncarnationLive.
+            serving.fences().ensureIncarnationLive(shardId);
         }
         serving.reconciler().enter(shardId);
         final org.opensearch.serverless.shard.ShardQuery.Result result;
@@ -353,7 +353,7 @@ final class SearchShardCalls {
         // Not for a frozen view: it is keyed by its view's id rather than the index's uuid, and outliving
         // its index is what a point in time is for.
         if (frozen == false) {
-            serving.ensureIncarnationLive(shardId);
+            serving.fences().ensureIncarnationLive(shardId);
         }
         return result;
     }

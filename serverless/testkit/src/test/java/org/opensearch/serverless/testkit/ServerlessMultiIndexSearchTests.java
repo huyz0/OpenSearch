@@ -73,7 +73,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("logs-b", "uuid-logs-b-0000000", 2, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-both"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 2, "logs-a", "logs-b");
 
@@ -111,7 +111,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("odd", "uuid-odd-0000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-page"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "even", "odd");
 
@@ -144,7 +144,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("metrics-a", "uuid-metrics-a-000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-prefix"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "logs-a", "logs-b", "metrics-a");
 
@@ -195,7 +195,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("logs-a", "uuid-logs-a-0000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-pattern"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "logs-a");
 
@@ -225,7 +225,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("logs-a", "uuid-logs-a-0000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-empty-pattern"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "logs-a");
             assertEquals(201, send(node, "PUT", "/logs-a/_doc/1?refresh=true", "{\"msg\":\"shared\",\"rank\":1}").status());
@@ -270,7 +270,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
             .put("serverless.search.pattern.max_indices", 3)
             .build();
         try (ServerlessNode node = new ServerlessNode(capped)) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "logs-a", "logs-b", "logs-c");
             assertEquals(201, send(node, "PUT", "/logs-a/_doc/1?refresh=true", "{\"msg\":\"shared\",\"rank\":1}").status());
@@ -312,7 +312,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("logs-b", "uuid-logs-b-0000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-deleted"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "logs-a", "logs-b");
             assertEquals(201, send(node, "PUT", "/logs-a/_doc/1?refresh=true", "{\"msg\":\"shared\",\"rank\":1}").status());
@@ -344,7 +344,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("present", "uuid-present-000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-missing"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "present");
             assertEquals(201, send(node, "PUT", "/present/_doc/1?refresh=true", body(1)).status());
@@ -375,7 +375,7 @@ public class ServerlessMultiIndexSearchTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("today", "uuid-today-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("multi-ignore"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "today");
             assertEquals(201, send(node, "PUT", "/today/_doc/1?refresh=true", body(1)).status());

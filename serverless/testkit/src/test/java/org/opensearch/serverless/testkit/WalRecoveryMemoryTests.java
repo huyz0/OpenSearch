@@ -50,11 +50,11 @@ public class WalRecoveryMemoryTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var shard = node.activateWriter(plane, descriptor.name(), 0).orElseThrow();
-                assertTrue(node.get(shard, "doc-0").found());
-                assertTrue(node.get(shard, "doc-5119").found());
+                assertTrue(node.reads().get(shard, "doc-0").found());
+                assertTrue(node.reads().get(shard, "doc-5119").found());
             }
         }
     }

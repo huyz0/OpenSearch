@@ -87,7 +87,7 @@ public class ServerlessGetTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("get-realtime"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -117,7 +117,7 @@ public class ServerlessGetTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("get-missing"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -138,7 +138,7 @@ public class ServerlessGetTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("get-deleted"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -167,8 +167,8 @@ public class ServerlessGetTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("get-fwd-a"));
             ServerlessNode b = new ServerlessNode(nodeSettings("get-fwd-b"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             a.setMetadataPlane(plane);
             b.setMetadataPlane(plane);
             final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
@@ -209,7 +209,7 @@ public class ServerlessGetTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, objectStore, 1);
 
         final ServerlessNode writer = new ServerlessNode(nodeSettings("get-zero-writer"));
-        writer.start();
+        writer.startup().start();
         writer.setMetadataPlane(plane);
         final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
         loop.want("alpha", 0);
@@ -229,7 +229,7 @@ public class ServerlessGetTests extends OpenSearchTestCase {
         assertTrue("nobody should own the shard now", plane.heads().read("alpha", 0).map(h -> h.ownerNodeId()).isEmpty());
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("get-zero-reader"))) {
-            reader.start();
+            reader.startup().start();
             reader.setMetadataPlane(plane);
             final Response got = send(reader, "GET", "/alpha/_doc/1", null);
             assertEquals("a get against an unowned shard must be served, not refused: " + got.body(), 200, got.status());
@@ -257,7 +257,7 @@ public class ServerlessGetTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, objectStore, 1);
 
         final ServerlessNode owner = new ServerlessNode(nodeSettings("get-stale-owner"));
-        owner.start();
+        owner.startup().start();
         owner.setMetadataPlane(plane);
         final BackgroundReconciler loop = new BackgroundReconciler(owner, plane);
         loop.want("alpha", 0);
@@ -274,7 +274,7 @@ public class ServerlessGetTests extends OpenSearchTestCase {
         owner.close();
 
         try (ServerlessNode other = new ServerlessNode(nodeSettings("get-stale-other"))) {
-            other.start();
+            other.startup().start();
             other.setMetadataPlane(plane);
             assertEquals(
                 "the head must still name the dead owner, or this tests nothing",

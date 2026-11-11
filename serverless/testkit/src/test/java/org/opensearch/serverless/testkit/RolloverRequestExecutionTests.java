@@ -42,7 +42,7 @@ public class RolloverRequestExecutionTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("logs-000001", "uuid-logs", 1, null, null));
                 metadata.createAlias(new AliasRecord("logs", List.of("logs-000001")));

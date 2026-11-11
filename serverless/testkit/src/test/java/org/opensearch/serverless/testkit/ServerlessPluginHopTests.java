@@ -345,9 +345,9 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
             ServerlessNode first = new ServerlessNode(nodeSettings("hop-a"), List.of(new WherePlugin()));
             ServerlessNode second = new ServerlessNode(nodeSettings("hop-b"), List.of(new WherePlugin()))
         ) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
             // Each publishes a lease, which is what one node reads to learn where another is.
             new BackgroundReconciler(first, plane).tick(clock.get());
@@ -393,9 +393,9 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("hop-owner"), List.of(new WherePlugin()));
             ServerlessNode stranger = new ServerlessNode(nodeSettings("hop-stranger"), List.of(new TransportCapturingPlugin()))
         ) {
-            owner.start();
+            owner.startup().start();
             owner.setMetadataPlane(plane);
-            stranger.start();
+            stranger.startup().start();
 
             final TransportService transport = STRANGER_TRANSPORT.get();
             assertNotNull("the stranger's transport service must have been captured", transport);
@@ -531,11 +531,11 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("window-owner"), List.of(new WherePlugin(), new BlockingActionPlugin()));
             ServerlessNode stranger = new ServerlessNode(nodeSettings("window-stranger"), List.of(new TransportCapturingPlugin()))
         ) {
-            stranger.start();
+            stranger.startup().start();
             final AtomicReference<Exception> startFailure = new AtomicReference<>();
             final Thread starting = new Thread(() -> {
                 try {
-                    owner.start();
+                    owner.startup().start();
                 } catch (Exception e) {
                     startFailure.set(e);
                 }

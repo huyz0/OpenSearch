@@ -54,7 +54,7 @@ public class ServerlessReaderBecomesWriterTests extends OpenSearchTestCase {
     /** Publishes a commit of {@code docs} documents from a writer node of its own, then closes it. */
     private void publishFromElsewhere(MetadataPlane plane, String name, int docs) throws Exception {
         try (ServerlessNode writer = new ServerlessNode(nodeSettings(name, "ingest"))) {
-            writer.start();
+            writer.startup().start();
             final long term = plane.activate("alpha", 0, writer.localNode().getId(), writer.localNode().getEphemeralId()).head().term();
             final ShardId shardId = writer.syncFrom(plane).iterator().next();
             for (int i = 1; i <= docs; i++) {
@@ -74,7 +74,7 @@ public class ServerlessReaderBecomesWriterTests extends OpenSearchTestCase {
         publishFromElsewhere(plane, "first-writer", 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("both", "ingest,search"))) {
-            node.start();
+            node.startup().start();
             final ShardId shardId = node.serveAsReader(plane, "alpha", 0);
             assertTrue(node.reconciler().readerShards().contains(shardId));
 

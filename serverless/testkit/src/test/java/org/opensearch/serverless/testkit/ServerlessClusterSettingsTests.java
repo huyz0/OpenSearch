@@ -73,7 +73,7 @@ public class ServerlessClusterSettingsTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cluster-config-empty"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -90,7 +90,7 @@ public class ServerlessClusterSettingsTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cluster-config-write"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -114,7 +114,7 @@ public class ServerlessClusterSettingsTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cluster-config-merge"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -133,7 +133,7 @@ public class ServerlessClusterSettingsTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cluster-config-nested"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -153,7 +153,7 @@ public class ServerlessClusterSettingsTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cluster-config-remove"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -184,7 +184,7 @@ public class ServerlessClusterSettingsTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cluster-config-transient"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -205,7 +205,7 @@ public class ServerlessClusterSettingsTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cluster-config-list"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -221,7 +221,7 @@ public class ServerlessClusterSettingsTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cluster-config-missing"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 

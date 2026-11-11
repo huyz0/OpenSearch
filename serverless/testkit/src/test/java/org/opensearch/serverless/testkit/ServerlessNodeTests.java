@@ -38,7 +38,7 @@ public class ServerlessNodeTests extends OpenSearchTestCase {
         final ServerlessNode node = new ServerlessNode(nodeSettings("phase1-a"));
         try {
             assertFalse("a freshly constructed node must not report started", node.isStarted());
-            node.start();
+            node.startup().start();
             assertTrue("start() did not take effect", node.isStarted());
 
             // The data plane is present and usable.
@@ -60,7 +60,7 @@ public class ServerlessNodeTests extends OpenSearchTestCase {
 
     public void testProductionNodeContainsNoControlPlane() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("phase1-b"))) {
-            node.start();
+            node.startup().start();
             // Scanned from the node itself rather than from named services: the transport and HTTP
             // layers are reachable only through its fields, and a check that covers
             // less than the node does would quietly stop being the assertion it claims to be.
@@ -76,8 +76,8 @@ public class ServerlessNodeTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("phase1-c1"));
             ServerlessNode b = new ServerlessNode(nodeSettings("phase1-c2"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             assertNotEquals("two nodes must not share an identity", a.localNode().getId(), b.localNode().getId());
             assertEquals(a.localNode().getId(), a.clusterService().state().nodes().getLocalNodeId());
             assertEquals(b.localNode().getId(), b.clusterService().state().nodes().getLocalNodeId());

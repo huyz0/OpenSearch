@@ -88,7 +88,7 @@ public abstract class NodeLogNodeFaultTestCase extends OpenSearchTestCase {
                 final ShardId shardId = shardOf(node, entry.getKey());
                 assertNotNull(what + ": shard " + entry.getKey() + " is open on " + node.localNode().getName(), shardId);
                 for (String id : entry.getValue()) {
-                    assertTrue(what + ": the acknowledged write " + id + " is found on " + shardId, node.get(shardId, id).found());
+                    assertTrue(what + ": the acknowledged write " + id + " is found on " + shardId, node.reads().get(shardId, id).found());
                 }
             }
         }
@@ -125,7 +125,7 @@ public abstract class NodeLogNodeFaultTestCase extends OpenSearchTestCase {
     private ServerlessNode startNode(String name, Path home, long idSeed, MetadataPlane plane) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name, home, idSeed));
         try {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
         } catch (Exception | AssertionError e) {
             closeQuietly(node);
@@ -145,7 +145,7 @@ public abstract class NodeLogNodeFaultTestCase extends OpenSearchTestCase {
 
     /** Renews the node's lease and takes the given shards in one reconciler pass. */
     private static void take(ServerlessNode node, MetadataPlane plane, AtomicLong clock, List<Integer> shards) throws Exception {
-        node.renewLease(plane);
+        node.leases().renewLease(plane);
         plane.membership().refresh();
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
         for (int shard : shards) {
@@ -172,7 +172,7 @@ public abstract class NodeLogNodeFaultTestCase extends OpenSearchTestCase {
             return false;
         }
         try {
-            node.index(shardId, id, "{\"msg\":\"m\",\"n\":" + shard + "}");
+            node.writes().index(shardId, id, "{\"msg\":\"m\",\"n\":" + shard + "}");
         } catch (Exception e) {
             if (CrashPointBlobStore.isInjected(e) == false && e instanceof IOException == false) {
                 throw new AssertionError("a write failed for a reason no fault explains", e);
@@ -573,7 +573,7 @@ public abstract class NodeLogNodeFaultTestCase extends OpenSearchTestCase {
             take(successor, successorPlane, clock, List.of(0));
             assertEquals("the late write ran in the window and was refused", Boolean.FALSE, lateAcknowledged.get());
             ledger.assertFoundOn(successor, "after a late epoch");
-            assertFalse("the refused write is not found", successor.get(shardOf(successor, 0), "late").found());
+            assertFalse("the refused write is not found", successor.reads().get(shardOf(successor, 0), "late").found());
 
             final List<NodeLogEpoch> later = leaseEpochs(planeOn(store, clock), writerId).stream()
                 .filter(epoch -> epoch.epoch() > highestBefore)
@@ -729,7 +729,7 @@ public abstract class NodeLogNodeFaultTestCase extends OpenSearchTestCase {
                 for (int shard : range(i * perSuccessor, (i + 1) * perSuccessor)) {
                     final ShardId shardId = shardOf(node, shard);
                     for (String id : List.of("dead-0-" + shard, "dead-1-" + shard)) {
-                        assertTrue(id + " found on " + shardId, node.get(shardId, id).found());
+                        assertTrue(id + " found on " + shardId, node.reads().get(shardId, id).found());
                     }
                 }
             }

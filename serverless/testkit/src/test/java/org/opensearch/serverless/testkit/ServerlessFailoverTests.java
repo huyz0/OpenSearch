@@ -69,8 +69,8 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("p6-a", "ingest"));
             ServerlessNode b = new ServerlessNode(nodeSettings("p6-b", "ingest"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
 
             assertTrue("A should have acquired the shard", a.activateWriter(plane, "alpha", 0).isPresent());
 
@@ -90,14 +90,14 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("p6-hb", "ingest"));
             ServerlessNode b = new ServerlessNode(nodeSettings("p6-hb2", "ingest"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             assertTrue(a.activateWriter(plane, "alpha", 0).isPresent());
 
             // Three TTLs pass, but A keeps heartbeating.
             for (int i = 1; i <= 3; i++) {
                 clock.set(1_000L + i * (TTL - 1_000L));
-                assertTrue("a live heartbeat must release nothing", a.heartbeat(plane).isEmpty());
+                assertTrue("a live heartbeat must release nothing", a.leases().heartbeat(plane).isEmpty());
             }
 
             assertTrue("B took a shard whose lease was being renewed", b.activateWriter(plane, "alpha", 0).isEmpty());
@@ -113,8 +113,8 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("p6-stop", "ingest"));
             ServerlessNode b = new ServerlessNode(nodeSettings("p6-take", "ingest"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             final ShardId shardId = a.activateWriter(plane, "alpha", 0).orElseThrow();
 
             // A stops heartbeating -- paused, partitioned, or simply busy. The clock does the rest.
@@ -123,7 +123,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
 
             // A is still holding the shard open at this instant. It finds out on its next heartbeat.
             assertEquals(1, a.reconciler().openShards().size());
-            assertEquals("A did not release the shard it lost", java.util.Set.of(shardId), a.heartbeat(plane));
+            assertEquals("A did not release the shard it lost", java.util.Set.of(shardId), a.leases().heartbeat(plane));
             assertTrue(a.reconciler().openShards().isEmpty());
         }
     }
@@ -134,7 +134,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock);
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("p6-kill", "ingest"));
-        a.start();
+        a.startup().start();
         final ShardId shardId = a.activateWriter(plane, "alpha", 0).orElseThrow();
         for (int i = 1; i <= 4; i++) {
             ShardOps.indexDoc(a.reconciler().shard(shardId), String.valueOf(i), "{\"msg\":\"durable\",\"n\":" + i + "}");
@@ -147,7 +147,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
 
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("p6-kill2", "ingest"))) {
-            b.start();
+            b.startup().start();
             final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals("published data did not survive an abrupt death", 4L, ShardOps.hits(b.searchService(), onB, "msg", "durable"));
         }
@@ -165,8 +165,8 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             ServerlessNode zombie = new ServerlessNode(nodeSettings("p6-zombie", "ingest"));
             ServerlessNode successor = new ServerlessNode(nodeSettings("p6-successor", "ingest"))
         ) {
-            zombie.start();
-            successor.start();
+            zombie.startup().start();
+            successor.startup().start();
 
             final ShardId onZombie = zombie.activateWriter(plane, "alpha", 0).orElseThrow();
             final long zombieTerm = plane.heads().read("alpha", 0).orElseThrow().term();
@@ -200,13 +200,13 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             // And on its next heartbeat the zombie discovers the truth and lets go. Its unpublished
             // document goes with it -- lost, not corrupting, which is a durability gap and not a fence
             // failure. Distinguishing those two is the whole point of the test.
-            assertEquals(java.util.Set.of(onZombie), zombie.heartbeat(plane));
+            assertEquals(java.util.Set.of(onZombie), zombie.leases().heartbeat(plane));
             assertTrue(zombie.reconciler().openShards().isEmpty());
         }
 
         // What survives is exactly what was published: the successor's view of the shard.
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("p6-verify", "search"))) {
-            reader.start();
+            reader.startup().start();
             final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
             assertEquals("the pre-pause document must survive", 1L, ShardOps.hits(reader.searchService(), shardId, "msg", "before"));
             assertEquals("the successor's document must survive", 1L, ShardOps.hits(reader.searchService(), shardId, "msg", "takeover"));
@@ -247,8 +247,8 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             ServerlessNode loser = new ServerlessNode(nodeSettings("p6-window-loser", "ingest"));
             ServerlessNode winner = new ServerlessNode(nodeSettings("p6-window-winner", "ingest"))
         ) {
-            loser.start();
-            winner.start();
+            loser.startup().start();
+            winner.startup().start();
 
             final ShardId onLoser = loser.activateWriter(plane, "alpha", 0).orElseThrow();
             final long loserTerm = plane.heads().read("alpha", 0).orElseThrow().term();
@@ -307,7 +307,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
         // The reader is the assertion that matters: a lost swap here would not look like an error, it
         // would look like the winner's document having never been written.
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("p6-window-verify", "search"))) {
-            reader.start();
+            reader.startup().start();
             final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
             assertEquals("the winner's document must survive", 1L, ShardOps.hits(reader.searchService(), shardId, "msg", "winner"));
         }

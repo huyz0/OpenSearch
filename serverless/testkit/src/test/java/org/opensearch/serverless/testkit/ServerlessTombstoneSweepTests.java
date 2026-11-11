@@ -310,7 +310,7 @@ public class ServerlessTombstoneSweepTests extends OpenSearchTestCase {
         clock.addAndGet(PAST_QUARANTINE);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings())) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final org.opensearch.serverless.reconcile.BackgroundReconciler loop =
                 new org.opensearch.serverless.reconcile.BackgroundReconciler(node, plane);

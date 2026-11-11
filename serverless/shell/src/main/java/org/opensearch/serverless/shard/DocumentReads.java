@@ -174,7 +174,7 @@ final class DocumentReads {
             if (expectedUuid.equals(taken.get().getIndex().getUUID()) == false) {
                 throw new org.opensearch.serverless.shell.StaleIncarnationException(new ShardId(index, expectedUuid, shard));
             }
-            return new Read(node.get(taken.get(), id), node.localNode().getId(), true, taken.get());
+            return new Read(node.reads().get(taken.get(), id), node.localNode().getId(), true, taken.get());
         }
         throw NotHereException.behindLog(behind);
     }
@@ -185,7 +185,7 @@ final class DocumentReads {
         // node is a writer that has not noticed it lost the shard, and its documents are behind the real
         // owner's: the forward below asks the node the head names, which is the one answer that is fresh.
         if (placement.local() != null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
-            return new Read(node.get(placement.local(), id), node.localNode().getId(), true, placement.local());
+            return new Read(node.reads().get(placement.local(), id), node.localNode().getId(), true, placement.local());
         }
         if (placement.owner() == null) {
             // Nobody owns it, so there is no writer holding unpublished writes and the commit is the
@@ -206,7 +206,7 @@ final class DocumentReads {
             }
             try {
                 final var shardId = node.serveAsReader(plane, index, placement.shard(), placement.uuid());
-                return new Read(node.get(shardId, id), node.localNode().getId(), false, shardId);
+                return new Read(node.reads().get(shardId, id), node.localNode().getId(), false, shardId);
             } catch (org.opensearch.serverless.shell.ShardBehindLogException behind) {
                 return readOnceTaken(index, id, placement.shard(), placement.uuid(), behind);
             } catch (IOException e) {
@@ -260,7 +260,7 @@ final class DocumentReads {
         final Placement placement = routing.place(index, id);
         // A retained writer may lag the successor's acknowledged writes, just as in doGet.
         if (placement.local() != null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
-            final ShardExplain.Outcome outcome = node.explain(placement.local(), id, query);
+            final ShardExplain.Outcome outcome = node.reads().explain(placement.local(), id, query);
             return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), true);
         }
         if (placement.owner() == null) {
@@ -272,7 +272,7 @@ final class DocumentReads {
             }
             try {
                 final var shardId = node.serveAsReader(plane, index, placement.shard(), placement.uuid());
-                final ShardExplain.Outcome outcome = node.explain(shardId, id, query);
+                final ShardExplain.Outcome outcome = node.reads().explain(shardId, id, query);
                 return new Explained(outcome.exists(), outcome.explanation(), node.localNode().getId(), false);
             } catch (org.opensearch.serverless.shell.ShardBehindLogException behind) {
                 throw NotHereException.behindLog(behind);

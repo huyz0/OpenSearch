@@ -65,7 +65,7 @@ public class ServerlessAliasTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("logs-tuesday", "uuid-tue-0000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-search"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "logs-monday", "logs-tuesday");
 
@@ -102,7 +102,7 @@ public class ServerlessAliasTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("real", "uuid-real-0000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-collide"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "real");
 
@@ -128,7 +128,7 @@ public class ServerlessAliasTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("two", "uuid-two-00000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-lifecycle"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "one", "two");
 
@@ -164,7 +164,7 @@ public class ServerlessAliasTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("present", "uuid-present-000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-missing"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "present");
 
@@ -202,7 +202,7 @@ public class ServerlessAliasTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("opts", "uuid-opts-0000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-options"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "opts");
 

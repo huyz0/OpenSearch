@@ -205,7 +205,7 @@ public final class BlobLeaseMembership implements MembershipSource {
      * enforce, and it is a rule about shards, not about the register: a node whose lease lapsed has lost
      * every shard it held and must let go of them <em>before</em> it renews, or the renewal reopens the
      * write path on shards a successor has already sealed. {@link #selfLeaseLapsedAt} is the question to
-     * ask first; {@code ServerlessNode#renewLease} asks it.
+     * ask first; {@code NodeLeases#renewLease} asks it.
      *
      * <p>Synchronized because two renewals at once -- the renewal timer and a backstop, or an activation
      * -- would each expect the other's generation and both take the re-read path for nothing.

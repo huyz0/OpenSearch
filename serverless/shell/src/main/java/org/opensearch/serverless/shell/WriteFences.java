@@ -11,7 +11,7 @@ package org.opensearch.serverless.shell;
  * Decides for {@link ServerlessNode} whether a write may go ahead: the shard's fence, its incarnation, and this
  * node's lease and head.
  */
-final class WriteFences {
+public final class WriteFences {
 
     private final ServerlessNode node;
 
@@ -46,7 +46,7 @@ final class WriteFences {
             node.confirmIncarnation(uuid, routed.get().readStartedNanos());
             // And it is a read of the mapping and settings like any other: a change made on another node reaches
             // this one's shards through whichever read sees it first, so the periodic refresh is only a backstop.
-            node.applyIfNewer(shardId.getIndexName(), routed.get().descriptor(), routed.get().readStartedNanos());
+            node.descriptorRefresh.applyIfNewer(shardId.getIndexName(), routed.get().descriptor(), routed.get().readStartedNanos());
             return;
         }
         synchronized (node.incarnationLocks[Math.floorMod(uuid.hashCode(), node.incarnationLocks.length)]) {
@@ -64,7 +64,7 @@ final class WriteFences {
             node.incarnationConfirmedAtNanos.put(uuid, startedAt);
             // The read is the refresh's read too: apply it, and let the periodic refresh skip this index.
             try {
-                node.applyDescriptor(shardId.getIndexName(), descriptor.get());
+                node.descriptorRefresh.applyDescriptor(shardId.getIndexName(), descriptor.get());
                 node.descriptorReadAtNanos.put(shardId.getIndexName(), startedAt);
             } catch (Exception e) {
                 ServerlessNode.logger.warn(
@@ -251,7 +251,7 @@ final class WriteFences {
      *
      * <p>For the node a write was forwarded to. Being open here was the only check, and "open here" is
      * true of a shard whose head has named another node since the last heartbeat: the lease fences a
-     * write only once the lapsed-lease rule in {@link ServerlessNode#renewLease} holds, and the head is the truth the
+     * write only once the lapsed-lease rule in {@link NodeLeases#renewLease} holds, and the head is the truth the
      * rule approximates. The heartbeat notes every held head once per renewal, so with an age of one
      * renewal this costs no register read on a healthy node; a head older than that is read fresh, and
      * one that names another node closes the shard here on the spot.
@@ -293,11 +293,11 @@ final class WriteFences {
             }
             node.noteHead(shardId.getIndexName(), shardId.id(), head.orElse(null));
         }
-        if (node.namesThisNode(head, shardId)) {
+        if (node.leases.namesThisNode(head, shardId)) {
             return true;
         }
         try {
-            node.releaseLost(
+            node.leases.releaseLost(
                 plane,
                 shardId,
                 "a forwarded write found the shard-head naming " + head.map(h -> h.ownerNodeId()).orElse("nobody"),

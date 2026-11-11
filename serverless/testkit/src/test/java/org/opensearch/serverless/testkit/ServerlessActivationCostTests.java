@@ -52,7 +52,7 @@ public class ServerlessActivationCostTests extends OpenSearchTestCase {
             .put("serverless.roles", "ingest")
             .build();
         try (ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             double first = -1;
             double last = -1;

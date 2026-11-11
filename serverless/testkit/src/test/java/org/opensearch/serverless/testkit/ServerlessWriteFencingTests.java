@@ -89,20 +89,20 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("fence-self"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final ShardId shardId = node.reconciler().openShards().iterator().next();
 
-            assertTrue("a node inside its lease writes normally", node.index(shardId, "a", "{\"msg\":\"a\"}").seqNo() >= 0);
+            assertTrue("a node inside its lease writes normally", node.writes().index(shardId, "a", "{\"msg\":\"a\"}").seqNo() >= 0);
 
             // Past the deadline this node last published, with no renewal in between: from here on it has
             // no standing to claim it still holds the shard.
             clock.set(clock.get() + TTL + 1);
 
-            final IOException refused = expectThrows(IOException.class, () -> node.index(shardId, "b", "{\"msg\":\"b\"}"));
+            final IOException refused = expectThrows(IOException.class, () -> node.writes().index(shardId, "b", "{\"msg\":\"b\"}"));
             assertTrue(
                 "the refusal must say the lease is why, so an operator is not left looking at the store: " + refused.getMessage(),
                 refused.getMessage().contains("lease has expired")
@@ -135,7 +135,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         final long zombieTerm;
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("fence-a"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
@@ -143,8 +143,8 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
 
         // Written and acknowledged before anything went wrong: this one is legitimate history and must
         // survive everything below.
-        a.index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
-        zombieTerm = a.get(onA, "legitimate").primaryTerm();
+        a.writes().index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
+        zombieTerm = a.reads().get(onA, "legitimate").primaryTerm();
         zombieLog = a.reconciler().wal(onA);
         assertNotNull("the test needs the predecessor's own log object to be a faithful zombie", zombieLog);
 
@@ -153,12 +153,12 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
 
         // B takes the shard over, which seals the log at the point legitimate history ended.
         final ServerlessNode b = new ServerlessNode(nodeSettings("fence-b"));
-        b.start();
+        b.startup().start();
         final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
         loopB.want("alpha", 0);
         loopB.tick(clock.get());
         final ShardId onB = b.reconciler().openShards().iterator().next();
-        assertTrue("the legitimate write must have replayed onto the successor", b.get(onB, "legitimate").found());
+        assertTrue("the legitimate write must have replayed onto the successor", b.reads().get(onB, "legitimate").found());
 
         // Now the zombie wakes up and appends under its old term, exactly as a node that has not yet
         // noticed it lost the shard would. Nothing rejects this: it is a well-formed write to a path the
@@ -177,16 +177,16 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode c = new ServerlessNode(nodeSettings("fence-c"))) {
-            c.start();
+            c.startup().start();
             final BackgroundReconciler loopC = new BackgroundReconciler(c, plane);
             loopC.want("alpha", 0);
             loopC.tick(clock.get());
             final ShardId onC = c.reconciler().openShards().iterator().next();
 
-            assertTrue("history written before the takeover must still survive", c.get(onC, "legitimate").found());
+            assertTrue("history written before the takeover must still survive", c.reads().get(onC, "legitimate").found());
             assertFalse(
                 "a record appended after the shard changed hands must not be replayed as acknowledged history",
-                c.get(onC, "zombie").found()
+                c.reads().get(onC, "zombie").found()
             );
         }
     }
@@ -211,14 +211,14 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         final long zombieTerm;
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("empty-a"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
         final ShardId onA = a.reconciler().openShards().iterator().next();
 
-        a.index(onA, "legitimate", "{\"msg\":\"written and published\"}");
-        zombieTerm = a.get(onA, "legitimate").primaryTerm();
+        a.writes().index(onA, "legitimate", "{\"msg\":\"written and published\"}");
+        zombieTerm = a.reads().get(onA, "legitimate").primaryTerm();
         zombieLog = a.reconciler().wal(onA);
 
         // Publish, which is what empties the log: the document now lives in a commit and its record is
@@ -230,12 +230,12 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         clock.set(clock.get() + TTL + 1);
 
         final ServerlessNode b = new ServerlessNode(nodeSettings("empty-b"));
-        b.start();
+        b.startup().start();
         final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
         loopB.want("alpha", 0);
         loopB.tick(clock.get());
         final ShardId onB = b.reconciler().openShards().iterator().next();
-        assertTrue("the published document must have arrived in the commit", b.get(onB, "legitimate").found());
+        assertTrue("the published document must have arrived in the commit", b.reads().get(onB, "legitimate").found());
 
         // The zombie appends under its old term, into a log that was empty when B sealed it.
         // Refused by the store: the takeover fenced this term, and the fence holds the slot it writes next.
@@ -251,14 +251,17 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode c = new ServerlessNode(nodeSettings("empty-c"))) {
-            c.start();
+            c.startup().start();
             final BackgroundReconciler loopC = new BackgroundReconciler(c, plane);
             loopC.want("alpha", 0);
             loopC.tick(clock.get());
             final ShardId onC = c.reconciler().openShards().iterator().next();
 
-            assertTrue("published history must still be there", c.get(onC, "legitimate").found());
-            assertFalse("an empty seal must be read as 'there was nothing here', not as 'nothing is known'", c.get(onC, "zombie").found());
+            assertTrue("published history must still be there", c.reads().get(onC, "legitimate").found());
+            assertFalse(
+                "an empty seal must be read as 'there was nothing here', not as 'nothing is known'",
+                c.reads().get(onC, "zombie").found()
+            );
         }
     }
 
@@ -292,7 +295,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         final long zombieTerm;
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("window-a"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, setup);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
@@ -300,8 +303,8 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
 
         // Legitimate history, never published, so the log is the only account of it and the cutoff is what
         // decides whether it survives.
-        a.index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
-        zombieTerm = a.get(onA, "legitimate").primaryTerm();
+        a.writes().index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
+        zombieTerm = a.reads().get(onA, "legitimate").primaryTerm();
         zombieLog = a.reconciler().wal(onA);
 
         a.close();
@@ -327,7 +330,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(hooked, BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode b = new ServerlessNode(nodeSettings("window-b"))) {
-            b.start();
+            b.startup().start();
             final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
@@ -335,10 +338,10 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
             assertTrue("an append after the fence must be refused by the store, not merely left out of replay", refused.get());
 
             final ShardId onB = b.reconciler().openShards().iterator().next();
-            assertTrue("history written before the takeover must still survive", b.get(onB, "legitimate").found());
+            assertTrue("history written before the takeover must still survive", b.reads().get(onB, "legitimate").found());
             assertFalse(
                 "a record appended between the swap and the open must not be replayed as acknowledged history",
-                b.get(onB, "zombie").found()
+                b.reads().get(onB, "zombie").found()
             );
         }
     }
@@ -356,13 +359,13 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         final MetadataPlane setup = freshIndex(clock, objectStore);
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("swap-a"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, setup);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
         final ShardId onA = a.reconciler().openShards().iterator().next();
-        a.index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
-        final long zombieTerm = a.get(onA, "legitimate").primaryTerm();
+        a.writes().index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
+        final long zombieTerm = a.reads().get(onA, "legitimate").primaryTerm();
         final WalStore zombieLog = a.reconciler().wal(onA);
         a.close();
         clock.set(clock.get() + TTL + 1);
@@ -385,15 +388,18 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(hooked, BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode b = new ServerlessNode(nodeSettings("swap-b"))) {
-            b.start();
+            b.startup().start();
             final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
             assertTrue("the append between the swap and the fence must have been acknowledged", acknowledged.get());
 
             final ShardId onB = b.reconciler().openShards().iterator().next();
-            assertTrue("history written before the takeover must survive", b.get(onB, "legitimate").found());
-            assertTrue("and an acknowledged append from inside the window must be replayed, not lost", b.get(onB, "inside").found());
+            assertTrue("history written before the takeover must survive", b.reads().get(onB, "legitimate").found());
+            assertTrue(
+                "and an acknowledged append from inside the window must be replayed, not lost",
+                b.reads().get(onB, "inside").found()
+            );
         }
     }
 
@@ -415,7 +421,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         planeA.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("stall-a"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, planeA);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
@@ -425,7 +431,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         final java.util.concurrent.atomic.AtomicReference<Throwable> outcome = new java.util.concurrent.atomic.AtomicReference<>();
         final Thread writer = new Thread(() -> {
             try {
-                a.index(onA, "stalled", "{\"msg\":\"landed, then stalled\"}");
+                a.writes().index(onA, "stalled", "{\"msg\":\"landed, then stalled\"}");
             } catch (Throwable t) {
                 outcome.set(t);
             }
@@ -442,7 +448,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
                 TTL
             );
             try (ServerlessNode b = new ServerlessNode(nodeSettings("stall-b"))) {
-                b.start();
+                b.startup().start();
                 final BackgroundReconciler loopB = new BackgroundReconciler(b, planeB);
                 loopB.want("alpha", 0);
                 loopB.tick(clock.get());
@@ -450,7 +456,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
                 writer.join(30_000);
                 assertNull("a write whose record landed before the fence must be acknowledged: " + outcome.get(), outcome.get());
                 final ShardId onB = b.reconciler().openShards().iterator().next();
-                assertTrue("and the successor must have it", b.get(onB, "stalled").found());
+                assertTrue("and the successor must have it", b.reads().get(onB, "stalled").found());
             }
         } finally {
             resume.countDown();

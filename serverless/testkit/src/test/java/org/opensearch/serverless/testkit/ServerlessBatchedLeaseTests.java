@@ -65,8 +65,8 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 4, MAPPING, null));
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8b-a")); ServerlessNode b = new ServerlessNode(nodeSettings("p8b-b"))) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             plane.membership().renew(leaseFor(a));
             for (int shard = 0; shard < 4; shard++) {
                 assertTrue(a.activateWriter(plane, "alpha", shard).isPresent());
@@ -76,7 +76,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
             // Two TTLs pass. One renewal per tick covers all four shards.
             for (int i = 1; i <= 2; i++) {
                 clock.set(1_000L + i * (TTL - 1_000L));
-                assertTrue("a live node must keep its shards", a.heartbeat(plane).isEmpty());
+                assertTrue("a live node must keep its shards", a.leases().heartbeat(plane).isEmpty());
             }
             for (int shard = 0; shard < 4; shard++) {
                 assertTrue("B took a shard from a live node", b.activateWriter(plane, "alpha", shard).isEmpty());
@@ -92,8 +92,8 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 3, MAPPING, null));
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8b-l1")); ServerlessNode b = new ServerlessNode(nodeSettings("p8b-l2"))) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             plane.membership().renew(leaseFor(a));
             for (int shard = 0; shard < 3; shard++) {
                 a.activateWriter(plane, "alpha", shard);
@@ -108,7 +108,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
                     b.activateWriter(plane, "alpha", shard).isPresent()
                 );
             }
-            assertEquals("A must let go of all three on its next tick", 3, a.heartbeat(plane).size());
+            assertEquals("A must let go of all three on its next tick", 3, a.leases().heartbeat(plane).size());
         }
     }
 
@@ -120,7 +120,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8b-r"))) {
-            a.start();
+            a.startup().start();
             plane.membership().renew(leaseFor(a));
             assertTrue(plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId()).acquired());
 
@@ -175,7 +175,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
 
         final String writerNodeId;
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8b-sweep"))) {
-            a.start();
+            a.startup().start();
             writerNodeId = a.localNode().getId();
             final ShardId shardId = a.activateWriter(plane, "alpha", 0).orElseThrow();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"kept\"}");
@@ -244,7 +244,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p8b-m-" + shards))) {
-            node.start();
+            node.startup().start();
             plane.membership().renew(leaseFor(node));
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             for (int shard = 0; shard < shards; shard++) {

@@ -62,14 +62,14 @@ public class ServerlessCommitRetentionTests extends OpenSearchTestCase {
 
         // The first writer publishes at term 1, and lets go.
         try (ServerlessNode first = new ServerlessNode(nodeSettings("inherit-first", "ingest"))) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final ShardId onFirst = first.reconciler().openShards().iterator().next();
             for (int i = 0; i < 10; i++) {
-                first.index(onFirst, "a" + i, "{\"msg\":\"first\",\"n\":" + i + "}");
+                first.writes().index(onFirst, "a" + i, "{\"msg\":\"first\",\"n\":" + i + "}");
             }
             loop.publishAll();
             loop.stopWanting("alpha", 0);
@@ -84,7 +84,7 @@ public class ServerlessCommitRetentionTests extends OpenSearchTestCase {
             .put("serverless.block_cache.max_blocks", 1)
             .build();
         try (ServerlessNode second = new ServerlessNode(uncached)) {
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(second, plane);
             loop.want("alpha", 0);
@@ -95,7 +95,7 @@ public class ServerlessCommitRetentionTests extends OpenSearchTestCase {
 
             // Writes, then one segment, so the commit it publishes names none of the files it inherited.
             for (int i = 0; i < 5; i++) {
-                second.index(shardId, "b" + i, "{\"msg\":\"second\",\"n\":" + i + "}");
+                second.writes().index(shardId, "b" + i, "{\"msg\":\"second\",\"n\":" + i + "}");
             }
             shard.forceMerge(new org.opensearch.action.admin.indices.forcemerge.ForceMergeRequest().maxNumSegments(1).flush(true));
             loop.publishAll();
@@ -120,15 +120,15 @@ public class ServerlessCommitRetentionTests extends OpenSearchTestCase {
 
             // And the writer goes on: it writes, commits and publishes.
             for (int i = 5; i < 10; i++) {
-                second.index(shardId, "b" + i, "{\"msg\":\"second\",\"n\":" + i + "}");
+                second.writes().index(shardId, "b" + i, "{\"msg\":\"second\",\"n\":" + i + "}");
             }
             loop.publishAll();
             assertTrue(
                 "its engine must not have failed",
                 second.reconciler().shard(shardId).state() == org.opensearch.index.shard.IndexShardState.STARTED
             );
-            assertTrue(second.get(shardId, "b9").found());
-            assertTrue(second.get(shardId, "a3").found());
+            assertTrue(second.reads().get(shardId, "b9").found());
+            assertTrue(second.reads().get(shardId, "a3").found());
         }
     }
 
@@ -139,7 +139,7 @@ public class ServerlessCommitRetentionTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("retention", "ingest"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -147,7 +147,7 @@ public class ServerlessCommitRetentionTests extends OpenSearchTestCase {
             final ShardId shardId = node.reconciler().openShards().iterator().next();
             for (int round = 0; round < 4; round++) {
                 for (int i = 0; i < 5; i++) {
-                    node.index(shardId, "d" + round + "-" + i, "{\"msg\":\"m\",\"n\":" + i + "}");
+                    node.writes().index(shardId, "d" + round + "-" + i, "{\"msg\":\"m\",\"n\":" + i + "}");
                 }
                 loop.publishAll();
             }

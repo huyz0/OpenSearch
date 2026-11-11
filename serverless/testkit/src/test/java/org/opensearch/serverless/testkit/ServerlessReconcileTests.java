@@ -81,8 +81,8 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("p8-a"));
             ServerlessNode thief = new ServerlessNode(nodeSettings("p8-thief"))
         ) {
-            a.start();
-            thief.start();
+            a.startup().start();
+            thief.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(a, d.plane);
             loop.want("alpha", 0);
 
@@ -114,8 +114,8 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
         d.plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8-h1")); ServerlessNode b = new ServerlessNode(nodeSettings("p8-h2"))) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(a, d.plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -154,8 +154,8 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             ServerlessNode zombie = new ServerlessNode(nodeSettings("p8-gc-z"));
             ServerlessNode successor = new ServerlessNode(nodeSettings("p8-gc-s"))
         ) {
-            zombie.start();
-            successor.start();
+            zombie.startup().start();
+            successor.startup().start();
 
             final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
@@ -225,8 +225,8 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             ServerlessNode zombie = new ServerlessNode(nodeSettings("p8-sweep-z"));
             ServerlessNode successor = new ServerlessNode(nodeSettings("p8-sweep-s"))
         ) {
-            zombie.start();
-            successor.start();
+            zombie.startup().start();
+            successor.startup().start();
 
             final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
@@ -292,8 +292,8 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             ServerlessNode zombie = new ServerlessNode(nodeSettings("p8-tick-z"));
             ServerlessNode successor = new ServerlessNode(nodeSettings("p8-tick-s"))
         ) {
-            zombie.start();
-            successor.start();
+            zombie.startup().start();
+            successor.startup().start();
             final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
@@ -344,8 +344,8 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             ServerlessNode zombie = new ServerlessNode(nodeSettings("p8-grace0-z"));
             ServerlessNode successor = new ServerlessNode(nodeSettings("p8-grace0-s"))
         ) {
-            zombie.start();
-            successor.start();
+            zombie.startup().start();
+            successor.startup().start();
             final ShardId onZombie = zombie.activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
@@ -388,7 +388,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
         assertTrue(gc.collectShard(d.plane, "alpha", 0).isEmpty());
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8-gc-live"))) {
-            a.start();
+            a.startup().start();
             final ShardId shardId = a.activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"live\",\"n\":1}");
@@ -437,7 +437,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
         d.plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8-pit-cost"))) {
-            a.start();
+            a.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(a, d.plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -478,15 +478,15 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("p8-busy"));
             ServerlessNode b = new ServerlessNode(nodeSettings("p8-busy-r"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(a, d.plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final var shardId = a.reconciler().openShards().iterator().next();
             // The first publish and the first sweep, paid once: the WAL root for older terms and the
             // shard's containers for a predecessor's orphans.
-            a.index(shardId, "warm", "{\"msg\":\"warm\",\"n\":0}");
+            a.writes().index(shardId, "warm", "{\"msg\":\"warm\",\"n\":0}");
             clock.set(clock.get() + 1_000L);
             loop.tick(clock.get());
 
@@ -495,7 +495,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             // sweep may list for, and few enough passes that the tenth-pass reap does not fall inside.
             final int passes = 5;
             for (int i = 0; i < passes; i++) {
-                a.index(shardId, "doc-" + i, "{\"msg\":\"busy\",\"n\":" + i + "}");
+                a.writes().index(shardId, "doc-" + i, "{\"msg\":\"busy\",\"n\":" + i + "}");
                 clock.set(clock.get() + 1_000L);
                 loop.tick(clock.get());
             }
@@ -529,7 +529,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
         d.plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8-measure"))) {
-            a.start();
+            a.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(a, d.plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());        // the acquiring tick; not what we are measuring

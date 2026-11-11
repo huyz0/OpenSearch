@@ -51,7 +51,7 @@ public class MembershipDepartureTests extends OpenSearchTestCase {
             var store = new org.opensearch.serverless.testkit.HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
             ServerlessNode node = new ServerlessNode(settings)
         ) {
-            node.start();
+            node.startup().start();
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, 30_000L);
             final var member = new NodeLease("member", "same-process", "127.0.0.1:9300", Set.of("ingest"), 0L);
             plane.membership().renew(member);
@@ -94,7 +94,7 @@ public class MembershipDepartureTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .build();
         try (FsBlobStore store = new FsBlobStore(1024, createTempDir(), false); ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, ttl);
             final var before = new NodeLease("member", "process", "127.0.0.1:9300", Set.of("ingest"), 0L);
             plane.membership().renew(before);

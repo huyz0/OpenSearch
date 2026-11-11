@@ -151,8 +151,8 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("wire-owner"));
             ServerlessNode other = new ServerlessNode(nodeSettings("wire-other"), List.of(new WireWatchingPlugin()))
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(owner, plane);
@@ -185,7 +185,7 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
      */
     public void testAPluginsAdditionalSettingsReachTheNodeButLoseToAnOperator() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("wire-settings"), List.of(new WireWatchingPlugin()))) {
-            node.start();
+            node.startup().start();
             final Settings seen = SEEN_SETTINGS.get();
             assertNotNull("the plugin's components must have been built", seen);
             assertEquals("a plugin's contributed setting must reach the node", "true", seen.get("serverless.wire_watcher.installed"));
@@ -200,7 +200,7 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
             .put("serverless.block_cache.max_blocks", 64)
             .build();
         try (ServerlessNode node = new ServerlessNode(explicit, List.of(new WireWatchingPlugin()))) {
-            node.start();
+            node.startup().start();
             assertEquals(
                 "an operator's explicit setting must beat a plugin's contribution",
                 "64",
@@ -279,8 +279,8 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("wire-sub-owner"), List.of(new SubstituteTransportPlugin()));
             ServerlessNode other = new ServerlessNode(nodeSettings("wire-sub-other"), List.of(new SubstituteTransportPlugin()))
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             assertTrue("the plugin's transport must be the one built", SUBSTITUTE_USED.get());
 
             owner.setMetadataPlane(plane);
@@ -301,7 +301,7 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
     /** A node with no network plugin is unchanged, which is every node the suite otherwise starts. */
     public void testANodeWithNoNetworkPluginIsUnchanged() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("wire-none"))) {
-            node.start();
+            node.startup().start();
             assertNotNull(node.boundHttpAddress().publishAddress());
             assertTrue("nothing can have been intercepted", SENT.isEmpty());
         }
@@ -398,8 +398,8 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("carry-owner"), List.of(new CallerCarryingPlugin()));
             ServerlessNode other = new ServerlessNode(nodeSettings("carry-other"), List.of(new CallerCarryingPlugin()))
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
             owner.activateWriter(plane, "alpha", 0);

@@ -89,7 +89,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("bulk-cost"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -126,7 +126,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("bulk-shards"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             for (int shard = 0; shard < shards; shard++) {
@@ -179,7 +179,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, objectStore, 1);
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("bulk-order"));
-        a.start();
+        a.startup().start();
         a.setMetadataPlane(plane);
         final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
         loop.want("alpha", 0);
@@ -201,7 +201,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         a.close();
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("bulk-order-successor"))) {
-            b.start();
+            b.startup().start();
             final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
             b.reconciler().shard(onB).refresh("test");
             assertEquals("replay resurrected a document the batch had deleted", 0, hits(b, "n", "1"));
@@ -220,7 +220,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("bulk-durable"));
-        a.start();
+        a.startup().start();
         a.setMetadataPlane(plane);
         final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
         loop.want("alpha", 0);
@@ -237,7 +237,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         a.close();
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("bulk-durable-successor"))) {
-            b.start();
+            b.startup().start();
             final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
             b.reconciler().shard(onB).refresh("test");
             assertEquals("an acknowledged batch was lost when the writer died", documents, hits(b, "msg", "bulk"));
@@ -257,7 +257,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("bulk-unsupported"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -344,7 +344,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         final var clock = new AtomicLong(1_000L);
         final var plane = freshIndex(clock, createTempDir(), 1);
         try (var node = new ServerlessNode(nodeSettings("bulk-missing-index"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final var loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -359,7 +359,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         final var clock = new AtomicLong(1_000L);
         final var plane = freshIndex(clock, createTempDir(), 1);
         try (var node = new ServerlessNode(nodeSettings("bulk-parse-refusal"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final var loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -384,7 +384,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         final var clock = new AtomicLong(1_000L);
         final var plane = freshIndex(clock, createTempDir(), 1);
         try (var node = new ServerlessNode(nodeSettings("bulk-empty-source"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final var loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -407,7 +407,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
             try (var node = new ServerlessNode(nodeSettings("bulk-metadata-failure"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var loop = new BackgroundReconciler(node, plane);
                 loop.want("alpha", 0);
@@ -446,8 +446,8 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("bulk-fwd-a"));
             ServerlessNode b = new ServerlessNode(nodeSettings("bulk-fwd-b"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             a.setMetadataPlane(plane);
             b.setMetadataPlane(plane);
             // One shard each, so any batch touching both must cross the network.
@@ -671,7 +671,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
         plane.createIndex(descriptor);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("bulk-rendezvous"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             for (int shard = 0; shard < shards; shard++) {

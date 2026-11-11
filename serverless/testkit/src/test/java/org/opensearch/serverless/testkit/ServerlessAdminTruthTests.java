@@ -83,7 +83,7 @@ public class ServerlessAdminTruthTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("paged", "uuid-paged-000000000", 2, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("stats-views"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "paged", 2);
             for (int i = 0; i < 4; i++) {
@@ -124,7 +124,7 @@ public class ServerlessAdminTruthTests extends OpenSearchTestCase {
     public void testATimedOutHealthCheckAnswers408() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("health-408"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane(clock));
 
             final Response unmet = send(node, "GET", "/_cluster/health?wait_for_nodes=9&timeout=300ms", null);
@@ -148,7 +148,7 @@ public class ServerlessAdminTruthTests extends OpenSearchTestCase {
     public void testWaitForNodesUnderstandsLessThan() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("health-lt"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane(clock));
 
             // A started node has enrolled its own lease, so the fleet it can see is exactly one node.
@@ -183,7 +183,7 @@ public class ServerlessAdminTruthTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("busy", "uuid-busy-0000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("health-alive"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             plane.membership().renew(leaseFor(node));
             hold(node, plane, clock, "busy", 1);
@@ -211,7 +211,7 @@ public class ServerlessAdminTruthTests extends OpenSearchTestCase {
         final var clock = new AtomicLong(1_000L);
         final var metadata = plane(clock);
         try (var node = new ServerlessNode(nodeSettings("health-expiry"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(metadata);
             final var ghost = new org.opensearch.serverless.membership.BlobLeaseMembership(
                 metadata.blobStore().blobContainer(org.opensearch.serverless.metadata.RegisterMap.members(BlobPath.cleanPath())),

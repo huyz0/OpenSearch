@@ -75,7 +75,7 @@ public class ServerlessTakeoverRankTests extends OpenSearchTestCase {
                     .build()
             )
         ) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setActivationConcurrency(12);
             assertEquals("fixed unless asked to adapt", 12, loop.currentActivationLimit());
             loop.adaptActivationLimit(java.util.concurrent.TimeUnit.SECONDS.toNanos(6));

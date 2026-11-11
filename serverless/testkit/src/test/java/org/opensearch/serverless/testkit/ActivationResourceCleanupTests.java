@@ -39,7 +39,7 @@ public class ActivationResourceCleanupTests extends OpenSearchTestCase {
             final var descriptor = new IndexDescriptor("docs", "uuid-docs", 1, MAPPING, null);
             metadata.createIndex(descriptor);
             try (var node = new ServerlessNode(settings("manifest-open-failure"))) {
-                node.start();
+                node.startup().start();
                 final var index = new Index(descriptor.name(), descriptor.uuid());
                 final var reachedManifest = new AtomicBoolean();
                 store.onNextRegisterRead("segments", SegmentPublisher.MANIFEST, () -> {
@@ -63,7 +63,7 @@ public class ActivationResourceCleanupTests extends OpenSearchTestCase {
             final var descriptor = new IndexDescriptor("docs", "uuid-docs", 2, MAPPING, null);
             metadata.createIndex(descriptor);
             try (var node = new ServerlessNode(settings("sibling-open-failure"))) {
-                node.start();
+                node.startup().start();
                 final var first = node.activateWriter(metadata, "docs", 0).orElseThrow();
                 final var service = node.indicesService().indexService(first.getIndex());
                 store.onNextRegisterRead("#1", SegmentPublisher.MANIFEST, () -> {
@@ -91,7 +91,7 @@ public class ActivationResourceCleanupTests extends OpenSearchTestCase {
             );
             metadata.createIndex(descriptor);
             try (var node = new ServerlessNode(settings("mapping-open-failure"))) {
-                node.start();
+                node.startup().start();
                 expectThrows(Exception.class, () -> node.activateWriter(metadata, "docs", 0));
                 assertTrue(node.reconciler().openShards().isEmpty());
                 assertNull(node.indicesService().indexService(new Index(descriptor.name(), descriptor.uuid())));

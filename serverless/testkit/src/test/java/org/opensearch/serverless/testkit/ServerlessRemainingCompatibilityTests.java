@@ -63,7 +63,7 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_700_000_000_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         return new Fixture(node, plane, clock, new BackgroundReconciler(node, plane));
     }
@@ -620,7 +620,7 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
                 "{\"@timestamp\":\"2026-10-30T00:00:00Z\",\"msg\":\"wrong-field\"}"
             );
             assertEquals(wrongField.body(), 400, wrongField.status());
-            assertFalse(f.node().get(f.node().reconciler().openShards().iterator().next(), "invalid").found());
+            assertFalse(f.node().reads().get(f.node().reconciler().openShards().iterator().next(), "invalid").found());
             final var descriptor = f.plane().describe(".ds-events-000001").orElseThrow();
             assertTrue(
                 f.plane()
