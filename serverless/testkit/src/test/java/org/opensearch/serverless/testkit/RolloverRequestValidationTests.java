@@ -85,7 +85,7 @@ public class RolloverRequestValidationTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest,search")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("logs-000001", "uuid-logs", 1, null, null));
                 metadata.createAlias(new org.opensearch.serverless.cluster.AliasRecord("logs", List.of("logs-000001")));

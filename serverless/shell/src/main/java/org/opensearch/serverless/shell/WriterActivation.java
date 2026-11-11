@@ -154,12 +154,12 @@ final class WriterActivation {
             final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = plane.heads()
                 .read(held.getIndexName(), held.id());
             node.noteHead(held.getIndexName(), held.id(), head.orElse(null));
-            if (node.namesThisNode(head, held)) {
+            if (node.leases.namesThisNode(head, held)) {
                 // The listing lagged, or the claim was never written. The head is what decides, and it
                 // says this shard is ours; keep serving it.
                 continue;
             }
-            node.releaseLost(plane, held, "the shard-head no longer names " + node.nodeName, true);
+            node.leases.releaseLost(plane, held, "the shard-head no longer names " + node.nodeName, true);
         }
         return opened;
     }
@@ -212,7 +212,7 @@ final class WriterActivation {
             // not. Half the TTL left, less the skew margin, is the bar -- the renewal timer runs at a third.
             final long now = plane.clock().getAsLong();
             if (now + plane.leaseTtlMillis() / 2 >= node.ownLeaseValidUntilMillis - plane.membership().skewMarginMillis()) {
-                node.renewLease(plane, false);
+                node.leases().renewLease(plane, false);
             }
             if (node.ownershipUnverified) {
                 // The lease lapsed, or was revoked, and another thread is re-reading the heads this node holds. Writes are
@@ -268,7 +268,7 @@ final class WriterActivation {
         node.reconciler.noteOlderTermsFenced(indexName, shardNumber, acquisition.head().term());
         if (node.nodeLogEnabled) {
             // Whose node logs the open replays: every node the head names as holding what was not published.
-            node.nodeLog(plane);
+            node.startup().nodeLog(plane);
             node.reconciler.noteNodeLogWriters(indexName, shardNumber, acquisition.head().writers());
         }
         try {

@@ -124,7 +124,7 @@ public class ServerlessListingMeasurementTests extends OpenSearchTestCase {
         final String aheadDeleted = name(population - 5);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings())) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             port = node.boundHttpAddress().publishAddress().getPort();
 

@@ -65,7 +65,7 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
             final var original = new org.opensearch.serverless.cluster.IndexDescriptor("alpha", "uuid-growth-original", 1, "{}", null);
             plane.createIndex(original);
             try (var node = new ServerlessNode(nodeSettings("mapping-growth-incarnation"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var id = node.activateWriter(plane, "alpha", 0).orElseThrow();
                 store.onNextRegisterSwap("indices/", "alpha", () -> {
@@ -78,7 +78,7 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
                         throw new java.io.UncheckedIOException(e);
                     }
                 });
-                expectThrows(java.io.IOException.class, () -> node.index(id, "old-document", "{\"old_only_field\":\"old\"}"));
+                expectThrows(java.io.IOException.class, () -> node.writes().index(id, "old-document", "{\"old_only_field\":\"old\"}"));
                 assertTrue("the index changed at the mapping CAS", store.fired());
                 final var replacement = plane.describe("alpha").orElseThrow();
                 assertEquals("uuid-growth-replacement", replacement.uuid());
@@ -98,7 +98,7 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
                 var node = new ServerlessNode(nodeSettings("concurrent-mapping-growth"));
                 var workers = java.util.concurrent.Executors.newFixedThreadPool(8)
             ) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var shards = new java.util.ArrayList<org.opensearch.core.index.shard.ShardId>();
                 for (int shard = 0; shard < 8; shard++) {
@@ -112,7 +112,7 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
                         start.await();
                         for (int doc = 0; doc < 8; doc++) {
                             final String field = "field_" + number + "_" + doc;
-                            node.index(shards.get(number), field, "{\"" + field + "\":" + doc + "}");
+                            node.writes().index(shards.get(number), field, "{\"" + field + "\":" + doc + "}");
                         }
                         return null;
                     }));
@@ -126,7 +126,7 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
                     for (int doc = 0; doc < 8; doc++) {
                         final String field = "field_" + shard + "_" + doc;
                         assertTrue(field + " missing from " + mapping, mapping.contains("\"" + field + "\""));
-                        assertTrue(node.get(shards.get(shard), field).found());
+                        assertTrue(node.reads().get(shards.get(shard), field).found());
                     }
                 }
             }
@@ -159,7 +159,7 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
 
     private ServerlessNode running(MetadataPlane plane, AtomicLong clock, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         port = node.boundHttpAddress().publishAddress().getPort();
         call("PUT", "/alpha", "{\"settings\":{\"number_of_shards\":1},\"mappings\":{\"properties\":{\"msg\":{\"type\":\"text\"}}}}");
@@ -279,7 +279,7 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode second = new ServerlessNode(nodeSettings("map-b"))) {
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
             port = second.boundHttpAddress().publishAddress().getPort();
             final BackgroundReconciler loop = new BackgroundReconciler(second, plane);

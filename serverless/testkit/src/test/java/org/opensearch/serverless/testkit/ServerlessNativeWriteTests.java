@@ -43,7 +43,7 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
     }
 
     private static void attach(ServerlessNode node, MetadataPlane plane) throws Exception {
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
     }
 

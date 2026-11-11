@@ -75,8 +75,8 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
         Pair(ServerlessNode a, ServerlessNode b, MetadataPlane plane, AtomicLong clock) throws Exception {
             this.a = a;
             this.b = b;
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             a.setMetadataPlane(plane);
             b.setMetadataPlane(plane);
             loopA = new BackgroundReconciler(a, plane);
@@ -315,9 +315,9 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
             ServerlessNode first = new ServerlessNode(nodeSettings("fwd-reader-a"));
             ServerlessNode second = new ServerlessNode(nodeSettings("fwd-reader-b"))
         ) {
-            coordinator.start();
-            first.start();
-            second.start();
+            coordinator.startup().start();
+            first.startup().start();
+            second.startup().start();
             coordinator.setMetadataPlane(plane);
             first.setMetadataPlane(plane);
             second.setMetadataPlane(plane);
@@ -342,7 +342,7 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
             // reading the head a moment before the first node lost it -- so it is re-noted here, fresh,
             // still naming the first node.
             coordinator.noteHead("alpha", 0, headNamingFirst);
-            assertEquals(1, first.heartbeat(plane).size());
+            assertEquals(1, first.leases().heartbeat(plane).size());
             assertTrue("the first node must have released the writer", first.reconciler().openShards().isEmpty());
             // ...and then opens the same shard as a search reader, which is the state the bug needs.
             final ShardId asReader = first.serveAsReader(plane, "alpha", 0);
@@ -387,14 +387,14 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor(".probe_state", "uuid-probe-000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-system"), List.of(new ProbeStatePlugin()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want(".probe_state", 0);
             loop.tick(clock.get());
             final ShardId shardId = node.reconciler().openShards().iterator().next();
             // Written from inside the node, as the plugin would write it: REST cannot, and must not, put it there.
-            node.index(shardId, "secret", "{\"msg\":\"the-record-nobody-may-read\",\"n\":42}");
+            node.writes().index(shardId, "secret", "{\"msg\":\"the-record-nobody-may-read\",\"n\":42}");
 
             final Response bodyAddressed = send(node, "POST", "/_mget", "{\"docs\":[{\"_index\":\".probe_state\",\"_id\":\"secret\"}]}");
             assertFalse("the record must not be disclosed: " + bodyAddressed.body(), bodyAddressed.body().contains("nobody-may-read"));

@@ -130,7 +130,7 @@ public class AliasRequestExecutionTests extends OpenSearchTestCase {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
             final var metadata = seed(store);
             try (var node = new ServerlessNode(settings("alias-denial-" + after), List.of(new AliasReadFilterPlugin(after)))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 for (String path : List.of("/_alias/a", "/protected/_alias/a", "/protected/_alias")) {
                     final var response = send(node, "GET", path, null);
@@ -146,7 +146,7 @@ public class AliasRequestExecutionTests extends OpenSearchTestCase {
         try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
             final var metadata = seed(store);
             try (var node = new ServerlessNode(settings("alias-worker"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 record Call(String method, String path, String body, String key) {
                 }
@@ -181,7 +181,7 @@ public class AliasRequestExecutionTests extends OpenSearchTestCase {
                     List.of(new AliasReadFilterPlugin(AliasReadFilterPlugin.Behavior.REWRITE))
                 )
             ) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 for (String path : List.of("/_alias/a", "/protected/_alias/a", "/protected/_alias")) {
                     final var response = send(node, "GET", path, null);
@@ -199,7 +199,7 @@ public class AliasRequestExecutionTests extends OpenSearchTestCase {
             final var metadata = seed(store);
             metadata.createAlias(new AliasRecord("stream", List.of("protected"), true, 1L, "@timestamp"));
             try (var node = new ServerlessNode(settings("alias-read-stream"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 final var response = send(node, "GET", "/protected/_alias", null);
                 assertEquals(response.body(), 200, response.statusCode());

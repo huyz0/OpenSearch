@@ -117,7 +117,7 @@ public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = plane(clock, createTempDir());
         try (ServerlessNode node = new ServerlessNode(nodeSettings("health-dormant", "ingest", createTempDir()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final int port = portOf(node);
             put(port, "/alpha", "{\"settings\":{\"number_of_shards\":3}}");
@@ -149,7 +149,7 @@ public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
     public void testHealthSaysWhatGreenDoesNotMean() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("health-honest", "ingest", createTempDir()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane(clock, createTempDir()));
             final int port = portOf(node);
 
@@ -174,7 +174,7 @@ public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = plane(clock, createTempDir());
         try (ServerlessNode node = new ServerlessNode(nodeSettings("health-scope", "ingest", createTempDir()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final int port = portOf(node);
             put(port, "/alpha", "{\"settings\":{\"number_of_shards\":2}}");
@@ -195,7 +195,7 @@ public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = plane(clock, createTempDir());
         try (ServerlessNode node = new ServerlessNode(nodeSettings("health-shards", "ingest", createTempDir()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final int port = portOf(node);
             put(port, "/alpha", "{\"settings\":{\"number_of_shards\":2}}");
@@ -220,9 +220,9 @@ public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
             ServerlessNode first = new ServerlessNode(nodeSettings("fleet-a", "ingest", createTempDir()));
             ServerlessNode second = new ServerlessNode(nodeSettings("fleet-b", "search", createTempDir()))
         ) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
             // Each publishes a lease; the reconcile pass is what does it in a running deployment.
             new BackgroundReconciler(first, plane).tick(clock.get());
@@ -256,7 +256,7 @@ public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = plane(clock, createTempDir());
         try (ServerlessNode node = new ServerlessNode(nodeSettings("named-node", "ingest", createTempDir()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             new BackgroundReconciler(node, plane).tick(clock.get());
 
@@ -271,7 +271,7 @@ public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = plane(clock, createTempDir());
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cat-node", "ingest", createTempDir()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             new BackgroundReconciler(node, plane).tick(clock.get());
             final int port = portOf(node);
@@ -309,7 +309,7 @@ public class ServerlessClusterEndpointTests extends OpenSearchTestCase {
     public void testWhatStaysRefusedSaysWhatItActuallyLacks() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("refused-node", "ingest", createTempDir()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane(clock, createTempDir()));
             final int port = portOf(node);
 

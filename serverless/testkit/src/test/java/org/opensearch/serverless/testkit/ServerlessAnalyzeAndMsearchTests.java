@@ -83,7 +83,7 @@ public class ServerlessAnalyzeAndMsearchTests extends OpenSearchTestCase {
 
     private ServerlessNode running(MetadataPlane plane, AtomicLong clock, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         port = node.boundHttpAddress().publishAddress().getPort();
         call(
@@ -105,7 +105,7 @@ public class ServerlessAnalyzeAndMsearchTests extends OpenSearchTestCase {
         final var clock = new AtomicLong(1_000L);
         final var metadata = plane(clock, createTempDir());
         try (var node = new ServerlessNode(nodeSettings("analyze-limit"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(metadata);
             port = node.boundHttpAddress().publishAddress().getPort();
             assertEquals(200, call("PUT", "/limited", "{\"settings\":{\"analyze.max_token_count\":2}}").status());

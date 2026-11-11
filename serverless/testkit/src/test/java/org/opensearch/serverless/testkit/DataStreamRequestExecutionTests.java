@@ -43,7 +43,7 @@ public class DataStreamRequestExecutionTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 metadata.indexTemplates().put("streams", "{\"index_patterns\":[\"stream-*\"],\"data_stream\":{}}");
                 for (String name : List.of("stream-original", "stream-selected")) {

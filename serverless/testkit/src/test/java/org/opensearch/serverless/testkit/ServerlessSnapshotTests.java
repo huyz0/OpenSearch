@@ -72,7 +72,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-repo"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
 
             assertEquals(404, send(node, "GET", "/_snapshot/backups", null).status());
@@ -108,7 +108,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, TTL);
             try (var node = new ServerlessNode(nodeSettings("repository-selectors"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 assertEquals(200, standardRepo(node, "backups").status());
                 for (String selector : new String[] { "_all", "*" }) {
@@ -132,7 +132,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("held", "uuid-held-000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-inuse"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "held", 1);
             assertEquals(201, send(node, "PUT", "/held/_doc/1?refresh=true", body(1)).status());
@@ -155,7 +155,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-noindices"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertEquals(200, standardRepo(node, "backups").status());
 
@@ -171,7 +171,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("fresh", "uuid-fresh-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-fresh"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertEquals(200, standardRepo(node, "backups").status());
 
@@ -192,7 +192,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("original", "uuid-original-0000000", 2, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-restore"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "original", 2);
             for (int i = 1; i <= 6; i++) {
@@ -252,7 +252,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("async", "uuid-async-000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-async"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "async", 1);
             assertEquals(201, send(node, "PUT", "/async/_doc/1?refresh=true", body(1)).status());
@@ -279,7 +279,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("taken", "uuid-taken-000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-taken"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "taken", 1);
             assertEquals(201, send(node, "PUT", "/taken/_doc/1?refresh=true", body(1)).status());
@@ -305,7 +305,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("logs-2026", "uuid-logs-2026-00000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-rename"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "logs-2026", 1);
             assertEquals(201, send(node, "PUT", "/logs-2026/_doc/1?refresh=true", body(1)).status());
@@ -343,7 +343,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("swept", "uuid-swept-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-sweep"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "swept", 1);
             for (int i = 1; i <= 4; i++) {
@@ -393,7 +393,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("reused", "uuid-reused-first-000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-reuse"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler firstLoop = hold(node, plane, clock, "reused", 1);
             assertEquals(201, send(node, "PUT", "/reused/_doc/1?refresh=true", body(1)).status());
@@ -437,7 +437,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("ephemeral", "uuid-ephemeral-00000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-delete"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "ephemeral", 1);
             assertEquals(201, send(node, "PUT", "/ephemeral/_doc/1?refresh=true", body(1)).status());
@@ -479,7 +479,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("ephemeral", "uuid-ephemeral-00001", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-standard-delete"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "ephemeral", 1);
             assertEquals(201, send(node, "PUT", "/ephemeral/_doc/1?refresh=true", body(1)).status());
@@ -514,7 +514,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("cleanup", "uuid-cleanup-0000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("snap-cleanup"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "cleanup", 1);
             assertEquals(201, send(node, "PUT", "/cleanup/_doc/1?refresh=true", body(1)).status());

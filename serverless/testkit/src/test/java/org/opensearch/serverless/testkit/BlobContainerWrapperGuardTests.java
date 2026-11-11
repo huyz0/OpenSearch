@@ -198,7 +198,7 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
             .build();
         final boolean honours = Boolean.parseBoolean(System.getProperty("tests.serverless.guard.conditional_delete", "true"));
         try (ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             try (ObjectStores.Handle handle = ObjectStores.create(settings, node.clusterService(), createTempDir())) {
                 exercise(handle.blobStore(), honours);
             }

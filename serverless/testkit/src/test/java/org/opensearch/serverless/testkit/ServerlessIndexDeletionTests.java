@@ -65,7 +65,7 @@ public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("reused", "uuid-reused-first-00", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("delete-recreate"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("reused", 0);
@@ -116,7 +116,7 @@ public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
         final java.nio.file.Path saved = createTempDir().resolve("saved");
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("delete-interrupted"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("halfdeleted", 0);
@@ -174,7 +174,7 @@ public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
         final java.nio.file.Path saved = createTempDir().resolve("saved");
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("delete-sweep"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("orphaned", 0);
@@ -233,7 +233,7 @@ public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("doomed", "uuid-doomed-0000000", 2, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("delete-release"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("doomed", 0);
@@ -265,7 +265,7 @@ public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("costly", "uuid-costly-0000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("delete-storage"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("costly", 0);

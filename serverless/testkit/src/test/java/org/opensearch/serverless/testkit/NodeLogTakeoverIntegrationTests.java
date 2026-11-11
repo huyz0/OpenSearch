@@ -50,7 +50,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
     }
 
     private static TickResult takeAll(ServerlessNode node, MetadataPlane plane, AtomicLong clock) throws Exception {
-        node.renewLease(plane);
+        node.leases().renewLease(plane);
         plane.membership().refresh();
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
         for (int shard = 0; shard < SHARDS; shard++) {
@@ -67,7 +67,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
         takeAll(node, plane, clock);
         final List<ShardId> held = new ArrayList<>(node.reconciler().openShards());
         for (int i = 0; i < 12; i++) {
-            node.index(held.get(i % SHARDS), tag + "-published-" + i, "{\"msg\":\"p\",\"n\":" + i + "}");
+            node.writes().index(held.get(i % SHARDS), tag + "-published-" + i, "{\"msg\":\"p\",\"n\":" + i + "}");
         }
         for (ShardId shardId : held) {
             node.reconciler().publish(shardId, node.reconciler().shard(shardId).getOperationPrimaryTerm());
@@ -75,7 +75,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
         final Map<Integer, String> unpublished = new HashMap<>();
         for (ShardId shardId : held) {
             final String id = tag + "-unpublished-" + shardId.id();
-            node.index(shardId, id, "{\"msg\":\"u\",\"n\":" + shardId.id() + "}");
+            node.writes().index(shardId, id, "{\"msg\":\"u\",\"n\":" + shardId.id() + "}");
             unpublished.put(shardId.id(), id);
         }
         return unpublished;
@@ -83,7 +83,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
 
     private static void assertFound(ServerlessNode node, Map<Integer, String> ids) throws Exception {
         for (ShardId shardId : node.reconciler().openShards()) {
-            assertTrue("the unpublished write to " + shardId + " was replayed", node.get(shardId, ids.get(shardId.id())).found());
+            assertTrue("the unpublished write to " + shardId + " was replayed", node.reads().get(shardId, ids.get(shardId.id())).found());
         }
     }
 
@@ -103,7 +103,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
         final ServerlessNode first = new ServerlessNode(nodeSettings("node-log-first"));
         final ServerlessNode second = new ServerlessNode(nodeSettings("node-log-second"));
         try {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             final Map<Integer, String> fromFirst = writeAndLeaveUnpublished(first, plane, clock, "first");
             assertTrue("the first writer logged through its node log", first.nodeLogWriter().committer().blobs() > 0);
@@ -114,7 +114,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
 
             // The first writer never lets go; its lease runs out on the shared clock.
             clock.addAndGet(2 * TTL);
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
             assertEquals(
                 "what the open replayed it published before serving, and the pass that took it does not publish it again",
@@ -123,19 +123,19 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
             );
             assertFound(second, fromFirst);
             for (ShardId shardId : second.reconciler().openShards()) {
-                second.index(shardId, "second-" + shardId.id(), "{\"msg\":\"s\",\"n\":" + shardId.id() + "}");
+                second.writes().index(shardId, "second-" + shardId.id(), "{\"msg\":\"s\",\"n\":" + shardId.id() + "}");
             }
 
             // The second writer crashes too. What it replayed from the first was published before it served, so a third
             // finds it without the first's log; what the second wrote itself it replays from the second's.
             clock.addAndGet(2 * TTL);
             try (ServerlessNode third = new ServerlessNode(nodeSettings("node-log-third"))) {
-                third.start();
+                third.startup().start();
                 third.setMetadataPlane(plane);
                 takeAll(third, plane, clock);
                 assertFound(third, fromFirst);
                 for (ShardId shardId : third.reconciler().openShards()) {
-                    assertTrue(third.get(shardId, "second-" + shardId.id()).found());
+                    assertTrue(third.reads().get(shardId, "second-" + shardId.id()).found());
                 }
             }
         } finally {
@@ -150,7 +150,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
         final Map<Integer, String> written;
         try (ServerlessNode first = new ServerlessNode(nodeSettings("node-log-clean-first"))) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             written = writeAndLeaveUnpublished(first, plane, clock, "clean");
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane);
@@ -160,7 +160,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
             }
             loop.releaseIdle(System.currentTimeMillis() + 60_000L);
             assertTrue("given back", first.reconciler().openShards().isEmpty());
-            first.renewLease(plane);
+            first.leases().renewLease(plane);
             assertEquals(
                 "a release publishes, so nothing in its log is still needed",
                 List.of(),
@@ -174,7 +174,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
             );
         }
         try (ServerlessNode second = new ServerlessNode(nodeSettings("node-log-clean-second"))) {
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
             takeAll(second, plane, clock);
             assertFound(second, written);
@@ -187,7 +187,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
         final ServerlessNode first = new ServerlessNode(nodeSettings("node-log-settle-first"));
         try {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             final Map<Integer, String> unpublished = writeAndLeaveUnpublished(first, plane, clock, "settle");
             final String dead = first.localNode().getId();
@@ -206,7 +206,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
 
             // Whoever takes them next reads the dead writer's log, fenced, since it is not live.
             try (ServerlessNode second = new ServerlessNode(nodeSettings("node-log-settle-second"))) {
-                second.start();
+                second.startup().start();
                 second.setMetadataPlane(plane);
                 takeAll(second, plane, clock);
                 assertFound(second, unpublished);
@@ -222,14 +222,14 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
         final ServerlessNode first = new ServerlessNode(nodeSettings("node-log-settle-clean"));
         try {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             writeAndLeaveUnpublished(first, plane, clock, "trimmed");
             for (ShardId shardId : new ArrayList<>(first.reconciler().openShards())) {
                 first.reconciler().publish(shardId, first.reconciler().shard(shardId).getOperationPrimaryTerm());
             }
             // The renewal records the trim point the publishes moved; nothing below it is needed.
-            first.renewLease(plane);
+            first.leases().renewLease(plane);
             final String dead = first.localNode().getId();
             clock.addAndGet(2 * TTL);
             for (int shard = 0; shard < SHARDS; shard++) {
@@ -246,7 +246,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
         final ServerlessNode first = new ServerlessNode(nodeSettings("node-log-chain-first"));
         try {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             final Map<Integer, String> unpublished = writeAndLeaveUnpublished(first, plane, clock, "chain");
 
@@ -261,7 +261,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
 
             clock.addAndGet(2 * TTL);
             try (ServerlessNode third = new ServerlessNode(nodeSettings("node-log-chain-third"))) {
-                third.start();
+                third.startup().start();
                 third.setMetadataPlane(plane);
                 takeAll(third, plane, clock);
                 assertFound(third, unpublished);

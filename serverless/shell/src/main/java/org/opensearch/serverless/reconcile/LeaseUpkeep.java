@@ -8,7 +8,6 @@
 package org.opensearch.serverless.reconcile;
 
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.serverless.shell.ServerlessNode;
 
 import java.io.IOException;
 import java.util.Map;
@@ -49,9 +48,9 @@ final class LeaseUpkeep {
                 // every renewal and every backstop alike made it the largest standing cost of an idle node.
                 // See ServerlessNode#DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS for why a bounded wait is safe here
                 // and where the unconditional scan still happens.
-                return reconciler.node.verifyHeadsIfDue(reconciler.plane);
+                return reconciler.node.leases().verifyHeadsIfDue(reconciler.plane);
             }
-            return reconciler.node.heartbeat(reconciler.plane);
+            return reconciler.node.leases().heartbeat(reconciler.plane);
         }
     }
 
@@ -61,7 +60,7 @@ final class LeaseUpkeep {
      * <p>Separated from {@link #verifyHeads()} so the lease can be renewed on its own clock, ahead of and
      * independent from the pass that reads one head per held shard. If the lease had already lapsed by
      * this node's own clock, every writer shard is released <em>before</em> the renewal -- see
-     * {@link ServerlessNode#renewLease}.
+     * {@link org.opensearch.serverless.shell.NodeLeases#renewLease}.
      *
      * @return the shards released because the lease had lapsed
      * @throws Exception if the metadata plane cannot be reached
@@ -71,7 +70,7 @@ final class LeaseUpkeep {
             if (work == null) {
                 return Set.of();
             }
-            return reconciler.node.renewLease(reconciler.plane);
+            return reconciler.node.leases().renewLease(reconciler.plane);
         }
     }
 
@@ -86,7 +85,7 @@ final class LeaseUpkeep {
             if (work == null) {
                 return Set.of();
             }
-            return reconciler.node.verifyHeadsIfDue(reconciler.plane);
+            return reconciler.node.leases().verifyHeadsIfDue(reconciler.plane);
         }
     }
 
@@ -101,7 +100,7 @@ final class LeaseUpkeep {
             if (work == null) {
                 return Set.of();
             }
-            return reconciler.node.verifyHeads(reconciler.plane);
+            return reconciler.node.leases().verifyHeads(reconciler.plane);
         }
     }
 

@@ -102,7 +102,7 @@ public class ServerlessThrottleTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("throttle-shared-address").build();
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
             assertEquals(
@@ -147,7 +147,7 @@ public class ServerlessThrottleTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("throttle-recovery").put("serverless.auth.throttle.max_delay", "1s").build();
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane(clock));
 
             for (int i = 0; i < 5; i++) {
@@ -188,7 +188,7 @@ public class ServerlessThrottleTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("throttle-planted").build();
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
 
@@ -243,7 +243,7 @@ public class ServerlessThrottleTests extends OpenSearchTestCase {
             .build();
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
             assertEquals(
@@ -290,7 +290,7 @@ public class ServerlessThrottleTests extends OpenSearchTestCase {
             .build();
 
         try (ServerlessNode node = new ServerlessNode(trusting, List.of(authPlugin(trusting)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane(clock));
 
             final Map<String, String> fromOne = Map.of("X-Forwarded-For", "10.0.0.1");
@@ -322,7 +322,7 @@ public class ServerlessThrottleTests extends OpenSearchTestCase {
 
         final Settings ignoring = nodeSettings("throttle-no-proxy").put("serverless.auth.throttle.max_delay", "1s").build();
         try (ServerlessNode node = new ServerlessNode(ignoring, List.of(authPlugin(ignoring)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane(clock));
             for (int i = 0; i < 5; i++) {
                 assertEquals(

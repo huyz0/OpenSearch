@@ -65,7 +65,7 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
 
     private static BackgroundReconciler holdingAll(ServerlessNode node, MetadataPlane plane, AtomicLong clock, int shards)
         throws Exception {
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
         for (int shard = 0; shard < shards; shard++) {
@@ -100,12 +100,12 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
             holdingAll(node, plane, clock, shards);
 
             counter.reset();
-            assertTrue("a live node loses nothing on renewal", node.renewLease(plane).isEmpty());
+            assertTrue("a live node loses nothing on renewal", node.leases().renewLease(plane).isEmpty());
             assertEquals("the lease is one register write: " + counter.breakdown(), 1L, counter.registerWrites());
             assertEquals("and it reads no head, whatever the node holds: " + counter.breakdown(), 0L, counter.registerReads());
 
             counter.reset();
-            assertTrue("a live node loses nothing on verification", node.verifyHeads(plane).isEmpty());
+            assertTrue("a live node loses nothing on verification", node.leases().verifyHeads(plane).isEmpty());
             assertEquals(
                 "one head per held shard and one descriptor per open index: " + counter.breakdown(),
                 shards + 1L,
@@ -125,7 +125,7 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("hb-lanes"))) {
             holdingAll(node, plane, clock, shards);
             counter.reset();
-            assertTrue(node.verifyHeads(plane).isEmpty());
+            assertTrue(node.leases().verifyHeads(plane).isEmpty());
             assertEquals("each head read once, in lanes: " + counter.breakdown(), shards + 1L, counter.registerReads());
             assertEquals(shards, node.reconciler().openShards().size());
         }
@@ -241,7 +241,7 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("hb-hint"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             node.noteHead("alpha", 0, new ShardHead("alpha", 0, 1L, "somebody-else", "eph", 0L, "uuid-alpha-00000000"));
             assertEquals("somebody-else", node.ownerHint("alpha", 0).orElseThrow());

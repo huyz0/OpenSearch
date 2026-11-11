@@ -69,7 +69,7 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
 
     private ServerlessNode started(String name, MetadataPlane plane, int shards) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
         for (int shard = 0; shard < shards; shard++) {
@@ -352,7 +352,7 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
 
         final ServerlessNode writer = new ServerlessNode(nodeSettings("fanout-writer"));
-        writer.start();
+        writer.startup().start();
         writer.setMetadataPlane(plane);
         final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
         for (int shard = 0; shard < shards; shard++) {
@@ -369,7 +369,7 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
         writer.close();
 
         try (ServerlessNode reader = new ServerlessNode(searchNodeSettings("fanout-reader"))) {
-            reader.start();
+            reader.startup().start();
             reader.setMetadataPlane(plane);
             final Response got = send(reader, "POST", "/alpha/_search", "{\"query\":{\"match\":{\"msg\":\"fanout\"}},\"size\":5}");
             assertEquals("the search should have been answered: " + got.body(), 200, got.status());

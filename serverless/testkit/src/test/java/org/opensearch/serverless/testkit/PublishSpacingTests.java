@@ -75,7 +75,7 @@ public class PublishSpacingTests extends OpenSearchTestCase {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
             try (ServerlessNode node = new ServerlessNode(nodeSettings("publish-spacing-" + label))) {
-                node.start();
+                node.startup().start();
                 final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
                 for (int shard = 0; shard < shards; shard++) {
                     loop.want("alpha", shard);
@@ -88,7 +88,7 @@ public class PublishSpacingTests extends OpenSearchTestCase {
                 long writes = 0;
                 for (int second = 0; second < seconds; second++) {
                     for (ShardId shardId : held) {
-                        node.index(shardId, second + "-" + shardId.id(), "{\"msg\":\"spacing\",\"n\":" + second + "}");
+                        node.writes().index(shardId, second + "-" + shardId.id(), "{\"msg\":\"spacing\",\"n\":" + second + "}");
                         loop.markDirty(shardId);
                         writes++;
                     }
@@ -162,7 +162,7 @@ public class PublishSpacingTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("publish-spacing-limit"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -170,12 +170,12 @@ public class PublishSpacingTests extends OpenSearchTestCase {
             final long interval = TimeValue.timeValueHours(1).millis();
             final long limit = 5;
 
-            node.index(shardId, "first", "{\"msg\":\"limit\",\"n\":0}");
+            node.writes().index(shardId, "first", "{\"msg\":\"limit\",\"n\":0}");
             loop.markDirty(shardId);
             assertEquals("a shard this node never published is due at once", 1, loop.publishDirty(clock.get(), interval, limit).size());
 
             for (int i = 1; i < limit; i++) {
-                node.index(shardId, "under-" + i, "{\"msg\":\"limit\",\"n\":" + i + "}");
+                node.writes().index(shardId, "under-" + i, "{\"msg\":\"limit\",\"n\":" + i + "}");
                 loop.markDirty(shardId);
                 assertTrue(
                     "under the limit and inside the interval, nothing is due",
@@ -183,7 +183,7 @@ public class PublishSpacingTests extends OpenSearchTestCase {
                 );
                 assertTrue("and the shard keeps its mark", loop.hasDirty());
             }
-            node.index(shardId, "at-limit", "{\"msg\":\"limit\",\"n\":" + limit + "}");
+            node.writes().index(shardId, "at-limit", "{\"msg\":\"limit\",\"n\":" + limit + "}");
             loop.markDirty(shardId);
             assertTrue(loop.hasDirtyDue(clock.get(), interval, limit));
             assertEquals(
@@ -205,7 +205,7 @@ public class PublishSpacingTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("publish-spacing-deferred"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -222,10 +222,10 @@ public class PublishSpacingTests extends OpenSearchTestCase {
                 ).setPublishSpacing(interval, 0L)
             ) {
                 node.setSignals(scheduler);
-                node.index(shardId, "1", "{\"msg\":\"deferred\",\"n\":1}");
+                node.writes().index(shardId, "1", "{\"msg\":\"deferred\",\"n\":1}");
                 assertEquals("the first write after a quiet period publishes at once", Set.of(shardId), scheduler.publishNow());
 
-                node.index(shardId, "2", "{\"msg\":\"deferred\",\"n\":2}");
+                node.writes().index(shardId, "2", "{\"msg\":\"deferred\",\"n\":2}");
                 clock.addAndGet(interval.millis() - 1);
                 assertTrue("inside the interval the second write waits", scheduler.publishNow().isEmpty());
                 assertEquals(0L, loop.lastPublishedMaxSeqNo(shardId).orElse(-1L));

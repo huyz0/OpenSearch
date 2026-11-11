@@ -87,7 +87,7 @@ public class ServerlessActivationTests extends OpenSearchTestCase {
                 .findFirst()
                 .orElseThrow();
             try (var node = new ServerlessNode(nodeSettings("writer-open-incarnation"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 store.onNextRegisterSwapAfter(rollups.path().buildAsString(), bucket, () -> {
                     try {
@@ -108,8 +108,8 @@ public class ServerlessActivationTests extends OpenSearchTestCase {
                 assertEquals(node.localNode().getId(), head.ownerNodeId());
                 final var opened = node.activateWriter(plane, "alpha", 0).orElseThrow();
                 assertEquals("uuid-open-replacement", opened.getIndex().getUUID());
-                node.index(opened, "doc", "{\"msg\":\"new lifetime\"}");
-                assertTrue(node.get(opened, "doc").found());
+                node.writes().index(opened, "doc", "{\"msg\":\"new lifetime\"}");
+                assertTrue(node.reads().get(opened, "doc").found());
             }
         }
     }
@@ -120,7 +120,7 @@ public class ServerlessActivationTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("cold", "uuid-cold-000000000", 1, MAPPING, null));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("first-write"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
             try (ReconcileScheduler scheduler = scheduler(loop, node, clock)) {
@@ -147,7 +147,7 @@ public class ServerlessActivationTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(counting, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("burst", "uuid-burst-00000000", 1, MAPPING, null));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("burst"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
             try (ReconcileScheduler scheduler = scheduler(loop, node, clock)) {
@@ -205,7 +205,7 @@ public class ServerlessActivationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("left", "uuid-left-000000000", 1, MAPPING, null));
         plane.createIndex(new IndexDescriptor("right", "uuid-right-00000000", 1, MAPPING, null));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("concurrent"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
             final java.util.Set<ShardId> taken = loop.activateOnDemand(List.of(Map.entry("left", 0), Map.entry("right", 0)));
@@ -228,8 +228,8 @@ public class ServerlessActivationTests extends OpenSearchTestCase {
             planeA.createIndex(new IndexDescriptor("race-" + i, "uuid-race-" + i + "-0000000", 1, MAPPING, null));
         }
         try (ServerlessNode a = new ServerlessNode(nodeSettings("race-a")); ServerlessNode b = new ServerlessNode(nodeSettings("race-b"))) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             a.setMetadataPlane(planeA);
             b.setMetadataPlane(planeB);
             final BackgroundReconciler loopA = new BackgroundReconciler(a, planeA).setDemandDrivenActivation(true);

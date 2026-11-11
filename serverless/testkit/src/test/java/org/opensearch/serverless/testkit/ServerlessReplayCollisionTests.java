@@ -70,11 +70,11 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             plane.createIndex(descriptor);
             plane.walStore("legacy", descriptor.uuid(), 0).append(1L, new WalRecord("logged", source));
             try (var node = new ServerlessNode(nodeSettings("legacy-replay-result"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 if (succeeds) {
                     final var shard = node.activateWriter(plane, "legacy", 0).orElseThrow();
-                    assertTrue("a valid old record is still replayed", node.get(shard, "logged").found());
+                    assertTrue("a valid old record is still replayed", node.reads().get(shard, "logged").found());
                 } else {
                     expectThrows(Exception.class, () -> node.activateWriter(plane, "legacy", 0));
                     assertTrue("a rejected logged operation must prevent activation", node.reconciler().openShards().isEmpty());
@@ -105,13 +105,13 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             ServerlessNode first = new ServerlessNode(nodeSettings("collision-first"));
             ServerlessNode second = new ServerlessNode(nodeSettings("collision-second"))
         ) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
-            first.renewLease(plane);
+            first.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(List.of(Map.entry("alpha", 0)));
             final ShardId shardId = first.reconciler().openShards().iterator().next();
-            first.index(shardId, "a", "{\"msg\":\"a\"}");
+            first.writes().index(shardId, "a", "{\"msg\":\"a\"}");
             loop.publishAll();
             loop.setIdleAfterMillis(1);
             loop.releaseIdle(System.currentTimeMillis() + 60_000L);
@@ -122,9 +122,9 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             final long term = plane.heads().read("alpha", 0).orElseThrow().term() + 1;
             plane.walStore("alpha", alpha.uuid(), 0).append(term, new WalRecord("b", "{\"msg\":\"b\"}", 0L, term, 1L));
 
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
-            second.renewLease(plane);
+            second.leases().renewLease(plane);
             final BackgroundReconciler other = new BackgroundReconciler(second, plane).setDemandDrivenActivation(true);
             try {
                 other.activateOnDemand(List.of(Map.entry("alpha", 0)));
@@ -159,23 +159,23 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             ServerlessNode writer = new ServerlessNode(nodeSettings("reader-write-writer"));
             ServerlessNode other = new ServerlessNode(nodeSettings("reader-write-other"))
         ) {
-            writer.start();
+            writer.startup().start();
             writer.setMetadataPlane(plane);
-            writer.renewLease(plane);
+            writer.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(writer, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(List.of(Map.entry("alpha", 0)));
-            writer.index(writer.reconciler().openShards().iterator().next(), "a", "{\"msg\":\"a\"}");
+            writer.writes().index(writer.reconciler().openShards().iterator().next(), "a", "{\"msg\":\"a\"}");
             loop.publishAll();
             loop.setIdleAfterMillis(1);
             loop.releaseIdle(System.currentTimeMillis() + 60_000L);
 
-            other.start();
+            other.startup().start();
             other.setMetadataPlane(plane);
-            other.renewLease(plane);
+            other.leases().renewLease(plane);
             final ShardId reader = other.serveAsReader(plane, "alpha", 0);
             other.reconciler().unrecordReaderForTesting(reader);
 
-            expectThrows(java.io.IOException.class, () -> other.index(reader, "b", "{\"msg\":\"b\"}"));
+            expectThrows(java.io.IOException.class, () -> other.writes().index(reader, "b", "{\"msg\":\"b\"}"));
             for (WalRecord record : plane.walStore("alpha", alpha.uuid(), 0).replayableAfterFencing()) {
                 assertNotEquals("nothing written through a reader reaches the log", "b", record.id());
             }
@@ -202,13 +202,13 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             ServerlessNode first = new ServerlessNode(nodeSettings("twice-first"));
             ServerlessNode second = new ServerlessNode(nodeSettings("twice-second"))
         ) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
-            first.renewLease(plane);
+            first.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(List.of(Map.entry("alpha", 0)));
             final ShardId shardId = first.reconciler().openShards().iterator().next();
-            first.index(shardId, "a", "{\"msg\":\"a\"}");
+            first.writes().index(shardId, "a", "{\"msg\":\"a\"}");
             loop.publishAll();
             loop.setIdleAfterMillis(1);
             loop.releaseIdle(System.currentTimeMillis() + 60_000L);
@@ -220,9 +220,9 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             plane.walStore("alpha", alpha.uuid(), 0)
                 .append(term + 1, new WalRecord("acknowledged", "{\"msg\":\"acknowledged\"}", 1L, term + 1, 1L));
 
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
-            second.renewLease(plane);
+            second.leases().renewLease(plane);
             final BackgroundReconciler other = new BackgroundReconciler(second, plane).setDemandDrivenActivation(true);
             try {
                 other.activateOnDemand(List.of(Map.entry("alpha", 0)));
@@ -264,10 +264,10 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             plane.createIndex(descriptor);
             plane.walStore("mixed", descriptor.uuid(), 0).append(1L, records);
             try (var node = new ServerlessNode(nodeSettings("mixed-replay-order"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var shard = node.activateWriter(plane, "mixed", 0).orElseThrow();
-                final var document = node.get(shard, "logged");
+                final var document = node.reads().get(shard, "logged");
                 assertEquals(expected != null, document.found());
                 assertEquals(expected, document.source());
             }
@@ -329,7 +329,7 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             plane.createIndex(descriptor);
             plane.walStore("conflict", descriptor.uuid(), 0).append(1L, records);
             try (var node = new ServerlessNode(nodeSettings("payload-replay-conflict"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final Exception failure = expectThrows(Exception.class, () -> node.activateWriter(plane, "conflict", 0));
                 final String reason = org.opensearch.ExceptionsHelper.detailedMessage(failure);

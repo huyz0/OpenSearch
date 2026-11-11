@@ -299,7 +299,7 @@ final class DirtyPublishing {
             // guard stays on the edge path too: a spurious mark must not become an upload.
             return false;
         }
-        if (reconciler.node.isWriteFenced(shardId)) {
+        if (reconciler.node.fences().isWriteFenced(shardId)) {
             // Its engine holds an operation its log does not. Publishing that commit would make the
             // failure the caller was told a lie; the shard is reopened from its log by the next
             // heartbeat that reaches the store, and published after.
@@ -322,7 +322,7 @@ final class DirtyPublishing {
             // ownershipDoubted exists for. Under the fence, so a write in flight is not acknowledged
             // against a shard that is being closed as fenced.
             try {
-                reconciler.node.underShardFence(shardId, () -> {
+                reconciler.node.fences().underShardFence(shardId, () -> {
                     reconciler.node.reconciler().releaseShard(shardId, "fenced while publishing: " + e.getMessage());
                     return null;
                 });

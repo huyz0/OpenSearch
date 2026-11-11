@@ -57,7 +57,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
     /** Indexes and publishes some documents from a writer node, then closes it. */
     private void writeAndPublish(MetadataPlane plane, Path home, int docs) throws Exception {
         try (ServerlessNode writer = new ServerlessNode(nodeSettings("p5-writer", "ingest"))) {
-            writer.start();
+            writer.startup().start();
             final long term = plane.activate("alpha", 0, writer.localNode().getId(), writer.localNode().getEphemeralId()).head().term();
             final ShardId shardId = writer.syncFrom(plane).iterator().next();
             for (int i = 1; i <= docs; i++) {
@@ -78,7 +78,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
         final long termBefore = plane.heads().read("alpha", 0).orElseThrow().term();
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("p5-reader", "search"))) {
-            reader.start();
+            reader.startup().start();
             final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
 
             assertEquals("the reader served nothing", 4L, ShardOps.hits(reader.searchService(), shardId, "msg", "searchable"));
@@ -97,7 +97,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
         writeAndPublish(plane, null, 2);
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("p5-ro", "search"))) {
-            reader.start();
+            reader.startup().start();
             final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
             final IndexShard shard = reader.reconciler().shard(shardId);
 
@@ -126,7 +126,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
 
         // A search node serves, then goes away entirely.
         try (ServerlessNode first = new ServerlessNode(nodeSettings("p5-z1", "search"))) {
-            first.start();
+            first.startup().start();
             final ShardId shardId = first.serveAsReader(plane, "alpha", 0);
             assertEquals(5L, ShardOps.hits(first.searchService(), shardId, "msg", "searchable"));
         }
@@ -135,7 +135,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
 
         // A different node, with its own empty disk, serves the same data.
         try (ServerlessNode second = new ServerlessNode(nodeSettings("p5-z2", "search"))) {
-            second.start();
+            second.startup().start();
             final ShardId shardId = second.serveAsReader(plane, "alpha", 0);
             assertEquals(
                 "scale-to-zero lost the data: a fresh search node served nothing",
@@ -156,8 +156,8 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
             ServerlessNode r1 = new ServerlessNode(nodeSettings("p5-m1", "search"));
             ServerlessNode r2 = new ServerlessNode(nodeSettings("p5-m2", "search"))
         ) {
-            r1.start();
-            r2.start();
+            r1.startup().start();
+            r2.startup().start();
             final ShardId s1 = r1.serveAsReader(plane, "alpha", 0);
             final ShardId s2 = r2.serveAsReader(plane, "alpha", 0);
 
@@ -181,7 +181,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("p5-empty", "search"))) {
-            reader.start();
+            reader.startup().start();
             final Exception e = expectThrows(Exception.class, () -> reader.serveAsReader(plane, "alpha", 0));
             assertTrue(
                 "the refusal must say why an empty answer would be wrong: " + e.getMessage(),
@@ -199,14 +199,14 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
         writeAndPublish(plane, null, 2);
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("p5-refresh", "search"))) {
-            reader.start();
+            reader.startup().start();
             final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
             assertEquals(2L, ShardOps.hits(reader.searchService(), shardId, "msg", "searchable"));
 
             // A new writer takes the shard over -- the old one's lease lapsed -- and publishes more.
             clock.set(1_000L + TTL);
             try (ServerlessNode writer2 = new ServerlessNode(nodeSettings("p5-writer2", "ingest"))) {
-                writer2.start();
+                writer2.startup().start();
                 final long term = plane.activate("alpha", 0, writer2.localNode().getId(), writer2.localNode().getEphemeralId())
                     .head()
                     .term();
@@ -261,7 +261,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
         writeAndPublish(plane, null, 2);
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("p5-stale", "search"))) {
-            reader.start();
+            reader.startup().start();
             final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
             assertEquals(2L, ShardOps.hits(reader.searchService(), shardId, "msg", "searchable"));
 
@@ -273,7 +273,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
 
                 clock.set(1_000L + TTL);
                 try (ServerlessNode writer2 = new ServerlessNode(nodeSettings("p5-stale-writer", "ingest"))) {
-                    writer2.start();
+                    writer2.startup().start();
                     final long term = plane.activate("alpha", 0, writer2.localNode().getId(), writer2.localNode().getEphemeralId())
                         .head()
                         .term();

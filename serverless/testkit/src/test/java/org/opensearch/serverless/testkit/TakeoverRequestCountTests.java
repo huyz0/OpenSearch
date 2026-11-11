@@ -60,7 +60,7 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
         final List<ShardId> held = new ArrayList<>(node.reconciler().openShards());
         assertEquals(SHARDS, held.size());
         for (int i = 0; i < 30; i++) {
-            node.index(held.get(i % SHARDS), "first-" + i, "{\"msg\":\"first\",\"n\":" + i + "}");
+            node.writes().index(held.get(i % SHARDS), "first-" + i, "{\"msg\":\"first\",\"n\":" + i + "}");
         }
         loop.publishAll();
         return held;
@@ -118,7 +118,7 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
         try (ServerlessNode first = new ServerlessNode(nodeSettings("released-first"))) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane);
             holdAndWrite(first, loop, clock);
@@ -129,7 +129,7 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
             loop.releaseIdle(System.currentTimeMillis() + 60_000L);
         }
         try (ServerlessNode second = new ServerlessNode(nodeSettings("released-second"))) {
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
             takeAll("released", store, second, plane, clock);
             final String where = store.byPlace();
@@ -153,17 +153,17 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
         final ServerlessNode first = new ServerlessNode(nodeSettings("crashed-first", false));
         try {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             final List<ShardId> held = holdAndWrite(first, new BackgroundReconciler(first, plane), clock);
             for (ShardId shardId : held) {
-                first.index(shardId, "unpublished-" + shardId.id(), "{\"msg\":\"first\",\"n\":" + shardId.id() + "}");
+                first.writes().index(shardId, "unpublished-" + shardId.id(), "{\"msg\":\"first\",\"n\":" + shardId.id() + "}");
             }
             clock.addAndGet(2 * TTL);
             try (ServerlessNode survivor = new ServerlessNode(nodeSettings("crashed-survivor", false))) {
-                survivor.start();
+                survivor.startup().start();
                 survivor.setMetadataPlane(plane);
-                survivor.renewLease(plane);
+                survivor.leases().renewLease(plane);
                 plane.membership().refresh();
                 takeAll("crashed", store, survivor, plane, clock);
                 // The dead writer's lease is judged and revoked once for all its shards taken together, not read
@@ -175,7 +175,7 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
                 );
                 assertTrue("and revoked once\n" + where, count(where, "REGISTER_CAS cluster/members/") <= 2);
                 for (ShardId shardId : survivor.reconciler().openShards()) {
-                    assertTrue(survivor.get(shardId, "unpublished-" + shardId.id()).found());
+                    assertTrue(survivor.reads().get(shardId, "unpublished-" + shardId.id()).found());
                 }
             }
         } finally {

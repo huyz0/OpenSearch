@@ -74,7 +74,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
 
     private ServerlessNode started(MetadataPlane plane, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         return node;
     }
@@ -158,7 +158,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
             try (
                 var node = new ServerlessNode(nodeSettings("dbq-filter-" + replace), java.util.List.of(new DeleteSelectionPlugin(replace)))
             ) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 prepareSelectionDocuments(node, plane);
                 final var http = node.boundHttpAddress().publishAddress();
@@ -334,7 +334,8 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
 
             final int documents = 2137;
             for (int i = 1; i <= documents; i++) {
-                node.index(node.reconciler().openShards().iterator().next(), "d" + i, "{\"msg\":\"x\",\"n\":" + i + ",\"keep\":false}");
+                node.writes()
+                    .index(node.reconciler().openShards().iterator().next(), "d" + i, "{\"msg\":\"x\",\"n\":" + i + ",\"keep\":false}");
             }
             node.reconciler().shard(node.reconciler().openShards().iterator().next()).refresh("dbq-paged");
             publish(node, plane, "alpha", 1);

@@ -190,15 +190,15 @@ public class MultiGetRequestExecutionTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 if (populate) {
                     metadata.createIndex(
                         new IndexDescriptor("docs", "uuid-docs", 1, "{\"properties\":{\"msg\":{\"type\":\"keyword\"}}}", null)
                     );
                     final var shard = node.activateWriter(metadata, "docs", 0).orElseThrow();
-                    node.index(shard, "private", "{\"msg\":\"private-value\"}");
-                    node.index(shard, "public", "{\"msg\":\"public-value\"}");
+                    node.writes().index(shard, "private", "{\"msg\":\"private-value\"}");
+                    node.writes().index(shard, "public", "{\"msg\":\"public-value\"}");
                 }
                 work.accept(node, metadata);
             }

@@ -270,7 +270,7 @@ final class ShardEviction {
             // record behind a seal. The fence makes the release wait for writes in flight and makes writes
             // that arrive during it wait for the close -- after which they find no shard and are refused,
             // which is the truthful answer.
-            return reconciler.node.underShardFence(shardId, () -> letGoFenced(shardId, reason));
+            return reconciler.node.fences().underShardFence(shardId, () -> letGoFenced(shardId, reason));
         } catch (Exception e) {
             // Releasing is an optimisation. Failing to do it costs money and nothing else, so it is
             // logged and retried on the next pass rather than propagated into the tick.
@@ -308,7 +308,7 @@ final class ShardEviction {
         // rebuilds it from the log, which is the state the caller was told about.
         // Unchanged only if the last publish's commit covered every operation this shard has: see #publish.
         final boolean unchanged = maxSeqNo < 0 || maxSeqNo <= reconciler.lastPublishedMaxSeqNo.getOrDefault(shardId, -1L);
-        if (unchanged == false && reconciler.node.isWriteFenced(shardId) == false) {
+        if (unchanged == false && reconciler.node.fences().isWriteFenced(shardId) == false) {
             synchronized (reconciler.publishLock(shardId)) {
                 reconciler.lastManifests.put(shardId, reconciler.node.publishShard(shardId, head.get().term()));
             }

@@ -217,8 +217,8 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("tls-owner"), List.of(new TlsPlugin()));
             ServerlessNode other = new ServerlessNode(nodeSettings("tls-other"), List.of(new TlsPlugin()))
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
             owner.activateWriter(plane, "alpha", 0);
@@ -252,8 +252,8 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("mtls-owner"), List.of(mutual()));
             ServerlessNode other = new ServerlessNode(nodeSettings("mtls-other"), List.of(mutual()))
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
             owner.activateWriter(plane, "alpha", 0);
@@ -282,8 +282,8 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("mtls-strict"), List.of(mutual()));
             ServerlessNode stranger = new ServerlessNode(nodeSettings("mtls-stranger"), List.of(new TlsPlugin()))
         ) {
-            owner.start();
-            stranger.start();
+            owner.startup().start();
+            stranger.startup().start();
             owner.setMetadataPlane(plane);
             stranger.setMetadataPlane(plane);
             owner.activateWriter(plane, "alpha", 0);

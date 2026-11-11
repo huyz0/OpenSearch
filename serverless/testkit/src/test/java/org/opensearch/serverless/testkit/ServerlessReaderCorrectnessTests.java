@@ -87,7 +87,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             final var original = new IndexDescriptor("alpha", "uuid-original-refresh", 1, MAPPING, null);
             plane.createIndex(original);
             try (var node = new ServerlessNode(nodeSettings("descriptor-refresh", "ingest"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var id = node.activateWriter(plane, "alpha", 0).orElseThrow();
                 final var service = node.indicesService().indexService(id.getIndex());
@@ -121,10 +121,10 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             assertTrue(plane.deleteIndex("recreated"));
             plane.createIndex(new IndexDescriptor("recreated", "uuid-replacement", 2, MAPPING, null));
             try (var node = new ServerlessNode(nodeSettings("reader-plan-incarnation", "ingest"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var writer = node.activateWriter(plane, "recreated", 0).orElseThrow();
-                node.index(writer, "new-document", "{\"msg\":\"replacement\",\"n\":1}");
+                node.writes().index(writer, "new-document", "{\"msg\":\"replacement\",\"n\":1}");
                 node.reconciler().shard(writer).refresh("test");
                 node.publishShard(writer, plane.heads().read("recreated", 0).orElseThrow().term());
                 final var failure = expectThrows(
@@ -161,10 +161,10 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             assertTrue(plane.deleteIndex("recreated"));
             plane.createIndex(new IndexDescriptor("recreated", "uuid-replacement", 1, MAPPING, null));
             try (var node = new ServerlessNode(nodeSettings("reader-document-incarnation", "ingest"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var writer = node.activateWriter(plane, "recreated", 0).orElseThrow();
-                node.index(writer, "new-document", "{\"msg\":\"replacement\",\"n\":1}");
+                node.writes().index(writer, "new-document", "{\"msg\":\"replacement\",\"n\":1}");
                 node.reconciler().shard(writer).refresh("test");
                 final long term = plane.heads().read("recreated", 0).orElseThrow().term();
                 node.publishShard(writer, term);
@@ -205,8 +205,8 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("rc-fenced", null));
             ServerlessNode b = new ServerlessNode(nodeSettings("rc-successor", "ingest"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
 
             final ShardId onA = a.activateWriter(plane, "alpha", 0).orElseThrow();
             final long termA = plane.heads().read("alpha", 0).orElseThrow().term();
@@ -234,7 +234,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
 
             // A discovers it lost the shard and lets go, then serves the very same shard as a reader from
             // the very same data path.
-            assertEquals("A must release the shard it lost", Set.of(onA), a.heartbeat(plane));
+            assertEquals("A must release the shard it lost", Set.of(onA), a.leases().heartbeat(plane));
             final ShardId asReader = a.serveAsReader(plane, "alpha", 0);
 
             assertEquals("the successor's document is what a reader on the ex-writer serves", 1L, hits(a, asReader, "successor"));
@@ -263,7 +263,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             .put("serverless.segments.pack.enabled", false)
             .build();
         try (ServerlessNode a = new ServerlessNode(unpacked)) {
-            a.start();
+            a.startup().start();
             final ShardId onA = a.activateWriter(plane, "alpha", 0).orElseThrow();
             for (int i = 1; i <= 3; i++) {
                 ShardOps.indexDoc(a.reconciler().shard(onA), String.valueOf(i), "{\"msg\":\"durable\",\"n\":" + i + "}");
@@ -274,7 +274,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
 
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("rc-retry", "ingest"))) {
-            b.start();
+            b.startup().start();
 
             // Reads of the published commit fail, after the shard exists in core. Every read, not the first only: the
             // open fetches its blocks ahead and lets a failed one be read again, so a single failure is absorbed.
@@ -304,7 +304,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("logs", "uuid-logs-first-0000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("rc-pit", "ingest"))) {
-            node.start();
+            node.startup().start();
             final ShardId first = node.activateWriter(plane, "logs", 0).orElseThrow();
             ShardOps.indexDoc(node.reconciler().shard(first), "1", "{\"msg\":\"first\",\"n\":1}");
             node.reconciler().shard(first).refresh("rc");
@@ -320,7 +320,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
 
             // The name is deleted and created again. Its first published segment has the same name.
             assertTrue(plane.deleteIndex("logs"));
-            node.heartbeat(plane);
+            node.leases().heartbeat(plane);
             plane.createIndex(new IndexDescriptor("logs", "uuid-logs-second-000", 1, MAPPING, null));
             final ShardId second = node.activateWriter(plane, "logs", 0).orElseThrow();
             ShardOps.indexDoc(node.reconciler().shard(second), "1", "{\"msg\":\"second\",\"n\":1}");
@@ -354,7 +354,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("paged", "uuid-paged-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("rc-view-disk", "ingest"))) {
-            node.start();
+            node.startup().start();
             final ShardId live = node.activateWriter(plane, "paged", 0).orElseThrow();
             ShardOps.indexDoc(node.reconciler().shard(live), "1", "{\"msg\":\"paged\",\"n\":1}");
             node.reconciler().shard(live).refresh("rc");

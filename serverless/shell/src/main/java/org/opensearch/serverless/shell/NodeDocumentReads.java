@@ -10,7 +10,7 @@ package org.opensearch.serverless.shell;
 /**
  * Reads documents for {@link ServerlessNode}: get and explain against a shard held here.
  */
-final class NodeDocumentReads {
+public final class NodeDocumentReads {
 
     private final ServerlessNode node;
 
@@ -37,9 +37,9 @@ final class NodeDocumentReads {
             throw new java.io.IOException("cannot explain from " + shardId + ": not open on " + node.nodeName);
         }
         node.markUsed(shardId);
-        node.ensureIncarnationLive(shardId);
+        node.fences().ensureIncarnationLive(shardId);
         final var outcome = org.opensearch.serverless.shard.ShardExplain.execute(node.searchService(), shardId, id, query);
-        node.ensureIncarnationLive(shardId);
+        node.fences().ensureIncarnationLive(shardId);
         return outcome;
     }
 
@@ -69,7 +69,7 @@ final class NodeDocumentReads {
             throw new java.io.IOException("cannot read from " + shardId + ": not open on " + node.nodeName);
         }
         node.markUsed(shardId);
-        node.ensureIncarnationLive(shardId);
+        node.fences().ensureIncarnationLive(shardId);
         final var result = shard.getService()
             .get(
                 id,
@@ -83,7 +83,7 @@ final class NodeDocumentReads {
         // value rather than a handle.
         // Before answering, found or not: a document from a deleted incarnation and a 404 from one are both
         // answers about an index that is gone. See INCARNATION_FENCE_MILLIS.
-        node.ensureIncarnationLive(shardId);
+        node.fences().ensureIncarnationLive(shardId);
         if (result.isExists() == false) {
             return Document.absent(id);
         }

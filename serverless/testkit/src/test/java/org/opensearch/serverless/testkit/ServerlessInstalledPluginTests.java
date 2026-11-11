@@ -271,7 +271,7 @@ public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
         install(home, "greeting", Version.CURRENT.toString());
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("installed-ok", home))) {
-            node.start();
+            node.startup().start();
             assertEquals("the installed plugin must be loaded", 1, node.plugins().plugins().size());
 
             final var plugin = node.plugins().plugins().get(0);
@@ -358,7 +358,7 @@ public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
         );
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("query-plugin", home))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final var loop = new org.opensearch.serverless.reconcile.BackgroundReconciler(node, plane);
             loop.want("docs", 0);
@@ -377,7 +377,7 @@ public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
 
         // The control: without the plugin the same body is not a query this node knows.
         try (ServerlessNode bare = new ServerlessNode(nodeSettings("query-none", createTempDir()))) {
-            bare.start();
+            bare.startup().start();
             bare.setMetadataPlane(plane);
             final Response rejected = send(bare, "POST", "/docs/_search", "{\"query\":{\"matches_nothing\":{}}}");
             assertEquals("without the plugin the query must be refused: " + rejected.body(), 400, rejected.status());
@@ -387,7 +387,7 @@ public class ServerlessInstalledPluginTests extends OpenSearchTestCase {
     /** A node whose home has no plugins directory at all is unaffected, which is nearly every node. */
     public void testANodeWithNoPluginsDirectoryIsUnchanged() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("installed-none", createTempDir()))) {
-            node.start();
+            node.startup().start();
             assertTrue(node.plugins().plugins().isEmpty());
             assertEquals(200, send(node, "GET", "/").status());
         }

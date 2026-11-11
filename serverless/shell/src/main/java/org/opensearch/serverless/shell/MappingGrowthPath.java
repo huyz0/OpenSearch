@@ -137,7 +137,7 @@ final class MappingGrowthPath {
                 // mapping declaring it had not reached it yet. Brought up to it, the client's retry indexes the
                 // document with the declared mapping instead of failing the same way.
                 try {
-                    node.applyDescriptor(indexName, current.get());
+                    node.descriptorRefresh.applyDescriptor(indexName, current.get());
                 } catch (Exception nested) {
                     e.addSuppressed(nested);
                 }

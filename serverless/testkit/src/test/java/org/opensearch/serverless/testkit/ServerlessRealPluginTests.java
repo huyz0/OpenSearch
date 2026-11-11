@@ -112,7 +112,7 @@ public class ServerlessRealPluginTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("without_icu", "uuid-without-icu-000", 1, PLAIN, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("real-plugin", home))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
 
             assertEquals("both plugins must be loaded", 2, node.plugins().plugins().size());
@@ -172,7 +172,7 @@ public class ServerlessRealPluginTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("hashed", "uuid-hashed-00000000", 1, mapping, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mapper-plugin", home))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("hashed", 0);
@@ -199,7 +199,7 @@ public class ServerlessRealPluginTests extends OpenSearchTestCase {
         );
         bareplane.createIndex(new IndexDescriptor("hashed", "uuid-hashed-00000001", 1, mapping, null));
         try (ServerlessNode bare = new ServerlessNode(nodeSettings("mapper-none", createTempDir()))) {
-            bare.start();
+            bare.startup().start();
             bare.setMetadataPlane(bareplane);
             final BackgroundReconciler loop = new BackgroundReconciler(bare, bareplane);
             loop.want("hashed", 0);

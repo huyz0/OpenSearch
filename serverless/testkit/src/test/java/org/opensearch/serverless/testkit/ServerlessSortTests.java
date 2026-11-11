@@ -70,7 +70,7 @@ public class ServerlessSortTests extends OpenSearchTestCase {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             try (var node = new ServerlessNode(nodeSettings("sort-mixed-types"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var loop = new BackgroundReconciler(node, plane);
                 for (int i = 0; i < 4; i++) {
@@ -112,7 +112,7 @@ public class ServerlessSortTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("ranked", "uuid-ranked-0000000", SHARDS, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("sort-numeric"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "ranked");
 
@@ -148,7 +148,7 @@ public class ServerlessSortTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("paged", "uuid-paged-00000000", SHARDS, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("sort-paged"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "paged");
 
@@ -170,7 +170,7 @@ public class ServerlessSortTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("named", "uuid-named-00000000", SHARDS, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("sort-keyword"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "named");
 
@@ -192,7 +192,7 @@ public class ServerlessSortTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("scored", "uuid-scored-0000000", SHARDS, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("sort-none"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "scored");
 
@@ -226,8 +226,8 @@ public class ServerlessSortTests extends OpenSearchTestCase {
             ServerlessNode first = new ServerlessNode(nodeSettings("sort-wire-1"));
             ServerlessNode second = new ServerlessNode(nodeSettings("sort-wire-2"))
         ) {
-            first.start();
-            second.start();
+            first.startup().start();
+            second.startup().start();
             first.setMetadataPlane(plane);
             second.setMetadataPlane(plane);
 
@@ -277,7 +277,7 @@ public class ServerlessSortTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("walked", "uuid-walked-0000000", SHARDS, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("sort-after"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "walked");
 
@@ -317,7 +317,7 @@ public class ServerlessSortTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("strict", "uuid-strict-0000000", SHARDS, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("sort-after-bad"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "strict");
             assertEquals(201, send(node, "PUT", "/strict/_doc/1?refresh=true", body(1)).status());

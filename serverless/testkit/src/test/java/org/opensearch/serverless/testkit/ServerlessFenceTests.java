@@ -82,7 +82,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
 
     /** Opens a node on the shard it is told to want, and returns the shard. */
     private static ShardId hold(ServerlessNode node, MetadataPlane plane, BackgroundReconciler loop, AtomicLong clock) throws Exception {
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         loop.want("alpha", 0);
         loop.tick(clock.get());
@@ -119,13 +119,13 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
         ) {
             final BackgroundReconciler loopZ = new BackgroundReconciler(z, planeZ);
             final ShardId onZ = hold(z, planeZ, loopZ, clock);
-            assertTrue(z.index(onZ, "before", "{\"msg\":\"before\"}").seqNo() >= 0);
+            assertTrue(z.writes().index(onZ, "before", "{\"msg\":\"before\"}").seqNo() >= 0);
 
             // Z pauses past its TTL. S takes the shard over and seals the log where Z's history ended.
-            s.start();
+            s.startup().start();
             clock.set(1_000L + TTL);
             final ShardId onS = s.activateWriter(planeS, "alpha", 0).orElseThrow();
-            assertTrue(s.get(onS, "before").found());
+            assertTrue(s.reads().get(onS, "before").found());
 
             // Z resumes and heartbeats. The store parks the first shard-head read of that heartbeat,
             // which is exactly the window after the renewal and before Z could learn it lost anything.
@@ -133,7 +133,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             final AtomicReference<Exception> heartbeatFailure = new AtomicReference<>();
             final Thread heartbeat = new Thread(() -> {
                 try {
-                    z.heartbeat(planeZ);
+                    z.leases().heartbeat(planeZ);
                 } catch (Exception e) {
                     heartbeatFailure.set(e);
                 }
@@ -148,7 +148,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             final IOException refused = expectThrows(
                 IOException.class,
                 "a write inside the renew-to-head-check window must be refused; it used to be acknowledged behind S's seal",
-                () -> z.index(onZ, "zombie", "{\"msg\":\"zombie\"}")
+                () -> z.writes().index(onZ, "zombie", "{\"msg\":\"zombie\"}")
             );
             logger.info("fence: the zombie's write was refused with: {}", refused.getMessage());
 
@@ -156,7 +156,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             heartbeat.join(TimeUnit.SECONDS.toMillis(30));
             assertNull("the heartbeat must not have failed: " + heartbeatFailure.get(), heartbeatFailure.get());
             assertNull("Z must have let go of the shard it lost", z.reconciler().shard(onZ));
-            assertFalse("nothing Z wrote after losing the shard may be visible on S", s.get(onS, "zombie").found());
+            assertFalse("nothing Z wrote after losing the shard may be visible on S", s.reads().get(onS, "zombie").found());
         }
     }
 
@@ -192,8 +192,8 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
         ) {
             final BackgroundReconciler loop = new BackgroundReconciler(a, planeA).setIdleAfterMillis(idleAfter);
             final ShardId onA = hold(a, planeA, loop, clock);
-            s.start();
-            a.index(onA, "before", "{\"msg\":\"before\"}");
+            s.startup().start();
+            a.writes().index(onA, "before", "{\"msg\":\"before\"}");
             loop.tick(clock.addAndGet(1_000L));   // published
 
             // Idle long enough to be let go, inside the lease so the lease is not what fences.
@@ -217,7 +217,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             final AtomicReference<Object> outcome = new AtomicReference<>();
             final Thread write = new Thread(() -> {
                 try {
-                    outcome.set(a.index(onA, "during", "{\"msg\":\"during\"}"));
+                    outcome.set(a.writes().index(onA, "during", "{\"msg\":\"during\"}"));
                 } catch (Exception e) {
                     outcome.set(e);
                 }
@@ -230,7 +230,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             assertTrue("the head-release swap must complete", afterRelease.reached.await(30, TimeUnit.SECONDS));
             // Head released, shard still open on A: a successor acquires and seals here.
             final ShardId onS = s.activateWriter(planeS, "alpha", 0).orElseThrow();
-            assertTrue("the published history must have reached the successor", s.get(onS, "before").found());
+            assertTrue("the published history must have reached the successor", s.reads().get(onS, "before").found());
 
             append.release();
             afterRelease.release();
@@ -242,9 +242,12 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             final boolean acknowledged = outcome.get() instanceof WriteOutcome;
             logger.info("fence: the write during the release was {}", acknowledged ? "acknowledged" : "refused: " + outcome.get());
             if (acknowledged) {
-                assertTrue("an acknowledged write must be visible on the successor; it was behind the seal", s.get(onS, "during").found());
+                assertTrue(
+                    "an acknowledged write must be visible on the successor; it was behind the seal",
+                    s.reads().get(onS, "during").found()
+                );
             } else {
-                assertFalse("a refused write must not surface anywhere", s.get(onS, "during").found());
+                assertFalse("a refused write must not surface anywhere", s.reads().get(onS, "during").found());
             }
         }
     }
@@ -277,7 +280,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             a.syncFrom(plane);
             assertNotNull("the head names this node; a missing claim blob is no reason to let the shard go", a.reconciler().shard(onA));
             assertEquals(a.localNode().getId(), plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
-            assertTrue("and it still serves", a.index(onA, "still", "{\"msg\":\"still\"}").seqNo() >= 0);
+            assertTrue("and it still serves", a.writes().index(onA, "still", "{\"msg\":\"still\"}").seqNo() >= 0);
         }
     }
 
@@ -305,21 +308,21 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
         try (ServerlessNode z = new ServerlessNode(nodeSettings("skew-z")); ServerlessNode s = new ServerlessNode(nodeSettings("skew-s"))) {
             final BackgroundReconciler loopZ = new BackgroundReconciler(z, planeZ);
             final ShardId onZ = hold(z, planeZ, loopZ, clockZ);
-            z.index(onZ, "before", "{\"msg\":\"before\"}");
-            s.start();
+            z.writes().index(onZ, "before", "{\"msg\":\"before\"}");
+            s.startup().start();
 
             // By S's clock Z's lease has expired; by Z's, it has half a second left.
             clockS.set(1_000L + TTL);
             clockZ.set(1_000L + TTL - skew);
             final ShardId onS = s.activateWriter(planeS, "alpha", 0).orElseThrow();
-            assertTrue(s.get(onS, "before").found());
+            assertTrue(s.reads().get(onS, "before").found());
 
             expectThrows(
                 IOException.class,
                 "inside the skew margin the holder must refuse; it used to acknowledge a record behind the successor's seal",
-                () -> z.index(onZ, "skewed", "{\"msg\":\"skewed\"}")
+                () -> z.writes().index(onZ, "skewed", "{\"msg\":\"skewed\"}")
             );
-            assertFalse(s.get(onS, "skewed").found());
+            assertFalse(s.reads().get(onS, "skewed").found());
         }
     }
 
@@ -498,17 +501,17 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
         try (ServerlessNode a = new ServerlessNode(nodeSettings("hold-a")); ServerlessNode b = new ServerlessNode(nodeSettings("hold-b"))) {
             final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
             final ShardId onA = hold(a, plane, loop, clock);
-            b.start();
-            assertTrue("the head read by the heartbeat a moment ago names this node", a.holdsAsWriter(onA, TTL));
+            b.startup().start();
+            assertTrue("the head read by the heartbeat a moment ago names this node", a.fences().holdsAsWriter(onA, TTL));
 
             // The head is given away underneath A -- what a deferred give-back or an operator does --
             // and B takes it while A's lease is still perfectly live.
             assertTrue(plane.heads().release("alpha", 0, a.localNode().getId()));
             final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
-            assertTrue(b.index(onB, "b", "{\"msg\":\"b\"}").seqNo() >= 0);
+            assertTrue(b.writes().index(onB, "b", "{\"msg\":\"b\"}").seqNo() >= 0);
 
             clock.incrementAndGet();
-            assertFalse("a head that names B is no evidence A holds the shard", a.holdsAsWriter(onA, 0L));
+            assertFalse("a head that names B is no evidence A holds the shard", a.fences().holdsAsWriter(onA, 0L));
             assertNull("and A stops serving it at once", a.reconciler().shard(onA));
         }
     }
@@ -531,15 +534,15 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
         try (ServerlessNode a = new ServerlessNode(nodeSettings("brownout"))) {
             final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
             final ShardId onA = hold(a, plane, loop, clock);
-            a.index(onA, "earlier", "{\"msg\":\"earlier\"}");
+            a.writes().index(onA, "earlier", "{\"msg\":\"earlier\"}");
 
             store.failWritesUnder("wal/t=");
-            final IOException refused = expectThrows(IOException.class, () -> a.index(onA, "lost", "{\"msg\":\"lost\"}"));
+            final IOException refused = expectThrows(IOException.class, () -> a.writes().index(onA, "lost", "{\"msg\":\"lost\"}"));
             assertTrue(refused.getMessage(), refused.getMessage().contains("not acknowledged"));
             assertNotNull("the shard stays open for reads", a.reconciler().shard(onA));
-            assertTrue("and still answers from its own copy", a.get(onA, "earlier").found());
-            assertTrue(a.isWriteFenced(onA));
-            final IOException fenced = expectThrows(IOException.class, () -> a.index(onA, "next", "{\"msg\":\"next\"}"));
+            assertTrue("and still answers from its own copy", a.reads().get(onA, "earlier").found());
+            assertTrue(a.fences().isWriteFenced(onA));
+            final IOException fenced = expectThrows(IOException.class, () -> a.writes().index(onA, "next", "{\"msg\":\"next\"}"));
             assertTrue(
                 "a fenced shard refuses before applying anything: " + fenced.getMessage(),
                 fenced.getMessage().contains("refusing to write")
@@ -550,10 +553,10 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             store.failWritesUnder(null);
             loop.tick(clock.addAndGet(1_000L));
             final ShardId reopened = a.reconciler().openShards().iterator().next();
-            assertFalse(a.isWriteFenced(reopened));
-            assertTrue("history the log holds survives the reopen", a.get(reopened, "earlier").found());
-            assertFalse("the operation the caller was told failed must not survive it", a.get(reopened, "lost").found());
-            assertTrue("and writes flow again", a.index(reopened, "after", "{\"msg\":\"after\"}").seqNo() >= 0);
+            assertFalse(a.fences().isWriteFenced(reopened));
+            assertTrue("history the log holds survives the reopen", a.reads().get(reopened, "earlier").found());
+            assertFalse("the operation the caller was told failed must not survive it", a.reads().get(reopened, "lost").found());
+            assertTrue("and writes flow again", a.writes().index(reopened, "after", "{\"msg\":\"after\"}").seqNo() >= 0);
         }
     }
 

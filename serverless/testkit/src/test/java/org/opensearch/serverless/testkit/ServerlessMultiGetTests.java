@@ -68,7 +68,7 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 3, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-basic"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 3, "alpha");
 
@@ -97,7 +97,7 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("right", "uuid-right-000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-indices"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "left", "right");
 
@@ -128,7 +128,7 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-partial"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "alpha");
             assertEquals(201, send(node, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"survivor\"}").status());
@@ -155,7 +155,7 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-refuse"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "alpha");
 
@@ -186,8 +186,8 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
             ServerlessNode writer = new ServerlessNode(nodeSettings("mget-writer"));
             ServerlessNode reader = new ServerlessNode(nodeSettings("mget-reader"))
         ) {
-            writer.start();
-            reader.start();
+            writer.startup().start();
+            reader.startup().start();
             writer.setMetadataPlane(plane);
             reader.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
@@ -275,7 +275,7 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("shaped", "uuid-shaped-0000000", 1, WIDE_MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-source"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, 1, "shaped");
             assertEquals(
@@ -376,7 +376,7 @@ public class ServerlessMultiGetTests extends OpenSearchTestCase {
         final MetadataPlane metadata = plane(clock);
         metadata.createIndex(new IndexDescriptor("shaped", "uuid-shaped-0000000", 1, WIDE_MAPPING, null));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mget-native-shape"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(metadata);
             hold(node, metadata, clock, 1, "shaped");
             final Response written = send(

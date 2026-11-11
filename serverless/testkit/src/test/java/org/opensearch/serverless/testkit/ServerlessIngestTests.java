@@ -87,7 +87,7 @@ public class ServerlessIngestTests extends OpenSearchTestCase {
     /** An index with <em>no</em> mapping at all, which is the state the dynamic-mapping bug made unusable. */
     private ServerlessNode running(MetadataPlane plane, AtomicLong clock, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         port = node.boundHttpAddress().publishAddress().getPort();
         call("PUT", "/alpha", "{\"settings\":{\"number_of_shards\":1}}");

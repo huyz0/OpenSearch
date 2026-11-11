@@ -639,7 +639,7 @@ public final class BulkHandler extends BaseRestHandler {
 
         if (local != null) {
             try {
-                record(group, serving.bulkOperations(local, operations), serving.localNode().getId());
+                record(group, serving.writes().bulkOperations(local, operations), serving.localNode().getId());
                 if (refresh) {
                     final var open = serving.reconciler().shard(local);
                     if (open != null) {

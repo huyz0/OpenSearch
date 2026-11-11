@@ -82,7 +82,7 @@ public class ServerlessExplainTests extends OpenSearchTestCase {
 
     private ServerlessNode running(MetadataPlane plane, AtomicLong clock, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         port = node.boundHttpAddress().publishAddress().getPort();
         call("PUT", "/books", "{\"settings\":{\"number_of_shards\":1},\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"}}}}");
@@ -101,7 +101,7 @@ public class ServerlessExplainTests extends OpenSearchTestCase {
             ServerlessNode former = running(metadata, clock, "explain-former");
             ServerlessNode successor = new ServerlessNode(nodeSettings("explain-successor"))
         ) {
-            successor.start();
+            successor.startup().start();
             successor.setMetadataPlane(metadata);
             assertTrue(metadata.heads().release("books", 0, former.localNode().getId()));
             assertTrue(successor.activateWriter(metadata, "books", 0).isPresent());
@@ -209,7 +209,7 @@ public class ServerlessExplainTests extends OpenSearchTestCase {
         final MetadataPlane plane = plane(clock, createTempDir());
 
         final ServerlessNode writer = new ServerlessNode(nodeSettings("explain-dormant-writer"));
-        writer.start();
+        writer.startup().start();
         writer.setMetadataPlane(plane);
         port = writer.boundHttpAddress().publishAddress().getPort();
         call("PUT", "/books", "{\"settings\":{\"number_of_shards\":1},\"mappings\":{\"properties\":{\"title\":{\"type\":\"text\"}}}}");
@@ -230,7 +230,7 @@ public class ServerlessExplainTests extends OpenSearchTestCase {
         assertTrue("nobody should own the shard now", plane.heads().read("books", 0).map(h -> h.ownerNodeId()).isEmpty());
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("explain-dormant-reader"))) {
-            reader.start();
+            reader.startup().start();
             reader.setMetadataPlane(plane);
             port = reader.boundHttpAddress().publishAddress().getPort();
 
@@ -263,8 +263,8 @@ public class ServerlessExplainTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("explain-fwd-a"));
             ServerlessNode b = new ServerlessNode(nodeSettings("explain-fwd-b"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             a.setMetadataPlane(plane);
             b.setMetadataPlane(plane);
             port = a.boundHttpAddress().publishAddress().getPort();

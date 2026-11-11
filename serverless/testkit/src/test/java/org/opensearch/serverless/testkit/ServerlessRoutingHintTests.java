@@ -77,13 +77,13 @@ public class ServerlessRoutingHintTests extends OpenSearchTestCase {
             ServerlessNode coordinator = new ServerlessNode(nodeSettings("hint-coordinator"));
             ServerlessNode successor = new ServerlessNode(nodeSettings("hint-successor"))
         ) {
-            coordinator.start();
-            successor.start();
+            coordinator.startup().start();
+            successor.startup().start();
             coordinator.setMetadataPlane(plane);
             successor.setMetadataPlane(plane);
 
             final ServerlessNode owner = new ServerlessNode(nodeSettings("hint-owner"));
-            owner.start();
+            owner.startup().start();
             owner.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(owner, plane);
             loop.want("alpha", 0);
@@ -147,8 +147,8 @@ public class ServerlessRoutingHintTests extends OpenSearchTestCase {
             ServerlessNode coordinator = new ServerlessNode(nodeSettings("recreate-coordinator"));
             ServerlessNode holder = new ServerlessNode(nodeSettings("recreate-holder"))
         ) {
-            coordinator.start();
-            holder.start();
+            coordinator.startup().start();
+            holder.startup().start();
             coordinator.setMetadataPlane(plane);
             holder.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(holder, plane);

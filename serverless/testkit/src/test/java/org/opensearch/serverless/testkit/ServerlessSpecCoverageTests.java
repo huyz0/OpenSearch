@@ -84,7 +84,7 @@ public class ServerlessSpecCoverageTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, "{\"properties\":{\"msg\":{\"type\":\"text\"}}}", null));
         final List<String> unanswered = new ArrayList<>();
         try (ServerlessNode node = new ServerlessNode(nodeSettings("spec-walk"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             for (Call call : calls) {
                 final Response answer = send(node, call.method(), call.path(), null);

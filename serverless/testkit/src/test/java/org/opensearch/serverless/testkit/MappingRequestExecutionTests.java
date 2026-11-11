@@ -41,7 +41,7 @@ public class MappingRequestExecutionTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("original", "uuid-original", 1, "{}", null));
                 metadata.createIndex(new IndexDescriptor("selected", "uuid-selected", 1, "{}", null));

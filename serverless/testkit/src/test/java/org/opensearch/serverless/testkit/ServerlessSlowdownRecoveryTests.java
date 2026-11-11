@@ -58,26 +58,26 @@ public class ServerlessSlowdownRecoveryTests extends OpenSearchTestCase {
             .put("serverless.roles", "ingest")
             .build();
         try (ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             node.setHeadVerifyIntervalMillis(TimeUnit.MINUTES.toMillis(5));
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(List.of(Map.entry("alpha", 0)));
             final ShardId shardId = node.reconciler().openShards().iterator().next();
             loop.verifyHeads();
-            assertTrue("held and verified", node.holdsAsWriter(shardId, TTL));
+            assertTrue("held and verified", node.fences().holdsAsWriter(shardId, TTL));
 
             // The lease runs out while the store throttles: the re-read of every head after the renewal fails.
             clock.addAndGet(2 * TTL);
             store.failRegisterReadsUnder("shards");
-            expectThrows(Exception.class, () -> node.renewLease(plane));
-            assertFalse("suspended until the heads are read again", node.holdsAsWriter(shardId, TTL));
+            expectThrows(Exception.class, () -> node.leases().renewLease(plane));
+            assertFalse("suspended until the heads are read again", node.fences().holdsAsWriter(shardId, TTL));
 
             // The store answers again. The next periodic pass, well inside the five minutes, must lift it.
             store.failRegisterReadsUnder(null);
             loop.verifyHeads();
-            assertTrue("acknowledging again after one pass", node.holdsAsWriter(shardId, TTL));
+            assertTrue("acknowledging again after one pass", node.fences().holdsAsWriter(shardId, TTL));
         }
     }
 

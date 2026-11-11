@@ -83,7 +83,7 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
 
     private ServerlessNode running(MetadataPlane plane, AtomicLong clock, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         port = node.boundHttpAddress().publishAddress().getPort();
         call(
@@ -297,7 +297,7 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
             var owner = running(metadata, clock, "update-delete-owner");
             var peer = new ServerlessNode(nodeSettings("update-delete-peer"))
         ) {
-            peer.start();
+            peer.startup().start();
             peer.setMetadataPlane(metadata);
             final int ownerPort = owner.boundHttpAddress().publishAddress().getPort();
             for (var via : java.util.List.of(owner, peer)) {

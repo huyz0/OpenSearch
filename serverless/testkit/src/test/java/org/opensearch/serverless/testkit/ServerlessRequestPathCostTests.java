@@ -71,7 +71,7 @@ public class ServerlessRequestPathCostTests extends OpenSearchTestCase {
         final HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("metadata-thread-" + index))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final var reader = new java.util.concurrent.atomic.AtomicReference<Thread>();
             store.onNextRegisterRead("indices", index, () -> reader.set(Thread.currentThread()));
@@ -100,7 +100,7 @@ public class ServerlessRequestPathCostTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("request-cost-reads"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             node.setIncarnationFenceMillis(60_000L);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
@@ -138,7 +138,7 @@ public class ServerlessRequestPathCostTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("request-cost-health"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             // The first check refreshes an empty snapshot; the burst after it finds a young one.
             assertEquals(200, send(node, "GET", "/_cluster/health", null).status());

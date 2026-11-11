@@ -70,7 +70,7 @@ public class ObjectStoreLifecycleTests extends OpenSearchTestCase {
             .setSecureSettings(secure)
             .build();
         try (var node = new org.opensearch.serverless.shell.ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             try (var handle = ObjectStores.create(settings, node.clusterService(), home.resolve("config"))) {
                 assertTrue(handle.blobStore() instanceof ObjectStores.Metered);
             }

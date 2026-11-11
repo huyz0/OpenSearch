@@ -95,9 +95,9 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         final MetadataPlane plane = plane(store, clock);
         plane.createIndex(descriptor("hollow"));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("hollow-node"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(List.of(Map.entry("hollow", 0)));
             assertNotNull("entered before it opened", entryOf(plane, "hollow"));
@@ -109,7 +109,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             loop.activateOnDemand(List.of(Map.entry("hollow", 0)));
             final ShardId shardId = node.reconciler().openShards().iterator().next();
             assertNotNull("a writer enters it again before it opens", entryOf(plane, "hollow"));
-            node.index(shardId, "doc", "{\"msg\":\"x\",\"n\":1}");
+            node.writes().index(shardId, "doc", "{\"msg\":\"x\",\"n\":1}");
             loop.releaseIdle(System.currentTimeMillis() + 120_000L);
             final DigestRollups.Entry entry = entryOf(plane, "hollow");
             assertNotNull("given back with something written, it keeps its entry", entry);
@@ -132,14 +132,14 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         }
         // One of them has a record in its log nobody published.
         try (ServerlessNode node = new ServerlessNode(nodeSettings("hollow-janitor"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             plane.membership().refresh();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(List.of(Map.entry("logged", 0)));
             final ShardId logged = node.reconciler().openShards().iterator().next();
-            node.index(logged, "unpublished", "{\"msg\":\"x\",\"n\":1}");
+            node.writes().index(logged, "unpublished", "{\"msg\":\"x\",\"n\":1}");
             final long term = plane.heads().read("logged", 0).orElseThrow().term();
             node.reconciler().releaseShard(logged, "test: given back unpublished, as a lapsed owner does");
             assertTrue(plane.heads().release("logged", 0, node.localNode().getId(), term));
@@ -166,14 +166,14 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         plane.createIndex(descriptor("digested"));
         plane.createIndex(descriptor("undigested"));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("backfill-node"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             plane.membership().refresh();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(List.of(Map.entry("digested", 0), Map.entry("undigested", 0)));
             for (ShardId shardId : node.reconciler().openShards()) {
-                node.index(shardId, "doc", "{\"msg\":\"x\",\"n\":5}");
+                node.writes().index(shardId, "doc", "{\"msg\":\"x\",\"n\":5}");
             }
             loop.setIdleAfterMillis(1);
             loop.releaseIdle(System.currentTimeMillis() + 60_000L);
@@ -253,18 +253,18 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
      */
     private void crashWithOnePublishedAndOneNot(BlobStore store, AtomicLong clock, ServerlessNode dying) throws Exception {
         final MetadataPlane plane = plane(store, clock);
-        dying.start();
+        dying.startup().start();
         dying.setMetadataPlane(plane);
-        dying.renewLease(plane);
+        dying.leases().renewLease(plane);
         final BackgroundReconciler loop = new BackgroundReconciler(dying, plane).setDemandDrivenActivation(true);
         loop.activateOnDemand(List.of(Map.entry("published", 0), Map.entry("unpublished", 0)));
         for (ShardId shardId : dying.reconciler().openShards()) {
-            dying.index(shardId, "first", "{\"msg\":\"published\",\"n\":1}");
+            dying.writes().index(shardId, "first", "{\"msg\":\"published\",\"n\":1}");
         }
         loop.publishAll();
         for (ShardId shardId : dying.reconciler().openShards()) {
             if (shardId.getIndexName().equals("unpublished")) {
-                dying.index(shardId, "second", "{\"msg\":\"only in the log\",\"n\":2}");
+                dying.writes().index(shardId, "second", "{\"msg\":\"only in the log\",\"n\":2}");
             }
         }
         assertTrue("marked while held", markedTerm(plane, "published") > 0L);
@@ -286,9 +286,9 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             clock.addAndGet(2 * TTL);
 
             final MetadataPlane plane = plane(store, clock);
-            survivor.start();
+            survivor.startup().start();
             survivor.setMetadataPlane(plane);
-            survivor.renewLease(plane);
+            survivor.leases().renewLease(plane);
             plane.membership().refresh();
             final BackgroundReconciler loop = new BackgroundReconciler(survivor, plane).setDemandDrivenActivation(true);
             loop.takeOverFrom(dead);
@@ -296,7 +296,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             assertBusy(() -> assertEquals(1, survivor.reconciler().openShards().size()), 30, TimeUnit.SECONDS);
             final ShardId taken = survivor.reconciler().openShards().iterator().next();
             assertEquals("only the shard with unpublished writes is taken", "unpublished", taken.getIndexName());
-            assertTrue("and its log is replayed", survivor.get(taken, "second").found());
+            assertTrue("and its log is replayed", survivor.reads().get(taken, "second").found());
 
             final var head = plane.heads().read("published", 0).orElseThrow();
             assertNull("the published shard is given back, not taken", head.ownerNodeId());
@@ -323,9 +323,9 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             clock.addAndGet(10 * TTL);
 
             final MetadataPlane plane = plane(store, clock);
-            later.start();
+            later.startup().start();
             later.setMetadataPlane(plane);
-            later.renewLease(plane);
+            later.leases().renewLease(plane);
             plane.membership().refresh();
             final BackgroundReconciler loop = new BackgroundReconciler(later, plane).setDemandDrivenActivation(true);
             final JanitorPass pass = loop.sweepAbandoned(100, 8);
@@ -340,7 +340,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             }, 30, TimeUnit.SECONDS);
             loop.activateOnDemand(List.of(Map.entry("unpublished", 0)));
             final ShardId taken = later.reconciler().openShards().iterator().next();
-            assertTrue("what the dead node acknowledged is there", later.get(taken, "second").found());
+            assertTrue("what the dead node acknowledged is there", later.reads().get(taken, "second").found());
             assertNull(plane.heads().read("published", 0).orElseThrow().ownerNodeId());
             assertEquals(0L, markedTerm(plane, "published"));
             assertTrue("the dead node's claims are all gone", plane.claimsOf(dead).isEmpty());
@@ -357,14 +357,14 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         final MetadataPlane plane = plane(store, clock);
         plane.createIndex(descriptor("leaked"));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("janitor-leaked"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             plane.membership().refresh();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(List.of(Map.entry("leaked", 0)));
             final ShardId shardId = node.reconciler().openShards().iterator().next();
-            node.index(shardId, "doc", "{\"msg\":\"x\",\"n\":1}");
+            node.writes().index(shardId, "doc", "{\"msg\":\"x\",\"n\":1}");
             loop.publishAll();
             final long term = plane.heads().read("leaked", 0).orElseThrow().term();
             // The head given back, the mark not cleared: what a failed clear leaves.
@@ -446,9 +446,9 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
         final MetadataPlane plane = plane(store, clock);
         plane.createIndex(descriptor("leaked"));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("janitor-claims"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             plane.membership().refresh();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(List.of(Map.entry("leaked", 0)));

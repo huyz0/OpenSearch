@@ -385,10 +385,10 @@ public class SearchFilterContractTests extends OpenSearchTestCase {
                 30_000L
             );
             plane.createIndex(new org.opensearch.serverless.cluster.IndexDescriptor("counted", "uuid-counted", 1, "{}", null));
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final var shard = node.activateWriter(plane, "counted", 0).orElseThrow();
-            node.index(shard, "one", "{}");
+            node.writes().index(shard, "one", "{}");
             node.reconciler().shard(shard).refresh("test");
             final var address = node.boundHttpAddress().publishAddress();
             final var request = java.net.http.HttpRequest.newBuilder(

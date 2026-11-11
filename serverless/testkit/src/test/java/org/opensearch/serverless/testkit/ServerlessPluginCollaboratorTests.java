@@ -105,7 +105,7 @@ public class ServerlessPluginCollaboratorTests extends OpenSearchTestCase {
     public void testAPluginIsHandedRealCollaborators() throws Exception {
         CapturingPlugin.CAPTURED.set(null);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("collaborators"), List.of(new CapturingPlugin()))) {
-            node.start();
+            node.startup().start();
             final Object[] got = CapturingPlugin.CAPTURED.get();
             assertNotNull("createComponents must have run", got);
 
@@ -147,7 +147,7 @@ public class ServerlessPluginCollaboratorTests extends OpenSearchTestCase {
     public void testAPluginIsHandedAWorkingScriptService() throws Exception {
         CapturingPlugin.CAPTURED.set(null);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("collaborators-script"), List.of(new CapturingPlugin()))) {
-            node.start();
+            node.startup().start();
             final ScriptService scripts = (ScriptService) CapturingPlugin.CAPTURED.get()[4];
             // The service a plugin is handed has a real engine in it: modules:lang-painless is a
             // dependency and its engine is registered directly, the same way the transport is chosen. A
@@ -176,7 +176,7 @@ public class ServerlessPluginCollaboratorTests extends OpenSearchTestCase {
     /** Using the resolver refuses, and the refusal says what to do instead. */
     public void testResolvingAnIndexNameRefusesWithAReason() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("collaborators-resolve"))) {
-            node.start();
+            node.startup().start();
             final IndexNameExpressionResolver resolver = node.indexNameExpressionResolver();
             final var failure = expectThrows(
                 UnsupportedOperationException.class,

@@ -190,7 +190,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                 List.of(ServerlessAuthPlugin.withClock(settings, System::currentTimeMillis), new ReadOnlyForEveryoneElsePlugin())
             )
         ) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -390,7 +390,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                 List.of(ServerlessAuthPlugin.withClock(settings, System::currentTimeMillis), new RedactingPlugin())
             )
         ) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -467,7 +467,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                 List.of(ServerlessAuthPlugin.withClock(settings, System::currentTimeMillis), new ReadOnlyForEveryoneElsePlugin())
             )
         ) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -500,7 +500,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                 List.of(ServerlessAuthPlugin.withClock(settings, System::currentTimeMillis), new ReadOnlyForEveryoneElsePlugin())
             )
         ) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want(".serverless_auth", 0);
@@ -549,7 +549,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                 List.of(ServerlessAuthPlugin.withClock(settings, System::currentTimeMillis), new ReadOnlyForEveryoneElsePlugin())
             )
         ) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -613,7 +613,7 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(plainSettings("authz-none"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertTrue("no filters", node.actionGate().isEmpty());
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);

@@ -118,8 +118,8 @@ public class IndexCreationValidationTests extends OpenSearchTestCase {
             assertEquals(response.body(), 200, response.statusCode());
             assertFalse("validation must not register an IndexService", node.indicesService().iterator().hasNext());
             final var shard = node.activateWriter(metadata, "valid", 0).orElseThrow();
-            node.index(shard, "doc", "{\"msg\":\"HELLO\"}");
-            assertTrue(node.get(shard, "doc").found());
+            node.writes().index(shard, "doc", "{\"msg\":\"HELLO\"}");
+            assertTrue(node.reads().get(shard, "doc").found());
         });
     }
 
@@ -135,7 +135,7 @@ public class IndexCreationValidationTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 work.accept(node, metadata);
             }
@@ -164,8 +164,8 @@ public class IndexCreationValidationTests extends OpenSearchTestCase {
             final var response = send(node, "PUT", "/events-1", "{\"mappings\":{\"_doc\":{\"properties\":{\"n\":{\"type\":\"long\"}}}}}");
             assertEquals(response.body(), 200, response.statusCode());
             final var shard = node.activateWriter(metadata, "events-1", 0).orElseThrow();
-            node.index(shard, "doc", "{\"n\":9,\"tag\":\"valid\"}");
-            assertTrue(node.get(shard, "doc").found());
+            node.writes().index(shard, "doc", "{\"n\":9,\"tag\":\"valid\"}");
+            assertTrue(node.reads().get(shard, "doc").found());
         });
     }
 
@@ -199,8 +199,8 @@ public class IndexCreationValidationTests extends OpenSearchTestCase {
             } else {
                 assertFalse(node.indicesService().iterator().hasNext());
                 final var shard = node.activateWriter(metadata, "sorted", 0).orElseThrow();
-                node.index(shard, "doc", "{\"n\":9}");
-                assertTrue(node.get(shard, "doc").found());
+                node.writes().index(shard, "doc", "{\"n\":9}");
+                assertTrue(node.reads().get(shard, "doc").found());
             }
         });
     }

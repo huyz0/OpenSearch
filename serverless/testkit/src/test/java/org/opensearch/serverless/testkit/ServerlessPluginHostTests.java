@@ -193,7 +193,7 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-host"), List.of(new TestPlugin()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertTrue("the plugin's createComponents must have run, with a usable client", STARTED.get());
             assertEquals("and the node must know it is running it", 1, node.plugins().plugins().size());
@@ -223,7 +223,7 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
      */
     public void testAPluginsWrapperCanRefuseARequest() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-refuse"), List.of(new TestPlugin()))) {
-            node.start();
+            node.startup().start();
             assertEquals("with the plugin permitting, the request is served", 200, send(node, "GET", "/").status());
 
             REFUSE.set(true);
@@ -244,7 +244,7 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
      */
     public void testANodeWithNoPluginsIsUnchanged() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-none"))) {
-            node.start();
+            node.startup().start();
             assertTrue("no plugins", node.plugins().plugins().isEmpty());
             assertEquals(200, send(node, "GET", "/").status());
             // Core's default: authenticates nobody and fails no checks, which is why plain OpenSearch is
@@ -278,7 +278,7 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
     public void testAPluginIsToldWhenTheNodeIsServing() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-started"), List.of(new TestPlugin()))) {
             assertNull("not before start", STARTED_NODE.get());
-            node.start();
+            node.startup().start();
             assertEquals("a plugin must be told the node is serving, and which node it is", node.localNode().getId(), STARTED_NODE.get());
         }
     }
@@ -293,7 +293,7 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
      */
     public void testAPluginIsClosedWithTheNode() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-close"), List.of(new TestPlugin()))) {
-            node.start();
+            node.startup().start();
             assertFalse("not while the node is running", CLOSED.get());
         }
         assertTrue("a plugin must be closed when its node is", CLOSED.get());
@@ -347,7 +347,7 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
      */
     public void testAPluginThatFailsToStartStopsTheNode() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-broken"), List.of(new BrokenPlugin()))) {
-            final var failure = expectThrows(IllegalStateException.class, node::start);
+            final var failure = expectThrows(IllegalStateException.class, node.startup()::start);
             assertTrue(
                 "the node must say a plugin stopped it: " + failure.getMessage(),
                 failure.getMessage().contains("plugin failed to start")

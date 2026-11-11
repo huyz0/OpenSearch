@@ -55,7 +55,7 @@ public class RolloverGenerationBoundaryTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 metadata.indexTemplates().put("streams", "{\"index_patterns\":[\"stream-*\"],\"data_stream\":{}}");
                 work.accept(new Fixture(node, metadata, store));

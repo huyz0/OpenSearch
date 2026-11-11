@@ -65,13 +65,13 @@ public class ServerlessLedgerVerdictTests extends OpenSearchTestCase {
 
     /** A node holding alpha, with its writes acknowledged and in the log only. */
     private ShardId writeAcknowledged(ServerlessNode node, MetadataPlane plane, List<String> ids) throws Exception {
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
-        node.renewLease(plane);
+        node.leases().renewLease(plane);
         new BackgroundReconciler(node, plane).setDemandDrivenActivation(true).activateOnDemand(List.of(Map.entry("alpha", 0)));
         final ShardId shardId = node.reconciler().openShards().iterator().next();
         for (String id : ids) {
-            node.index(shardId, id, "{\"msg\":\"m\",\"n\":1}");
+            node.writes().index(shardId, id, "{\"msg\":\"m\",\"n\":1}");
         }
         return shardId;
     }
@@ -163,9 +163,9 @@ public class ServerlessLedgerVerdictTests extends OpenSearchTestCase {
             clock.addAndGet(2 * TTL);
 
             final MetadataPlane takerPlane = plane(store, clock);
-            after.start();
+            after.startup().start();
             after.setMetadataPlane(takerPlane);
-            after.renewLease(takerPlane);
+            after.leases().renewLease(takerPlane);
             final AtomicReference<Exception> takeoverFailed = new AtomicReference<>();
             final Thread takeover = new Thread(() -> {
                 try {

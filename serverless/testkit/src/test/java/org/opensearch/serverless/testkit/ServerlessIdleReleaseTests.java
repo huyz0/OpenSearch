@@ -76,7 +76,7 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("idle-one", "ingest"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setIdleAfterMillis(IDLE_AFTER);
             loop.want("alpha", 0);
@@ -120,7 +120,7 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("idle-busy", "ingest"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setIdleAfterMillis(IDLE_AFTER);
             loop.want("alpha", 0);
@@ -159,7 +159,7 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, 1);
 
         final ServerlessNode writer = new ServerlessNode(nodeSettings("idle-reader-writer", "ingest"));
-        writer.start();
+        writer.startup().start();
         writer.setMetadataPlane(plane);
         final BackgroundReconciler writing = new BackgroundReconciler(writer, plane);
         writing.want("alpha", 0);
@@ -170,7 +170,7 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
         writer.close();
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("idle-reader", "search"))) {
-            reader.start();
+            reader.startup().start();
             reader.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(reader, plane).setIdleAfterMillis(IDLE_AFTER);
 
@@ -209,7 +209,7 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("idle-publish", "ingest"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setIdleAfterMillis(IDLE_AFTER);
             loop.want("alpha", 0);
@@ -250,7 +250,7 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
             try (ServerlessNode node = new ServerlessNode(nodeSettings("idle-old-process", "ingest"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var loop = new BackgroundReconciler(node, plane).setIdleAfterMillis(IDLE_AFTER);
                 loop.want("alpha", 0);
@@ -297,7 +297,7 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
     /** Opens the shard fresh from the object store alone and counts what is there. */
     private long documentsInThePublishedCommit(MetadataPlane plane, String name) throws Exception {
         try (ServerlessNode verifier = new ServerlessNode(nodeSettings(name, "search"))) {
-            verifier.start();
+            verifier.startup().start();
             verifier.setMetadataPlane(plane);
             final ShardId shardId = verifier.serveAsReader(plane, "alpha", 0);
             return org.opensearch.serverless.shard.ShardQuery.execute(verifier.searchService(), shardId, "msg", "flushed", 10).total();

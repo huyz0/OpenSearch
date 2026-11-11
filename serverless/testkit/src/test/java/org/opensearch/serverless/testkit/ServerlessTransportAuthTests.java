@@ -118,7 +118,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
         try (var store = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), now, TTL);
             try (var node = new ServerlessNode(nodeSettings("secret-cache-coalescing"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 node.transportSecrets(false);
                 final var rotated = plane.rotateTransportSecret();
@@ -261,8 +261,8 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("mac-owner"), List.of());
             ServerlessNode other = new ServerlessNode(nodeSettings("mac-other"), List.of(new TransportCapturingPlugin()))
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
             owner.activateWriter(plane, "alpha", 0);
@@ -329,8 +329,8 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("raw-owner"), List.of());
             ServerlessNode stranger = new ServerlessNode(nodeSettings("raw-stranger"), List.of(new TransportCapturingPlugin()))
         ) {
-            owner.start();
-            stranger.start();
+            owner.startup().start();
+            stranger.startup().start();
             owner.setMetadataPlane(plane);
             owner.activateWriter(plane, "alpha", 0);
 
@@ -387,8 +387,8 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("replay-owner"), List.of());
             ServerlessNode other = new ServerlessNode(nodeSettings("replay-other"), List.of(new TransportCapturingPlugin()))
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
             owner.activateWriter(plane, "alpha", 0);
@@ -444,8 +444,8 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("rotate-owner"), List.of());
             ServerlessNode other = new ServerlessNode(nodeSettings("rotate-other"), List.of())
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
             owner.activateWriter(plane, "alpha", 0);

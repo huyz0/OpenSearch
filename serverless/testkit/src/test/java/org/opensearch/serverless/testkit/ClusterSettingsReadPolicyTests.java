@@ -44,7 +44,7 @@ public class ClusterSettingsReadPolicyTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 metadata.clusterConfig().update(Map.of("original.key", "secret"));
                 store.reset();

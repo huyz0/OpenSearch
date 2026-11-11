@@ -46,7 +46,7 @@ public class NodeLogJanitorTests extends OpenSearchTestCase {
     }
 
     private static BackgroundReconciler takeAll(ServerlessNode node, MetadataPlane plane, AtomicLong clock) throws Exception {
-        node.renewLease(plane);
+        node.leases().renewLease(plane);
         plane.membership().refresh();
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
         for (int shard = 0; shard < SHARDS; shard++) {
@@ -63,11 +63,11 @@ public class NodeLogJanitorTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
         final ServerlessNode first = new ServerlessNode(nodeSettings("node-log-janitor-first"));
         try {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             takeAll(first, plane, clock);
             for (ShardId shardId : new ArrayList<>(first.reconciler().openShards())) {
-                first.index(shardId, "unpublished-" + shardId.id(), "{\"msg\":\"u\",\"n\":" + shardId.id() + "}");
+                first.writes().index(shardId, "unpublished-" + shardId.id(), "{\"msg\":\"u\",\"n\":" + shardId.id() + "}");
             }
             final String dead = first.localNode().getId();
             assertEquals("a live node's log is its own", MetadataPlane.NodeLogCollected.NOTHING, plane.collectNodeLog(dead));
@@ -83,17 +83,17 @@ public class NodeLogJanitorTests extends OpenSearchTestCase {
             assertEquals("and the lease still names it", epochs, plane.membership().read(dead).orElseThrow().nodeLog());
 
             try (ServerlessNode second = new ServerlessNode(nodeSettings("node-log-janitor-second"))) {
-                second.start();
+                second.startup().start();
                 second.setMetadataPlane(plane);
                 final BackgroundReconciler loop = takeAll(second, plane, clock);
                 for (ShardId shardId : second.reconciler().openShards()) {
-                    assertTrue(second.get(shardId, "unpublished-" + shardId.id()).found());
+                    assertTrue(second.reads().get(shardId, "unpublished-" + shardId.id()).found());
                 }
 
                 // Long enough after the departure that takeovers are done; the survivor's janitor deletes the log.
                 for (int step = 0; step < 6; step++) {
                     clock.addAndGet(TTL / 2);
-                    second.renewLease(plane);
+                    second.leases().renewLease(plane);
                 }
                 plane.membership().refresh();
                 loop.sweepAbandoned(BackgroundReconciler.DEFAULT_JANITOR_BUDGET, 0);

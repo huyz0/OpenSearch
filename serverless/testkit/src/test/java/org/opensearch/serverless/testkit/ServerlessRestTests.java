@@ -58,7 +58,7 @@ public class ServerlessRestTests extends OpenSearchTestCase {
 
     public void testNodeBindsAndServesItsAllowlistedSurface() throws Exception {
         try (ServerlessNode node = new ServerlessNode(httpNodeSettings("rest-a"))) {
-            node.start();
+            node.startup().start();
 
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             assertTrue("HTTP did not bind to a real port", http.getPort() > 0);
@@ -80,7 +80,7 @@ public class ServerlessRestTests extends OpenSearchTestCase {
 
     public void testUnimplementedEndpointsDoNotReturnAConfidentEmptyAnswer() throws Exception {
         try (ServerlessNode node = new ServerlessNode(httpNodeSettings("rest-b"))) {
-            node.start();
+            node.startup().start();
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
             // The surface is an allowlist. These exist in classic OpenSearch and must NOT answer
@@ -104,7 +104,7 @@ public class ServerlessRestTests extends OpenSearchTestCase {
 
     public void testHealthReportsTheMembershipSourceRatherThanAConstant() throws Exception {
         try (ServerlessNode node = new ServerlessNode(httpNodeSettings("rest-d"))) {
-            node.start();
+            node.startup().start();
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             assertTrue(get(http, "/_serverless/health").contains("\"members_visible_to_this_node\":1"));
 
@@ -141,7 +141,7 @@ public class ServerlessRestTests extends OpenSearchTestCase {
 
     public void testNodeShutsDownCleanlyAndReleasesItsPort() throws Exception {
         final ServerlessNode node = new ServerlessNode(httpNodeSettings("rest-c"));
-        node.start();
+        node.startup().start();
         final TransportAddress http = node.boundHttpAddress().publishAddress();
         assertTrue(get(http, "/").startsWith("200 "));
         node.close();

@@ -42,7 +42,7 @@ public class DocumentWriteRequestExecutionTests extends OpenSearchTestCase {
 
         void seed(String index, String id) throws Exception {
             final var shard = new ShardId(index, "uuid-" + index, 0);
-            node.index(shard, id, "{\"value\":\"before\"}");
+            node.writes().index(shard, id, "{\"value\":\"before\"}");
             node.reconciler().shard(shard).refresh("seed-policy-test");
         }
     }
@@ -60,7 +60,7 @@ public class DocumentWriteRequestExecutionTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 for (String index : List.of("original", "selected")) {
                     metadata.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, "{}", null));

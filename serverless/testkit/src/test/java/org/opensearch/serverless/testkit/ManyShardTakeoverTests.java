@@ -57,7 +57,7 @@ public class ManyShardTakeoverTests extends OpenSearchTestCase {
         final List<ShardId> held = new ArrayList<>(node.reconciler().openShards());
         assertEquals("the first writer opens every shard", SHARDS, held.size());
         for (int i = 0; i < 20; i++) {
-            node.index(held.get(i % SHARDS), "first-" + i, "{\"msg\":\"first\",\"n\":" + i + "}");
+            node.writes().index(held.get(i % SHARDS), "first-" + i, "{\"msg\":\"first\",\"n\":" + i + "}");
         }
         loop.publishAll();
         return held;
@@ -73,7 +73,7 @@ public class ManyShardTakeoverTests extends OpenSearchTestCase {
         assertEquals("one pass opens every shard it wants", SHARDS, node.reconciler().openShards().size());
         for (ShardId shardId : node.reconciler().openShards()) {
             assertTrue(shardId + " opens at the term it won", node.reconciler().shard(shardId).getOperationPrimaryTerm() > 1L);
-            node.index(shardId, "second-" + shardId.id(), "{\"msg\":\"second\",\"n\":" + shardId.id() + "}");
+            node.writes().index(shardId, "second-" + shardId.id(), "{\"msg\":\"second\",\"n\":" + shardId.id() + "}");
         }
         loop.publishAll();
     }
@@ -83,7 +83,7 @@ public class ManyShardTakeoverTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
         try (ServerlessNode first = new ServerlessNode(nodeSettings("many-take-first"))) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane);
             holdAndWrite(first, loop, clock);
@@ -95,7 +95,7 @@ public class ManyShardTakeoverTests extends OpenSearchTestCase {
             assertTrue("given back", first.reconciler().openShards().isEmpty());
         }
         try (ServerlessNode second = new ServerlessNode(nodeSettings("many-take-second"))) {
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
             takeAllInOnePass(second, plane, clock);
         }
@@ -107,28 +107,28 @@ public class ManyShardTakeoverTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
         final ServerlessNode first = new ServerlessNode(nodeSettings("many-crash-first"));
         try {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             final List<ShardId> held = holdAndWrite(first, new BackgroundReconciler(first, plane), clock);
             // Unpublished writes, so the survivor has a log to replay on every shard.
             final java.util.Map<Integer, String> unpublished = new java.util.HashMap<>();
             for (ShardId shardId : held) {
                 final String id = "unpublished-" + shardId.id();
-                first.index(shardId, id, "{\"msg\":\"first\",\"n\":" + shardId.id() + "}");
+                first.writes().index(shardId, id, "{\"msg\":\"first\",\"n\":" + shardId.id() + "}");
                 unpublished.put(shardId.id(), id);
             }
             // The writer never lets go; its lease runs out on the shared clock.
             clock.addAndGet(2 * TTL);
             try (ServerlessNode survivor = new ServerlessNode(nodeSettings("many-crash-survivor"))) {
-                survivor.start();
+                survivor.startup().start();
                 survivor.setMetadataPlane(plane);
-                survivor.renewLease(plane);
+                survivor.leases().renewLease(plane);
                 plane.membership().refresh();
                 takeAllInOnePass(survivor, plane, clock);
                 for (ShardId shardId : survivor.reconciler().openShards()) {
                     assertTrue(
                         "the unpublished write to " + shardId + " was replayed",
-                        survivor.get(shardId, unpublished.get(shardId.id())).found()
+                        survivor.reads().get(shardId, unpublished.get(shardId.id())).found()
                     );
                 }
             }
@@ -147,7 +147,7 @@ public class ManyShardTakeoverTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
         try (ServerlessNode first = new ServerlessNode(nodeSettings("many-refresh-first"))) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane);
             holdAndWrite(first, loop, clock);
@@ -158,7 +158,7 @@ public class ManyShardTakeoverTests extends OpenSearchTestCase {
             loop.releaseIdle(System.currentTimeMillis() + 60_000L);
         }
         try (ServerlessNode second = new ServerlessNode(nodeSettings("many-refresh-second"))) {
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
             final ShardId shardId = second.activateWriter(plane, "alpha", 0).orElseThrow();
             final long term = second.reconciler().shard(shardId).getOperationPrimaryTerm();

@@ -75,7 +75,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
 
     private ServerlessNode started(MetadataPlane plane, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         return node;
     }
@@ -400,7 +400,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
             owner.activateWriter(plane, "alpha", 0);
             send(ownerHttp, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"original\",\"n\":1}");
 
-            other.start();
+            other.startup().start();
             other.setMetadataPlane(plane);
             final TransportAddress otherHttp = other.boundHttpAddress().publishAddress();
             assertTrue("the other node must not own the shard", other.reconciler().openShards().isEmpty());

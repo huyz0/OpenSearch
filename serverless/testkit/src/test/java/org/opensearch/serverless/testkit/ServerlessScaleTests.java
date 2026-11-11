@@ -117,7 +117,7 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
         createIndices(plane, 0, 1_000);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p9-residency"))) {
-            node.start();
+            node.startup().start();
             node.activateWriter(plane, "idx-7", 0);
 
             // A thousand indices exist. This node holds one shard of one of them.
@@ -171,8 +171,8 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("p9-stale-a"));
             ServerlessNode b = new ServerlessNode(nodeSettings("p9-stale-b"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             a.activateWriter(plane, "idx-0", 0);
             assertEquals(1, plane.truthFor(a.localNode().getId()).assignments().size());
 
@@ -195,7 +195,7 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
         createIndices(plane, 0, 2);
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p9-deleted"))) {
-            a.start();
+            a.startup().start();
             a.activateWriter(plane, "idx-0", 0);
             a.activateWriter(plane, "idx-1", 0);
             assertEquals(2, plane.truthFor(a.localNode().getId()).assignments().size());
@@ -313,7 +313,7 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
         createIndices(plane, 0, population);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p9-truth-" + population))) {
-            node.start();
+            node.startup().start();
             node.activateWriter(plane, "idx-3", 0);
             counter.reset();
             plane.truthFor(node.localNode().getId());

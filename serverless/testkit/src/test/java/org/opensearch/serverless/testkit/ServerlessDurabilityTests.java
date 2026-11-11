@@ -72,7 +72,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("m10-auto"))) {
-            a.start();
+            a.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -83,8 +83,8 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
                 plane.segmentPublisher("alpha", 0).readManifest().isEmpty()
             );
 
-            a.index(shardId, "1", "{\"msg\":\"auto\",\"n\":1}");
-            a.index(shardId, "2", "{\"msg\":\"auto\",\"n\":2}");
+            a.writes().index(shardId, "1", "{\"msg\":\"auto\",\"n\":1}");
+            a.writes().index(shardId, "2", "{\"msg\":\"auto\",\"n\":2}");
 
             final TickResult published = loop.tick(clock.get() + 1_000);
             assertEquals("the tick should have published the shard", 1, published.published().size());
@@ -108,7 +108,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, objectStore);
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("m10-writer"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
         loop.want("alpha", 0);
         loop.tick(clock.get());
@@ -116,13 +116,13 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
 
         // Five writes, then a tick publishes them. Note: publishShard is never called by this test.
         for (int i = 1; i <= 5; i++) {
-            a.index(shardId, String.valueOf(i), "{\"msg\":\"durable\",\"n\":" + i + "}");
+            a.writes().index(shardId, String.valueOf(i), "{\"msg\":\"durable\",\"n\":" + i + "}");
         }
         assertEquals(1, loop.tick(clock.get() + 1_000).published().size());
 
         // Three more writes that no publication will ever cover.
         for (int i = 6; i <= 8; i++) {
-            a.index(shardId, String.valueOf(i), "{\"msg\":\"durable\",\"n\":" + i + "}");
+            a.writes().index(shardId, String.valueOf(i), "{\"msg\":\"durable\",\"n\":" + i + "}");
         }
 
         // The process dies. No release, no drain, no final flush.
@@ -130,7 +130,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
 
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("m10-successor"))) {
-            b.start();
+            b.startup().start();
             final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals(
                 "writes made after the last publication were lost: the WAL did not replay",
@@ -146,13 +146,13 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("m10-idem"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
         loop.want("alpha", 0);
         loop.tick(clock.get());
         final ShardId shardId = a.reconciler().openShards().iterator().next();
         for (int i = 1; i <= 4; i++) {
-            a.index(shardId, String.valueOf(i), "{\"msg\":\"same\",\"n\":" + i + "}");
+            a.writes().index(shardId, String.valueOf(i), "{\"msg\":\"same\",\"n\":" + i + "}");
         }
         // Published, so all four are in the commit -- and still in the WAL, because truncation drops
         // only what the PREVIOUS publish saw.
@@ -161,7 +161,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
 
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("m10-idem2"))) {
-            b.start();
+            b.startup().start();
             final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals(
                 "replay duplicated documents that were already committed",
@@ -177,18 +177,18 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("m10-trunc"))) {
-            a.start();
+            a.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final ShardId shardId = a.reconciler().openShards().iterator().next();
             final var wal = a.reconciler().wal(shardId);
 
-            a.index(shardId, "1", "{\"msg\":\"cycle\",\"n\":1}");
+            a.writes().index(shardId, "1", "{\"msg\":\"cycle\",\"n\":1}");
             loop.tick(clock.get() + 1_000);
             assertEquals("the first publish must retain what it just saw", 1, wal.replayable().size());
 
-            a.index(shardId, "2", "{\"msg\":\"cycle\",\"n\":2}");
+            a.writes().index(shardId, "2", "{\"msg\":\"cycle\",\"n\":2}");
             loop.tick(clock.get() + 2_000);
             assertEquals("the second publish should drop the first cycle and keep its own", 1, wal.replayable().size());
         }
@@ -244,13 +244,13 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, objectStore);
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("m15-reclaim-a"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
         final ShardId onA = a.reconciler().openShards().iterator().next();
         for (int i = 1; i <= 3; i++) {
-            a.index(onA, String.valueOf(i), "{\"msg\":\"reclaim\",\"n\":" + i + "}");
+            a.writes().index(onA, String.valueOf(i), "{\"msg\":\"reclaim\",\"n\":" + i + "}");
         }
         a.close(); // dies with three records and no publication behind them
 
@@ -261,14 +261,14 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
 
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("m15-reclaim-b"))) {
-            b.start();
+            b.startup().start();
             final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
             final ShardId onB = b.reconciler().openShards().iterator().next();
             assertEquals("the successor did not replay", 3L, ShardOps.hits(b.searchService(), onB, "msg", "reclaim"));
 
-            b.index(onB, "4", "{\"msg\":\"reclaim\",\"n\":4}");
+            b.writes().index(onB, "4", "{\"msg\":\"reclaim\",\"n\":4}");
             assertEquals("nothing published, so nothing could be reclaimed", 1, loopB.tick(clock.get() + 1_000).published().size());
 
             final var afterPublish = walRecordsByTerm(objectStore);
@@ -303,20 +303,20 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, objectStore);
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("m15-chain-a"));
-        a.start();
+        a.startup().start();
         final ShardId onA = a.activateWriter(plane, "alpha", 0).orElseThrow();
         for (int i = 1; i <= 3; i++) {
-            a.index(onA, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}");
+            a.writes().index(onA, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}");
         }
         a.close();
 
         clock.set(1_000L + TTL);
         final ServerlessNode b = new ServerlessNode(nodeSettings("m15-chain-b"));
-        b.start();
+        b.startup().start();
         final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
         assertEquals("the second writer did not replay", 3L, ShardOps.hits(b.searchService(), onB, "msg", "chain"));
-        b.index(onB, "4", "{\"msg\":\"chain\",\"n\":4}");
-        b.index(onB, "5", "{\"msg\":\"chain\",\"n\":5}");
+        b.writes().index(onB, "4", "{\"msg\":\"chain\",\"n\":4}");
+        b.writes().index(onB, "5", "{\"msg\":\"chain\",\"n\":5}");
         b.close();
 
         final var beforeAnyPublish = walRecordsByTerm(objectStore);
@@ -329,7 +329,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
 
         clock.set(1_000L + 2 * TTL);
         final ServerlessNode c = new ServerlessNode(nodeSettings("m15-chain-c"));
-        c.start();
+        c.startup().start();
         final BackgroundReconciler loopC = new BackgroundReconciler(c, plane);
         loopC.want("alpha", 0);
         // Activates, replaying both older terms, and publishes in the same pass.
@@ -348,12 +348,12 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
 
         // One more write that no publication will ever cover, so the last failover has to combine a
         // commit with a log rather than reading either one alone.
-        c.index(onC, "6", "{\"msg\":\"chain\",\"n\":6}");
+        c.writes().index(onC, "6", "{\"msg\":\"chain\",\"n\":6}");
         c.close();
 
         clock.set(1_000L + 3 * TTL);
         try (ServerlessNode d = new ServerlessNode(nodeSettings("m15-chain-d"))) {
-            d.start();
+            d.startup().start();
             final ShardId onD = d.activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals(
                 "reclaiming the older terms lost writes that were supposed to be in the commit",

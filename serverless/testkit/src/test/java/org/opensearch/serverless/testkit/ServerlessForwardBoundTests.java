@@ -117,8 +117,8 @@ public class ServerlessForwardBoundTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("bound-owner"), List.of(new SwallowingPlugin()));
             ServerlessNode other = new ServerlessNode(nodeSettings("bound-other"), List.of(new SwallowingPlugin()))
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
             owner.activateWriter(plane, "alpha", 0);

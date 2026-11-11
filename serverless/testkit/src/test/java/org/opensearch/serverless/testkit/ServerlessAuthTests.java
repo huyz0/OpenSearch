@@ -162,7 +162,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
     public void testARequestWithNoCredentialIsRefusedAndChallenged() throws Exception {
         final Settings settings = nodeSettings("auth-anonymous");
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             final Response denied = send(node, "GET", "/", null, null);
             assertEquals("an unauthenticated request must not be served: " + denied.body(), 401, denied.status());
             assertTrue("and must say what is missing: " + denied.body(), denied.body().contains("no credentials were offered"));
@@ -180,7 +180,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final Settings settings = nodeSettings("auth-admin");
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             // A plane, but no account index: the state a deployment is in before anyone creates an
             // account, and the one where "no such user" must not be reported as "store unreachable".
             node.setMetadataPlane(plane(clock));
@@ -216,7 +216,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("auth-first");
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             assertTrue("no account index exists yet", plane.describe(AUTH_INDEX).isEmpty());
 
@@ -260,7 +260,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("auth-usable");
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = ready(node, plane, clock, "alpha");
 
@@ -300,7 +300,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("auth-privilege");
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
 
@@ -355,7 +355,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("auth-removal");
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
 
@@ -396,7 +396,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("auth-staleness");
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
 
@@ -446,7 +446,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final ServerlessAuthPlugin plugin = authPlugin(settings);
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(plugin))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
             assertEquals(
@@ -511,7 +511,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final MetadataPlane plane = plane(clock);
         final Settings settings = nodeSettings("auth-throttle");
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
             assertEquals(
@@ -577,7 +577,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
             .put("serverless.auth.throttle.max_delay", "0s")
             .build();
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane(clock));
 
             final List<Response> answers = sendConcurrently(node, 12, basic(ADMIN, "not-the-password"));
@@ -616,7 +616,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("auth-degraded");
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
             assertEquals(
@@ -647,7 +647,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings), new IdentityProbePlugin()))) {
             PROBE_NODE.set(node);
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
             assertEquals(
@@ -674,7 +674,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("auth-storage");
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
             assertEquals(
@@ -716,7 +716,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("auth-system-index");
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             ready(node, plane, clock);
             assertEquals(
@@ -774,7 +774,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("auth-dotted");
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = ready(node, plane, clock, ".ordinary");
             // A leading dot is decoration. What makes an index a system index is a plugin declaring it.
@@ -876,7 +876,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final Settings settings = nodeSettings("auth-subject");
         try (ServerlessNode node = new ServerlessNode(settings, List.of(authPlugin(settings)))) {
-            node.start();
+            node.startup().start();
             // With a plane but no account index, an unknown credential is "no such account" rather than
             // "the accounts are unreachable", which is the case worth checking here.
             node.setMetadataPlane(plane(clock));

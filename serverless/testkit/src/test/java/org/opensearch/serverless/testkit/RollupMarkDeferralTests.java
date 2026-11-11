@@ -152,9 +152,9 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(descriptor("deferred"));
             try (ServerlessNode node = new ServerlessNode(nodeSettings("rollup-deferral-owner"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
-                node.renewLease(plane);
+                node.leases().renewLease(plane);
                 final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
                 loop.activateOnDemand(List.of(Map.entry("deferred", 0)));
                 final ShardId shardId = node.reconciler().openShards().iterator().next();
@@ -163,7 +163,7 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
                 store.reset();
                 for (int n = 1; n <= 5; n++) {
                     // Each value widens the digest, so every one of these publishes used to swap the rollup.
-                    node.index(shardId, "doc-" + n, "{\"msg\":\"deferred\",\"n\":" + n + "}");
+                    node.writes().index(shardId, "doc-" + n, "{\"msg\":\"deferred\",\"n\":" + n + "}");
                     loop.markDirty(shardId);
                     assertEquals(1, loop.publishDirty().size());
                 }
@@ -187,14 +187,14 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
             ServerlessNode survivor = new ServerlessNode(nodeSettings("rollup-deferral-survivor"))
         ) {
             final MetadataPlane dyingPlane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
-            dying.start();
+            dying.startup().start();
             dying.setMetadataPlane(dyingPlane);
-            dying.renewLease(dyingPlane);
+            dying.leases().renewLease(dyingPlane);
             final BackgroundReconciler dyingLoop = new BackgroundReconciler(dying, dyingPlane).setDemandDrivenActivation(true);
             dyingLoop.activateOnDemand(List.of(Map.entry("orphaned", 0)));
             final ShardId shardId = dying.reconciler().openShards().iterator().next();
             for (int n = 1; n <= 5; n++) {
-                dying.index(shardId, "doc-" + n, "{\"msg\":\"orphaned\",\"n\":" + n + "}");
+                dying.writes().index(shardId, "doc-" + n, "{\"msg\":\"orphaned\",\"n\":" + n + "}");
                 dyingLoop.markDirty(shardId);
                 assertEquals(1, dyingLoop.publishDirty().size());
             }
@@ -206,9 +206,9 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
             // The writer never lets go; its lease runs out on the shared clock.
             clock.addAndGet(2 * TTL);
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
-            survivor.start();
+            survivor.startup().start();
             survivor.setMetadataPlane(plane);
-            survivor.renewLease(plane);
+            survivor.leases().renewLease(plane);
             plane.membership().refresh();
             assertEquals(MetadataPlane.Settled.RELEASED_CLEAN, plane.settleAbandoned("orphaned", 0, dead));
             assertCoversThePublishedRange(entryOf(plane, "orphaned"), clock.get());

@@ -356,8 +356,8 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
                 s3Settings("fence-winner", bucket)
             )
         ) {
-            loser.start();
-            winner.start();
+            loser.startup().start();
+            winner.startup().start();
 
             final ShardId onLoser = loser.activateWriter(plane, "alpha", 0).orElseThrow();
             final long loserTerm = plane.heads().read("alpha", 0).orElseThrow().term();
@@ -413,7 +413,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
                 s3Settings("fence-verify", bucket)
             )
         ) {
-            reader.start();
+            reader.startup().start();
             final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
             assertEquals("the winner's document must survive", 1L, ShardOps.hits(reader.searchService(), shardId, "msg", "winner"));
         }

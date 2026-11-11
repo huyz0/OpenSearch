@@ -61,7 +61,7 @@ public class ServerlessSearchSpillTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("filler", "uuid-filler-00000000", 1, MAPPING, null));
 
         try (ServerlessNode writer = new ServerlessNode(settings("spill-writer", "ingest"))) {
-            writer.start();
+            writer.startup().start();
             writer.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
             loop.want("spill", 0);
@@ -77,9 +77,9 @@ public class ServerlessSearchSpillTests extends OpenSearchTestCase {
             for (String name : List.of("spill-a", "spill-b", "spill-c")) {
                 final ServerlessNode node = new ServerlessNode(settings(name, "search"));
                 searchers.add(node);
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
-                node.heartbeat(plane);
+                node.leases().heartbeat(plane);
             }
             final List<String> ranked = ReaderPlacement.candidatesFor(
                 "spill",

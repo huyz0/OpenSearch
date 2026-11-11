@@ -39,7 +39,7 @@ public class IndexServiceLifecycleTests extends OpenSearchTestCase {
             final var metadata = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, 30_000L);
             metadata.createIndex(new IndexDescriptor("docs", "uuid-docs", 2, MAPPING, null));
             try (var node = new ServerlessNode(settings("opening-sibling"))) {
-                node.start();
+                node.startup().start();
                 final var first = node.activateWriter(metadata, "docs", 0).orElseThrow();
                 final var service = node.indicesService().indexService(first.getIndex());
                 final var opening = new CountDownLatch(1);
@@ -78,7 +78,7 @@ public class IndexServiceLifecycleTests extends OpenSearchTestCase {
             final var metadata = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, 30_000L);
             metadata.createIndex(new IndexDescriptor("docs", "uuid-docs", 2, MAPPING, null));
             try (var node = new ServerlessNode(settings("failed-sibling-marker"))) {
-                node.start();
+                node.startup().start();
                 final var first = node.activateWriter(metadata, "docs", 0).orElseThrow();
                 store.onNextRegisterRead(
                     "#1",

@@ -138,7 +138,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-" + label + "-" + shards))) {
-            node.start();
+            node.startup().start();
             node.setHeadVerifyIntervalMillis(headVerifyMillis);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             for (int shard = 0; shard < shards; shard++) {
@@ -330,7 +330,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
             try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-doc-" + label))) {
-                node.start();
+                node.startup().start();
                 final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
                 loop.want("alpha", 0);
                 loop.tick(System.currentTimeMillis());
@@ -340,7 +340,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 store.reset();
                 final long startedAt = System.nanoTime();
                 for (int i = 0; i < documents; i++) {
-                    node.index(shardId, String.valueOf(i), "{\"msg\":\"cost\",\"n\":" + i + "}");
+                    node.writes().index(shardId, String.valueOf(i), "{\"msg\":\"cost\",\"n\":" + i + "}");
                 }
                 final long writeMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
                 final long perDocument = store.impliedS3Requests();
@@ -390,7 +390,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-idle"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(System.currentTimeMillis());
@@ -477,7 +477,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
 
             clock.addAndGet(TTL + 1);
             try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-reclaim-" + label))) {
-                node.start();
+                node.startup().start();
                 final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
                 loop.want("alpha", 0);
                 loop.tick(clock.get());   // activates, and publishes in the same pass
@@ -492,12 +492,12 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                         .append(ghost, new org.opensearch.serverless.store.WalRecord("g" + ghost, "{\"msg\":\"ghost\"}"));
                 }
 
-                node.index(shardId, "one", "{\"msg\":\"cost\",\"n\":1}");
+                node.writes().index(shardId, "one", "{\"msg\":\"cost\",\"n\":1}");
                 store.reset();
                 assertEquals(1, loop.tick(clock.addAndGet(1_000)).published().size());
                 final long reclaiming = store.listings();
 
-                node.index(shardId, "two", "{\"msg\":\"cost\",\"n\":2}");
+                node.writes().index(shardId, "two", "{\"msg\":\"cost\",\"n\":2}");
                 store.reset();
                 assertEquals(1, loop.tick(clock.addAndGet(1_000)).published().size());
                 final long afterwards = store.listings();
@@ -543,7 +543,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
             try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-bulk-" + label))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
                 loop.want("alpha", 0);
@@ -555,7 +555,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 // The baseline, re-measured here rather than quoted: one document at a time.
                 store.reset();
                 for (int i = 0; i < documents; i++) {
-                    node.index(shardId, "single-" + i, "{\"msg\":\"cost\",\"n\":" + i + "}");
+                    node.writes().index(shardId, "single-" + i, "{\"msg\":\"cost\",\"n\":" + i + "}");
                 }
                 final long oneAtATime = store.blobWrites();
 
@@ -622,7 +622,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
             try (ServerlessNode node = new ServerlessNode(nodeSettings("cost-group-" + label))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
                 loop.want("alpha", 0);
@@ -636,7 +636,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 // when the next write arrives and nothing can be grouped.
                 store.reset();
                 for (int i = 0; i < documents; i++) {
-                    node.index(shardId, "serial-" + i, "{\"msg\":\"cost\",\"n\":" + i + "}");
+                    node.writes().index(shardId, "serial-" + i, "{\"msg\":\"cost\",\"n\":" + i + "}");
                 }
                 final long serial = store.blobWrites();
 
@@ -652,7 +652,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                         try {
                             start.await(30, TimeUnit.SECONDS);
                             for (int i = which; i < documents; i += writers) {
-                                node.index(shardId, "concurrent-" + i, "{\"msg\":\"cost\",\"n\":" + i + "}");
+                                node.writes().index(shardId, "concurrent-" + i, "{\"msg\":\"cost\",\"n\":" + i + "}");
                             }
                         } catch (Throwable t) {
                             failures.add(t);
@@ -760,7 +760,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             );
 
             try (ServerlessNode writer = new ServerlessNode(nodeSettings("cost-aggs-" + label))) {
-                writer.start();
+                writer.startup().start();
                 writer.setMetadataPlane(plane);
                 final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
                 for (int shard = 0; shard < shards; shard++) {
@@ -768,11 +768,12 @@ public class ServerlessCostTests extends OpenSearchTestCase {
                 }
                 loop.tick(System.currentTimeMillis());
                 for (int i = 0; i < 60; i++) {
-                    writer.index(
-                        shardOf(writer, "aggs", i),
-                        String.valueOf(i),
-                        "{\"msg\":\"aggcost\",\"n\":" + i + ",\"colour\":\"c" + (i % 4) + "\"}"
-                    );
+                    writer.writes()
+                        .index(
+                            shardOf(writer, "aggs", i),
+                            String.valueOf(i),
+                            "{\"msg\":\"aggcost\",\"n\":" + i + ",\"colour\":\"c" + (i % 4) + "\"}"
+                        );
                 }
                 loop.tick(System.currentTimeMillis());
 
@@ -872,7 +873,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
 
             final ServerlessNode writer = new ServerlessNode(nodeSettings("cost-get-" + label));
-            writer.start();
+            writer.startup().start();
             writer.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
             for (int shard = 0; shard < shards; shard++) {
@@ -880,7 +881,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             }
             loop.tick(System.currentTimeMillis());
             for (int i = 0; i < 20; i++) {
-                writer.index(shardOf(writer, "alpha", i), String.valueOf(i), "{\"msg\":\"getcost\",\"n\":" + i + "}");
+                writer.writes().index(shardOf(writer, "alpha", i), String.valueOf(i), "{\"msg\":\"getcost\",\"n\":" + i + "}");
             }
             loop.tick(System.currentTimeMillis());   // publish, so a cold reader has something to open
 
@@ -952,7 +953,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
 
             // 3. Forwarded: a peer while the writer still owns the shard.
             try (ServerlessNode idle = new ServerlessNode(nodeSettings("cost-get-fwd-" + label))) {
-                idle.start();
+                idle.startup().start();
                 idle.setMetadataPlane(plane);
                 store.reset();
                 startedAt = System.nanoTime();
@@ -980,7 +981,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             writer.close();
 
             try (ServerlessNode cold = new ServerlessNode(nodeSettings("cost-get-cold-" + label))) {
-                cold.start();
+                cold.startup().start();
                 cold.setMetadataPlane(plane);
                 store.reset();
                 startedAt = System.nanoTime();
@@ -1018,7 +1019,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
 
             final ServerlessNode writer = new ServerlessNode(nodeSettings("cost-search-" + label));
-            writer.start();
+            writer.startup().start();
             writer.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
             for (int shard = 0; shard < shards; shard++) {
@@ -1027,7 +1028,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             loop.tick(System.currentTimeMillis());
             assertEquals("the writer must hold every shard", shards, writer.reconciler().openShards().size());
             for (int i = 0; i < 60; i++) {
-                writer.index(shardOf(writer, "alpha", i), String.valueOf(i), "{\"msg\":\"searchcost\",\"n\":" + i + "}");
+                writer.writes().index(shardOf(writer, "alpha", i), String.valueOf(i), "{\"msg\":\"searchcost\",\"n\":" + i + "}");
             }
             loop.tick(System.currentTimeMillis());   // publish, so a reader has something to open
 
@@ -1059,7 +1060,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
 
             // 2. Forwarded: a second node while the writer still owns everything.
             try (ServerlessNode idle = new ServerlessNode(nodeSettings("cost-search-fwd-" + label))) {
-                idle.start();
+                idle.startup().start();
                 idle.setMetadataPlane(plane);
                 store.reset();
                 startedAt = System.nanoTime();
@@ -1096,7 +1097,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
             // it this node is not a candidate for a shard nobody owns, the fan-out finds no target, and the
             // search returns an empty but honest answer -- which the completeness assertions below catch.
             try (ServerlessNode cold = new ServerlessNode(nodeSettings("cost-search-cold-" + label, "search"))) {
-                cold.start();
+                cold.startup().start();
                 cold.setMetadataPlane(plane);
                 store.reset();
                 startedAt = System.nanoTime();

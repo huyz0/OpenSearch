@@ -108,8 +108,8 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("dev-stale-a"));
             ServerlessNode b = new ServerlessNode(nodeSettings("dev-stale-b"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             assertTrue("A takes the shard", a.activateWriter(deviating.plane(), "alpha", 0).isPresent());
 
             // Now every read of the shard-head is one version out of date -- B is about to be told the
@@ -141,7 +141,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
         deviating.store().broken(RegisterMap.shards(BlobPath.cleanPath())).ambiguousCreateEvery(1);
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("dev-ambiguous"))) {
-            a.start();
+            a.startup().start();
             expectThrows(Exception.class, () -> a.activateWriter(deviating.plane(), "alpha", 0));
             assertTrue("the node must not be serving a shard it believes it failed to take", a.reconciler().openShards().isEmpty());
 
@@ -194,8 +194,8 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("dev-two-a"));
             ServerlessNode b = new ServerlessNode(nodeSettings("dev-two-b"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
 
             final var onA = a.activateWriter(planeA, "alpha", 0);
             final var onB = b.activateWriter(planeB, "alpha", 0);
@@ -223,7 +223,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             // The surviving commit is the first writer's, whole. The second's write is gone -- that part is
             // not recoverable and never was -- but it is gone with an exception rather than in silence.
             try (ServerlessNode reader = new ServerlessNode(readerSettings("dev-two-reader"))) {
-                reader.start();
+                reader.startup().start();
                 final ShardId served = reader.serveAsReader(planeA, "alpha", 0);
                 assertEquals(
                     "the first writer's document must be in the published commit",
@@ -271,8 +271,8 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("dev-mixed-a"));
             ServerlessNode b = new ServerlessNode(nodeSettings("dev-mixed-b"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             final var onA = a.activateWriter(planeA, "alpha", 0).orElseThrow();
             final var onB = b.activateWriter(planeB, "alpha", 0).orElseThrow();
 
@@ -309,7 +309,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("dev-legacy"))) {
-            a.start();
+            a.startup().start();
             final var onA = a.activateWriter(plane, "alpha", 0).orElseThrow();
             ShardOps.indexDoc(a.reconciler().shard(onA), "a1", "{\"msg\":\"aaa\"}");
             a.reconciler().shard(onA).refresh("deviation");

@@ -54,7 +54,7 @@ public class ServerlessActivationStarvationTests extends OpenSearchTestCase {
             .put("serverless.roles", "ingest")
             .build();
         try (ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
 

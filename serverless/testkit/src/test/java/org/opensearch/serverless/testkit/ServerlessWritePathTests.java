@@ -70,8 +70,8 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("p4-a", null));
             ServerlessNode b = new ServerlessNode(nodeSettings("p4-b", null))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
 
             final var acquired = plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId());
             assertTrue(acquired.acquired());
@@ -112,8 +112,8 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("p4-z1", null));
             ServerlessNode b = new ServerlessNode(nodeSettings("p4-z2", null))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             final long termA = plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId()).head().term();
             final ShardId shardId = a.syncFrom(plane).iterator().next();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"from A\",\"n\":1}");
@@ -152,7 +152,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
         plane.createIndex(alpha());
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p4-r", null))) {
-            a.start();
+            a.startup().start();
             final long term = plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId()).head().term();
             final ShardId shardId = a.syncFrom(plane).iterator().next();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"one\",\"n\":1}");
@@ -180,7 +180,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
         plane.createIndex(alpha());
 
         try (ServerlessNode searchOnly = new ServerlessNode(nodeSettings("p4-search", "search"))) {
-            searchOnly.start();
+            searchOnly.startup().start();
             assertEquals(java.util.Set.of("search"), searchOnly.roles());
 
             // Truth says it owns the shard -- someone activated it here -- but its role says otherwise.
@@ -197,7 +197,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
         plane.createIndex(alpha());
 
         try (ServerlessNode ingest = new ServerlessNode(nodeSettings("p4-ingest", "ingest"))) {
-            ingest.start();
+            ingest.startup().start();
             plane.activate("alpha", 0, ingest.localNode().getId(), ingest.localNode().getEphemeralId());
             assertEquals(1, ingest.syncFrom(plane).size());
         }

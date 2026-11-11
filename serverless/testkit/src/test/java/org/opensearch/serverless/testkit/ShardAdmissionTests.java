@@ -37,7 +37,7 @@ public class ShardAdmissionTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var id = node.activateWriter(plane, "index", 0).orElseThrow();
                 node.releaseShard(id, "closed before query admission");
@@ -61,7 +61,7 @@ public class ShardAdmissionTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var id = node.activateWriter(plane, "index", 0).orElseThrow();
                 final var reconciler = node.reconciler();

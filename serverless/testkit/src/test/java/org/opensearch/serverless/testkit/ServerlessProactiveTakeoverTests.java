@@ -61,19 +61,19 @@ public class ServerlessProactiveTakeoverTests extends OpenSearchTestCase {
             ServerlessNode dying = new ServerlessNode(nodeSettings("takeover-dying"));
             ServerlessNode survivor = new ServerlessNode(nodeSettings("takeover-survivor"))
         ) {
-            dying.start();
-            survivor.start();
+            dying.startup().start();
+            survivor.startup().start();
             dying.setMetadataPlane(plane);
             survivor.setMetadataPlane(plane);
             final BackgroundReconciler dyingLoop = new BackgroundReconciler(dying, plane).setDemandDrivenActivation(true);
             dyingLoop.activateOnDemand(indices.stream().map(i -> Map.entry(i, 0)).toList());
             for (ShardId shardId : dying.reconciler().openShards()) {
-                dying.index(shardId, "acked", "{\"msg\":\"in the log only\",\"n\":1}");
+                dying.writes().index(shardId, "acked", "{\"msg\":\"in the log only\",\"n\":1}");
             }
 
             // The dying node stops renewing; its lease runs out on the survivor's clock.
             clock.addAndGet(2 * TTL);
-            survivor.renewLease(plane);
+            survivor.leases().renewLease(plane);
             plane.membership().refresh();
 
             final BackgroundReconciler loop = new BackgroundReconciler(survivor, plane).setDemandDrivenActivation(true);
@@ -92,7 +92,7 @@ public class ServerlessProactiveTakeoverTests extends OpenSearchTestCase {
             }, 30, java.util.concurrent.TimeUnit.SECONDS);
             for (ShardId shardId : survivor.reconciler().openShards()) {
                 assertEquals(survivor.localNode().getId(), plane.heads().read(shardId.getIndexName(), 0).orElseThrow().ownerNodeId());
-                assertTrue("what the dead node acknowledged is there: " + shardId, survivor.get(shardId, "acked").found());
+                assertTrue("what the dead node acknowledged is there: " + shardId, survivor.reads().get(shardId, "acked").found());
             }
         }
     }
@@ -111,12 +111,12 @@ public class ServerlessProactiveTakeoverTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("takeover-live-owner"));
             ServerlessNode peer = new ServerlessNode(nodeSettings("takeover-live-peer"))
         ) {
-            owner.start();
-            peer.start();
+            owner.startup().start();
+            peer.startup().start();
             owner.setMetadataPlane(plane);
             peer.setMetadataPlane(plane);
-            owner.renewLease(plane);
-            peer.renewLease(plane);
+            owner.leases().renewLease(plane);
+            peer.leases().renewLease(plane);
             final BackgroundReconciler ownerLoop = new BackgroundReconciler(owner, plane).setDemandDrivenActivation(true);
             ownerLoop.activateOnDemand(List.of(Map.entry("alpha", 0)));
             assertEquals(owner.localNode().getId(), plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
@@ -139,8 +139,8 @@ public class ServerlessProactiveTakeoverTests extends OpenSearchTestCase {
             ServerlessNode leaving = new ServerlessNode(nodeSettings("takeover-leaving"));
             ServerlessNode staying = new ServerlessNode(nodeSettings("takeover-staying"))
         ) {
-            leaving.start();
-            staying.start();
+            leaving.startup().start();
+            staying.startup().start();
             leaving.setMetadataPlane(plane);
             staying.setMetadataPlane(plane);
             final BackgroundReconciler leavingLoop = new BackgroundReconciler(leaving, plane).setDemandDrivenActivation(true);

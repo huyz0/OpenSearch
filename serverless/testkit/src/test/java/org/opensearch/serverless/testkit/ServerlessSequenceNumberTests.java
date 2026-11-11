@@ -79,14 +79,14 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("seq-basic"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final ShardId shardId = node.reconciler().openShards().iterator().next();
 
-            final var first = node.index(shardId, "1", "{\"msg\":\"a\",\"n\":1}");
-            final var second = node.index(shardId, "2", "{\"msg\":\"b\",\"n\":2}");
+            final var first = node.writes().index(shardId, "1", "{\"msg\":\"a\",\"n\":1}");
+            final var second = node.writes().index(shardId, "2", "{\"msg\":\"b\",\"n\":2}");
             assertEquals("the first write of a shard's life is sequence number 0", 0L, first.seqNo());
             assertEquals("and the next is 1", 1L, second.seqNo());
             assertTrue("a write must report a positive primary term", first.primaryTerm() > 0);
@@ -94,7 +94,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
             assertEquals("a first write of a document is version 1", 1L, first.version());
 
             // Overwriting the same document advances its version but not the other document's.
-            final var overwrite = node.index(shardId, "1", "{\"msg\":\"a2\",\"n\":1}");
+            final var overwrite = node.writes().index(shardId, "1", "{\"msg\":\"a2\",\"n\":1}");
             assertEquals("an overwrite is version 2 of that document", 2L, overwrite.version());
             assertEquals("and takes the next sequence number", 2L, overwrite.seqNo());
             assertFalse("an overwrite is not a creation", overwrite.created());
@@ -118,34 +118,34 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         final long termBefore;
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("seq-a"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
         final ShardId onA = a.reconciler().openShards().iterator().next();
 
         // Two documents that get published, so they arrive at the successor inside the commit.
-        before.put("published-1", a.index(onA, "published-1", "{\"msg\":\"p1\",\"n\":1}").seqNo());
-        before.put("published-2", a.index(onA, "published-2", "{\"msg\":\"p2\",\"n\":2}").seqNo());
+        before.put("published-1", a.writes().index(onA, "published-1", "{\"msg\":\"p1\",\"n\":1}").seqNo());
+        before.put("published-2", a.writes().index(onA, "published-2", "{\"msg\":\"p2\",\"n\":2}").seqNo());
         loopA.tick(clock.get() + 1_000);
 
         // And two that never are, so they arrive only by replay -- the half that used to be renumbered.
-        before.put("logged-1", a.index(onA, "logged-1", "{\"msg\":\"l1\",\"n\":3}").seqNo());
-        before.put("logged-2", a.index(onA, "logged-2", "{\"msg\":\"l2\",\"n\":4}").seqNo());
-        termBefore = a.get(onA, "logged-2").primaryTerm();
+        before.put("logged-1", a.writes().index(onA, "logged-1", "{\"msg\":\"l1\",\"n\":3}").seqNo());
+        before.put("logged-2", a.writes().index(onA, "logged-2", "{\"msg\":\"l2\",\"n\":4}").seqNo());
+        termBefore = a.reads().get(onA, "logged-2").primaryTerm();
 
         a.close();
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode b = new ServerlessNode(nodeSettings("seq-b"))) {
-            b.start();
+            b.startup().start();
             final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
             final ShardId onB = b.reconciler().openShards().iterator().next();
 
             for (Map.Entry<String, Long> entry : before.entrySet()) {
-                final var recovered = b.get(onB, entry.getKey());
+                final var recovered = b.reads().get(onB, entry.getKey());
                 assertTrue(entry.getKey() + " must have survived the failover", recovered.found());
                 assertEquals(
                     "the sequence number of " + entry.getKey() + " must be the one its writer assigned, not a new one",
@@ -156,7 +156,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
 
             // The successor's own writes continue above the inherited history rather than colliding with
             // it -- the property that makes the numbers usable at all.
-            final var next = b.index(onB, "after-failover", "{\"msg\":\"n\",\"n\":5}");
+            final var next = b.writes().index(onB, "after-failover", "{\"msg\":\"n\",\"n\":5}");
             for (Long inherited : before.values()) {
                 assertTrue(
                     "a new write must take a sequence number above everything inherited: " + next.seqNo() + " vs " + inherited,
@@ -180,13 +180,13 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, objectStore);
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("seq-cas-a"));
-        a.start();
+        a.startup().start();
         final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
         loopA.want("alpha", 0);
         loopA.tick(clock.get());
         final ShardId onA = a.reconciler().openShards().iterator().next();
 
-        final var minted = a.index(onA, "doc", "{\"msg\":\"original\",\"n\":1}");
+        final var minted = a.writes().index(onA, "doc", "{\"msg\":\"original\",\"n\":1}");
         final long tokenSeqNo = minted.seqNo();
         final long tokenTerm = minted.primaryTerm();
 
@@ -194,7 +194,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode b = new ServerlessNode(nodeSettings("seq-cas-b"))) {
-            b.start();
+            b.startup().start();
             final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
             loopB.want("alpha", 0);
             loopB.tick(clock.get());
@@ -204,14 +204,14 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
             // ignored, the success below would prove nothing at all.
             expectThrows(
                 org.opensearch.index.engine.VersionConflictEngineException.class,
-                () -> b.index(onB, "doc", "{\"msg\":\"stale\",\"n\":9}", tokenSeqNo + 500, tokenTerm)
+                () -> b.writes().index(onB, "doc", "{\"msg\":\"stale\",\"n\":9}", tokenSeqNo + 500, tokenTerm)
             );
 
             // And the token minted on the node that has since died is still honoured.
-            final var conditional = b.index(onB, "doc", "{\"msg\":\"updated\",\"n\":2}", tokenSeqNo, tokenTerm);
+            final var conditional = b.writes().index(onB, "doc", "{\"msg\":\"updated\",\"n\":2}", tokenSeqNo, tokenTerm);
             assertTrue("the conditional write must have been applied", conditional.seqNo() > tokenSeqNo);
             assertEquals("and it overwrote rather than created", false, conditional.created());
-            assertEquals("the document must now hold the new source", "updated", messageOf(b.get(onB, "doc").source()));
+            assertEquals("the document must now hold the new source", "updated", messageOf(b.reads().get(onB, "doc").source()));
         }
     }
 
@@ -221,7 +221,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("seq-rest"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -277,7 +277,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("seq-update"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -316,7 +316,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir());
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("seq-bulk"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -390,15 +390,15 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         );
 
         try (ServerlessNode writer = new ServerlessNode(nodeSettings("gap-writer"))) {
-            writer.start();
+            writer.startup().start();
             final ShardId shardId = writer.activateWriter(plane, "alpha", 0).orElseThrow();
 
             // Both logged documents are there, each keeping the number it was logged with: the hole cost
             // no data and did not renumber what surrounded it.
-            assertTrue("the record before the hole must have replayed", writer.get(shardId, "a").found());
-            assertTrue("and the one after it", writer.get(shardId, "c").found());
-            assertEquals("the surviving records keep their own sequence numbers", 0L, writer.get(shardId, "a").seqNo());
-            assertEquals(2L, writer.get(shardId, "c").seqNo());
+            assertTrue("the record before the hole must have replayed", writer.reads().get(shardId, "a").found());
+            assertTrue("and the one after it", writer.reads().get(shardId, "c").found());
+            assertEquals("the surviving records keep their own sequence numbers", 0L, writer.reads().get(shardId, "a").seqNo());
+            assertEquals(2L, writer.reads().get(shardId, "c").seqNo());
 
             // The assertion that matters. Without gap-filling the checkpoint stalls at 0 -- one below the
             // hole -- for the rest of this shard's life and every successor's, because a checkpoint cannot
@@ -425,10 +425,10 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
             .put("serverless.roles", "search")
             .build();
         try (ServerlessNode reader = new ServerlessNode(searchOnly)) {
-            reader.start();
+            reader.startup().start();
             final ShardId asReader = reader.serveAsReader(plane, "alpha", 0);
             assertNotNull("a reader must be able to open a shard whose log had a hole in it", asReader);
-            assertTrue("and serve what was published", reader.get(asReader, "a").found());
+            assertTrue("and serve what was published", reader.reads().get(asReader, "a").found());
         }
     }
 

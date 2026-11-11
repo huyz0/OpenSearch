@@ -115,7 +115,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
         theirs.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("freshness-stale"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(mine);
             final BackgroundReconciler loop = new BackgroundReconciler(node, mine);
             loop.want("alpha", 0);
@@ -169,7 +169,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
         theirs.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("freshness-rest"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(mine);
             final BackgroundReconciler loop = new BackgroundReconciler(node, mine);
             loop.want("alpha", 0);
@@ -207,7 +207,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
         theirs.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("freshness-read"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(mine);
             final BackgroundReconciler loop = new BackgroundReconciler(node, mine);
             loop.want("alpha", 0);
@@ -240,7 +240,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("freshness-delete"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final long startedAt = System.nanoTime();
             final Response deleted = send(node, "DELETE", "/alpha", null);
@@ -295,7 +295,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("freshness-a"));
             ServerlessNode b = new ServerlessNode(nodeSettings("freshness-b"))
         ) {
-            a.start();
+            a.startup().start();
             a.setMetadataPlane(planeA);
             // Never scans on its own, so the test says when.
             a.setHeadVerifyIntervalMillis(Long.MAX_VALUE);
@@ -306,17 +306,20 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
             assertEquals(1, a.reconciler().openShards().size());
 
             // A's lease expires and B takes the shard.
-            b.start();
+            b.startup().start();
             clock.set(1_000L + TTL);
             b.activateWriter(planeB, "alpha", 0).orElseThrow();
 
             // A scan that is not due changes nothing, which is the saving.
-            assertTrue("a pass inside the interval must not scan", a.verifyHeadsIfDue(planeA).isEmpty());
+            assertTrue("a pass inside the interval must not scan", a.leases().verifyHeadsIfDue(planeA).isEmpty());
             assertTrue("and must therefore still be holding the shard open", a.reconciler().openShards().contains(held));
 
             // The scan, when it comes, still finds the loss and lets go.
             a.setHeadVerifyIntervalMillis(0L);
-            assertTrue("the periodic scan must still release a shard this node has lost", a.verifyHeadsIfDue(planeA).contains(held));
+            assertTrue(
+                "the periodic scan must still release a shard this node has lost",
+                a.leases().verifyHeadsIfDue(planeA).contains(held)
+            );
             assertFalse("and the shard must be closed here", a.reconciler().openShards().contains(held));
         }
     }
@@ -335,7 +338,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("freshness-count"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             node.setHeadVerifyIntervalMillis(Long.MAX_VALUE);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
@@ -346,12 +349,12 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
             assertEquals(shards, node.reconciler().openShards().size());
 
             store.reset();
-            node.verifyHeadsIfDue(plane);
+            node.leases().verifyHeadsIfDue(plane);
             final long skipped = store.registerReads();
 
             node.setHeadVerifyIntervalMillis(0L);
             store.reset();
-            node.verifyHeadsIfDue(plane);
+            node.leases().verifyHeadsIfDue(plane);
             final long scanned = store.registerReads();
 
             logger.info("freshness: a skipped pass read {} registers, a scanning pass read {} over {} shards", skipped, scanned, shards);

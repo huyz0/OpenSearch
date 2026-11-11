@@ -139,7 +139,7 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", totalShards, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mem-writer", "ingest"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
 
             final long baseline = usedHeapBytes();
@@ -202,7 +202,7 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", totalShards, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("fd-writer", "ingest"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
 
             final long baseline = openFileDescriptorCount();
@@ -255,7 +255,7 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
         // Published, so a reader has something to open -- an unpublished shard cannot be served as a
         // reader at all (ServerlessSearchPathTests), so measuring readers needs real published commits.
         try (ServerlessNode writer = new ServerlessNode(nodeSettings("mem-publisher" + suffix, "ingest"))) {
-            writer.start();
+            writer.startup().start();
             writer.setMetadataPlane(plane);
             for (int shard = 0; shard < COMPARISON_BATCH; shard++) {
                 final var shardId = writer.activateWriter(plane, "alpha", shard).orElseThrow();
@@ -276,14 +276,14 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
         // per-shard cost. A throwaway reader shard pays that cost first, matching the writer path's
         // free warm-up rather than leaving the comparison asymmetric.
         try (ServerlessNode warmup = new ServerlessNode(nodeSettings("mem-reader-warmup" + suffix, "search"))) {
-            warmup.start();
+            warmup.startup().start();
             warmup.setMetadataPlane(plane);
             warmup.serveAsReader(plane, "alpha", 0);
         }
 
         final long writerCost;
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mem-writer-cmp" + suffix, "ingest"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final long baseline = usedHeapBytes();
             openWriterShards(node, plane, "alpha", 0, COMPARISON_BATCH);
@@ -292,7 +292,7 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
 
         final long readerCost;
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mem-reader-cmp" + suffix, "search"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final long baseline = usedHeapBytes();
             for (int shard = 0; shard < COMPARISON_BATCH; shard++) {

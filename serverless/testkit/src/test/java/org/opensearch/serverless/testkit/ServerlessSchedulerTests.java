@@ -89,7 +89,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("alpha", "uuid-closed-scheduler", 1, MAPPING, null));
             try (var node = new ServerlessNode(nodeSettings("closed-driver"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 try (var loop = new BackgroundReconciler(node, plane); var scheduler = edgesOnly(node, loop, clock, TimeValue.ZERO)) {
                     loop.want("alpha", 0);
@@ -112,7 +112,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final var clock = new AtomicLong(1000L);
         final var plane = freshIndex(clock, createTempDir(), 1);
         try (var node = new ServerlessNode(nodeSettings("closed-loop"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             try (var loop = new BackgroundReconciler(node, plane)) {
                 loop.setDemandDrivenActivation(true);
@@ -131,7 +131,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
                 var node = new ServerlessNode(nodeSettings("closing-renewal"));
                 var workers = java.util.concurrent.Executors.newFixedThreadPool(2)
             ) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 try (var loop = new BackgroundReconciler(node, plane); var scheduler = edgesOnly(node, loop, clock, TimeValue.ZERO)) {
                     loop.renewLease();
@@ -173,7 +173,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final var clock = new AtomicLong(1000L);
         final var plane = freshIndex(clock, createTempDir(), 1);
         try (var node = new ServerlessNode(nodeSettings("rejected-activation"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             try (var loop = new BackgroundReconciler(node, plane)) {
                 loop.setDemandDrivenActivation(true);
@@ -198,7 +198,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
                 var node = new ServerlessNode(nodeSettings("closing-activation-queue"));
                 var closer = java.util.concurrent.Executors.newSingleThreadExecutor()
             ) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 try (var loop = new BackgroundReconciler(node, plane)) {
                     loop.setDemandDrivenActivation(true).setAdaptiveActivation(false).setActivationConcurrency(1);
@@ -256,7 +256,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-edge"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());     // the one deliberate tick: acquire the shard, then hands off
@@ -268,7 +268,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
 
                 assertTrue("nothing published before the write", plane.segmentPublisher("alpha", 0).readManifest().isEmpty());
 
-                node.index(shardId, "1", "{\"msg\":\"edge\",\"n\":1}");
+                node.writes().index(shardId, "1", "{\"msg\":\"edge\",\"n\":1}");
 
                 assertBusy(
                     () -> assertTrue(
@@ -299,7 +299,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final int writes = 200;
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-burst"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -312,7 +312,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
                 node.setSignals(scheduler);
 
                 for (int i = 1; i <= writes; i++) {
-                    node.index(shardId, String.valueOf(i), "{\"msg\":\"burst\",\"n\":" + i + "}");
+                    node.writes().index(shardId, String.valueOf(i), "{\"msg\":\"burst\",\"n\":" + i + "}");
                 }
 
                 assertBusy(
@@ -339,7 +339,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-idle"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -356,7 +356,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
                 // Now write once, and the same marks that produced nothing produce exactly one publish.
                 // This is what proves the emptiness above was the guard working and not the plumbing
                 // being disconnected.
-                node.index(shardId, "1", "{\"msg\":\"real\",\"n\":1}");
+                node.writes().index(shardId, "1", "{\"msg\":\"real\",\"n\":1}");
                 loop.markDirty(shardId);
                 assertEquals("a real write must publish", 1, scheduler.publishNow().size());
                 assertTrue("and again produce nothing", scheduler.publishNow().isEmpty());
@@ -375,7 +375,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-renew"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
 
@@ -437,12 +437,12 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-fenced"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final ShardId shardId = node.reconciler().openShards().iterator().next();
-            node.index(shardId, "1", "{\"msg\":\"zombie\",\"n\":1}");
+            node.writes().index(shardId, "1", "{\"msg\":\"zombie\",\"n\":1}");
 
             // Somebody else publishes at a higher term. From here this node's own publish is fenced,
             // which is exactly what a successor taking over looks like from the loser's side.
@@ -468,12 +468,12 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-fenced-signal"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final ShardId shardId = node.reconciler().openShards().iterator().next();
-            node.index(shardId, "1", "{\"msg\":\"zombie\",\"n\":1}");
+            node.writes().index(shardId, "1", "{\"msg\":\"zombie\",\"n\":1}");
 
             final long ourTerm = plane.heads().read("alpha", 0).orElseThrow().term();
             plane.segmentPublisher("alpha", 0).publish(node.reconciler().shard(shardId).store(), ourTerm + 5);
@@ -510,7 +510,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-unowned"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);   // it wants the shard; nothing has told it to take it
@@ -548,7 +548,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-jitter"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             final TimeValue interval = TimeValue.timeValueMillis(1_000);
 
@@ -598,7 +598,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-nodemand"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             // Note: no want() at all.
@@ -633,7 +633,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-demand"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
 
@@ -663,7 +663,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 4);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-cap"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true).setMaxShardsHeld(2);
 
@@ -702,7 +702,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-selfforward"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -746,7 +746,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-backstop"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
 
@@ -770,7 +770,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
                 );
 
                 final ShardId shardId = node.reconciler().openShards().iterator().next();
-                node.index(shardId, "1", "{\"msg\":\"unsignalled\",\"n\":1}");
+                node.writes().index(shardId, "1", "{\"msg\":\"unsignalled\",\"n\":1}");
 
                 assertBusy(
                     () -> assertTrue(
@@ -794,7 +794,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, createTempDir(), 1);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-compose"))) {
-            node.start();
+            node.startup().start();
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
 
@@ -802,7 +802,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
             assertEquals("tick must still activate", 1, acquiring.activated().size());
 
             final ShardId shardId = node.reconciler().openShards().iterator().next();
-            node.index(shardId, "1", "{\"msg\":\"compose\",\"n\":1}");
+            node.writes().index(shardId, "1", "{\"msg\":\"compose\",\"n\":1}");
 
             final TickResult publishing = loop.tick(clock.get() + 1_000);
             assertEquals("tick must still publish", 1, publishing.published().size());
@@ -833,7 +833,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m13-bootstrap"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -851,7 +851,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
                 );
 
                 final ShardId shardId = node.reconciler().openShards().iterator().next();
-                node.index(shardId, "1", "{\"msg\":\"unattended\",\"n\":1}");
+                node.writes().index(shardId, "1", "{\"msg\":\"unattended\",\"n\":1}");
 
                 assertBusy(
                     () -> assertTrue("and publish on its own", plane.segmentPublisher("alpha", 0).readManifest().isPresent()),

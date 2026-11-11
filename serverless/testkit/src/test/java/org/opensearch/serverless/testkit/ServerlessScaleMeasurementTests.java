@@ -157,7 +157,7 @@ public class ServerlessScaleMeasurementTests extends OpenSearchTestCase {
         clock.addAndGet(DescriptorStore.DEFAULT_TOMBSTONE_QUARANTINE_MILLIS + DescriptorStore.TOMBSTONE_BUCKET_MILLIS);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("scale-" + population))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             node.setHeadVerifyIntervalMillis(ServerlessBootstrap.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS);
             node.setDescriptorRefreshIntervalMillis(ServerlessBootstrap.DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS);

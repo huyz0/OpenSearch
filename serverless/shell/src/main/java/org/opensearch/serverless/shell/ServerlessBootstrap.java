@@ -306,7 +306,7 @@ public final class ServerlessBootstrap implements Closeable {
         BackgroundReconciler openedLoop = null;
         ReconcileScheduler openedScheduler = null;
         try {
-            node.start();
+            node.startup().start();
             node.projector().setReuseProjections(complete.getAsBoolean(VIEW_REUSE, true));
             node.setRouteTakeovers(complete.getAsBoolean(ROUTE_TAKEOVERS, true));
             logger.info("startup: node started at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
