@@ -152,6 +152,50 @@ public final class CacheWarmCopy {
             CacheBlocksRequest::new,
             this::handleBlocks
         );
+        router.transportService.registerRequestHandler(
+            HandOffRequest.ACTION,
+            ThreadPool.Names.GENERIC,
+            HandOffRequest::new,
+            this::handleHandOff
+        );
+    }
+
+    void handleHandOff(HandOffRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
+        router.requireMac(HandOffRequest.ACTION, request);
+        final MetadataPlane plane = router.plane.get();
+        if (plane == null) {
+            channel.sendResponse(new HandOffResponse(0, 0));
+            return;
+        }
+        final org.opensearch.serverless.shell.SearchWarmup.Outcome outcome = org.opensearch.serverless.shell.SearchWarmup.takeOverFrom(
+            router.node,
+            plane,
+            request.drainingId()
+        );
+        channel.sendResponse(new HandOffResponse(outcome.opened(), outcome.copy().blocksCopied()));
+    }
+
+    /**
+     * Asks a search peer to take over this draining node's share of its readers, and waits until it has: copied the
+     * warm blocks, opened the shards.
+     *
+     * @param peerId the peer
+     * @param timeout how long to wait
+     * @return its answer, or null if it could not be reached
+     * @throws IOException if the request cannot be sent
+     */
+    public HandOffResponse handOffTo(String peerId, org.opensearch.common.unit.TimeValue timeout) throws IOException {
+        final Optional<DiscoveryNode> peer = router.peer(peerId);
+        if (peer.isEmpty()) {
+            return null;
+        }
+        return router.send(
+            peer.get(),
+            HandOffRequest.ACTION,
+            new HandOffRequest(router.node.localNode().getId()),
+            HandOffResponse::new,
+            timeout
+        );
     }
 
     void handleHotSet(HotSetRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
@@ -209,6 +253,22 @@ public final class CacheWarmCopy {
             }
         }
         peers.sort(null);
+        return copyFrom(peers);
+    }
+
+    /**
+     * Copies this node's share of some peers' warm blocks into its cache, whatever roles those peers advertise: a
+     * draining peer has already dropped the search role, and is asked precisely because it is leaving.
+     *
+     * @param peers the peers to copy from
+     * @return what was copied, and the shards this node will serve
+     */
+    public Outcome copyFrom(List<String> peers) {
+        final MetadataPlane plane = router.plane.get();
+        if (plane == null) {
+            return new Outcome(Set.of(), 0, 0, 0, 0, 0, 0, Map.of());
+        }
+        final String self = router.node.localNode().getId();
         final BlockCache cache = router.node.blockCache();
         final Pacer pacer = new Pacer();
         final Map<Shard, java.util.LinkedHashSet<String>> shards = new LinkedHashMap<>();

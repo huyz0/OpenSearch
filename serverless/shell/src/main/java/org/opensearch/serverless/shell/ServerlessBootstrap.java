@@ -501,6 +501,10 @@ public final class ServerlessBootstrap implements Closeable {
      */
     @Override
     public void close() {
+        // First, while the node still runs: a search node that drains hands its warm shards to its peers before it goes.
+        if (SearchDrain.onShutdown(node)) {
+            SearchDrain.drain(node, plane);
+        }
         // Stop admission and drain the loop before handover. Scheduled callbacks then become no-ops,
         // and settling queued activations lets a scheduler pass waiting on them finish as well.
         loop.close();
