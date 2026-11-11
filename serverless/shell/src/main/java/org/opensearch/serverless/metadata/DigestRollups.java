@@ -151,7 +151,7 @@ public final class DigestRollups {
     public void widen(String name, String uuid, int shards, int shard, PruningDigest digest) throws IOException {
         final PruningDigest coarse = digest.coarsened();
         update(name, entry -> {
-            final RollupEntry base = entry == null || entry.uuid().equals(uuid) == false ? fresh(uuid, shards) : entry;
+            final RollupEntry base = covering(entry, uuid, shards);
             final RollupShardState was = base.states().get(shard);
             final PruningDigest merged = was.digest() == null ? coarse : was.digest().union(coarse);
             if (entry != null && merged.equals(was.digest()) && entry == base) {
@@ -213,7 +213,7 @@ public final class DigestRollups {
      */
     public void markOwned(String name, String uuid, int shards, int shard, long term) throws IOException {
         final Change change = entry -> {
-            final RollupEntry base = entry == null || entry.uuid().equals(uuid) == false ? fresh(uuid, shards) : entry;
+            final RollupEntry base = covering(entry, uuid, shards);
             final RollupShardState was = base.states().get(shard);
             if (entry == base && was.ownerTerm() >= term) {
                 return null;
@@ -548,6 +548,25 @@ public final class DigestRollups {
                 + (changes.size() > 1 ? " and others in its register" : "")
                 + ": the register kept moving"
         );
+    }
+
+    /**
+     * The entry a change to one shard starts from: the one stored when it is this incarnation's and covers
+     * every shard, a fresh one for a new incarnation, and the stored one widened with empty states when the
+     * index has gained shard slots since it was written -- a split adds units above every existing id.
+     */
+    private static RollupEntry covering(RollupEntry entry, String uuid, int shards) {
+        if (entry == null || entry.uuid().equals(uuid) == false) {
+            return fresh(uuid, shards);
+        }
+        if (entry.states().size() >= shards) {
+            return entry;
+        }
+        final List<RollupShardState> states = new ArrayList<>(entry.states());
+        while (states.size() < shards) {
+            states.add(new RollupShardState(0L, null));
+        }
+        return new RollupEntry(entry.uuid(), shards, java.util.Collections.unmodifiableList(states), entry.alias());
     }
 
     private static RollupEntry fresh(String uuid, int shards) {
