@@ -911,7 +911,11 @@ public final class BlobLeaseMembership implements MembershipSource {
                     continue;
                 }
                 named.add(lease.nodeId());
-                lastRead.merge(lease.nodeId(), lease, (held, digested) -> digested.expiresAtMillis() > held.expiresAtMillis() ? digested : held);
+                lastRead.merge(
+                    lease.nodeId(),
+                    lease,
+                    (held, digested) -> digested.expiresAtMillis() > held.expiresAtMillis() ? digested : held
+                );
             }
             digestIds = Set.copyOf(named);
         } catch (Exception e) {

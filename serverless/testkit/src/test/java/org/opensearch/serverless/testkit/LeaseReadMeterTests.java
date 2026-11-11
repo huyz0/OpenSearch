@@ -35,7 +35,9 @@ public class LeaseReadMeterTests extends OpenSearchTestCase {
             final List<NodeLease> leases = new ArrayList<>();
             for (int i = 0; i < nodes; i++) {
                 members.add(new BlobLeaseMembership(store.blobContainer(BlobPath.cleanPath().add("members")), clock::get, TTL));
-                leases.add(new NodeLease(String.format(java.util.Locale.ROOT, "node-%04d", i), "e" + i, "10.0.0." + i + ":9300", Set.of(), 0L));
+                leases.add(
+                    new NodeLease(String.format(java.util.Locale.ROOT, "node-%04d", i), "e" + i, "10.0.0." + i + ":9300", Set.of(), 0L)
+                );
             }
             final long step = 1_000L;
             final long renewEvery = TTL / 3;
