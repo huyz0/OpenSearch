@@ -70,7 +70,7 @@ public class NodePackPublishTests extends OpenSearchTestCase {
 
     private static void write(ServerlessNode node, ShardId shardId, String prefix, int count) throws Exception {
         for (int i = 0; i < count; i++) {
-            node.index(shardId, prefix + i, "{\"msg\":\"node pack\",\"n\":" + i + "}");
+            node.writes().index(shardId, prefix + i, "{\"msg\":\"node pack\",\"n\":" + i + "}");
         }
     }
 
@@ -116,9 +116,9 @@ public class NodePackPublishTests extends OpenSearchTestCase {
         final Map<String, CommitManifest> manifests = new HashMap<>();
         final List<String[]> shards = List.of(new String[] { "alpha", "0" }, new String[] { "bravo", "0" }, new String[] { "bravo", "1" });
         try (ServerlessNode node = new ServerlessNode(nodeSettings("node-pack-one", nodePacksOn()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             for (String[] shard : shards) {
                 loop.want(shard[0], Integer.parseInt(shard[1]));
@@ -152,15 +152,15 @@ public class NodePackPublishTests extends OpenSearchTestCase {
 
         // A successor that has node packs off still reads what is in them, and writes what it adds the default way.
         try (ServerlessNode second = new ServerlessNode(nodeSettings("node-pack-second", Settings.EMPTY))) {
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
-            second.renewLease(plane);
+            second.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(second, plane);
             loop.want("bravo", 1);
             loop.tick(clock.get());
             final ShardId shardId = second.reconciler().openShards().iterator().next();
             for (int i = 0; i < 10; i++) {
-                assertTrue("read out of the node pack", second.get(shardId, "bravo-1-" + i).found());
+                assertTrue("read out of the node pack", second.reads().get(shardId, "bravo-1-" + i).found());
             }
             write(second, shardId, "later-", 5);
             loop.publishAll();
@@ -191,9 +191,9 @@ public class NodePackPublishTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("node-pack-off", extra))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -229,9 +229,9 @@ public class NodePackPublishTests extends OpenSearchTestCase {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("many", "uuid-many-000000000", shards, MAPPING, null));
             try (ServerlessNode node = new ServerlessNode(nodeSettings("node-pack-many", extra))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
-                node.renewLease(plane);
+                node.leases().renewLease(plane);
                 final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
                 for (int shard = 0; shard < shards; shard++) {
                     loop.want("many", shard);
