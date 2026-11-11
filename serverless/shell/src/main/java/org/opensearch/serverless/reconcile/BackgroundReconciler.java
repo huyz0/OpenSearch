@@ -188,7 +188,7 @@ public final class BackgroundReconciler implements Closeable {
         this.plane = plane;
         this.collector = new GarbageCollector(plane.blobStore(), plane.basePath());
         // Readers and frozen views are admitted under this loop's cap and eviction, not a constant.
-        node.setShardAdmission(new ShardAdmission() {
+        node.nodeCapacity().setShardAdmission(new ShardAdmission() {
             @Override
             public int maxShardsHeld() {
                 return BackgroundReconciler.this.maxShardsHeld;

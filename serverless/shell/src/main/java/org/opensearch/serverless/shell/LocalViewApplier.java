@@ -280,8 +280,8 @@ final class LocalViewApplier {
             transportAddress.address().getHostString(),
             transportAddress.getAddress(),
             transportAddress,
-            ServerlessNode.discoveryAttributesFor(lease.roles()),
-            ServerlessNode.discoveryRolesFor(lease.roles()),
+            NodeComponents.discoveryAttributesFor(lease.roles()),
+            NodeComponents.discoveryRolesFor(lease.roles()),
             Version.CURRENT
         );
     }

@@ -17,6 +17,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shard.ShardExplain;
 import org.opensearch.serverless.shard.ShardQuery;
+import org.opensearch.serverless.shell.NodeComponents;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportChannel;
@@ -683,8 +684,8 @@ public final class ShardRouter {
             address,
             // The lease's roles, as the node itself advertises them, rather than every built-in role: a
             // peer that never accepts writer activation should not be described as ingest.
-            ServerlessNode.discoveryAttributesFor(lease.get().roles()),
-            ServerlessNode.discoveryRolesFor(lease.get().roles()),
+            NodeComponents.discoveryAttributesFor(lease.get().roles()),
+            NodeComponents.discoveryRolesFor(lease.get().roles()),
             Version.CURRENT
         );
         if (transportService.nodeConnected(peer) == false) {

@@ -58,7 +58,8 @@ public final class WriterActivation {
         // zero.
         final java.util.Map<Integer, Long> terms = new java.util.HashMap<>();
         pit.shards().forEach((shard, commit) -> terms.put(shard, commit.term()));
-        if (node.reconciler.heldShards().size() >= node.admission.maxShardsHeld() && node.admission.makeRoom() == false) {
+        if (node.reconciler.heldShards().size() >= node.nodeCapacity().admission.maxShardsHeld()
+            && node.nodeCapacity().admission.makeRoom() == false) {
             throw new IllegalStateException(
                 "this node holds " + node.reconciler.heldShards().size() + " shards, the cap; the view was not opened here"
             );
@@ -214,7 +215,7 @@ public final class WriterActivation {
             if (now + plane.leaseTtlMillis() / 2 >= node.ownLeaseValidUntilMillis - plane.membership().skewMarginMillis()) {
                 node.leases().renewLease(plane, false);
             }
-            if (node.ownershipUnverified) {
+            if (node.leases().ownershipUnverified) {
                 // The lease lapsed, or was revoked, and another thread is re-reading the heads this node holds. Writes are
                 // refused until it finishes, so a shard taken now could not be written; and waiting for it put every
                 // activation thread behind that scan, on one lock, for as long as the store took to answer four hundred
@@ -237,7 +238,7 @@ public final class WriterActivation {
             return java.util.Optional.empty();
         }
         final long acquiringAt = System.nanoTime();
-        node.activationPhases[0].addAndGet(acquiringAt - describedAt);
+        node.nodeCapacity().activationPhases[0].addAndGet(acquiringAt - describedAt);
         final org.opensearch.serverless.metadata.Acquisition acquisition = plane.activate(
             indexName,
             shardNumber,
@@ -245,7 +246,7 @@ public final class WriterActivation {
             node.localNode.getEphemeralId(),
             described.get().uuid()
         );
-        node.activationPhases[1].addAndGet(System.nanoTime() - acquiringAt);
+        node.nodeCapacity().activationPhases[1].addAndGet(System.nanoTime() - acquiringAt);
         if (acquisition.acquired() == false) {
             // The winner's head is the freshest routing fact this node has, and it was paid for: a
             // write for this shard forwards there without another read.
@@ -281,13 +282,13 @@ public final class WriterActivation {
             final long markingAt = System.nanoTime();
             plane.rollups().markOwned(indexName, described.get().uuid(), described.get().numberOfShards(), shardNumber, assignment.term());
             final long openingAt = System.nanoTime();
-            node.activationPhases[2].addAndGet(openingAt - markingAt);
+            node.nodeCapacity().activationPhases[2].addAndGet(openingAt - markingAt);
             final ClusterState view = node.projectAndApply(java.util.List.of(described.get()), java.util.List.of(assignment));
-            node.activationPhases[4].addAndGet(System.nanoTime() - openingAt);
+            node.nodeCapacity().activationPhases[4].addAndGet(System.nanoTime() - openingAt);
             node.reconciler.ensureOpen(view, java.util.List.of(assignment));
-            node.activationPhases[3].addAndGet(System.nanoTime() - openingAt);
-            node.activationsOpened.incrementAndGet();
-            node.confirmIncarnation(described.get().uuid(), describedAt);
+            node.nodeCapacity().activationPhases[3].addAndGet(System.nanoTime() - openingAt);
+            node.nodeCapacity().activationsOpened.incrementAndGet();
+            node.fences().confirmIncarnation(described.get().uuid(), describedAt);
         } catch (Exception e) {
             // The head was won and the shard could not be opened. Held and unserved, that head would
             // refuse every other node's acquisition for as long as this node's lease lives, and nothing

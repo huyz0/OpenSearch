@@ -91,7 +91,7 @@ final class RoutingCache {
      * one the shard has. That catches a stale resolution only when the landing node no longer holds the old
      * incarnation's shard. When it still does, the uuids match -- both are the old one -- and this cache
      * alone acknowledged a write into a deleted index. What closes that is the landing node's own fence:
-     * it answers from a shard only within {@code ServerlessNode#INCARNATION_FENCE_MILLIS} of having read
+     * it answers from a shard only within {@code WriteFences#INCARNATION_FENCE_MILLIS} of having read
      * that the shard's incarnation still exists, and a delete answers only after that window has passed.
      * So a request routed here can be refused and retried, and is never answered from an incarnation whose
      * delete has returned. Search, get, multi-get and the shard operations behind them route through here
