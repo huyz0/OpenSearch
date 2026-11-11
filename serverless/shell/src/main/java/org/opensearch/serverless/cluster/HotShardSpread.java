@@ -124,7 +124,46 @@ public final class HotShardSpread {
      * @return the same readers, the one chosen for this search first
      */
     public List<String> order(String index, int shard, List<String> ranked) {
-        final int width = Math.min(width(record(index + "#" + shard)), ranked.size());
+        return pick(width(record(index + "#" + shard)), ranked);
+    }
+
+    /**
+     * Orders a shard's ranked readers as {@link #order} does, without counting a search: for a second ranking of the
+     * same search, such as the readers in the coordinator's own zone.
+     *
+     * @param index the index
+     * @param shard the shard number
+     * @param ranked the readers, best first
+     * @return the same readers, the one chosen first
+     */
+    public List<String> orderCounted(String index, int shard, List<String> ranked) {
+        return pick(widthOf(index, shard), ranked);
+    }
+
+    /**
+     * Returns how often this coordinator has searched a shard lately, as the higher of its burst and decaying rates.
+     *
+     * @param index the index
+     * @param shard the shard number
+     * @return searches a second, zero for a shard not searched here lately
+     */
+    public double perSecond(String index, int shard) {
+        final Rate rate = rates.get(index + "#" + shard);
+        return rate == null ? 0.0 : rate.perSecond(nanos.getAsLong());
+    }
+
+    /**
+     * Returns how many searches this coordinator has in flight to a node.
+     *
+     * @param nodeId the node
+     * @return the count
+     */
+    public int inFlight(String nodeId) {
+        return load(nodeId);
+    }
+
+    private List<String> pick(int spread, List<String> ranked) {
+        final int width = Math.min(spread, ranked.size());
         if (width <= 1) {
             return ranked;
         }

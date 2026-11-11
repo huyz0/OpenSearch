@@ -13,6 +13,7 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.cluster.ReaderPlacement;
+import org.opensearch.serverless.cluster.ZonePreference;
 import org.opensearch.serverless.cluster.Zones;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
@@ -126,6 +127,58 @@ public class ZoneTrafficTests extends OpenSearchTestCase {
             assertEquals(stats.body(), 200, stats.status());
             assertTrue(stats.body(), stats.body().contains("\"zone_traffic\""));
             assertTrue(stats.body(), stats.body().contains("\"cross_zone_bytes\":" + meter.total(ZoneTraffic.Path.CROSS_ZONE)));
+        } finally {
+            for (ServerlessNode node : searchers) {
+                node.close();
+            }
+        }
+    }
+
+    public void testAHotShardIsAnsweredInsideTheCoordinatorsZone() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("hot", "uuid-hot-0000000000", 1, MAPPING, null));
+        try (ServerlessNode writer = new ServerlessNode(settings("hot-writer", "ingest", "zone-a"))) {
+            writer.startup().start();
+            writer.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
+            loop.want("hot", 0);
+            loop.tick(clock.get());
+            assertEquals(201, send(writer, "PUT", "/hot/_doc/1", "{\"msg\":\"needle\"}").status());
+            loop.publishAll();
+        }
+        final List<ServerlessNode> searchers = new ArrayList<>();
+        try {
+            for (String[] node : new String[][] { { "hot-s1", "zone-a" }, { "hot-s2", "zone-b" }, { "hot-s3", "zone-c" } }) {
+                // Every shard counts as hot here, so the first search already prefers the zone.
+                final Settings hot = Settings.builder()
+                    .put(settings(node[0], "search", node[1]))
+                    .put(ZonePreference.MIN_PER_SECOND, 0.0)
+                    .build();
+                final ServerlessNode searcher = new ServerlessNode(hot);
+                searchers.add(searcher);
+                searcher.startup().start();
+                searcher.setMetadataPlane(plane);
+                searcher.leases().heartbeat(plane);
+            }
+            final var members = plane.membership().refresh();
+            final List<String> ranked = ReaderPlacement.candidatesFor("hot", 0, members, ServerlessNode.ROLE_SEARCH, 3);
+            // Placement would send this coordinator's search to another zone; its zone's reader is itself.
+            final ServerlessNode coordinator = byId(searchers, ranked.get(2));
+            for (int i = 0; i < 3; i++) {
+                final Response found = send(coordinator, "POST", "/hot/_search", "{\"query\":{\"match\":{\"msg\":\"needle\"}}}");
+                assertEquals(found.body(), 200, found.status());
+                assertTrue(found.body(), found.body().contains("\"value\":1"));
+            }
+            assertEquals(
+                "nothing crossed a zone: " + coordinator.router().zoneTraffic().byAction(ZoneTraffic.Path.CROSS_ZONE),
+                0,
+                coordinator.router().zoneTraffic().total(ZoneTraffic.Path.CROSS_ZONE)
+            );
+            assertTrue(
+                "the coordinator answers from its own reader",
+                coordinator.reconciler().openShards().stream().anyMatch(s -> s.getIndexName().equals("hot"))
+            );
         } finally {
             for (ServerlessNode node : searchers) {
                 node.close();
