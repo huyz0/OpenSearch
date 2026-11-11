@@ -14,7 +14,6 @@ import org.opensearch.common.blobstore.BlobStore;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -60,12 +59,8 @@ public final class WalStore {
 
     private final BlobStore blobStore;
     private final BlobPath shardBase;
-    /** A record's blob name: a zero-padded ordinal, and nothing else in the container is ours. */
-    private static final java.util.regex.Pattern RECORD_NAME = java.util.regex.Pattern.compile("\\d{20}");
     /** Where takeover cutoffs are recorded. Not a term, so term listings and term pruning both skip it. */
     private static final String SEALS = "seals";
-    /** A seal's blob name. Deliberately not a bare ordinal, so nothing counting records can count a seal. */
-    private static final java.util.regex.Pattern SEAL_NAME = java.util.regex.Pattern.compile("seal-\\d{20}");
 
     /**
      * Left in a term's directory by a successor that has fenced it. A term whose last blob is a fence is closed only if
@@ -180,7 +175,7 @@ public final class WalStore {
         final java.util.concurrent.Executor executor = reads;
         if (executor == null || names.size() < 2) {
             for (int i = 0; i < names.size(); i++) {
-                bodies[i] = readOne(container, names.get(i));
+                bodies[i] = WalLayout.readOne(container, names.get(i));
             }
             return java.util.Arrays.asList(bodies);
         }
@@ -191,7 +186,7 @@ public final class WalStore {
             for (int i = next.getAndIncrement(); i < names.size(); i = next.getAndIncrement()) {
                 try {
                     if (failed.get() == null) {
-                        bodies[i] = readOne(container, names.get(i));
+                        bodies[i] = WalLayout.readOne(container, names.get(i));
                     }
                 } catch (IOException e) {
                     failed.compareAndSet(null, e);
@@ -220,14 +215,6 @@ public final class WalStore {
             throw failed.get();
         }
         return java.util.Arrays.asList(bodies);
-    }
-
-    private static byte[] readOne(BlobContainer container, String name) throws IOException {
-        try (InputStream in = container.readBlob(name)) {
-            return in.readAllBytes();
-        } catch (IOException e) {
-            throw new IOException("unreadable WAL record at " + container.path().buildAsString() + name, e);
-        }
     }
 
     private BlobContainer containerFor(long term) {
@@ -351,7 +338,7 @@ public final class WalStore {
      */
     public synchronized void establish(long term, java.util.function.BooleanSupplier stillOwner) throws IOException {
         final long fence = fence(term, true);
-        ownFences.add(name(fence));
+        ownFences.add(WalLayout.name(fence));
         ordinal.set(fence);
         seededTerm = term;
         poisoned = false;
@@ -391,7 +378,7 @@ public final class WalStore {
                 ? listed
                 : container.listBlobs();
             for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : blobs.entrySet()) {
-                if (RECORD_NAME.matcher(blob.getKey()).matches()) {
+                if (WalLayout.RECORD_NAME.matcher(blob.getKey()).matches()) {
                     highest = Math.max(highest, Long.parseLong(blob.getKey()));
                     if (own && blob.getValue().length() == 0L) {
                         ownFences.add(blob.getKey());
@@ -403,7 +390,7 @@ public final class WalStore {
             }
             final long slot = highest + 1;
             try {
-                container.writeBlob(name(slot), new ByteArrayInputStream(new byte[0]), 0L, true);
+                container.writeBlob(WalLayout.name(slot), new ByteArrayInputStream(new byte[0]), 0L, true);
                 return slot;
             } catch (java.nio.file.FileAlreadyExistsException e) {
                 // A writer took the slot first: its record is before the fence. Look again.
@@ -432,7 +419,7 @@ public final class WalStore {
             long lastLength = -1L;
             final Map<String, org.opensearch.common.blobstore.BlobMetadata> listed = older.getValue().listBlobs();
             for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : listed.entrySet()) {
-                if (RECORD_NAME.matcher(blob.getKey()).matches() && (last == null || blob.getKey().compareTo(last) > 0)) {
+                if (WalLayout.RECORD_NAME.matcher(blob.getKey()).matches() && (last == null || blob.getKey().compareTo(last) > 0)) {
                     last = blob.getKey();
                     lastLength = blob.getValue().length();
                 }
@@ -477,23 +464,19 @@ public final class WalStore {
             return;
         }
         final BlobContainer sealsContainer = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
-        final List<String> sealNames = sealNamesIn(sealsContainer.listBlobs().keySet());
+        final List<String> sealNames = WalLayout.sealNamesIn(sealsContainer.listBlobs().keySet());
         if (sealNames.isEmpty()) {
             replayable(null, termsInOrder(), consumer);
             return;
         }
-        final Map<Long, String> sealed = mergeSeals(sealsContainer, sealNames);
-        final long sealedBelow = highestSealedTerm(sealNames);
+        final Map<Long, String> sealed = WalLayout.mergeSeals(sealsContainer, sealNames);
+        final long sealedBelow = WalLayout.highestSealedTerm(sealNames);
         final Map<Long, String> cutoff = new java.util.HashMap<>();
         for (Long term : termsInOrder().keySet()) {
             // Above the last legacy seal, unbounded; at or below it, what that seal recorded.
             cutoff.put(term, term >= sealedBelow ? null : sealed.getOrDefault(term, ""));
         }
         replayable(cutoff, termsInOrder(), consumer);
-    }
-
-    private static String name(long ordinal) {
-        return String.format(java.util.Locale.ROOT, "%020d", ordinal);
     }
 
     /**
@@ -534,10 +517,10 @@ public final class WalStore {
     public Map<Long, String> position() throws IOException {
         final Map<Long, String> highest = new java.util.HashMap<>();
         // Every term, compacted or not: a legacy seal's cutoff speaks for all of them.
-        for (Map.Entry<Long, BlobContainer> term : termsIn(blobStore.blobContainer(shardBase.add("wal")).children()).entrySet()) {
+        for (Map.Entry<Long, BlobContainer> term : WalLayout.termsIn(blobStore.blobContainer(shardBase.add("wal")).children()).entrySet()) {
             String max = "";
             for (String name : term.getValue().listBlobs().keySet()) {
-                if (RECORD_NAME.matcher(name).matches() && name.compareTo(max) > 0) {
+                if (WalLayout.RECORD_NAME.matcher(name).matches() && name.compareTo(max) > 0) {
                     max = name;
                 }
             }
@@ -581,7 +564,7 @@ public final class WalStore {
             final Map<String, org.opensearch.common.blobstore.BlobMetadata> listed = container.listBlobs();
             final List<String> names = new ArrayList<>(listed.keySet());
             // Fences hold no records: a blob of no bytes is one, and is not read.
-            names.removeIf(name -> RECORD_NAME.matcher(name).matches() == false || listed.get(name).length() == 0L);
+            names.removeIf(name -> WalLayout.RECORD_NAME.matcher(name).matches() == false || listed.get(name).length() == 0L);
             if (limit != null) {
                 names.removeIf(name -> name.compareTo(limit) > 0);
             }
@@ -605,7 +588,7 @@ public final class WalStore {
                 for (int i = 0; i < selected.size(); i++) {
                     final String name = selected.get(i);
                     try {
-                        parseBatch(bodies.get(i), consumer);
+                        WalLayout.parseBatch(bodies.get(i), consumer);
                     } catch (IOException e) {
                         // Preserve the failing blob's identity and stop before reading another window.
                         throw new IOException("unreadable WAL record at " + container.path().buildAsString() + name, e);
@@ -658,9 +641,9 @@ public final class WalStore {
         // was read is what makes "everything this seal supersedes" mean "everything this seal has already
         // accounted for". A concurrent seal is now neither merged nor deleted; it stays, and the next
         // sealer merges it.
-        final List<String> sealNames = sealNamesIn(sealsContainer.listBlobs().keySet());
-        final Map<Long, String> sealed = mergeSeals(sealsContainer, sealNames);
-        final long sealedBelow = highestSealedTerm(sealNames);
+        final List<String> sealNames = WalLayout.sealNamesIn(sealsContainer.listBlobs().keySet());
+        final Map<Long, String> sealed = WalLayout.mergeSeals(sealsContainer, sealNames);
+        final long sealedBelow = WalLayout.highestSealedTerm(sealNames);
         final Map<Long, String> cutoff = new java.util.HashMap<>();
         for (Map.Entry<Long, String> entry : here.entrySet()) {
             if (entry.getKey() >= sealedBelow) {
@@ -716,75 +699,7 @@ public final class WalStore {
      */
     public Map<Long, String> sealedPosition() throws IOException {
         final BlobContainer seals = blobStore.blobContainer(shardBase.add("wal").add(SEALS));
-        return mergeSeals(seals, sealNamesIn(seals.listBlobs().keySet()));
-    }
-
-    /** The seal blobs among a listing's names, in the order the listing gave them. */
-    private static List<String> sealNamesIn(java.util.Collection<String> names) {
-        final List<String> seals = new ArrayList<>();
-        for (String name : names) {
-            if (SEAL_NAME.matcher(name).matches()) {
-                seals.add(name);
-            }
-        }
-        return seals;
-    }
-
-    /** Merges the named seals, taking the lowest recorded position per term. Caller supplies the listing. */
-    private Map<Long, String> mergeSeals(BlobContainer seals, List<String> sealNames) throws IOException {
-        final Map<Long, String> merged = new java.util.HashMap<>();
-        for (String sealName : sealNames) {
-            final byte[] bytes;
-            try (InputStream in = seals.readBlob(sealName)) {
-                bytes = in.readAllBytes();
-            }
-            for (String line : new String(bytes, java.nio.charset.StandardCharsets.UTF_8).split("\n")) {
-                if (line.isEmpty()) {
-                    continue;
-                }
-                final int space = line.indexOf(' ');
-                if (space < 0) {
-                    throw new IOException("unreadable WAL seal at " + seals.path().buildAsString() + sealName);
-                }
-                final Long term = parseTermNumber(line.substring(0, space));
-                if (term == null) {
-                    throw new IOException("unreadable WAL seal at " + seals.path().buildAsString() + sealName);
-                }
-                final String position = line.substring(space + 1);
-                merged.merge(term, position, (a, b) -> a.compareTo(b) <= 0 ? a : b);
-            }
-        }
-        return merged;
-    }
-
-    /**
-     * The highest term any seal was written at. Every term below it has been sealed, whether or not that
-     * seal mentions it — a seal that does not mention a term is saying the term was empty, which is a
-     * stronger statement than saying nothing.
-     *
-     * <p>A pure function of the listing the caller already has, so asking this costs nothing on top of
-     * the merge it is asked alongside.
-     *
-     * @param sealNames the seal blob names, from one listing
-     * @return the highest sealing term, or {@link Long#MIN_VALUE} if the log has never been sealed
-     */
-    private static long highestSealedTerm(List<String> sealNames) {
-        long highest = Long.MIN_VALUE;
-        for (String name : sealNames) {
-            final Long term = parseTermNumber(name.substring("seal-".length()));
-            if (term != null && term > highest) {
-                highest = term;
-            }
-        }
-        return highest;
-    }
-
-    private static Long parseTermNumber(String text) {
-        try {
-            return Long.parseLong(text);
-        } catch (NumberFormatException e) {
-            return null;
-        }
+        return WalLayout.mergeSeals(seals, WalLayout.sealNamesIn(seals.listBlobs().keySet()));
     }
 
     /** The log's term directories, lowest term first, which is replay order. */
@@ -832,7 +747,7 @@ public final class WalStore {
      */
     public boolean landedPast(long term, long ordinal) throws IOException {
         final Map<String, BlobContainer> children = blobStore.blobContainer(shardBase.add("wal")).children();
-        Map<Long, BlobContainer> candidates = termsIn(children);
+        Map<Long, BlobContainer> candidates = WalLayout.termsIn(children);
         candidates.keySet().removeIf(t -> t < term);
         if (candidates.size() > 1) {
             // Several terms to list: the compaction marker rules out the ones holding only fences, for one request.
@@ -844,7 +759,7 @@ public final class WalStore {
         // round trip in front of every reader check.
         for (Map.Entry<Long, BlobContainer> each : candidates.entrySet()) {
             for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : each.getValue().listBlobs().entrySet()) {
-                if (RECORD_NAME.matcher(blob.getKey()).matches()
+                if (WalLayout.RECORD_NAME.matcher(blob.getKey()).matches()
                     && blob.getValue().length() > 0L
                     && (each.getKey() > term || Long.parseLong(blob.getKey()) > ordinal)) {
                     return true;
@@ -882,7 +797,7 @@ public final class WalStore {
 
     private Map<Long, BlobContainer> liveTerms(Map<String, BlobContainer> children) throws IOException {
         final long below = compactedBelow();
-        final Map<Long, BlobContainer> terms = termsIn(children);
+        final Map<Long, BlobContainer> terms = WalLayout.termsIn(children);
         terms.keySet().removeIf(term -> term < below);
         return terms;
     }
@@ -904,46 +819,6 @@ public final class WalStore {
         }
         compactedBelowSeen = below;
         return below;
-    }
-
-    private static Map<Long, BlobContainer> termsIn(Map<String, BlobContainer> children) {
-        final Map<Long, BlobContainer> byTerm = new TreeMap<>();
-        for (Map.Entry<String, BlobContainer> child : children.entrySet()) {
-            final Long term = parseTerm(child.getKey());
-            if (term != null) {
-                byTerm.put(term, child.getValue());
-            }
-        }
-        return byTerm;
-    }
-
-    /**
-     * Parses one blob, which holds a single record or a batch of them, one per line.
-     *
-     * <p>Splitting on the newline byte is safe on UTF-8 without decoding first: {@code 0x0A} cannot
-     * appear inside a multi-byte sequence, so a byte-level split cannot land mid-character.
-     *
-     * @param blob the blob's bytes
-     * @return the records it holds, in order
-     * @throws IOException if a line does not parse
-     */
-    private static List<WalRecord> parseBatch(byte[] blob) throws IOException {
-        final List<WalRecord> records = new ArrayList<>();
-        parseBatch(blob, records::add);
-        return records;
-    }
-
-    private static void parseBatch(byte[] blob, org.opensearch.common.CheckedConsumer<WalRecord, IOException> consumer) throws IOException {
-        int start = 0;
-        for (int i = 0; i <= blob.length; i++) {
-            if (i != blob.length && blob[i] != '\n') {
-                continue;
-            }
-            if (i > start) {
-                consumer.accept(WalRecord.fromStream(new java.io.ByteArrayInputStream(blob, start, i - start)));
-            }
-            start = i + 1;
-        }
     }
 
     /**
@@ -969,17 +844,17 @@ public final class WalStore {
         // at the next open and skipped there by sequence number, which truncation lagging a publish already
         // relies on. It goes once something newer is written.
         final List<String> toDelete = new ArrayList<>(previousSnapshot);
-        final boolean keptHighest = toDelete.remove(name(upTo));
+        final boolean keptHighest = toDelete.remove(WalLayout.name(upTo));
         toDelete.removeAll(ownFences);
         if (toDelete.isEmpty() == false) {
             container.deleteBlobsIgnoringIfNotExists(toDelete);
         }
         final List<String> current = new ArrayList<>();
         if (keptHighest) {
-            current.add(name(upTo));
+            current.add(WalLayout.name(upTo));
         }
         for (long each = publishedUpTo + 1; each <= upTo; each++) {
-            final String each20 = name(each);
+            final String each20 = WalLayout.name(each);
             // Never a fence: a deleted fence frees the slot a stopped writer's next PUT is aimed at.
             if (ownFences.contains(each20) == false) {
                 current.add(each20);
@@ -1056,7 +931,7 @@ public final class WalStore {
             // Fences stay, and so does the term's highest blob -- which after a takeover is its fence, so the
             // records below it all go; a term not yet fenced keeps its last record, which is how its fence
             // will find the slot.
-            ours.removeIf(name -> RECORD_NAME.matcher(name).matches() == false);
+            ours.removeIf(name -> WalLayout.RECORD_NAME.matcher(name).matches() == false);
             final String highest = ours.stream().max(Comparator.naturalOrder()).orElse(null);
             if (highest != null && listed.get(highest).length() != 0L) {
                 // Not fenced yet: its last record stays for the fence to find, so it is not compacted.
@@ -1104,8 +979,8 @@ public final class WalStore {
             // Seals go too: this is the log being destroyed, not truncated, so the cutoffs recorded
             // against it have nothing left to bound.
             ours.removeIf(
-                name -> RECORD_NAME.matcher(name).matches() == false
-                    && SEAL_NAME.matcher(name).matches() == false
+                name -> WalLayout.RECORD_NAME.matcher(name).matches() == false
+                    && WalLayout.SEAL_NAME.matcher(name).matches() == false
                     && FENCED_MARKER.equals(name) == false
             );
             child.deleteBlobsIgnoringIfNotExists(ours);
@@ -1113,14 +988,4 @@ public final class WalStore {
         walRoot.deleteBlobsIgnoringIfNotExists(new ArrayList<>(walRoot.listBlobsByPrefix(COMPACTED_PREFIX).keySet()));
     }
 
-    private static Long parseTerm(String containerName) {
-        if (containerName.startsWith("t=") == false) {
-            return null;
-        }
-        try {
-            return Long.parseLong(containerName.substring(2));
-        } catch (NumberFormatException e) {
-            return null;
-        }
-    }
 }
