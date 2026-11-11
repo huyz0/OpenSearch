@@ -24,7 +24,6 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.UUID;
 import java.util.function.Supplier;
 
 /**
@@ -201,13 +200,13 @@ public final class IndexAdminHandler extends BaseRestHandler {
 
         // Which projection of the descriptor this path asks for. _mapping and _settings are the same read
         // as GET /{index}, rendered narrower, so neither adds an object-store request.
-        final View view;
+        final IndexDescriptorRendering.View view;
         if (request.path().endsWith("/_settings") || settingName != null) {
-            view = View.SETTINGS;
+            view = IndexDescriptorRendering.View.SETTINGS;
         } else if (request.path().endsWith("/_mapping") || request.path().endsWith("/_mappings")) {
-            view = View.MAPPING;
+            view = IndexDescriptorRendering.View.MAPPING;
         } else {
-            view = View.FULL;
+            view = IndexDescriptorRendering.View.FULL;
         }
 
         switch (request.method()) {
@@ -306,7 +305,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
                     try (XContentBuilder builder = channel.newBuilder()) {
                         builder.startObject();
                         builder.startObject(index);
-                        if (view == View.FULL) {
+                        if (view == IndexDescriptorRendering.View.FULL) {
                             // Core's shape, keyed by alias name. Verified against each alias record, so an
                             // alias that lost its creation race or has since moved on is not listed; the
                             // cost is one register read per alias that names this index, and nothing for
@@ -317,11 +316,11 @@ public final class IndexAdminHandler extends BaseRestHandler {
                             }
                             builder.endObject();
                         }
-                        if (view != View.SETTINGS) {
-                            renderMapping(builder, descriptor.get());
+                        if (view != IndexDescriptorRendering.View.SETTINGS) {
+                            IndexDescriptorRendering.renderMapping(builder, descriptor.get());
                         }
-                        if (view != View.MAPPING) {
-                            renderSettings(builder, descriptor.get(), settingName);
+                        if (view != IndexDescriptorRendering.View.MAPPING) {
+                            IndexDescriptorRendering.renderSettings(builder, descriptor.get(), settingName);
                         }
                         builder.endObject();
                         builder.endObject();
@@ -400,109 +399,6 @@ public final class IndexAdminHandler extends BaseRestHandler {
         }
     }
 
-    /** Which part of a descriptor a GET is asking for. */
-    private enum View {
-        FULL,
-        MAPPING,
-        SETTINGS
-    }
-
-    /**
-     * Renders the mapping the way OpenSearch does, as the mapping object itself.
-     *
-     * <p>This replaced a {@code "has_mapping": true} flag, which told a caller a mapping existed without
-     * letting them see it — and with {@code _mapping} and {@code _settings} both unrouted, there was no
-     * path by which a client could read back anything it had configured.
-     *
-     * @param builder the response being built
-     * @param descriptor the index
-     * @throws IOException if writing fails
-     */
-    private static void renderMapping(XContentBuilder builder, IndexDescriptor descriptor) throws IOException {
-        if (descriptor.mapping() == null) {
-            builder.startObject("mappings").endObject();
-            return;
-        }
-        try {
-            final Map<String, Object> mapping = org.opensearch.common.xcontent.XContentHelper.convertToMap(
-                new org.opensearch.core.common.bytes.BytesArray(descriptor.mapping()),
-                false,
-                org.opensearch.common.xcontent.XContentType.JSON
-            ).v2();
-            builder.field("mappings", mapping);
-        } catch (Exception e) {
-            // A mapping that does not parse is stored data this handler did not write, and swallowing it
-            // would report an index as having no mapping when it has an unreadable one.
-            throw new IOException("the stored mapping for " + descriptor.name() + " could not be read", e);
-        }
-    }
-
-    /**
-     * Renders settings under {@code index}, the way OpenSearch nests them.
-     *
-     * <p><b>{@code aliases} is absent rather than empty.</b> Resolving an index's aliases needs a reverse
-     * lookup this design does not offer — aliases are found by name, and enumerating them is the inventory
-     * operation {@code /_serverless/indices} refuses for the same reason. Rendering {@code "aliases": {}}
-     * would be a confident empty answer, which is the one thing this surface will not do; a caller that
-     * needs aliases asks {@code GET /_alias/{name}}.
-     *
-     * @param builder the response being built
-     * @param descriptor the index
-     * @throws IOException if writing fails
-     */
-    private static void renderSettings(XContentBuilder builder, IndexDescriptor descriptor, String only) throws IOException {
-        final java.util.Map<String, String> settings = new java.util.LinkedHashMap<>();
-        // Strings, not numbers, because that is what OpenSearch returns: settings are a string map there.
-        settings.put("number_of_shards", Integer.toString(descriptor.numberOfShards()));
-        // Zero, and true: a shard here has exactly one writer, and its redundancy is the object store
-        // rather than a second copy. Reporting it is more honest than omitting it, because a client
-        // reading a replica count gets the real one.
-        settings.put("number_of_replicas", "0");
-        settings.put("uuid", descriptor.uuid());
-        settings.put("provided_name", descriptor.name());
-        // Recorded at creation; a descriptor written by an older version has neither, and omitting them is
-        // truer than inventing a moment or a version.
-        if (descriptor.createdAtMillis() != 0L) {
-            settings.put("creation_date", Long.toString(descriptor.createdAtMillis()));
-        }
-        if (descriptor.createdVersionId() != 0) {
-            settings.put("version.created", Integer.toString(descriptor.createdVersionId()));
-        }
-        for (String key : descriptor.extraSettings().keySet()) {
-            final String bare = key.startsWith(IndexMetadata.INDEX_SETTING_PREFIX)
-                ? key.substring(IndexMetadata.INDEX_SETTING_PREFIX.length())
-                : key;
-            settings.put(bare, descriptor.extraSettings().get(key));
-        }
-        builder.startObject("settings");
-        builder.startObject("index");
-        for (java.util.Map.Entry<String, String> setting : settings.entrySet()) {
-            if (only == null || matchesSettingName(setting.getKey(), only)) {
-                if ("version.created".equals(setting.getKey())) {
-                    // Nested, as core renders it: settings.index.version.created.
-                    builder.startObject("version").field("created", setting.getValue()).endObject();
-                } else {
-                    builder.field(setting.getKey(), setting.getValue());
-                }
-            }
-        }
-        builder.endObject();
-        builder.endObject();
-    }
-
-    /** {@code GET /{index}/_settings/{name}}: an exact name, with or without the {@code index.} prefix, or a trailing-star prefix. */
-    private static boolean matchesSettingName(String bare, String wanted) {
-        for (String each : wanted.split(",")) {
-            final String name = each.startsWith(IndexMetadata.INDEX_SETTING_PREFIX)
-                ? each.substring(IndexMetadata.INDEX_SETTING_PREFIX.length())
-                : each;
-            if (name.endsWith("*") ? bare.startsWith(name.substring(0, name.length() - 1)) : bare.equals(name)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
     /** A refusal raised while parsing, carrying the status and type the caller should see. */
     static final class RefusedException extends Exception {
         final RestStatus status;
@@ -549,121 +445,22 @@ public final class IndexAdminHandler extends BaseRestHandler {
         MetadataPlane metadata,
         org.opensearch.action.admin.indices.create.CreateIndexRequest request
     ) throws Exception {
-        try {
-            return createIndex(serving, metadata, request.index(), fromNative(request));
-        } catch (RefusedException e) {
-            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), e.status);
-        } catch (org.opensearch.serverless.metadata.TemplateResolver.MissingComponentException e) {
-            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
-        }
+        return IndexCreation.createIndex(serving, metadata, request);
     }
 
-    /** Shared native creation payload validation for create-index and rollover. */
     static CreateRequest fromNative(org.opensearch.action.admin.indices.create.CreateIndexRequest request) throws RefusedException {
-        final var invalid = request.validate();
-        if (invalid != null) {
-            throw invalid;
-        }
-        if (request.context() != null) {
-            throw new org.opensearch.OpenSearchStatusException("create-index contexts are not supported", RestStatus.NOT_IMPLEMENTED);
-        }
-        if (request.aliases().isEmpty() == false) {
-            throw new org.opensearch.OpenSearchStatusException(
-                "aliases in a create-index request are not supported; create the index, then create the alias",
-                RestStatus.NOT_IMPLEMENTED
-            );
-        }
-        final Settings settings = Settings.builder().put(request.settings()).normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX).build();
-        final String mapping = normalizeMapping(request.mappings());
-        return CreateRequest.fromSettings(settings, mapping, 1);
+        return IndexCreation.fromNative(request);
     }
 
-    private static String normalizeMapping(String source) {
-        if (source == null || source.isEmpty()) {
-            return null;
-        }
-        try (
-            var parser = org.opensearch.common.xcontent.json.JsonXContent.jsonXContent.createParser(
-                org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
-                org.opensearch.core.xcontent.DeprecationHandler.IGNORE_DEPRECATIONS,
-                source
-            )
-        ) {
-            if (parser.nextToken() != org.opensearch.core.xcontent.XContentParser.Token.START_OBJECT) {
-                throw new IllegalArgumentException("mappings must be an object");
-            }
-            Map<String, Object> mapping = parser.mapOrdered();
-            if (parser.nextToken() != null) {
-                throw new IllegalArgumentException("trailing content after mappings");
-            }
-            // Native map-based builders wrap mappings in _doc; templates use the unwrapped shape.
-            final String type = org.opensearch.index.mapper.MapperService.SINGLE_MAPPING_NAME;
-            if (mapping.containsKey(type)) {
-                if (mapping.size() != 1 || mapping.get(type) instanceof Map == false) {
-                    throw new IllegalArgumentException("a typed mapping must contain one mapping object");
-                }
-                @SuppressWarnings("unchecked")
-                final Map<String, Object> unwrapped = (Map<String, Object>) mapping.get(type);
-                mapping = unwrapped;
-            }
-            try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
-                builder.map(mapping);
-                return builder.toString();
-            }
-        } catch (IOException | RuntimeException e) {
-            throw new org.opensearch.OpenSearchStatusException("could not parse mappings: " + e.getMessage(), RestStatus.BAD_REQUEST, e);
-        }
-    }
-
-    /**
-     * Creates an index from a request, with what matching templates contribute layered under it.
-     *
-     * <p>A caller who spelled out a mapping is not overruled by configuration they may not know exists.
-     * Shared with rollover and data streams, which create indices the same way from a body of their own.
-     *
-     * @param serving the node supplying plugin-aware mapper validation
-     * @param metadata the metadata plane
-     * @param index the name
-     * @param create the request
-     * @return the descriptor as created
-     * @throws IOException if a register cannot be read or written
-     */
     static IndexDescriptor createIndex(
         org.opensearch.serverless.shell.ServerlessNode serving,
         MetadataPlane metadata,
         String index,
         CreateRequest create
     ) throws IOException, RefusedException {
-        return createIndex(
-            serving,
-            metadata,
-            index,
-            create,
-            org.opensearch.serverless.metadata.TemplateResolver.resolveFromStores(
-                metadata.indexTemplates(),
-                metadata::componentTemplates,
-                index
-            )
-        );
+        return IndexCreation.createIndex(serving, metadata, index, create);
     }
 
-    /**
-     * Creates an index from a request and what it inherits, for a caller that resolved the templates
-     * against a different name than the index's own.
-     *
-     * <p>A data stream's backing index is named {@code .ds-<stream>-<n>}, which no template pattern written
-     * for the stream matches; what it inherits is what the <em>stream's</em> name matches, so the caller
-     * resolves against that and hands the result here.
-     *
-     * @param serving the node supplying plugin-aware mapper validation
-     * @param metadata the metadata plane
-     * @param index the name
-     * @param create the request
-     * @param inherited what the templates contributed
-     * @return the descriptor as created
-     * @throws IOException if a register cannot be read or written
-     * @throws RefusedException if the merged settings are ones core would refuse, or this design cannot honour
-     */
     static IndexDescriptor createIndex(
         org.opensearch.serverless.shell.ServerlessNode serving,
         MetadataPlane metadata,
@@ -671,72 +468,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
         CreateRequest create,
         org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited
     ) throws IOException, RefusedException {
-        final Settings settings = CreateRequest.settingsWith(create.settings, inherited);
-        // Parsed and validated before the descriptor exists, not by the first shard to open it. A value
-        // core cannot parse used to land in the register and fail every node that later built
-        // IndexSettings from it, with a 400 to the caller that read like a refusal.
-        validateIndexSettings(settings == null ? Settings.EMPTY : settings, true);
-        final IndexDescriptor descriptor = new IndexDescriptor(
-            index,
-            UUID.randomUUID().toString(),
-            CreateRequest.shardsWith(create.shards, create.explicitShards, inherited),
-            CreateRequest.mappingWith(create.mapping, inherited),
-            settings
-        ).createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id);
-        if (serving == null) {
-            throw new RefusedException(RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable");
-        }
-        // Validate the final mapping and analysis configuration with this node's actual plugin registry.
-        // The administrative factory creates no registered IndexService, shard, or on-disk index.
-        final var candidate = descriptor.toIndexMetadata(Map.of());
-        try (var mapper = serving.indicesService().createIndexMapperService(candidate)) {
-            mapper.merge(candidate, org.opensearch.index.mapper.MapperService.MergeReason.INDEX_TEMPLATE);
-            validateTimestampMapping(mapper, candidate, descriptor.mapping());
-            final var validatedSettings = mapper.getIndexSettings();
-            if (validatedSettings.getIndexSortConfig().hasIndexSort()) {
-                final var noCache = new org.opensearch.index.fielddata.IndexFieldDataCache.None();
-                validatedSettings.getIndexSortConfig()
-                    .buildIndexSort(
-                        validatedSettings.shouldWidenIndexSortType(),
-                        mapper::fieldType,
-                        (field, lookup) -> field.fielddataBuilder(index, lookup).build(noCache, serving.circuitBreakerService())
-                    );
-            }
-        }
-        metadata.createIndex(descriptor);
-        return descriptor;
-    }
-
-    private static void validateTimestampMapping(org.opensearch.index.mapper.MapperService mapper, IndexMetadata candidate, String source) {
-        final String metadataField = org.opensearch.index.mapper.DataStreamFieldMapper.NAME;
-        if (source == null || source.contains(metadataField) == false) {
-            return;
-        }
-        final Object declared = candidate.mapping().sourceAsMap().get(metadataField);
-        if (declared instanceof Map<?, ?> == false) {
-            return;
-        }
-        final Map<?, ?> guard = (Map<?, ?>) declared;
-        if (Boolean.parseBoolean(String.valueOf(guard.get("enabled"))) == false) {
-            return;
-        }
-        String name = org.opensearch.index.mapper.DataStreamFieldMapper.Defaults.TIMESTAMP_FIELD.getName();
-        final Object selected = guard.get("timestamp_field");
-        if (selected instanceof Map<?, ?> named) {
-            if (named.get("name") instanceof String == false || ((String) named.get("name")).isEmpty()) {
-                throw new org.opensearch.index.mapper.MapperParsingException("data stream timestamp field requires a name");
-            }
-            name = (String) named.get("name");
-        }
-        final var field = mapper.fieldType(name);
-        if (field instanceof org.opensearch.index.mapper.DateFieldMapper.DateFieldType == false || field.name().equals(name) == false) {
-            throw new org.opensearch.index.mapper.MapperParsingException(
-                "data stream timestamp field [" + name + "] must be a date or date_nanos field"
-            );
-        }
-        if (mapper.getIndexSettings().isPluggableDataFormatEnabled() == false && field.hasDocValues() == false) {
-            throw new org.opensearch.index.mapper.MapperParsingException("data stream timestamp field [" + name + "] requires doc values");
-        }
+        return IndexCreation.createIndex(serving, metadata, index, create, inherited);
     }
 
     /**
@@ -755,58 +487,12 @@ public final class IndexAdminHandler extends BaseRestHandler {
         return null;
     }
 
-    /**
-     * Names an index setting this design accepts nowhere, with the reason, or null.
-     *
-     * <p>{@code index.default_pipeline} and {@code index.final_pipeline} used to be here, refused because
-     * nothing read them: stored, they would have reported a pipeline that never ran. The write path reads
-     * both now -- see {@code IngestPipelines#pipelinesFor} -- so they are ordinary settings. The search
-     * one is still refused, for the reason all three were.
-     *
-     * @param settings normalised settings
-     * @return the reason to refuse, or null when there is none
-     */
     static String unsupportedIndexSetting(Settings settings) {
-        final String key = org.opensearch.index.IndexSettings.DEFAULT_SEARCH_PIPELINE.getKey();
-        if (settings.hasValue(key)) {
-            return key
-                + " is not supported: an index-level search pipeline is applied by the search path, and this "
-                + "shell's does not read it, so the value would be stored and never run. Name the pipeline on "
-                + "the request instead (?search_pipeline=)";
-        }
-        return null;
+        return IndexCreation.unsupportedIndexSetting(settings);
     }
 
-    /**
-     * Refuses settings core would not accept, or this design cannot honour, before anything is written.
-     *
-     * @param settings normalised ({@code index.}-prefixed) settings
-     * @param atCreation whether this is a create, where dependencies between settings are checked as
-     *     core checks them; an update validates each value on its own, as core's update does
-     * @throws RefusedException with the status and words the caller should see
-     */
     static void validateIndexSettings(Settings settings, boolean atCreation) throws RefusedException {
-        final String unsupported = unsupportedIndexSetting(settings);
-        if (unsupported != null) {
-            throw new RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_setting", unsupported);
-        }
-        final var scoped = org.opensearch.common.settings.IndexScopedSettings.DEFAULT_SCOPED_SETTINGS;
-        for (String key : settings.keySet()) {
-            final var setting = scoped.get(key);
-            if (scoped.isPrivateSetting(key) || (setting != null && setting.isPrivateIndex())) {
-                throw new RefusedException(
-                    RestStatus.BAD_REQUEST,
-                    "illegal_argument_exception",
-                    "private index setting [" + key + "] can not be set explicitly"
-                );
-            }
-        }
-        try {
-            // Only user settings reach the descriptor: private values belong to its authoritative fields.
-            scoped.validate(settings, atCreation, false, false);
-        } catch (IllegalArgumentException e) {
-            throw new RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
-        }
+        IndexCreation.validateIndexSettings(settings, atCreation);
     }
 
     static final class CreateRequest {
@@ -872,7 +558,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
          */
         static String mappingWith(String requested, org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited)
             throws IOException {
-            requested = normalizeMapping(requested);
+            requested = IndexCreation.normalizeMapping(requested);
             if (inherited.mappings().isEmpty()) {
                 return requested;
             }
@@ -1013,7 +699,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
             return fromSettings(settings, mapping, fromQuery);
         }
 
-        private static CreateRequest fromSettings(Settings settings, String mapping, int fromQuery) throws RefusedException {
+        static CreateRequest fromSettings(Settings settings, String mapping, int fromQuery) throws RefusedException {
             final String replicas = settings.get(IndexMetadata.SETTING_NUMBER_OF_REPLICAS);
             if (replicas != null && "0".equals(replicas) == false) {
                 // Refused, and with the real reason. Accepting it would mean recording a replica count that

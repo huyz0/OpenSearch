@@ -10,15 +10,11 @@ package org.opensearch.serverless.rest;
 
 import org.opensearch.Version;
 import org.opensearch.common.UUIDs;
-import org.opensearch.common.blobstore.BlobContainer;
-import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobStore;
-import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
-import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
@@ -37,12 +33,10 @@ import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Set;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
@@ -74,46 +68,6 @@ import java.util.regex.Pattern;
  * caller sees the same outcome either way, sooner than an async caller polling a real cluster would.
  */
 public final class SnapshotHandler extends BaseRestHandler {
-
-    /** What a restore here reads. Everything else core's restore accepts is refused with its reason, below. */
-    private static final Set<String> RESTORE_KNOWN_KEYS = Set.of("indices", "rename_pattern", "rename_replacement");
-
-    /**
-     * Core's other restore fields, each with why it is refused rather than accepted and ignored. An
-     * allowlist used to admit all of these and act on three, which told a caller -- by answering 400 for
-     * an unknown key -- that a known key was honoured.
-     */
-    private static final java.util.Map<String, String> RESTORE_REFUSED_KEYS = java.util.Map.ofEntries(
-        java.util.Map.entry("partial", "a restore here creates every shard of an index or refuses; there is no partial index to make"),
-        java.util.Map.entry("include_global_state", "there is no global state in a snapshot here to restore"),
-        java.util.Map.entry("include_aliases", "aliases are not captured in a snapshot here"),
-        java.util.Map.entry("rename_alias_pattern", "aliases are not captured in a snapshot here"),
-        java.util.Map.entry("rename_alias_replacement", "aliases are not captured in a snapshot here"),
-        java.util.Map.entry(
-            "index_settings",
-            "the settings an index had when it was captured are restored with it, unchanged; change them on the "
-                + "restored index with PUT /{index}/_settings"
-        ),
-        java.util.Map.entry(
-            "ignore_index_settings",
-            "the settings an index had when it was captured are restored with it, unchanged; change them on the "
-                + "restored index with PUT /{index}/_settings"
-        ),
-        java.util.Map.entry("settings", "repository settings are fixed when the repository is registered"),
-        java.util.Map.entry(
-            "storage_type",
-            "a restored index is served from this deployment's own object store; there is no other storage type"
-        ),
-        java.util.Map.entry("source_remote_store_repository", "there is one object store here, and it is the repository"),
-        java.util.Map.entry("source_remote_translog_repository", "there is one object store here, and it is the repository"),
-        java.util.Map.entry("alias_write_index_policy", "aliases are not captured in a snapshot here"),
-        java.util.Map.entry("ignore_unavailable", "a restore names the indices it wants; one the snapshot did not capture is a 404"),
-        java.util.Map.entry("allow_no_indices", "a restore names the indices it wants; patterns are not matched against the snapshot"),
-        java.util.Map.entry("expand_wildcards", "a restore names the indices it wants; patterns are not matched against the snapshot")
-    );
-
-    /** What a create here reads. */
-    private static final Set<String> CREATE_KNOWN_KEYS = Set.of("indices", "ignore_unavailable", "partial", "include_global_state");
 
     private final Supplier<MetadataPlane> plane;
     private final Supplier<ServerlessNode> node;
@@ -165,10 +119,10 @@ public final class SnapshotHandler extends BaseRestHandler {
         // include another's snapshots, and a name like "x,y" was created and then never found by the GET
         // and DELETE that split on the comma. _all and * are the two spellings that are not names.
         final boolean listing = request.method() == RestRequest.Method.GET && ("_all".equals(snapshotParam) || "*".equals(snapshotParam));
-        final String badName = invalidName(repo, "repository", false);
+        final String badName = SnapshotRequestBodies.invalidName(repo, "repository", false);
         final String badSnapshot = listing
             ? null
-            : invalidName(
+            : SnapshotRequestBodies.invalidName(
                 snapshotParam,
                 "snapshot",
                 request.method() != RestRequest.Method.PUT && request.method() != RestRequest.Method.POST
@@ -180,8 +134,8 @@ public final class SnapshotHandler extends BaseRestHandler {
             );
         }
         if (request.path().endsWith("/_restore")) {
-            final Map<String, Object> body = request.hasContent() ? parseBody(request) : Map.of();
-            for (Map.Entry<String, String> refused : RESTORE_REFUSED_KEYS.entrySet()) {
+            final Map<String, Object> body = request.hasContent() ? SnapshotRequestBodies.parseBody(request) : Map.of();
+            for (Map.Entry<String, String> refused : SnapshotRequestBodies.RESTORE_REFUSED_KEYS.entrySet()) {
                 if (body.containsKey(refused.getKey())) {
                     return channel -> channel.sendResponse(
                         IndexAdminHandler.error(
@@ -193,7 +147,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                     );
                 }
             }
-            final String unknown = firstUnknownKey(body, RESTORE_KNOWN_KEYS);
+            final String unknown = SnapshotRequestBodies.firstUnknownKey(body, SnapshotRequestBodies.RESTORE_KNOWN_KEYS);
             if (unknown != null) {
                 return channel -> channel.sendResponse(
                     IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "unknown_parameter", "Unknown parameter " + unknown)
@@ -208,7 +162,7 @@ public final class SnapshotHandler extends BaseRestHandler {
         switch (request.method()) {
             case PUT:
             case POST: {
-                final Map<String, Object> body = request.hasContent() ? parseBody(request) : Map.of();
+                final Map<String, Object> body = request.hasContent() ? SnapshotRequestBodies.parseBody(request) : Map.of();
                 if (body.containsKey("metadata")) {
                     // Refused rather than admitted and dropped: the record has no field for it, and a
                     // caller who sent it and then read the snapshot back found nothing, with no reason why.
@@ -222,7 +176,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                         )
                     );
                 }
-                final String unknownCreateKey = firstUnknownKey(body, CREATE_KNOWN_KEYS);
+                final String unknownCreateKey = SnapshotRequestBodies.firstUnknownKey(body, SnapshotRequestBodies.CREATE_KNOWN_KEYS);
                 if (unknownCreateKey != null) {
                     // The same check the restore path has always made, which the create path did not: an
                     // unknown key was accepted and dropped.
@@ -235,7 +189,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                         )
                     );
                 }
-                final List<String> indices = readIndices(body.get("indices"));
+                final List<String> indices = SnapshotRequestBodies.readIndices(body.get("indices"));
                 if (indices.isEmpty()) {
                     return channel -> channel.sendResponse(
                         IndexAdminHandler.error(
@@ -246,13 +200,13 @@ public final class SnapshotHandler extends BaseRestHandler {
                         )
                     );
                 }
-                final boolean ignoreUnavailable = readBoolean(body.get("ignore_unavailable"), false);
-                final boolean partial = readBoolean(body.get("partial"), false);
+                final boolean ignoreUnavailable = SnapshotRequestBodies.readBoolean(body.get("ignore_unavailable"), false);
+                final boolean partial = SnapshotRequestBodies.readBoolean(body.get("partial"), false);
                 // Read, and reported as what happened rather than as what was asked: there is no global
                 // state here to capture, so a snapshot never includes it. Core's default is true, and
                 // refusing that default would refuse every client that sends it; echoing true would report
                 // a capture that did not happen.
-                readBoolean(body.get("include_global_state"), true);
+                SnapshotRequestBodies.readBoolean(body.get("include_global_state"), true);
                 final boolean includeGlobalState = false;
                 return channel -> dispatch(
                     channel,
@@ -415,7 +369,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                     index.getValue().uuid(),
                     index.getValue().numberOfShards(),
                     index.getValue().mapping(),
-                    settingsOf(index.getValue()),
+                    SnapshotBlobs.settingsOf(index.getValue()),
                     Map.of()
                 )
             );
@@ -463,7 +417,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                     for (Map.Entry<Integer, CommitManifest> shard : shards.entrySet()) {
                         final BlobPath sourceBase = RegisterMap.shardData(metadata.basePath(), trimmed, descriptor.uuid(), shard.getKey());
                         final BlobPath destBase = RegisterMap.snapshotShardData(metadata.basePath(), reservation, trimmed, shard.getKey());
-                        stored.put(shard.getKey(), copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue()));
+                        stored.put(shard.getKey(), SnapshotBlobs.copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue()));
                     }
                 }
                 captured.put(
@@ -472,7 +426,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                         descriptor.uuid(),
                         descriptor.numberOfShards(),
                         descriptor.mapping(),
-                        settingsOf(descriptor),
+                        SnapshotBlobs.settingsOf(descriptor),
                         stored
                     )
                 );
@@ -499,24 +453,6 @@ public final class SnapshotHandler extends BaseRestHandler {
                 }
             }
             throw e;
-        }
-    }
-
-    /**
-     * An index's settings as a snapshot records them: the structured form the descriptor itself writes,
-     * so a list-valued setting (an analyzer's filters) comes back as a list rather than as the bracketed
-     * string {@code Settings#get} would render it.
-     */
-    private static Map<String, Object> settingsOf(IndexDescriptor descriptor) throws IOException {
-        try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
-            builder.startObject();
-            descriptor.extraSettings().toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
-            builder.endObject();
-            return org.opensearch.common.xcontent.XContentHelper.convertToMap(
-                BytesReference.bytes(builder),
-                false,
-                org.opensearch.common.xcontent.XContentType.JSON
-            ).v2();
         }
     }
 
@@ -737,7 +673,7 @@ public final class SnapshotHandler extends BaseRestHandler {
         final ServerlessNode serving = node.get();
 
         final List<String> requested = body.containsKey("indices")
-            ? readIndices(body.get("indices"))
+            ? SnapshotRequestBodies.readIndices(body.get("indices"))
             : List.copyOf(record.indices().keySet());
         for (String name : requested) {
             if (record.indices().containsKey(name) == false) {
@@ -784,7 +720,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                 final String newUuid = UUIDs.randomBase64UUID();
                 // The settings the index had when it was captured, restored with it: the analyzers a mapping
                 // names live there, and a restored index without them could neither index nor search.
-                final org.opensearch.common.settings.Settings settings = restorableSettings(capturedIndex.settings());
+                final org.opensearch.common.settings.Settings settings = SnapshotBlobs.restorableSettings(capturedIndex.settings());
                 metadata.createIndex(
                     new IndexDescriptor(restoring.getValue(), newUuid, capturedIndex.numberOfShards(), capturedIndex.mapping(), settings)
                         .createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id)
@@ -795,7 +731,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                         ? RegisterMap.shardData(metadata.basePath(), restoring.getKey(), capturedIndex.uuid(), shard.getKey())
                         : RegisterMap.snapshotShardData(metadata.basePath(), record, restoring.getKey(), shard.getKey());
                     final BlobPath destBase = RegisterMap.shardData(metadata.basePath(), restoring.getValue(), newUuid, shard.getKey());
-                    final CommitManifest restored = copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue());
+                    final CommitManifest restored = SnapshotBlobs.copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue());
                     // Entered before the manifest lands, with a digest that rules nothing out: a restored index holds
                     // documents no writer marked, and an entry a deleted index left under the name would otherwise
                     // let a search rule the restored documents out -- or leave the index off a pattern's name list.
@@ -830,35 +766,6 @@ public final class SnapshotHandler extends BaseRestHandler {
             throw e;
         }
         return new RestoreOutcome(targets, shardsRestored);
-    }
-
-    /**
-     * The captured settings a restored index is created with: everything core's restore carries over,
-     * and none of what it does not. The uuid, creation date, version and provided name are the new
-     * index's own; the shard count is structural and travels as {@code numberOfShards}; replicas are
-     * refused here. A descriptor never stores these in its extra settings, but a snapshot record is data
-     * this handler did not necessarily write, and a restored descriptor carrying another index's uuid is
-     * a shard that opens under the wrong storage path.
-     */
-    private static org.opensearch.common.settings.Settings restorableSettings(Map<String, Object> captured) {
-        if (captured.isEmpty()) {
-            return org.opensearch.common.settings.Settings.EMPTY;
-        }
-        final org.opensearch.common.settings.Settings.Builder settings = org.opensearch.common.settings.Settings.builder()
-            .loadFromMap(captured)
-            .normalizePrefix(org.opensearch.cluster.metadata.IndexMetadata.INDEX_SETTING_PREFIX);
-        for (String key : new String[] {
-            org.opensearch.cluster.metadata.IndexMetadata.SETTING_INDEX_UUID,
-            org.opensearch.cluster.metadata.IndexMetadata.SETTING_HISTORY_UUID,
-            org.opensearch.cluster.metadata.IndexMetadata.SETTING_VERSION_CREATED,
-            org.opensearch.cluster.metadata.IndexMetadata.SETTING_VERSION_UPGRADED,
-            org.opensearch.cluster.metadata.IndexMetadata.SETTING_CREATION_DATE,
-            org.opensearch.cluster.metadata.IndexMetadata.SETTING_INDEX_PROVIDED_NAME,
-            org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_SHARDS,
-            org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS }) {
-            settings.remove(key);
-        }
-        return settings.build();
     }
 
     /** Thrown from inside {@link #handleRestore}'s gate when the snapshot is still being taken. */
@@ -921,142 +828,6 @@ public final class SnapshotHandler extends BaseRestHandler {
             builder.field("accepted", true);
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
-        }
-    }
-
-    /**
-     * Copies every blob a captured shard's manifest names into a new location, under one fresh term
-     * container. Used both by a standard snapshot's own capture (source: the live index; destination: the
-     * repository's own storage) and by every restore (source: either of those, by
-     * {@link SnapshotRecord#shallow()}; destination: the new index being created) — one copy routine, not
-     * two, because both are the same operation with different endpoints.
-     *
-     * @param blobStore the backing store
-     * @param sourceBase where the manifest's blob paths are relative to
-     * @param destBase where to copy them to
-     * @param source the manifest to copy
-     * @return the manifest to record or publish at the destination
-     * @throws IOException if a referenced blob is missing, or copying fails
-     */
-    private CommitManifest copyShardBlobs(BlobStore blobStore, BlobPath sourceBase, BlobPath destBase, CommitManifest source)
-        throws IOException {
-        final String destTermDir = SegmentPublisher.termSegment(1L);
-        final BlobContainer destContainer = blobStore.blobContainer(destBase.add(destTermDir));
-        final Map<String, String> destFiles = new LinkedHashMap<>();
-        final Map<String, Long> lengths = new LinkedHashMap<>();
-        final Map<String, java.util.Set<String>> missingByTerm = new LinkedHashMap<>();
-        for (var file : source.files().entrySet()) {
-            final Long known = source.lengths().get(file.getKey());
-            if (known != null) {
-                if (known < 0L) {
-                    throw new IOException("snapshot contains a negative file length");
-                }
-                lengths.put(file.getKey(), known);
-            } else {
-                missingByTerm.computeIfAbsent(file.getValue(), ignored -> new java.util.HashSet<>()).add(file.getKey());
-            }
-        }
-        // Older manifests have no lengths. Page their term inventory rather than retaining every
-        // historical file in that term, and stop as soon as the captured files have been found.
-        for (var term : missingByTerm.entrySet()) {
-            final BlobContainer container = blobStore.blobContainer(sourceBase.add(term.getKey()));
-            String cursor = null;
-            while (term.getValue().isEmpty() == false) {
-                final var page = container.listBlobsByPrefix("", cursor, 1000);
-                for (BlobMetadata metadata : page) {
-                    if (term.getValue().remove(metadata.name())) {
-                        lengths.put(metadata.name(), metadata.length());
-                    }
-                }
-                if (page.size() < 1000) {
-                    break;
-                }
-                final String next = page.get(page.size() - 1).name();
-                if (next.equals(cursor)) {
-                    throw new IOException("snapshot source listing did not advance");
-                }
-                cursor = next;
-            }
-            if (term.getValue().isEmpty() == false) {
-                throw new IOException("snapshot references blobs that no longer exist in " + term.getKey());
-            }
-        }
-        for (var file : source.files().entrySet()) {
-            final String name = file.getKey();
-            final BlobContainer sourceContainer = blobStore.blobContainer(sourceBase.add(file.getValue()));
-            // S3 requires mark/reset for upload retries. Reopen a ranged read on reset rather
-            // than buffering a potentially multi-gigabyte segment in memory.
-            try (var input = new org.opensearch.serverless.store.RepeatableBlobInputStream(sourceContainer, name, lengths.get(name))) {
-                destContainer.writeBlob(name, input, lengths.get(name), false);
-            }
-            destFiles.put(name, destTermDir);
-        }
-        return new CommitManifest(1L, destFiles, null, lengths);
-    }
-
-    private static List<String> readIndices(Object field) {
-        if (field instanceof String string) {
-            final List<String> split = new ArrayList<>();
-            for (String piece : string.split(",")) {
-                if (piece.isBlank() == false) {
-                    split.add(piece.trim());
-                }
-            }
-            return split;
-        }
-        if (field instanceof List<?> list) {
-            final List<String> result = new ArrayList<>(list.size());
-            for (Object item : list) {
-                result.add(String.valueOf(item));
-            }
-            return result;
-        }
-        return List.of();
-    }
-
-    private static boolean readBoolean(Object field, boolean defaultValue) {
-        if (field == null) {
-            return defaultValue;
-        }
-        if (field instanceof Boolean bool) {
-            return bool;
-        }
-        return Boolean.parseBoolean(String.valueOf(field));
-    }
-
-    /**
-     * Why a repository or snapshot name is not one, or null when it is.
-     *
-     * @param name the name, or a comma-separated list of them when {@code list} is true
-     * @param what "repository" or "snapshot", for the message
-     * @param list whether several names may be given
-     */
-    private static String invalidName(String name, String what, boolean list) {
-        if (name == null) {
-            return null;
-        }
-        for (String each : list ? name.split(",") : new String[] { name }) {
-            try {
-                org.opensearch.serverless.metadata.Names.validateId(each, what);
-            } catch (IllegalArgumentException e) {
-                return e.getMessage();
-            }
-        }
-        return null;
-    }
-
-    private static String firstUnknownKey(Map<String, Object> body, Set<String> known) {
-        for (String key : body.keySet()) {
-            if (known.contains(key) == false) {
-                return key;
-            }
-        }
-        return null;
-    }
-
-    private Map<String, Object> parseBody(RestRequest request) throws IOException {
-        try (XContentParser parser = request.contentOrSourceParamParser()) {
-            return parser.map();
         }
     }
 
