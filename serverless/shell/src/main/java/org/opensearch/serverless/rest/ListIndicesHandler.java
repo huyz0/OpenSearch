@@ -203,7 +203,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
             table.row(
                 descriptor.get().name(),
                 descriptor.get().uuid(),
-                descriptor.get().numberOfShards(),
+                descriptor.get().declaredShards(),
                 0,
                 "open",
                 descriptor.get().mappingVersion()
@@ -238,7 +238,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
             if (serving.isSystemIndex(descriptor.name())) {
                 continue;
             }
-            table.row(descriptor.name(), descriptor.uuid(), descriptor.numberOfShards(), 0, "open", descriptor.mappingVersion());
+            table.row(descriptor.name(), descriptor.uuid(), descriptor.declaredShards(), 0, "open", descriptor.mappingVersion());
         }
         table.sendPage(channel, request, "indices", page.hasMore() ? Paging.token(paging.prefix(), page.nextAfter()) : null);
     }

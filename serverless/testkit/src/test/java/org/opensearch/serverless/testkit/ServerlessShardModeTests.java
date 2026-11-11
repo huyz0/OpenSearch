@@ -18,6 +18,7 @@ import org.opensearch.serverless.reconcile.ReconcileScheduler;
 import org.opensearch.serverless.rest.DocumentRouting;
 import org.opensearch.serverless.routing.RoutingHash;
 import org.opensearch.serverless.routing.ShardMode;
+import org.opensearch.serverless.routing.UnitLayout;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -157,6 +158,49 @@ public class ServerlessShardModeTests extends OpenSearchTestCase {
                 final Response got = send(node, "GET", "/again/_doc/doc-" + doc, null);
                 assertTrue(got.body(), got.body().contains("\"found\":true"));
             }
+        });
+    }
+
+    /**
+     * An index whose first unit was split: documents route to the two live units, and search, gets, health
+     * and the catalog cover those two and not the retired slot.
+     */
+    public void testASplitLayoutServesOnlyItsLiveUnits() throws Exception {
+        onOneNode("split", (node, plane, loop) -> {
+            final UnitLayout initial = UnitLayout.initial(ShardMode.ADAPTIVE, 4);
+            final UnitLayout split = initial.apply(initial.planSplit(0));
+            final IndexDescriptor descriptor = new IndexDescriptor(
+                "halves",
+                "uuid-halves-00000000",
+                1,
+                "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}",
+                null
+            ).withLayout(split);
+            plane.createIndex(descriptor);
+            assertEquals(3, descriptor.numberOfShards());
+            final Set<Integer> used = new HashSet<>();
+            for (int doc = 0; doc < 20; doc++) {
+                final String id = "doc-" + doc;
+                final int unit = DocumentRouting.shardFor(descriptor, id);
+                assertTrue("routed to a live unit: " + unit, unit == 1 || unit == 2);
+                used.add(unit);
+                final Response put = send(node, "PUT", "/halves/_doc/" + id + "?refresh=true", "{\"msg\":\"half\",\"n\":" + doc + "}");
+                assertEquals(put.body(), 201, put.status());
+            }
+            assertEquals(Set.of(1, 2), used);
+            for (int doc = 0; doc < 20; doc++) {
+                assertTrue(send(node, "GET", "/halves/_doc/doc-" + doc, null).body().contains("\"found\":true"));
+            }
+            final Response count = send(node, "GET", "/halves/_count", null);
+            assertTrue(count.body(), count.body().contains("\"count\":20"));
+            assertTrue("two units searched, not three slots: " + count.body(), count.body().contains("\"total\":2"));
+            final Response health = send(node, "GET", "/_cluster/health/halves?level=indices", null);
+            assertEquals(health.body(), 200, health.status());
+            assertFalse("the retired slot is not reported: " + health.body(), health.body().contains("\"active_shards\":3"));
+            final Response catalog = send(node, "GET", "/_serverless/shards/halves", null);
+            assertEquals(catalog.body(), 200, catalog.status());
+            assertFalse("the retired slot is not listed: " + catalog.body(), catalog.body().contains("\"shard\":0"));
+            assertTrue(catalog.body(), catalog.body().contains("\"shard\":1") && catalog.body().contains("\"shard\":2"));
         });
     }
 
