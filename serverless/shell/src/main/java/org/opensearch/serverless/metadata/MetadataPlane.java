@@ -272,7 +272,7 @@ public final class MetadataPlane {
      * @throws IOException if a register cannot be read
      */
     public Optional<WriteTarget> writeTarget(String name) throws IOException {
-        final DescriptorStore.Resolution resolved = resolveForRouting(name);
+        final DescriptorResolution resolved = resolveForRouting(name);
         if (resolved.index() != null) {
             return Optional.of(new WriteTarget(resolved.index(), null));
         }
@@ -304,15 +304,15 @@ public final class MetadataPlane {
      * @return what it names
      * @throws IOException if the read fails
      */
-    public DescriptorStore.Resolution resolve(String name) throws IOException {
+    public DescriptorResolution resolve(String name) throws IOException {
         final var resolved = aliases.recoverAlias(name);
         return resolved.alias() != null && resolved.alias().creationPending()
-            ? new DescriptorStore.Resolution(null, null, resolved.generation())
+            ? new DescriptorResolution(null, null, resolved.generation())
             : resolved;
     }
 
     /** Reads an alias for mutation, briefly backing off while another writer prepares its hints. */
-    public DescriptorStore.Resolution resolveForAliasMutation(String name) throws IOException {
+    public DescriptorResolution resolveForAliasMutation(String name) throws IOException {
         return aliases.resolveForAliasMutation(name);
     }
 
@@ -336,7 +336,7 @@ public final class MetadataPlane {
      * @return what it names
      * @throws IOException if the register cannot be read or parsed
      */
-    public DescriptorStore.Resolution resolveForRouting(String name) throws IOException {
+    public DescriptorResolution resolveForRouting(String name) throws IOException {
         return routingCache.resolveForRouting(name);
     }
 
@@ -505,7 +505,7 @@ public final class MetadataPlane {
      * @param prefix the prefix, empty for every name
      * @param cap the most names to return before refusing
      * @return the matching names, in lexicographic order
-     * @throws DescriptorStore.TooManyMatchesException if more than {@code cap} match
+     * @throws TooManyMatchesException if more than {@code cap} match
      * @throws IOException if the listing fails
      */
     public java.util.List<String> namesWithPrefix(String prefix, int cap) throws IOException {
