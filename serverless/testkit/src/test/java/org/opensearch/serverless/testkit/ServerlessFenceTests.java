@@ -66,6 +66,8 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            // The failed append is injected into the shard's own log, which only takes writes with the node log off.
+            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 

@@ -332,7 +332,7 @@ public final class ServerlessBootstrap implements Closeable {
 
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             openedLoop = loop;
-            final boolean nodeLog = complete.getAsBoolean("serverless.wal.node_log.enabled", false);
+            final boolean nodeLog = complete.getAsBoolean("serverless.wal.node_log.enabled", true);
             final long window = complete.getAsLong(NODE_LOG_WINDOW, NodeLogCommitter.DEFAULT_WINDOW_MILLIS);
             if (nodeLog) {
                 if (NodeLogCommitter.ALLOWED_WINDOW_MILLIS.contains(window) == false) {

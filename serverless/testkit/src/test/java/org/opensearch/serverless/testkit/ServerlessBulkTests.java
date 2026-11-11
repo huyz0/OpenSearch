@@ -53,6 +53,8 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            // These count appends to the shard's own log, which only takes writes with the node log off.
+            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 
