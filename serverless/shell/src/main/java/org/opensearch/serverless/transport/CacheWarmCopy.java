@@ -59,6 +59,12 @@ public final class CacheWarmCopy {
     /** The default batch: 4 MB of 64 KB blocks. */
     static final int DEFAULT_BATCH_BLOCKS = 64;
 
+    /** How many peers a joiner copies from at once. */
+    public static final String PARALLEL_PEERS = "serverless.search.warm_copy.parallel_peers";
+
+    /** The default: enough to keep a joiner's network busy without one peer's slowness setting the pace of all. */
+    static final int DEFAULT_PARALLEL_PEERS = 8;
+
     /** The most blocks a peer hands over in one answer, whatever it is asked for. */
     static final int MAX_BATCH_BLOCKS = 1024;
 
@@ -103,6 +109,7 @@ public final class CacheWarmCopy {
     private final ShardRouter router;
     private final long maxBytesPerSecond;
     private final int batchBlocks;
+    private final int parallelPeers;
     private volatile LongSupplier nanoClock = System::nanoTime;
     private volatile Pause pause = nanos -> Thread.sleep(nanos / 1_000_000L, (int) (nanos % 1_000_000L));
 
@@ -110,6 +117,7 @@ public final class CacheWarmCopy {
         this.router = router;
         this.maxBytesPerSecond = Math.max(1L, router.node.settings().getAsLong(MAX_BYTES_PER_SECOND, DEFAULT_MAX_BYTES_PER_SECOND));
         this.batchBlocks = Math.max(1, Math.min(MAX_BATCH_BLOCKS, router.node.settings().getAsInt(BATCH_BLOCKS, DEFAULT_BATCH_BLOCKS)));
+        this.parallelPeers = Math.max(1, router.node.settings().getAsInt(PARALLEL_PEERS, DEFAULT_PARALLEL_PEERS));
     }
 
     /**
@@ -238,8 +246,22 @@ public final class CacheWarmCopy {
      * @throws IOException if the membership cannot be read
      */
     public Outcome copyFromPeers() throws IOException {
+        return copyFromPeers(1.0, shards -> {});
+    }
+
+    /**
+     * Copies this node's share of its search peers' warm blocks, saying when a share of them is held; see
+     * {@link #copyFrom(List, double, java.util.function.Consumer)}.
+     *
+     * @param fraction the share of named blocks at which to call {@code atFraction}
+     * @param atFraction called once with the shards this node will serve
+     * @return what was copied
+     * @throws IOException if the membership cannot be read
+     */
+    public Outcome copyFromPeers(double fraction, java.util.function.Consumer<Set<Shard>> atFraction) throws IOException {
         final MetadataPlane plane = router.plane.get();
         if (plane == null) {
+            atFraction.accept(Set.of());
             return new Outcome(Set.of(), 0, 0, 0, 0, 0, 0, Map.of());
         }
         final String self = router.node.localNode().getId();
@@ -253,7 +275,7 @@ public final class CacheWarmCopy {
             }
         }
         peers.sort(null);
-        return copyFrom(peers);
+        return copyFrom(peers, fraction, atFraction);
     }
 
     /**
@@ -264,79 +286,251 @@ public final class CacheWarmCopy {
      * @return what was copied, and the shards this node will serve
      */
     public Outcome copyFrom(List<String> peers) {
+        return copyFrom(peers, 1.0, shards -> {});
+    }
+
+    /**
+     * Copies from some peers, all at once, and says when a share of the named blocks is held.
+     *
+     * <p>Every peer is asked for its hot set together, and a block named by several (a hot shard is spread over
+     * several readers) is fetched from only one of them. The blocks are then taken from every peer at once, up to
+     * {@value #PARALLEL_PEERS}, within one shared pace: a joiner's time is the slowest peer's, not their sum. Each
+     * peer's blocks go hottest first across its shards, so the share that arrives first is the share searches want.
+     *
+     * @param peers the peers to copy from
+     * @param fraction the share of named blocks, from 0 to 1, at which to call {@code atFraction}
+     * @param atFraction called once, on a copying thread, with the shards this node will serve, when that share is held,
+     *                   or at the end if it never is
+     * @return what was copied, and the shards this node will serve
+     */
+    public Outcome copyFrom(List<String> peers, double fraction, java.util.function.Consumer<Set<Shard>> atFraction) {
         final MetadataPlane plane = router.plane.get();
         if (plane == null) {
+            atFraction.accept(Set.of());
             return new Outcome(Set.of(), 0, 0, 0, 0, 0, 0, Map.of());
         }
         final String self = router.node.localNode().getId();
         final BlockCache cache = router.node.blockCache();
         final Pacer pacer = new Pacer();
-        final Map<Shard, java.util.LinkedHashSet<String>> shards = new LinkedHashMap<>();
-        int failed = 0;
-        long copied = 0;
-        long bytes = 0;
-        long missed = 0;
-        for (String peerId : peers) {
-            try {
-                final Optional<DiscoveryNode> peer = router.peer(peerId);
-                if (peer.isEmpty()) {
-                    failed++;
+        final java.util.concurrent.atomic.AtomicInteger failed = new java.util.concurrent.atomic.AtomicInteger();
+        final java.util.concurrent.atomic.AtomicLong copied = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong bytes = new java.util.concurrent.atomic.AtomicLong();
+        final java.util.concurrent.atomic.AtomicLong missed = new java.util.concurrent.atomic.AtomicLong();
+        try {
+            // Every peer's hot set at once.
+            final List<java.util.concurrent.Callable<Optional<Map.Entry<DiscoveryNode, HotSetResponse>>>> asks = new ArrayList<>();
+            for (String peerId : peers) {
+                asks.add(() -> {
+                    final Optional<DiscoveryNode> peer = router.peer(peerId);
+                    if (peer.isEmpty()) {
+                        return Optional.empty();
+                    }
+                    final HotSetResponse hot = router.send(peer.get(), HotSetRequest.ACTION, new HotSetRequest(self), HotSetResponse::new);
+                    return Optional.of(Map.entry(peer.get(), hot));
+                });
+            }
+            final List<java.util.concurrent.Future<Optional<Map.Entry<DiscoveryNode, HotSetResponse>>>> answers = runBounded(asks);
+            final Map<String, java.util.concurrent.Future<Optional<Map.Entry<DiscoveryNode, HotSetResponse>>>> asked =
+                new LinkedHashMap<>();
+            for (int i = 0; i < peers.size(); i++) {
+                asked.put(peers.get(i), answers.get(i));
+            }
+            final Map<Shard, java.util.LinkedHashSet<String>> shards = new LinkedHashMap<>();
+            final Map<DiscoveryNode, List<String>> wantedFrom = new LinkedHashMap<>();
+            final Set<String> claimed = new java.util.HashSet<>();
+            long held = 0;
+            for (Map.Entry<String, java.util.concurrent.Future<Optional<Map.Entry<DiscoveryNode, HotSetResponse>>>> answer : asked
+                .entrySet()) {
+                final Optional<Map.Entry<DiscoveryNode, HotSetResponse>> got;
+                try {
+                    got = answer.getValue().get();
+                } catch (java.util.concurrent.ExecutionException e) {
+                    failed.incrementAndGet();
+                    LOG.warn("search peer [" + answer.getKey() + "] did not say what it holds for this node", e.getCause());
                     continue;
                 }
-                final HotSetResponse hot = router.send(peer.get(), HotSetRequest.ACTION, new HotSetRequest(self), HotSetResponse::new);
-                for (CacheHotSet.HotShard shard : hot.shards()) {
+                if (got.isEmpty()) {
+                    failed.incrementAndGet();
+                    continue;
+                }
+                final List<List<String>> perShard = new ArrayList<>();
+                for (CacheHotSet.HotShard shard : got.get().getValue().shards()) {
                     shards.computeIfAbsent(
                         new Shard(shard.indexName(), shard.indexUuid(), shard.shard()),
                         k -> new java.util.LinkedHashSet<>()
                     ).addAll(shard.keys());
-                    final List<String> wanted = new ArrayList<>();
+                    final List<String> mine = new ArrayList<>();
                     for (String key : shard.keys()) {
-                        // A hot shard is spread over several peers, and each names the same blocks.
-                        if (cache.holds(key) == false) {
-                            wanted.add(key);
-                        } else {
-                            missed++;
+                        if (cache.holds(key)) {
+                            held++;
+                            missed.incrementAndGet();
+                        } else if (claimed.add(key)) {
+                            mine.add(key);
                         }
                     }
-                    for (int from = 0; from < wanted.size(); from += batchBlocks) {
-                        final List<String> batch = wanted.subList(from, Math.min(wanted.size(), from + batchBlocks));
-                        final CacheBlocksResponse answer = router.send(
-                            peer.get(),
-                            CacheBlocksRequest.ACTION,
-                            new CacheBlocksRequest(batch),
-                            CacheBlocksResponse::new
-                        );
-                        long batchBytes = 0;
-                        for (Map.Entry<String, byte[]> block : answer.blocks().entrySet()) {
-                            if (cache.putCopied(block.getKey(), block.getValue())) {
-                                copied++;
-                                batchBytes += block.getValue().length;
-                            } else {
-                                missed++;
-                            }
-                        }
-                        missed += batch.size() - answer.blocks().size();
-                        bytes += batchBytes;
-                        pacer.took(batchBytes);
-                    }
+                    perShard.add(mine);
                 }
-            } catch (IOException | RuntimeException e) {
-                // A peer that went away mid-copy costs this node only the blocks it did not hand over.
-                failed++;
-                LOG.warn("could not copy warm blocks from search peer [" + peerId + "]", e);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
+                wantedFrom.put(got.get().getKey(), hottestFirst(perShard));
+            }
+            final Set<Shard> share = Set.copyOf(shards.keySet());
+            final Threshold threshold = new Threshold(
+                fraction,
+                shards.values().stream().mapToLong(Set::size).sum(),
+                held,
+                () -> atFraction.accept(share)
+            );
+            // Then every peer's blocks at once.
+            final List<java.util.concurrent.Callable<Object>> work = new ArrayList<>();
+            for (Map.Entry<DiscoveryNode, List<String>> from : wantedFrom.entrySet()) {
+                work.add(() -> {
+                    final List<String> wanted = from.getValue();
+                    try {
+                        for (int i = 0; i < wanted.size(); i += batchBlocks) {
+                            final List<String> batch = wanted.subList(i, Math.min(wanted.size(), i + batchBlocks));
+                            final CacheBlocksResponse answer = router.send(
+                                from.getKey(),
+                                CacheBlocksRequest.ACTION,
+                                new CacheBlocksRequest(batch),
+                                CacheBlocksResponse::new
+                            );
+                            long batchBytes = 0;
+                            int stored = 0;
+                            for (Map.Entry<String, byte[]> block : answer.blocks().entrySet()) {
+                                if (cache.putCopied(block.getKey(), block.getValue())) {
+                                    stored++;
+                                    batchBytes += block.getValue().length;
+                                } else {
+                                    missed.incrementAndGet();
+                                }
+                            }
+                            copied.addAndGet(stored);
+                            missed.addAndGet(batch.size() - answer.blocks().size());
+                            bytes.addAndGet(batchBytes);
+                            threshold.held(stored);
+                            pacer.took(batchBytes);
+                        }
+                    } catch (IOException | RuntimeException e) {
+                        // A peer that went away mid-copy costs this node only the blocks it did not hand over.
+                        failed.incrementAndGet();
+                        LOG.warn("could not copy warm blocks from search peer [" + from.getKey().getId() + "]", e);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return null;
+                });
+            }
+            for (java.util.concurrent.Future<?> transfer : runBounded(work)) {
+                try {
+                    transfer.get();
+                } catch (java.util.concurrent.ExecutionException e) {
+                    failed.incrementAndGet();
+                }
+            }
+            threshold.end();
+            final Map<Shard, List<String>> unheld = new LinkedHashMap<>();
+            for (Map.Entry<Shard, java.util.LinkedHashSet<String>> shard : shards.entrySet()) {
+                final List<String> keys = shard.getValue().stream().filter(key -> cache.holds(key) == false).toList();
+                if (keys.isEmpty() == false) {
+                    unheld.put(shard.getKey(), keys);
+                }
+            }
+            return new Outcome(
+                Set.copyOf(shards.keySet()),
+                peers.size(),
+                failed.get(),
+                copied.get(),
+                bytes.get(),
+                missed.get(),
+                pacer.paused(),
+                unheld
+            );
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            atFraction.accept(Set.of());
+            return new Outcome(Set.of(), peers.size(), peers.size(), copied.get(), bytes.get(), missed.get(), pacer.paused(), Map.of());
+        }
+    }
+
+    /**
+     * Runs tasks on the node's generic pool, at most {@link #parallelPeers} at a time.
+     *
+     * @return each task's result, in order
+     */
+    private <T> List<java.util.concurrent.Future<T>> runBounded(List<java.util.concurrent.Callable<T>> tasks) {
+        final List<java.util.concurrent.CompletableFuture<T>> results = new ArrayList<>(tasks.size());
+        for (int i = 0; i < tasks.size(); i++) {
+            results.add(new java.util.concurrent.CompletableFuture<>());
+        }
+        final java.util.concurrent.atomic.AtomicInteger next = new java.util.concurrent.atomic.AtomicInteger();
+        final Runnable worker = () -> {
+            for (int i = next.getAndIncrement(); i < tasks.size(); i = next.getAndIncrement()) {
+                try {
+                    results.get(i).complete(tasks.get(i).call());
+                } catch (Exception e) {
+                    results.get(i).completeExceptionally(e);
+                }
+            }
+        };
+        final int workers = Math.min(parallelPeers, tasks.size());
+        for (int w = 0; w < workers; w++) {
+            try {
+                router.node.threadPool().generic().execute(worker);
+            } catch (RuntimeException rejected) {
+                // A pool that refuses leaves the work to the workers already running, or to this thread.
+                worker.run();
             }
         }
-        final Map<Shard, List<String>> unheld = new LinkedHashMap<>();
-        for (Map.Entry<Shard, java.util.LinkedHashSet<String>> shard : shards.entrySet()) {
-            final List<String> keys = shard.getValue().stream().filter(key -> cache.holds(key) == false).toList();
-            if (keys.isEmpty() == false) {
-                unheld.put(shard.getKey(), keys);
+        return new ArrayList<>(results);
+    }
+
+    /** Interleaves shards' hottest-first key lists, so the first blocks taken are the hottest of every shard. */
+    static List<String> hottestFirst(List<List<String>> perShard) {
+        final List<String> order = new ArrayList<>();
+        for (int i = 0, left = perShard.size(); left > 0; i++) {
+            left = 0;
+            for (List<String> keys : perShard) {
+                if (i < keys.size()) {
+                    order.add(keys.get(i));
+                }
+                if (i + 1 < keys.size()) {
+                    left++;
+                }
             }
         }
-        return new Outcome(Set.copyOf(shards.keySet()), peers.size(), failed, copied, bytes, missed, pacer.paused, unheld);
+        return order;
+    }
+
+    /** Calls back once when a share of the named blocks is held, or at the end. */
+    private static final class Threshold {
+        private final long needed;
+        private final Runnable callback;
+        private final java.util.concurrent.atomic.AtomicLong held;
+        private final java.util.concurrent.atomic.AtomicBoolean called = new java.util.concurrent.atomic.AtomicBoolean();
+
+        Threshold(double fraction, long named, long alreadyHeld, Runnable callback) {
+            this.needed = (long) Math.ceil(Math.max(0.0, Math.min(1.0, fraction)) * named);
+            this.callback = callback;
+            this.held = new java.util.concurrent.atomic.AtomicLong(alreadyHeld);
+            if (alreadyHeld >= needed) {
+                fire();
+            }
+        }
+
+        void held(long blocks) {
+            if (held.addAndGet(blocks) >= needed) {
+                fire();
+            }
+        }
+
+        void end() {
+            fire();
+        }
+
+        private void fire() {
+            if (called.compareAndSet(false, true)) {
+                callback.run();
+            }
+        }
     }
 
     /** Keeps the copy to {@link #maxBytesPerSecond} over its whole run. */
@@ -345,14 +539,24 @@ public final class CacheWarmCopy {
         private long total;
         private long paused;
 
+        /** Counts a transfer against the shared pace and waits, outside the lock, for as long as it ran ahead. */
         void took(long bytes) throws InterruptedException {
-            total += bytes;
-            final long due = started + (long) (total * 1e9 / maxBytesPerSecond);
-            final long ahead = due - nanoClock.getAsLong();
+            final long ahead;
+            synchronized (this) {
+                total += bytes;
+                final long due = started + (long) (total * 1e9 / maxBytesPerSecond);
+                ahead = due - nanoClock.getAsLong();
+                if (ahead > 0) {
+                    paused += ahead;
+                }
+            }
             if (ahead > 0) {
-                paused += ahead;
                 pause.sleep(ahead);
             }
+        }
+
+        synchronized long paused() {
+            return paused;
         }
     }
 }
