@@ -8,11 +8,11 @@
 
 package org.opensearch.serverless.store;
 
-import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 
@@ -87,7 +87,7 @@ public final class NodePackLedger {
         }
     }
 
-    private final BlobContainer container;
+    private final ConditionalBlobContainer container;
     private final String nodeId;
 
     /**
@@ -99,7 +99,7 @@ public final class NodePackLedger {
      */
     public NodePackLedger(BlobStore blobStore, BlobPath base, String nodeId) {
         this.nodeId = Objects.requireNonNull(nodeId, "nodeId");
-        this.container = blobStore.blobContainer(base.add(NodePackStore.ROOT).add(nodeId));
+        this.container = ConditionalBlobContainer.of(blobStore.blobContainer(base.add(NodePackStore.ROOT).add(nodeId)));
     }
 
     /**

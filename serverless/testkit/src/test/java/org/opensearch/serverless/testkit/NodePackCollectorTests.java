@@ -8,9 +8,9 @@
 
 package org.opensearch.serverless.testkit;
 
-import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.RegisterMap;
@@ -78,7 +78,9 @@ public class NodePackCollectorTests extends OpenSearchTestCase {
             lengths.put(file, landed.block().length());
         }
         final CommitManifest manifest = new CommitManifest(1L, located, "writer", lengths);
-        final BlobContainer container = store.blobContainer(RegisterMap.shardData(BlobPath.cleanPath(), index, uuid, shard));
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(
+            store.blobContainer(RegisterMap.shardData(BlobPath.cleanPath(), index, uuid, shard))
+        );
         final Optional<BlobRegister> current = container.readRegister(SegmentPublisher.MANIFEST);
         if (current.isEmpty()) {
             container.createRegisterIfAbsent(SegmentPublisher.MANIFEST, manifest.toBytes());
