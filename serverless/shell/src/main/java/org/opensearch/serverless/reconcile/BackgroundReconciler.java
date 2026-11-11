@@ -2057,6 +2057,52 @@ public final class BackgroundReconciler implements Closeable {
 
     private final java.util.concurrent.atomic.AtomicLong janitorCursor = new java.util.concurrent.atomic.AtomicLong();
 
+    /** How many dead nodes' write logs a janitor pass looks at, at most: each is a fence and a few reads per shard named. */
+    public static final int DEFAULT_NODE_LOGS_PER_PASS = 4;
+
+    private final java.util.concurrent.atomic.AtomicLong nodeLogsCollected = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Returns how many dead nodes' write logs this node's janitor has deleted.
+     *
+     * @return the count
+     */
+    public long nodeLogsCollected() {
+        return nodeLogsCollected.get();
+    }
+
+    private void collectNodeLogs(List<String> live, int rank, long now, long settledAfter) {
+        final java.util.Set<String> enrolled;
+        try {
+            enrolled = plane.membership().enrolledIds();
+        } catch (Exception e) {
+            logger.debug("janitor could not read the members index", e);
+            return;
+        }
+        int looked = 0;
+        for (String nodeId : new java.util.TreeSet<>(enrolled)) {
+            if (looked >= DEFAULT_NODE_LOGS_PER_PASS) {
+                break;
+            }
+            if (live.contains(nodeId) || Math.floorMod(("node-log#" + nodeId).hashCode(), live.size()) != rank) {
+                continue;
+            }
+            try {
+                final var lease = plane.membership().read(nodeId);
+                if (lease.isEmpty() || lease.get().nodeLog().isEmpty() || now - lease.get().expiresAtMillis() < settledAfter) {
+                    continue;
+                }
+                looked++;
+                if (plane.collectNodeLog(nodeId) == MetadataPlane.NodeLogCollected.COLLECTED) {
+                    nodeLogsCollected.incrementAndGet();
+                    logger.info("janitor: deleted the write log of departed node {}: every shard it named had published", nodeId);
+                }
+            } catch (Exception e) {
+                logger.debug("janitor could not collect the write log of " + nodeId, e);
+            }
+        }
+    }
+
     /**
      * Cleans up after crashed nodes, a bounded amount at a time.
      *
@@ -2121,6 +2167,12 @@ public final class BackgroundReconciler implements Closeable {
                     }
                 }
             }
+
+            // Write logs of nodes dead for as long: each looked at by the one live node it hashes to, which deletes it once
+            // every shard it names has published past it. A node going down moves its share to the others with the live
+            // list. One read of the members index, and a lease read for each node not live, whose leases are kept only
+            // while they name a log.
+            collectNodeLogs(live, rank, now, settledAfter);
 
             // One rollup bucket, rotating through every group's buckets; this node reads the ones that hash to it.
             final List<String> groups = plane.rollups().groups();

@@ -231,7 +231,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
     }
 
     static ShardKey keyOf(ShardId shardId) {
-        return new ShardKey(shardId.getIndex().getUUID(), shardId.id());
+        return new ShardKey(shardId.getIndex().getUUID(), shardId.id(), shardId.getIndexName());
     }
 
     /**

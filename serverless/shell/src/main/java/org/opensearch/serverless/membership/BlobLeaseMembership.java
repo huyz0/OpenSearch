@@ -636,6 +636,49 @@ public final class BlobLeaseMembership implements MembershipSource {
         }
     }
 
+    /**
+     * Lists every node on the members index, live or not: one read.
+     *
+     * @return the node ids
+     * @throws IOException if the index cannot be read
+     */
+    public Set<String> enrolledIds() throws IOException {
+        final Optional<BlobRegister> index = container.readRegister(MEMBERS);
+        return index.isPresent() ? decodeIds(index.get()) : listedIds();
+    }
+
+    /**
+     * Stops a node's lease naming epochs of its write log, once nothing in them is needed: for a node that is not live,
+     * on its behalf, so its lease can be pruned like any other.
+     *
+     * <p>Only if the lease names exactly the epochs the caller checked and the node is still not live, by one swap: a
+     * node that comes back renews the register first, and the swap is lost.
+     *
+     * @param nodeId the node
+     * @param checked the epochs the caller found nothing needed in
+     * @return true if the lease names no epochs afterwards
+     * @throws IOException if the register cannot be read or written
+     */
+    public boolean forgetNodeLog(String nodeId, java.util.List<org.opensearch.serverless.store.NodeLogEpoch> checked) throws IOException {
+        final String name = LEASE_PREFIX + nodeId;
+        final Optional<BlobRegister> register = container.readRegister(name);
+        if (register.isEmpty()) {
+            return true;
+        }
+        final NodeLease lease;
+        try (InputStream in = register.get().value().streamInput()) {
+            lease = NodeLease.fromStream(in);
+        }
+        if (lease.nodeLog().isEmpty()) {
+            return true;
+        }
+        if (lease.nodeLog().equals(checked) == false || (lease.revoked() == false && lease.isExpiredAt(clock.getAsLong()) == false)) {
+            return false;
+        }
+        return container.compareAndSwapRegister(name, register.get().generation(), lease.withNodeLog(java.util.List.of()).toBytes())
+            .applied();
+    }
+
     /** The lease this node last renewed, which {@link #current} includes while it is unexpired. */
     private volatile NodeLease ownLease;
 
