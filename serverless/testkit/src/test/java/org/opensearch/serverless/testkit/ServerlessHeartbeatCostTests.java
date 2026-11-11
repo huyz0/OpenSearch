@@ -18,6 +18,7 @@ import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.ShardHead;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
+import org.opensearch.serverless.reconcile.TickResult;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -141,7 +142,7 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
             loop.setRenewalDrivenByTimer(true);
 
             counter.reset();
-            final BackgroundReconciler.TickResult quiet = loop.tick(clock.addAndGet(1_000L));
+            final TickResult quiet = loop.tick(clock.addAndGet(1_000L));
             assertTrue("a quiet backstop releases nothing", quiet.released().isEmpty());
             assertEquals("and writes no register when a timer renews the lease: " + counter.breakdown(), 0L, counter.registerWrites());
             assertTrue("but still verifies the heads: " + counter.breakdown(), counter.registerReads() >= 2);
