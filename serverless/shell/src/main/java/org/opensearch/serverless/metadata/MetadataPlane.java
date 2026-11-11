@@ -1605,6 +1605,97 @@ public final class MetadataPlane {
         return reader.holds(new NodeLogBlob.ShardKey(uuid, shard));
     }
 
+    /** What became of a node's write log when a survivor looked at it. */
+    public enum NodeLogCollected {
+        /** The node is live, or names no epochs: nothing to do. */
+        NOTHING,
+        /** A shard named in it has not published what it holds: kept, to be looked at again. */
+        STILL_NEEDED,
+        /** Nothing in it was needed: the lease names no epochs any more, and the blobs were deleted. */
+        COLLECTED
+    }
+
+    /**
+     * Deletes the write log of a node that is not live, once every shard it names has published past what it holds.
+     *
+     * <p><b>Why.</b> A lease that names epochs of a write log is never pruned, since it is the only place a successor
+     * finds them, and nothing else deletes a dead node's blobs: without this both stay for ever.
+     *
+     * <p><b>When it is safe.</b> Every epoch is fenced first, so the node, if it is not as dead as it looks, can add
+     * nothing after what is read. Each shard the last headers name is then judged: an index deleted or recreated
+     * needs nothing; otherwise its published commit must reach the highest sequence number this log holds of it,
+     * which is read from blob headers alone. A shard whose new owner has not yet replayed and published keeps the log.
+     * Only then does the lease stop naming the epochs, by a swap that a node coming back wins, and the blobs go.
+     *
+     * <p>A blob left behind by a delete that fails, or above a second fence, costs storage, not records: the
+     * bucket's lifecycle rule on the log prefix removes it.
+     *
+     * @param nodeId the node
+     * @return what was done
+     * @throws IOException if the store cannot be read or written
+     */
+    public NodeLogCollected collectNodeLog(String nodeId) throws IOException {
+        final Optional<NodeLease> lease = membership().read(nodeId);
+        if (lease.isEmpty() || lease.get().nodeLog().isEmpty() || isLive(lease.get())) {
+            return NodeLogCollected.NOTHING;
+        }
+        final List<NodeLogEpoch> epochs = lease.get().nodeLog();
+        final NodeLogStore log = new NodeLogStore(blobStore, base, nodeId);
+        final NodeLogTakeover reader = new NodeLogTakeover(
+            log,
+            epochs,
+            "collected-by-survivor",
+            0L,
+            () -> membership().read(nodeId).map(NodeLease::nodeLog).orElse(List.of())
+        );
+        for (NodeLogBlob.ShardKey shard : reader.named()) {
+            if (publishedPast(nodeId, shard, reader) == false) {
+                return NodeLogCollected.STILL_NEEDED;
+            }
+        }
+        final Map<Long, Long> ends = reader.ends();
+        if (membership().forgetNodeLog(nodeId, epochs) == false) {
+            return NodeLogCollected.STILL_NEEDED;
+        }
+        for (NodeLogEpoch epoch : epochs) {
+            // From the trim point the lease recorded: the node deleted below it itself, up to a renewal's worth.
+            log.deleteRange(epoch.epoch(), epoch.trimPoint(), ends.getOrDefault(epoch.epoch(), epoch.landed()) + 1);
+        }
+        return NodeLogCollected.COLLECTED;
+    }
+
+    /** Whether a shard's published commit holds everything a node's log holds of it. */
+    private boolean publishedPast(String nodeId, NodeLogBlob.ShardKey shard, NodeLogTakeover reader) throws IOException {
+        if (shard.indexName() == null) {
+            return false;
+        }
+        final Optional<IndexDescriptor> descriptor = describe(shard.indexName());
+        if (descriptor.isEmpty() || descriptor.get().uuid().equals(shard.indexUuid()) == false) {
+            // Deleted, or recreated under the name: nothing of this incarnation is read again.
+            return true;
+        }
+        final Optional<ShardHead> head = heads.read(shard.indexName(), shard.shard());
+        if (head.isPresent() && nodeId.equals(head.get().ownerNodeId())) {
+            // Still the dead node's own: settled or taken first, and judged then.
+            return false;
+        }
+        final long held = reader.maxSeqNoOf(shard);
+        if (held == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO) {
+            return true;
+        }
+        final org.opensearch.serverless.store.SegmentPublisher publisher = segmentPublisher(
+            shard.indexName(),
+            shard.indexUuid(),
+            shard.shard()
+        );
+        final Optional<org.opensearch.serverless.store.CommitManifest> commit = publisher.readManifest();
+        if (commit.isEmpty()) {
+            return false;
+        }
+        final java.util.OptionalLong committed = publisher.committedMaxSeqNo(commit.get());
+        return committed.isPresent() && committed.getAsLong() >= held;
+    }
+
     /**
      * Whether a lease names a node that is live now: neither revoked nor expired on this plane's clock.
      *

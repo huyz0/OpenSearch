@@ -18,6 +18,7 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -49,7 +50,7 @@ public final class NodeLogBlob {
     /** Starts every fence. */
     static final int FENCE_MAGIC = 0x4E4C4746;
     /** The format this class writes, and the only one it reads. */
-    static final byte VERSION = 1;
+    static final byte VERSION = 2;
     /** Magic, version and header length. */
     static final int PREFIX_BYTES = Integer.BYTES + 1 + Integer.BYTES;
 
@@ -58,16 +59,41 @@ public final class NodeLogBlob {
     /**
      * One shard of one index incarnation.
      *
+     * <p>Identified by the uuid and shard number alone. The index's name travels with it, so a reader holding only a
+     * dead node's log can find the shard's head and commit, which are kept by name; two keys that differ only in a
+     * missing name are the same shard.
+     *
      * @param indexUuid the index's uuid, so a recreated index under the same name is a different shard
      * @param shard the shard number
+     * @param indexName the index's name, or null where it is not known
      */
-    public record ShardKey(String indexUuid, int shard) implements Comparable<ShardKey> {
+    public record ShardKey(String indexUuid, int shard, String indexName) implements Comparable<ShardKey> {
         /** Validates. */
         public ShardKey {
             Objects.requireNonNull(indexUuid, "indexUuid");
             if (shard < 0) {
                 throw new IllegalArgumentException("shard must not be negative, got " + shard);
             }
+        }
+
+        /**
+         * Creates a key whose index name is not known.
+         *
+         * @param indexUuid the index's uuid
+         * @param shard the shard number
+         */
+        public ShardKey(String indexUuid, int shard) {
+            this(indexUuid, shard, null);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof ShardKey key && indexUuid.equals(key.indexUuid) && shard == key.shard;
+        }
+
+        @Override
+        public int hashCode() {
+            return 31 * indexUuid.hashCode() + shard;
         }
 
         @Override
@@ -78,7 +104,7 @@ public final class NodeLogBlob {
 
         @Override
         public String toString() {
-            return indexUuid + "[" + shard + "]";
+            return (indexName == null ? "" : indexName + "/") + indexUuid + "[" + shard + "]";
         }
     }
 
@@ -247,9 +273,24 @@ public final class NodeLogBlob {
             out.writeLong(epoch);
             out.writeLong(ordinal);
             out.writeLong(trimPoint);
+            // Each index named once, however many of its shards the blob holds or indexes.
+            final Map<String, String> names = new LinkedHashMap<>();
+            for (Slice slice : slices) {
+                nameOnce(names, slice.shard());
+            }
+            for (ShardKey shard : index.keySet()) {
+                nameOnce(names, shard);
+            }
+            final Map<String, Integer> positions = new HashMap<>();
+            out.writeInt(names.size());
+            for (Map.Entry<String, String> name : names.entrySet()) {
+                positions.put(name.getKey(), positions.size());
+                out.writeUTF(name.getKey());
+                out.writeUTF(name.getValue() == null ? "" : name.getValue());
+            }
             out.writeInt(slices.size());
             for (Slice slice : slices) {
-                writeShard(out, slice.shard());
+                writeShard(out, positions, slice.shard());
                 out.writeLong(slice.term());
                 out.writeLong(slice.offset());
                 out.writeInt(slice.length());
@@ -258,7 +299,7 @@ public final class NodeLogBlob {
             }
             out.writeInt(index.size());
             for (Map.Entry<ShardKey, List<Range>> entry : index.entrySet()) {
-                writeShard(out, entry.getKey());
+                writeShard(out, positions, entry.getKey());
                 out.writeInt(entry.getValue().size());
                 for (Range range : entry.getValue()) {
                     out.writeLong(range.from());
@@ -364,15 +405,22 @@ public final class NodeLogBlob {
             final long epoch = in.readLong();
             final long ordinal = in.readLong();
             final long trimPoint = in.readLong();
+            final int nameCount = in.readInt();
+            final List<String[]> names = new ArrayList<>(nameCount);
+            for (int i = 0; i < nameCount; i++) {
+                final String uuid = in.readUTF();
+                final String name = in.readUTF();
+                names.add(new String[] { uuid, name.isEmpty() ? null : name });
+            }
             final int sliceCount = in.readInt();
             final List<Slice> slices = new ArrayList<>(sliceCount);
             for (int i = 0; i < sliceCount; i++) {
-                slices.add(new Slice(readShard(in), in.readLong(), in.readLong(), in.readInt(), in.readInt(), in.readLong()));
+                slices.add(new Slice(readShard(in, names), in.readLong(), in.readLong(), in.readInt(), in.readInt(), in.readLong()));
             }
             final int indexCount = in.readInt();
             final Map<ShardKey, List<Range>> index = new LinkedHashMap<>();
             for (int i = 0; i < indexCount; i++) {
-                final ShardKey shard = readShard(in);
+                final ShardKey shard = readShard(in, names);
                 final int ranges = in.readInt();
                 final List<Range> runs = new ArrayList<>(ranges);
                 for (int r = 0; r < ranges; r++) {
@@ -459,12 +507,23 @@ public final class NodeLogBlob {
         return ((bytes[0] & 0xFF) << 24) | ((bytes[1] & 0xFF) << 16) | ((bytes[2] & 0xFF) << 8) | (bytes[3] & 0xFF);
     }
 
-    private static void writeShard(DataOutputStream out, ShardKey shard) throws IOException {
-        out.writeUTF(shard.indexUuid());
+    private static void nameOnce(Map<String, String> names, ShardKey shard) {
+        if (shard.indexName() != null || names.containsKey(shard.indexUuid()) == false) {
+            names.put(shard.indexUuid(), shard.indexName() != null ? shard.indexName() : names.get(shard.indexUuid()));
+        }
+    }
+
+    private static void writeShard(DataOutputStream out, Map<String, Integer> positions, ShardKey shard) throws IOException {
+        out.writeInt(positions.get(shard.indexUuid()));
         out.writeInt(shard.shard());
     }
 
-    private static ShardKey readShard(DataInputStream in) throws IOException {
-        return new ShardKey(in.readUTF(), in.readInt());
+    private static ShardKey readShard(DataInputStream in, List<String[]> names) throws IOException {
+        final int position = in.readInt();
+        if (position < 0 || position >= names.size()) {
+            throw new IOException("corrupt node-log header: index " + position + " of " + names.size() + " named");
+        }
+        final String[] name = names.get(position);
+        return new ShardKey(name[0], in.readInt(), name[1]);
     }
 }

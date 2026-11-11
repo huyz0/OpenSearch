@@ -54,6 +54,8 @@ public final class NodeLogTakeover {
 
     /** Per epoch, the last header below its fence, or empty if it held no records above its trim point. */
     private volatile Map<Long, Optional<Header>> lastHeaders;
+    /** Per epoch, the slot its fence took, or its first free slot when nothing was fenced. */
+    private volatile Map<Long, Long> ends;
     /** Headers read for one shard, kept for the others in the same blob. */
     private final Map<Long, Map<Long, Header>> headers = new ConcurrentHashMap<>();
 
@@ -194,7 +196,67 @@ public final class NodeLogTakeover {
         for (NodeLogEpoch epoch : epochs) {
             found.put(epoch.epoch(), log.lastHeaderBelow(epoch.epoch(), fences.get(epoch.epoch()), floors.get(epoch.epoch())));
         }
+        ends = Map.copyOf(fences);
         lastHeaders = found;
+    }
+
+    /**
+     * Returns, per epoch, the slot the fence took, or the first free slot for a reader that fences nothing: every slot
+     * of the epoch the writer used is below it.
+     *
+     * @return the slot per epoch
+     * @throws IOException if a fence or a read fails
+     */
+    public Map<Long, Long> ends() throws IOException {
+        fenceAll();
+        return ends;
+    }
+
+    /**
+     * Returns every shard any epoch's last header names as holding records not yet published.
+     *
+     * @return the shards
+     * @throws IOException if a fence or a read fails
+     */
+    public java.util.Set<ShardKey> named() throws IOException {
+        fenceAll();
+        final java.util.Set<ShardKey> out = new java.util.TreeSet<>();
+        for (Optional<Header> last : lastHeaders.values()) {
+            last.ifPresent(header -> out.addAll(header.index().keySet()));
+        }
+        return out;
+    }
+
+    /**
+     * Returns the highest sequence number of a shard's records here, reading the header of each blob that holds them
+     * and no slice.
+     *
+     * @param shard the shard
+     * @return the highest sequence number, or {@link org.opensearch.index.seqno.SequenceNumbers#UNASSIGNED_SEQ_NO} if
+     *     none is held
+     * @throws IOException if a fence or a read fails
+     */
+    public long maxSeqNoOf(ShardKey shard) throws IOException {
+        fenceAll();
+        long max = org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
+        for (NodeLogEpoch epoch : epochs) {
+            final Optional<Header> last = lastHeaders.get(epoch.epoch());
+            if (last.isEmpty()) {
+                continue;
+            }
+            for (Range run : last.get().ordinalsOf(shard)) {
+                for (long ordinal = run.from(); ordinal <= run.to(); ordinal++) {
+                    final Header header = header(epoch.epoch(), ordinal, last.get());
+                    if (header == null) {
+                        continue;
+                    }
+                    for (Slice slice : header.slicesOf(shard)) {
+                        max = Math.max(max, slice.maxSeqNo());
+                    }
+                }
+            }
+        }
+        return max;
     }
 
     /**
