@@ -180,7 +180,8 @@ final class ReaderValidation {
             }, threadPool.generic())
             : null;
         final var published = plane.segmentPublisher(indexName, shardId.getIndex().getUUID(), shardNumber).readManifest();
-        if (published.isPresent() && sameCommit(commit, published.get()) == false) {
+        // A commit its writer staged after the register is not superseded by it: the writer is gone and had published it.
+        if (published.isPresent() && sameCommit(commit, published.get()) == false && commit.stagedAfter(published.get()) == false) {
             if (landed != null) {
                 landed.cancel(false);
             }

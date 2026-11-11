@@ -843,6 +843,11 @@ public final class BackgroundReconciler implements Closeable {
         return this;
     }
 
+    /** Writes every staged commit that has waited its time to its register; see {@link DirtyPublishing#checkpointDue}. */
+    public Set<ShardId> checkpointDue() {
+        return publishing.checkpointDue();
+    }
+
     /** Publishes every open shard whose commit has moved on. */
     public Set<ShardId> publishAll() throws Exception {
         return publishing.publishAll();

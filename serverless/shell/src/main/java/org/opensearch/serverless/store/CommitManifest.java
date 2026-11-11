@@ -126,6 +126,62 @@ public final class CommitManifest {
         this.lengths = Map.copyOf(lengths);
         this.digest = digest == null ? PruningDigest.EMPTY : digest;
         this.walOrdinal = walOrdinal;
+        this.stageSequence = -1L;
+    }
+
+    private CommitManifest(CommitManifest of, long stageSequence) {
+        this.term = of.term;
+        this.files = of.files;
+        this.writer = of.writer;
+        this.lengths = of.lengths;
+        this.digest = of.digest;
+        this.walOrdinal = of.walOrdinal;
+        this.stageSequence = stageSequence;
+    }
+
+    /**
+     * Where this commit stands among those its writer staged in its term, when the writer stages commits.
+     *
+     * <p>A writer that stages commits writes the register only now and then; the commits between are held by the writer
+     * and handed to readers that ask it. A register that records a sequence tells a reader to ask the writer for a newer
+     * one; a staged commit carries a higher sequence than the register it follows. Negative when the writer does not
+     * stage, which is every manifest written before staging existed.
+     */
+    private final long stageSequence;
+
+    /**
+     * Returns where this commit stands among those its writer staged in its term.
+     *
+     * @return the sequence, or a negative number if the writer does not stage commits
+     */
+    public long stageSequence() {
+        return stageSequence;
+    }
+
+    /**
+     * Returns this manifest with a stage sequence.
+     *
+     * @param sequence the sequence; negative for none
+     * @return the manifest
+     */
+    public CommitManifest withStageSequence(long sequence) {
+        return sequence == stageSequence ? this : new CommitManifest(this, sequence);
+    }
+
+    /**
+     * Whether this is a later commit of the same writer and term than another, by stage sequence.
+     *
+     * @param other the other manifest
+     * @return true if both are staged by one writer in one term and this one is later
+     */
+    public boolean stagedAfter(CommitManifest other) {
+        return other != null
+            && stageSequence >= 0L
+            && other.stageSequence >= 0L
+            && term == other.term
+            && writer != null
+            && writer.equals(other.writer)
+            && stageSequence > other.stageSequence;
     }
 
     /**
@@ -268,6 +324,9 @@ public final class CommitManifest {
                 // Scalars, which every older parser skips: a field it does not know is ignored, not a failure.
                 builder.field("wal_ordinal", walOrdinal);
             }
+            if (stageSequence >= 0L) {
+                builder.field("stage_seq", stageSequence);
+            }
             if (digest.isEmpty() == false) {
                 // Last, always: see the constructor.
                 builder.field("digest");
@@ -299,6 +358,7 @@ public final class CommitManifest {
             final Map<String, Long> lengths = new LinkedHashMap<>();
             PruningDigest digest = PruningDigest.EMPTY;
             long walOrdinal = -1L;
+            long stageSequence = -1L;
             boolean sawFiles = false;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
@@ -347,13 +407,15 @@ public final class CommitManifest {
                         }
                         digest = PruningDigest.parse(parser);
                     }
-                    case "term", "wal_ordinal" -> {
+                    case "term", "wal_ordinal", "stage_seq" -> {
                         if (token != XContentParser.Token.VALUE_NUMBER) {
                             throw new IOException("malformed commit manifest: " + field + " must be an integer");
                         }
                         final long number = parser.longValue(false);
                         if (field.equals("term")) {
                             term = number;
+                        } else if (field.equals("stage_seq")) {
+                            stageSequence = number;
                         } else {
                             walOrdinal = number;
                         }
@@ -374,7 +436,7 @@ public final class CommitManifest {
                 throw new IOException("malformed commit manifest: trailing content");
             }
             checkLocations(files);
-            return new CommitManifest(term, files, writer, lengths, digest, walOrdinal);
+            return new CommitManifest(term, files, writer, lengths, digest, walOrdinal).withStageSequence(stageSequence);
         }
     }
 
@@ -409,6 +471,7 @@ public final class CommitManifest {
         this.digest = PruningDigest.EMPTY;
         // Nor this: a frozen view serves the commit it froze on purpose, however far the log has moved since.
         this.walOrdinal = -1L;
+        this.stageSequence = -1L;
     }
 
     /**

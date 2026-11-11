@@ -37,6 +37,26 @@ final class ShardPublishing {
      * @throws IOException if the shard is not held here, or publication fails
      */
     public CommitManifest publish(ShardId shardId, long term) throws IOException {
+        return publish(shardId, term, false);
+    }
+
+    /** What a staged commit leaves to its checkpoint: trimming the logs it covers. */
+    private record StagedTrim(long term, org.opensearch.serverless.store.NodeLogCommitter.Position nodeLogAt) {
+    }
+
+    private final java.util.Map<ShardId, StagedTrim> stagedTrims = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Publishes a shard's current commit, staging it if the shard's publisher stages commits and this publish is
+     * routine; a staged commit's logs are trimmed by the checkpoint that writes it.
+     *
+     * @param shardId the shard
+     * @param term the owning writer's term
+     * @param mayStage whether this publish is routine, so may be staged
+     * @return the manifest published
+     * @throws IOException if the shard is not held here, or publication fails
+     */
+    public CommitManifest publish(ShardId shardId, long term, boolean mayStage) throws IOException {
         final IndexShard shard = reconciler.open.get(shardId);
         if (shard == null) {
             throw new IOException("cannot publish " + shardId + ": not open on " + reconciler.localNode.getId());
@@ -56,6 +76,9 @@ final class ShardPublishing {
         final var log = reconciler.wal(shardId);
         final long walOrdinal;
         final ShardReconciler.NodeLogHooks nodeLogHooks = reconciler.nodeLog;
+        // Commits are staged only beside the node's own write log, never a shard's: the node log is what a successor
+        // replays past the register, and what keeps every staged commit's records until a checkpoint covers them.
+        final boolean stages = mayStage && nodeLogHooks != null;
         final org.opensearch.serverless.store.NodeLogCommitter.Position nodeLogAt;
         exclusive.lock();
         try {
@@ -90,14 +113,62 @@ final class ShardPublishing {
             if (hook != null) {
                 hook.accept(shardId, shard.indexSettings().getNumberOfShards(), term, digest);
             }
-            manifest = reconciler.publisherCache.computeIfAbsent(shardId, reconciler.publishers)
-                .publish(shard.store(), commit.get(), term, reconciler.localNode.getId(), digest, walOrdinal);
+            final org.opensearch.serverless.store.SegmentPublisher.Published done = reconciler.publisherCache.computeIfAbsent(
+                shardId,
+                reconciler.publishers
+            ).publishCommit(shard.store(), commit.get(), term, reconciler.localNode.getId(), digest, walOrdinal, stages);
+            manifest = done.manifest();
+            if (done.checkpointed() == false) {
+                // The log is trimmed only behind the register: a successor restores it and replays the rest.
+                stagedTrims.put(shardId, new StagedTrim(term, nodeLogAt));
+                return manifest;
+            }
+            stagedTrims.remove(shardId);
         }
-        final var walForPublish = log;
-        if (walForPublish != null) {
+        trim(shardId, term, nodeLogAt);
+        return manifest;
+    }
+
+    /**
+     * Writes a shard's staged commit to the register if it has one, and trims the logs behind it.
+     *
+     * @param shardId the shard
+     * @param dueOnly true to write it only once it has waited its time
+     * @return the commit written, or null if nothing was
+     * @throws IOException if the register cannot be written
+     */
+    public CommitManifest checkpoint(ShardId shardId, boolean dueOnly) throws IOException {
+        final org.opensearch.serverless.store.SegmentPublisher publisher = reconciler.publisherCache.get(shardId);
+        if (publisher == null || (dueOnly && publisher.checkpointDue() == false)) {
+            return null;
+        }
+        final StagedTrim pending = stagedTrims.get(shardId);
+        final CommitManifest written;
+        try {
+            written = publisher.checkpoint();
+        } catch (IOException | RuntimeException e) {
+            stagedTrims.remove(shardId);
+            throw e;
+        }
+        if (written != null && pending != null) {
+            stagedTrims.remove(shardId, pending);
+            trim(shardId, pending.term(), pending.nodeLogAt());
+        }
+        return written;
+    }
+
+    /** Forgets a shard's staged trim once it is no longer held here. */
+    void forget(ShardId shardId) {
+        stagedTrims.remove(shardId);
+    }
+
+    private void trim(ShardId shardId, long term, org.opensearch.serverless.store.NodeLogCommitter.Position nodeLogAt) throws IOException {
+        final var log = reconciler.wal(shardId);
+        final ShardReconciler.NodeLogHooks nodeLogHooks = reconciler.nodeLog;
+        if (log != null) {
             // Only after the commit is durable in the object store. Truncation drops what the previous
             // publish saw, never what this one did -- see WalStore for why that gap is load-bearing.
-            walForPublish.onPublished(term);
+            log.onPublished(term);
         }
         if (nodeLogHooks != null) {
             nodeLogHooks.published(shardId, nodeLogAt);
@@ -111,7 +182,6 @@ final class ShardPublishing {
                 }
             }
         }
-        return manifest;
     }
 
     /**

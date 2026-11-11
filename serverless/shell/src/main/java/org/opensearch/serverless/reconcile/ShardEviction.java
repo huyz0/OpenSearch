@@ -316,6 +316,14 @@ final class ShardEviction {
             synchronized (reconciler.publishLock(shardId)) {
                 reconciler.lastManifests.put(shardId, reconciler.node.shards().publishShard(shardId, head.get().term()));
             }
+        } else {
+            // A staged commit is written before the head is let go, so the successor restores it rather than replaying.
+            synchronized (reconciler.publishLock(shardId)) {
+                final var staged = reconciler.node.reconciler().checkpoint(shardId, false);
+                if (staged != null) {
+                    reconciler.lastManifests.put(shardId, staged);
+                }
+            }
         }
         if (reconciler.plane.heads()
             .release(
