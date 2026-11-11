@@ -2080,6 +2080,9 @@ public final class ServerlessNode implements Closeable {
         // shard cost a node holding a thousand a thousand reads, and a failover storm cost the square of
         // that. The full sync still runs from the backstop, rarely, for what only it can find.
         final ShardAssignment assignment = new ShardAssignment(indexName, shardNumber, acquisition.head().term());
+        // The head just won is the freshest there is: the first publish checks ownership against it rather than
+        // reading it back.
+        noteHead(indexName, shardNumber, acquisition.head());
         hosted.put(indexName, described.get());
         final String openingKey = shardKey(indexName, shardNumber);
         writerAssignments.put(openingKey, assignment);
@@ -2109,6 +2112,7 @@ public final class ServerlessNode implements Closeable {
             // on this node would try again: a shard nobody serves and nobody is looking for. Give the
             // head back, so the next node to ask -- possibly this one -- acquires cleanly.
             writerAssignments.remove(shardKey(indexName, shardNumber));
+            noteHead(indexName, shardNumber, null);
             try {
                 plane.heads()
                     .release(

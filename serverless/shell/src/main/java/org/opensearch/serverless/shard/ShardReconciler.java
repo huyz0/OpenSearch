@@ -471,6 +471,28 @@ public final class ShardReconciler {
     private final Map<ShardId, CommitManifest> pendingManifests = new ConcurrentHashMap<>();
 
     /**
+     * Writers opened from a published commit that already held every operation they have, by the sequence number
+     * that commit is certain to hold. Taken once by {@link #takePublishedThroughAtOpen}.
+     */
+    private final Map<ShardId, Long> publishedThroughAtOpen = new ConcurrentHashMap<>();
+
+    /**
+     * Returns, once, how far the published commit a writer was just opened from already covers it: the commit's local
+     * checkpoint, when nothing was replayed past it.
+     *
+     * <p>A shard taken and not written to has nothing to publish. Without this, the node taking it knew of no publish
+     * of its own and published the same operations again under its term: a new commit, a manifest swap, a log trim
+     * and the sweep after it, about a dozen requests per shard taken, and the same again when it was let go idle.
+     *
+     * @param shardId the writer just opened
+     * @return the sequence number the published commit covers, or empty if it may not cover everything
+     */
+    public java.util.OptionalLong takePublishedThroughAtOpen(ShardId shardId) {
+        final Long through = publishedThroughAtOpen.remove(shardId);
+        return through == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(through);
+    }
+
+    /**
      * The log a shard currently being opened should replay, for the moments its engine is being built.
      *
      * <p><b>Why the engine cannot simply ask for the shard's log.</b> Every shard on this node has one --
@@ -634,6 +656,7 @@ public final class ShardReconciler {
             ).initialize(localNode.getId(), null, ShardRouting.UNAVAILABLE_EXPECTED_SHARD_SIZE);
 
             final IndexShard shard;
+            long restoredCheckpoint = org.opensearch.index.seqno.SequenceNumbers.NO_OPS_PERFORMED;
             published.ifPresent(manifest -> pendingManifests.put(shardId, manifest));
             try {
                 shard = indexService.createShard(
@@ -676,7 +699,7 @@ public final class ShardReconciler {
                     dropLocalFilesNamedBy(shard.store().directory(), published.get());
                     // A translog is still needed, because recovery reads one and a node taking a shard
                     // over has none.
-                    bootstrapTranslogFor(shard);
+                    restoredCheckpoint = bootstrapTranslogFor(shard);
                 }
                 lap.run();
 
@@ -743,6 +766,18 @@ public final class ShardReconciler {
                 lap.run();
                 if (replayWal) {
                     writerOpens.incrementAndGet();
+                    if (restoring
+                        && shard.seqNoStats().getMaxSeqNo() <= restoredCheckpoint
+                        && published.get().walOrdinal() >= 0L
+                        && published.get().digest().isEmpty() == false) {
+                        // Nothing was replayed past the published commit, so that commit already holds every
+                        // operation this shard has. Recorded so the first publish is not one that says so again.
+                        // Not for a commit published before commits recorded their log position and digest: the
+                        // publish is what records them, and a reader check and the rollup janitor wait on it.
+                        publishedThroughAtOpen.put(shardId, restoredCheckpoint);
+                    } else {
+                        publishedThroughAtOpen.remove(shardId);
+                    }
                 }
                 open.put(shardId, shard);
                 return shard;
@@ -1234,7 +1269,8 @@ public final class ShardReconciler {
      * write-ahead log, never from a local translog: this deletes the local one, on every open, which is
      * why fsyncing it per operation buys nothing.
      */
-    private void bootstrapTranslogFor(IndexShard shard) throws IOException {
+    /** Returns the local checkpoint of the restored commit, the one the new translog starts from. */
+    private long bootstrapTranslogFor(IndexShard shard) throws IOException {
         shard.store().bootstrapNewHistory();
         final org.apache.lucene.index.SegmentInfos segmentInfos = shard.store().readLastCommittedSegmentsInfo();
         final long localCheckpoint = Long.parseLong(
@@ -1249,6 +1285,7 @@ public final class ShardReconciler {
             translogUUID,
             java.nio.channels.FileChannel::open
         );
+        return localCheckpoint;
     }
 
     /**
@@ -1363,6 +1400,7 @@ public final class ShardReconciler {
     }
 
     private boolean releaseShardLocked(ShardId shardId, String reason, boolean deleteStore, boolean failed) {
+        publishedThroughAtOpen.remove(shardId);
         if (readers.contains(shardId) == false && open.containsKey(shardId)) {
             // Writers only: every way a writer stops, for reconstructing a handover.
             final IndexShard writer = open.get(shardId);
