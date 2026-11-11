@@ -20,10 +20,32 @@ public final class Acquisition {
 
     private final boolean acquired;
     private final ShardHead head;
+    private final String previousOwner;
 
-    private Acquisition(boolean acquired, ShardHead head) {
+    private Acquisition(boolean acquired, ShardHead head, String previousOwner) {
         this.acquired = acquired;
         this.head = head;
+        this.previousOwner = previousOwner;
+    }
+
+    /**
+     * The caller now owns the shard, taken over from a head that named another owner, or this node's earlier process.
+     *
+     * @param head the head as written
+     * @param previousOwner the node the replaced head named, or null if it named none
+     * @return the outcome
+     */
+    public static Acquisition won(ShardHead head, String previousOwner) {
+        return new Acquisition(true, head, previousOwner);
+    }
+
+    /**
+     * Returns the node the replaced head named: the writer whose log may hold this shard's unpublished records.
+     *
+     * @return its id; null if the head was new or released, or for a loss
+     */
+    public String previousOwner() {
+        return previousOwner;
     }
 
     /**
@@ -33,7 +55,7 @@ public final class Acquisition {
      * @return the outcome
      */
     public static Acquisition won(ShardHead head) {
-        return new Acquisition(true, head);
+        return new Acquisition(true, head, null);
     }
 
     /**
@@ -43,7 +65,7 @@ public final class Acquisition {
      * @return the outcome
      */
     public static Acquisition heldByAnother(ShardHead head) {
-        return new Acquisition(false, head);
+        return new Acquisition(false, head, null);
     }
 
     /**
