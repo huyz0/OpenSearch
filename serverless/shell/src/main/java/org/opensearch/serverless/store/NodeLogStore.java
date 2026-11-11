@@ -117,45 +117,79 @@ public final class NodeLogStore {
     }
 
     /**
-     * Closes an epoch to its writer: puts a fence in its first free slot at or after {@code fromOrdinal}.
+     * Closes an epoch to its writer: puts a fence where the writer must stop, and returns the lowest fence in the epoch.
      *
-     * <p>{@code fromOrdinal} must not be past the first free slot. The node's trim point, or the ordinal its lease last
-     * recorded, is always safe: every slot below the first free one is taken, so the search is a run of existence checks
-     * that doubles its step until it finds a free slot and then halves back to the first one. With a hint at most a
-     * few seconds old that is a handful of checks, each priced as a read rather than a listing.
+     * <p>{@code fromOrdinal} must not be past the first free slot. The landed hint the node's lease records is always
+     * safe: every slot below the first free one is taken, so the search is a run of existence checks that doubles its
+     * step until it finds a free slot and then halves back to the first one. With a hint at most a few seconds old that
+     * is a handful of checks, each priced as a read rather than a listing.
      *
-     * <p>If the writer takes the slot between the search and the fence, its blob is before the fence and the next slot
-     * is tried. The writer never skips a slot, so the fence lands as soon as it wins one, and every blob the writer
-     * landed in this epoch is below it.
+     * <p><b>A writer appending back to back.</b> Aiming at the first free slot races the writer's next PUT, which is
+     * headed for that same slot, and the writer is always a request ahead. So after a lost race the fence aims ahead of
+     * it, by a gap that doubles. The writer never skips a slot, so it must reach that fence and stop there. The fence
+     * then fills the gap from the bottom, one slot at a time: the writer can take at most the slots below the barrier,
+     * so this ends, and the first fence it lands in the gap is where the writer stopped. Every slot below that one is
+     * the writer's, which is what {@link #lastHeaderBelow} relies on.
+     *
+     * <p>A fence another successor has already placed is shared rather than added to.
      *
      * @param epoch the epoch to close
      * @param fromOrdinal a slot at or before the first free one
      * @param fencedBy the node putting the fence
      * @param term the term that node has just won, recorded for diagnosis
-     * @return the fence's ordinal
+     * @return the lowest fence's ordinal: every slot below it holds one of the writer's blobs
      * @throws IOException if the store fails, or the writer kept taking the next slot
      */
     public long fence(long epoch, long fromOrdinal, String fencedBy, long term) throws IOException {
         final BlobContainer container = container(epoch);
         final byte[] fence = NodeLogBlob.encodeFence(fencedBy, term);
         long slot = firstFree(container, fromOrdinal);
+        long gap = 0;
         for (int attempt = 0; attempt < FENCE_ATTEMPTS; attempt++) {
             // A fence just below the first free slot closed the epoch already: another successor's, which this one shares.
             if (slot > 0 && readEntry(epoch, slot - 1).orElse(null) instanceof NodeLogBlob.Fence) {
                 return slot - 1;
             }
-            try {
-                container.writeBlob(name(slot), new ByteArrayInputStream(fence), fence.length, true);
-                return slot;
-            } catch (FileAlreadyExistsException taken) {
-                // The writer, or another successor's fence, took it first. Either way it is below the fence that lands.
-                if (readEntry(epoch, slot).orElse(null) instanceof NodeLogBlob.Fence) {
-                    return slot;
-                }
-                slot = firstFree(container, slot + 1);
+            final long target = slot + gap;
+            if (tryFence(container, target, fence)) {
+                return gap == 0 ? target : fillBelow(epoch, container, slot, target, fence);
             }
+            // The writer, or another successor's fence, took it first.
+            if (readEntry(epoch, target).orElse(null) instanceof NodeLogBlob.Fence) {
+                return gap == 0 ? target : fillBelow(epoch, container, slot, target, fence);
+            }
+            slot = firstFree(container, target + 1);
+            gap = gap == 0 ? 1 : Math.min(gap << 1, MAX_FENCE_GAP);
         }
         throw new IOException("could not fence epoch " + epoch + " of " + nodeId + ": its writer kept taking the next slot");
+    }
+
+    /** The widest gap a fence leaves ahead of a writer it keeps losing to. */
+    static final long MAX_FENCE_GAP = 1024;
+
+    private static boolean tryFence(BlobContainer container, long slot, byte[] fence) throws IOException {
+        try {
+            container.writeBlob(name(slot), new ByteArrayInputStream(fence), fence.length, true);
+            return true;
+        } catch (FileAlreadyExistsException taken) {
+            return false;
+        }
+    }
+
+    /**
+     * With a barrier fence at {@code barrier}, fences the lowest free slot from {@code from} up, and returns the lowest
+     * fence below or at the barrier: where the writer stopped.
+     */
+    private long fillBelow(long epoch, BlobContainer container, long from, long barrier, byte[] fence) throws IOException {
+        for (long slot = from; slot < barrier; slot++) {
+            if (tryFence(container, slot, fence)) {
+                return slot;
+            }
+            if (readEntry(epoch, slot).orElse(null) instanceof NodeLogBlob.Fence) {
+                return slot;
+            }
+        }
+        return barrier;
     }
 
     private static long firstFree(BlobContainer container, long fromOrdinal) throws IOException {
