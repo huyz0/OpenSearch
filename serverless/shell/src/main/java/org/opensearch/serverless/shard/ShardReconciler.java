@@ -906,7 +906,12 @@ public final class ShardReconciler {
                     // Published before it serves, so what it replayed is in a commit and no later takeover depends on the
                     // log that held it: a predecessor's log names this shard's records only until the shard is taken.
                     try {
+                        // What the commit is certain to hold, read before its flush, as a publish from the loop reads it.
+                        final long covered = shard.seqNoStats().getLocalCheckpoint();
                         publish(shardId, shardHeadTerm);
+                        // This is the node's first publish of the shard: recorded, so the loop does not publish the same
+                        // operations again under the same term as soon as the take returns.
+                        publishedThroughAtOpen.put(shardId, covered);
                     } catch (IOException | RuntimeException e) {
                         open.remove(shardId);
                         throw e;
