@@ -100,6 +100,30 @@ public final class NodeLogTakeover {
      * @param reread reads the predecessor's lease again; null to trust the epochs given, as for this node's own log
      */
     public NodeLogTakeover(NodeLogStore log, List<NodeLogEpoch> epochs, String fencedBy, long term, LeaseReader reread) {
+        this(log, epochs, fencedBy, term, reread, true);
+    }
+
+    /**
+     * Creates a reader of a log whose writer has let go of the shards it will be asked about: it reads up to each epoch's
+     * first free slot and fences nothing, so the writer's other shards go on writing. A writer that has let go of a shard
+     * writes nothing more of it, so every header written since says whether the shard still has records there.
+     *
+     * <p>The writer may be deleting behind its trim point meanwhile, so the end of each epoch is checked against its lease
+     * as it stands afterwards, as a fence is.
+     *
+     * @param log the writer's log
+     * @param epochs the epochs its lease names
+     * @param reread reads the writer's lease again
+     * @return the reader
+     */
+    public static NodeLogTakeover unfenced(NodeLogStore log, List<NodeLogEpoch> epochs, LeaseReader reread) {
+        return new NodeLogTakeover(log, epochs, log.nodeId(), 0L, reread, false);
+    }
+
+    private final boolean fence;
+
+    private NodeLogTakeover(NodeLogStore log, List<NodeLogEpoch> epochs, String fencedBy, long term, LeaseReader reread, boolean fence) {
+        this.fence = fence;
         this.reread = reread;
         this.log = Objects.requireNonNull(log, "log");
         this.epochs = List.copyOf(epochs);
@@ -138,7 +162,10 @@ public final class NodeLogTakeover {
         final Map<Long, Long> floors = new HashMap<>();
         for (NodeLogEpoch epoch : epochs) {
             floors.put(epoch.epoch(), epoch.trimPoint());
-            fences.put(epoch.epoch(), log.fence(epoch.epoch(), epoch.landed(), fencedBy, term));
+            fences.put(
+                epoch.epoch(),
+                this.fence ? log.fence(epoch.epoch(), epoch.landed(), fencedBy, term) : log.firstFree(epoch.epoch(), epoch.landed())
+            );
         }
         if (reread != null) {
             for (int attempt = 0; attempt < MAX_REFENCES; attempt++) {
@@ -151,7 +178,10 @@ public final class NodeLogTakeover {
                     }
                     if (fence != null && now.trimPoint() > fence) {
                         // Deleted past the fence after the lease this started from: the fence may be in a hole.
-                        fences.put(now.epoch(), log.fence(now.epoch(), now.landed(), fencedBy, term));
+                        fences.put(
+                            now.epoch(),
+                            this.fence ? log.fence(now.epoch(), now.landed(), fencedBy, term) : log.firstFree(now.epoch(), now.landed())
+                        );
                         moved = true;
                     }
                 }
@@ -215,6 +245,26 @@ public final class NodeLogTakeover {
                 }
             }
         }
+    }
+
+    /**
+     * Returns whether any epoch's last header names unpublished records of a shard, reading no slice.
+     *
+     * <p>A header's index is as of when it was written, so a shard that published after it is still named: an answer
+     * that errs towards a replay, never away from one.
+     *
+     * @param shard the shard
+     * @return true if the shard may have records here that it has not published
+     * @throws IOException if a fence or a read fails
+     */
+    public boolean holds(ShardKey shard) throws IOException {
+        fenceAll();
+        for (Optional<Header> last : lastHeaders.values()) {
+            if (last.isPresent() && last.get().ordinalsOf(shard).isEmpty() == false) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

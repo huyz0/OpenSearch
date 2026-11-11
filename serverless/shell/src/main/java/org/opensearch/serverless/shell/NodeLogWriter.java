@@ -288,13 +288,14 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
      * @param shardId the shard
      * @param predecessor the node the head named before this node took it; null or this node's id for a shard this node
      *     reopens itself
+     * @param letGo whether the predecessor had given the shard back, so its log is read with no fence
      * @param term the term this node opens it at
      * @param consumer what takes each record
      * @return how many records were streamed
      * @throws IOException if a fence or a read fails
      */
     @Override
-    public long replay(ShardId shardId, String predecessor, long term, CheckedConsumer<WalRecord, IOException> consumer)
+    public long replay(ShardId shardId, String predecessor, boolean letGo, long term, CheckedConsumer<WalRecord, IOException> consumer)
         throws IOException {
         final ShardKey key = keyOf(shardId);
         final long[] count = { 0 };
@@ -319,13 +320,15 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
         if (epochs.isEmpty()) {
             return 0L;
         }
-        takeoverOf(
-            predecessor,
-            new NodeLogStore(plane.blobStore(), plane.basePath(), predecessor),
-            epochs,
-            term,
-            () -> plane.membership().read(predecessor).map(NodeLease::nodeLog).orElse(List.of())
-        ).forEachRecord(key, counting);
+        final NodeLogStore theirs = new NodeLogStore(plane.blobStore(), plane.basePath(), predecessor);
+        final NodeLogTakeover.LeaseReader reread = () -> plane.membership().read(predecessor).map(NodeLease::nodeLog).orElse(List.of());
+        if (letGo && plane.isLive(lease.get())) {
+            // It gave the shard back and writes no more of it; fencing would fail the writes of every shard it still holds.
+            // One that is not live may have been given back for, and may still be writing, so it is fenced below.
+            NodeLogTakeover.unfenced(theirs, epochs, reread).forEachRecord(key, counting);
+            return count[0];
+        }
+        takeoverOf(predecessor, theirs, epochs, term, reread).forEachRecord(key, counting);
         return count[0];
     }
 
