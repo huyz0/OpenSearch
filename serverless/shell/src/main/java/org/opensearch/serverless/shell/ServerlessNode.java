@@ -722,7 +722,7 @@ public final class ServerlessNode implements Closeable {
             settings.getAsLong("serverless.wal.group_commit.max_bytes", org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES)
         );
         this.nodeLogEnabled = settings.getAsBoolean("serverless.wal.node_log.enabled", true);
-        this.packSegments = settings.getAsBoolean("serverless.segments.pack.enabled", false);
+        this.packSegments = settings.getAsBoolean("serverless.segments.pack.enabled", true);
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
         final Environment environment = new Environment(settings, null);
