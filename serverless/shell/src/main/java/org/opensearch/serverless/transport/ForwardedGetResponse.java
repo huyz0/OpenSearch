@@ -11,7 +11,7 @@ package org.opensearch.serverless.transport;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.transport.TransportResponse;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.shell.Document;
 
 import java.io.IOException;
 
@@ -19,7 +19,7 @@ import java.io.IOException;
 public final class ForwardedGetResponse extends TransportResponse {
 
     private final String ownerNodeId;
-    private final ServerlessNode.Document document;
+    private final Document document;
 
     /**
      * Creates a response.
@@ -27,7 +27,7 @@ public final class ForwardedGetResponse extends TransportResponse {
      * @param ownerNodeId the node that performed the read
      * @param document what it found, which may be nothing
      */
-    public ForwardedGetResponse(String ownerNodeId, ServerlessNode.Document document) {
+    public ForwardedGetResponse(String ownerNodeId, Document document) {
         this.ownerNodeId = ownerNodeId;
         this.document = document;
     }
@@ -50,7 +50,7 @@ public final class ForwardedGetResponse extends TransportResponse {
         final long seqNo = in.readZLong();
         final long primaryTerm = in.readVLong();
         final long version = in.readZLong();
-        this.document = new ServerlessNode.Document(id, found, source, seqNo, primaryTerm, version);
+        this.document = new Document(id, found, source, seqNo, primaryTerm, version);
     }
 
     @Override
@@ -78,7 +78,7 @@ public final class ForwardedGetResponse extends TransportResponse {
      *
      * @return the document, which may be absent
      */
-    public ServerlessNode.Document document() {
+    public Document document() {
         return document;
     }
 }

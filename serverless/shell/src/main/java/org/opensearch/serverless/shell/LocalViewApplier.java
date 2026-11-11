@@ -204,7 +204,7 @@ final class LocalViewApplier {
      * @param timeout how long to wait for the state to be applied
      * @throws Exception if application fails or times out
      */
-    void applyLocalView(ClusterState state, ServerlessNode.TimeValueLike timeout) throws Exception {
+    void applyLocalView(ClusterState state, TimeValueLike timeout) throws Exception {
         final ClusterState toApply = withPeers(state);
         final CountDownLatch latch = new CountDownLatch(1);
         final AtomicReference<Exception> failure = new AtomicReference<>();

@@ -11,7 +11,7 @@ package org.opensearch.serverless.transport;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.transport.TransportResponse;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.shell.BulkOutcome;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -27,7 +27,7 @@ import java.util.List;
 public final class ForwardedBulkResponse extends TransportResponse {
 
     private final String ownerNodeId;
-    private final List<ServerlessNode.BulkOutcome> outcomes;
+    private final List<BulkOutcome> outcomes;
 
     /**
      * Creates a response.
@@ -35,7 +35,7 @@ public final class ForwardedBulkResponse extends TransportResponse {
      * @param ownerNodeId the node that performed the batch
      * @param outcomes one outcome per operation, in request order
      */
-    public ForwardedBulkResponse(String ownerNodeId, List<ServerlessNode.BulkOutcome> outcomes) {
+    public ForwardedBulkResponse(String ownerNodeId, List<BulkOutcome> outcomes) {
         this.ownerNodeId = ownerNodeId;
         this.outcomes = List.copyOf(outcomes);
     }
@@ -49,7 +49,7 @@ public final class ForwardedBulkResponse extends TransportResponse {
     public ForwardedBulkResponse(StreamInput in) throws IOException {
         this.ownerNodeId = in.readString();
         final int count = in.readVInt();
-        final List<ServerlessNode.BulkOutcome> read = new ArrayList<>(count);
+        final List<BulkOutcome> read = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             final String id = in.readString();
             final String failure = in.readOptionalString();
@@ -71,14 +71,14 @@ public final class ForwardedBulkResponse extends TransportResponse {
             final boolean created = in.readBoolean();
             if (failure != null) {
                 read.add(
-                    retryable ? ServerlessNode.BulkOutcome.retryable(id, failure)
-                        : conflict ? ServerlessNode.BulkOutcome.conflicted(id, failure)
-                        : ServerlessNode.BulkOutcome.failed(id, failure)
+                    retryable ? BulkOutcome.retryable(id, failure)
+                        : conflict ? BulkOutcome.conflicted(id, failure)
+                        : BulkOutcome.failed(id, failure)
                 );
             } else if (deletion) {
-                read.add(ServerlessNode.BulkOutcome.deleted(id, found, seqNo, primaryTerm, version));
+                read.add(BulkOutcome.deleted(id, found, seqNo, primaryTerm, version));
             } else {
-                read.add(ServerlessNode.BulkOutcome.indexed(id, seqNo, primaryTerm, version, created));
+                read.add(BulkOutcome.indexed(id, seqNo, primaryTerm, version, created));
             }
         }
         this.outcomes = List.copyOf(read);
@@ -88,7 +88,7 @@ public final class ForwardedBulkResponse extends TransportResponse {
     public void writeTo(StreamOutput out) throws IOException {
         out.writeString(ownerNodeId);
         out.writeVInt(outcomes.size());
-        for (ServerlessNode.BulkOutcome outcome : outcomes) {
+        for (BulkOutcome outcome : outcomes) {
             out.writeString(outcome.id());
             out.writeOptionalString(outcome.failure());
             out.writeBoolean(outcome.conflict());
@@ -116,7 +116,7 @@ public final class ForwardedBulkResponse extends TransportResponse {
      *
      * @return the outcomes
      */
-    public List<ServerlessNode.BulkOutcome> outcomes() {
+    public List<BulkOutcome> outcomes() {
         return outcomes;
     }
 }

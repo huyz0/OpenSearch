@@ -10,6 +10,7 @@ package org.opensearch.serverless.shard;
 
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shell.Document;
 import org.opensearch.serverless.shell.ServerlessNode;
 
 import java.io.IOException;
@@ -710,7 +711,7 @@ public final class ShardOperations {
         // calling the public get() here would run the filter chain a second time under GetAction's --
         // which is not what a filter checking "may this caller write" expects to see for an update.
         final Read current = reads.doGet(index, id);
-        final ServerlessNode.Document existing = current.document();
+        final Document existing = current.document();
         if (existing.found()
             && ifSeqNo != org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO
             && (existing.seqNo() != ifSeqNo || existing.primaryTerm() != ifPrimaryTerm)) {

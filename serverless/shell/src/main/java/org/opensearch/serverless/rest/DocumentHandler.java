@@ -20,6 +20,7 @@ import org.opensearch.serverless.rest.DocumentWriteOutcomes.ForwardFailed;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteRefusal;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteResult;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.shell.WriteOutcome;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -521,7 +522,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
                     .markCoordinatingOperationStarted(inFlightBytes, false)
             ) {
-                final ServerlessNode.WriteOutcome outcome = deletion
+                final WriteOutcome outcome = deletion
                     ? serving.delete(into, id, ifSeqNo, ifPrimaryTerm)
                     : serving.index(into, id, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent);
                 boolean refreshed = false;
@@ -666,7 +667,7 @@ public final class DocumentHandler extends BaseRestHandler {
                                                     id,
                                                     ack.ownerNodeId(),
                                                     deletion,
-                                                    new ServerlessNode.WriteOutcome(
+                                                    new WriteOutcome(
                                                         ack.seqNo(),
                                                         ack.primaryTerm(),
                                                         ack.version(),
@@ -716,7 +717,7 @@ public final class DocumentHandler extends BaseRestHandler {
                                 id,
                                 ack.ownerNodeId(),
                                 deletion,
-                                new ServerlessNode.WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
+                                new WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
                                 refresh
                             )
                         );
@@ -772,7 +773,7 @@ public final class DocumentHandler extends BaseRestHandler {
                                 id,
                                 ack.ownerNodeId(),
                                 deletion,
-                                new ServerlessNode.WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
+                                new WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
                                 refresh
                             )
                         );
@@ -867,7 +868,7 @@ public final class DocumentHandler extends BaseRestHandler {
         int shard,
         String writtenBy,
         boolean deletion,
-        ServerlessNode.WriteOutcome outcome,
+        WriteOutcome outcome,
         boolean refreshed
     ) throws IOException {
         {

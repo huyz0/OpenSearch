@@ -22,6 +22,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.RegisterMap;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.shell.WriteOutcome;
 import org.opensearch.serverless.store.WalRecord;
 import org.opensearch.serverless.store.WalStore;
 import org.opensearch.test.OpenSearchTestCase;
@@ -238,7 +239,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             assertNull("the tick must not have failed: " + tickFailure.get(), tickFailure.get());
             assertFalse("the write thread must have finished", write.isAlive());
 
-            final boolean acknowledged = outcome.get() instanceof ServerlessNode.WriteOutcome;
+            final boolean acknowledged = outcome.get() instanceof WriteOutcome;
             logger.info("fence: the write during the release was {}", acknowledged ? "acknowledged" : "refused: " + outcome.get());
             if (acknowledged) {
                 assertTrue("an acknowledged write must be visible on the successor; it was behind the seal", s.get(onS, "during").found());

@@ -9,17 +9,17 @@
 package org.opensearch.serverless.shard;
 
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.shell.Document;
 
 /** A document, and which copy answered for it. */
 public final class Read {
 
-    private final ServerlessNode.Document document;
+    private final Document document;
     private final String servedBy;
     private final boolean realtime;
     private final ShardId shardId;
 
-    Read(ServerlessNode.Document document, String servedBy, boolean realtime, ShardId shardId) {
+    Read(Document document, String servedBy, boolean realtime, ShardId shardId) {
         this.document = document;
         this.servedBy = servedBy;
         this.realtime = realtime;
@@ -31,7 +31,7 @@ public final class Read {
      *
      * @return the document
      */
-    public ServerlessNode.Document document() {
+    public Document document() {
         return document;
     }
 

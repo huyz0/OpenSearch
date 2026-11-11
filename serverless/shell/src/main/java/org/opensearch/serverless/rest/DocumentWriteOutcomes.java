@@ -10,6 +10,7 @@ package org.opensearch.serverless.rest;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.shell.WriteOutcome;
 
 /**
  * What a single-document write produced or why it was refused: the result with its routing facts, the typed
@@ -58,7 +59,7 @@ final class DocumentWriteOutcomes {
         final String id;
         final String owner;
         final boolean deletion;
-        final ServerlessNode.WriteOutcome outcome;
+        final WriteOutcome outcome;
         final boolean refreshed;
         final String droppedBy;
         final boolean requireAbsent;
@@ -69,7 +70,7 @@ final class DocumentWriteOutcomes {
             String id,
             String owner,
             boolean deletion,
-            ServerlessNode.WriteOutcome outcome,
+            WriteOutcome outcome,
             boolean refreshed,
             String droppedBy,
             boolean requireAbsent
@@ -84,14 +85,7 @@ final class DocumentWriteOutcomes {
             this.requireAbsent = requireAbsent;
         }
 
-        static WriteResult written(
-            ShardId shardId,
-            String id,
-            String owner,
-            boolean deletion,
-            ServerlessNode.WriteOutcome outcome,
-            boolean refreshed
-        ) {
+        static WriteResult written(ShardId shardId, String id, String owner, boolean deletion, WriteOutcome outcome, boolean refreshed) {
             return new WriteResult(shardId, id, owner, deletion, outcome, refreshed, null, false);
         }
 

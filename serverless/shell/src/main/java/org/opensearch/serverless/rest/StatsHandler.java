@@ -15,6 +15,8 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shell.Capacity;
+import org.opensearch.serverless.shell.FleetSize;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.ObjectStores;
 import org.opensearch.transport.client.node.NodeClient;
@@ -367,7 +369,7 @@ public final class StatsHandler extends BaseRestHandler {
             // What to scale on. Shards held against the cap says how full; the refusals and evictions say what being
             // full has cost -- a node can sit at its cap harmlessly, and these move only when it has turned work away
             // or given up shards to make room.
-            final ServerlessNode.Capacity capacity = serving.capacity();
+            final Capacity capacity = serving.capacity();
             // The heap, for setting the cap from memory: a held shard measured at 110-190 KB, so heap is rarely what bounds
             // how many a node can hold -- this is where to see whether it is.
             final java.lang.management.MemoryUsage heap = java.lang.management.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
@@ -395,7 +397,7 @@ public final class StatsHandler extends BaseRestHandler {
             // The fleet as this node sees it from the members' leases: how many writer nodes report their load, and how many
             // the last minute's demand wants. One number for an autoscaler, the same from whichever node it asks.
             if (metadata != null) {
-                final ServerlessNode.FleetSize fleet = serving.fleetSize(metadata);
+                final FleetSize fleet = serving.fleetSize(metadata);
                 if (fleet.wanted() >= 0) {
                     builder.startObject("fleet");
                     builder.field("members", fleet.members());

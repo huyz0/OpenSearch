@@ -15,6 +15,7 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
+import org.opensearch.serverless.shell.FleetSize;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -516,7 +517,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
                 node.renewLease(plane);
             }
             plane.membership().refresh();
-            final ServerlessNode.FleetSize size = a.fleetSize(plane);
+            final FleetSize size = a.fleetSize(plane);
             assertEquals(2, size.members());
             return size.wanted();
         }

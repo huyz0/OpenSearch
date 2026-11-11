@@ -31,6 +31,8 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ActionGate;
+import org.opensearch.serverless.shell.BulkOperation;
+import org.opensearch.serverless.shell.BulkOutcome;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.WalRecord;
 import org.opensearch.transport.client.node.NodeClient;
@@ -623,9 +625,9 @@ public final class BulkHandler extends BaseRestHandler {
         final String index = group.get(0).writtenIndex;
         final String uuid = group.get(0).writtenUuid;
         final int shard = group.get(0).shard;
-        final List<ServerlessNode.BulkOperation> operations = new ArrayList<>(group.size());
+        final List<BulkOperation> operations = new ArrayList<>(group.size());
         for (Item item : group) {
-            operations.add(new ServerlessNode.BulkOperation(item.operation, item.ifSeqNo, item.ifPrimaryTerm, item.requireAbsent));
+            operations.add(new BulkOperation(item.operation, item.ifSeqNo, item.ifPrimaryTerm, item.requireAbsent));
         }
 
         // By uuid as well as name, as the single-document path has matched since the recreate bug: a
@@ -782,7 +784,7 @@ public final class BulkHandler extends BaseRestHandler {
         }
     }
 
-    void record(List<Item> group, List<ServerlessNode.BulkOutcome> outcomes, String nodeId) {
+    void record(List<Item> group, List<BulkOutcome> outcomes, String nodeId) {
         if (outcomes.size() != group.size()) {
             // Cannot happen through either path, and if it ever does, silently pairing the wrong outcome
             // with the wrong document is far worse than saying so.
@@ -921,7 +923,7 @@ public final class BulkHandler extends BaseRestHandler {
             this.result = "noop";
         }
 
-        void succeed(ServerlessNode.BulkOutcome outcome, String nodeId) {
+        void succeed(BulkOutcome outcome, String nodeId) {
             if (outcome.failure() != null) {
                 // A lost condition is a 409, not a 400, and carries the type classic OpenSearch uses --
                 // a client retrying a compare-and-swap needs to tell "your condition did not hold" from

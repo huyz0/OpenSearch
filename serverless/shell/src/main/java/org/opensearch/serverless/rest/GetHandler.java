@@ -16,6 +16,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shell.Document;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -228,7 +229,7 @@ public final class GetHandler extends BaseRestHandler {
         org.opensearch.rest.RestChannel channel,
         String index,
         int shard,
-        ServerlessNode.Document document,
+        Document document,
         String servedBy,
         boolean realtime,
         boolean bodyless,
