@@ -69,7 +69,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
             b.startup().start();
             plane.membership().renew(leaseFor(a));
             for (int shard = 0; shard < 4; shard++) {
-                assertTrue(a.activateWriter(plane, "alpha", shard).isPresent());
+                assertTrue(a.activation().activateWriter(plane, "alpha", shard).isPresent());
             }
             assertEquals(4, a.reconciler().openShards().size());
 
@@ -79,7 +79,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
                 assertTrue("a live node must keep its shards", a.leases().heartbeat(plane).isEmpty());
             }
             for (int shard = 0; shard < 4; shard++) {
-                assertTrue("B took a shard from a live node", b.activateWriter(plane, "alpha", shard).isEmpty());
+                assertTrue("B took a shard from a live node", b.activation().activateWriter(plane, "alpha", shard).isEmpty());
             }
         }
     }
@@ -96,7 +96,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
             b.startup().start();
             plane.membership().renew(leaseFor(a));
             for (int shard = 0; shard < 3; shard++) {
-                a.activateWriter(plane, "alpha", shard);
+                a.activation().activateWriter(plane, "alpha", shard);
             }
 
             // A stops heartbeating entirely. One lease expiring frees three shards.
@@ -105,7 +105,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
             for (int shard = 0; shard < 3; shard++) {
                 assertTrue(
                     "shard " + shard + " should be acquirable once A's node lease lapsed",
-                    b.activateWriter(plane, "alpha", shard).isPresent()
+                    b.activation().activateWriter(plane, "alpha", shard).isPresent()
                 );
             }
             assertEquals("A must let go of all three on its next tick", 3, a.leases().heartbeat(plane).size());
@@ -177,7 +177,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p8b-sweep"))) {
             a.startup().start();
             writerNodeId = a.localNode().getId();
-            final ShardId shardId = a.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId shardId = a.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"kept\"}");
             a.reconciler().shard(shardId).refresh("p8b");
             final var manifest = a.publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());

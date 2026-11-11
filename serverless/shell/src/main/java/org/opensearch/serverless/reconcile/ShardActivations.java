@@ -556,7 +556,7 @@ final class ShardActivations {
                     // and no unpublished write, so closing it costs nothing.
                     reconciler.node.reconciler().releaseShard(open, "reopening as a writer");
                 }
-                final Optional<ShardId> taken = reconciler.node.activateWriter(reconciler.plane, indexName, shard);
+                final Optional<ShardId> taken = reconciler.node.activation().activateWriter(reconciler.plane, indexName, shard);
                 // Its idle clock starts here, so a shard just taken is not immediately a candidate for being
                 // given straight back -- whether it was wanted or taken on demand.
                 taken.ifPresent(shardId -> reconciler.openedAt.put(shardId, reconciler.plane.clock().getAsLong()));

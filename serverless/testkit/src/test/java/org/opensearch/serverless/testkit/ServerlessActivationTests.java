@@ -101,12 +101,12 @@ public class ServerlessActivationTests extends OpenSearchTestCase {
                         throw new java.io.UncheckedIOException(e);
                     }
                 });
-                expectThrows(java.io.IOException.class, () -> node.activateWriter(plane, "alpha", 0));
+                expectThrows(java.io.IOException.class, () -> node.activation().activateWriter(plane, "alpha", 0));
                 assertTrue("recreation happened after acquisition and before engine recovery", store.fired());
                 final var head = plane.heads().read("alpha", 0).orElseThrow();
                 assertEquals("uuid-open-replacement", head.indexUuid());
                 assertEquals(node.localNode().getId(), head.ownerNodeId());
-                final var opened = node.activateWriter(plane, "alpha", 0).orElseThrow();
+                final var opened = node.activation().activateWriter(plane, "alpha", 0).orElseThrow();
                 assertEquals("uuid-open-replacement", opened.getIndex().getUUID());
                 node.writes().index(opened, "doc", "{\"msg\":\"new lifetime\"}");
                 assertTrue(node.reads().get(opened, "doc").found());

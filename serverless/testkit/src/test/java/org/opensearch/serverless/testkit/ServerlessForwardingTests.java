@@ -336,7 +336,7 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
             // The first node's lease lapses, the second takes the shard, and the first notices and lets
             // go on its next heartbeat -- which also renews its own lease, so it is reachable again.
             clock.set(clock.get() + TTL + 1_000);
-            final ShardId onSecond = second.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onSecond = second.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             // A hint older than a lease is dropped by age, which is right and is not the case under test.
             // The case is a hint refreshed just before the takeover -- the coordinator's own hint rebuild
             // reading the head a moment before the first node lost it -- so it is re-noted here, fresh,
@@ -345,7 +345,7 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
             assertEquals(1, first.leases().heartbeat(plane).size());
             assertTrue("the first node must have released the writer", first.reconciler().openShards().isEmpty());
             // ...and then opens the same shard as a search reader, which is the state the bug needs.
-            final ShardId asReader = first.serveAsReader(plane, "alpha", 0);
+            final ShardId asReader = first.readers().serveAsReader(plane, "alpha", 0);
             assertTrue(
                 "the fixture needs the first node to hold the shard as a reader",
                 first.reconciler().readerShards().contains(asReader)

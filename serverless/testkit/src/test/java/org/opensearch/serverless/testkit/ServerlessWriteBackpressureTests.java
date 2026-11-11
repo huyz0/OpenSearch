@@ -105,7 +105,7 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(settings)) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                final var id = node.activateWriter(plane, "alpha", 0).orElseThrow();
+                final var id = node.activation().activateWriter(plane, "alpha", 0).orElseThrow();
                 node.writes().index(id, "doc", "{\"new_field\":\"first\"}");
                 assertTrue(node.reads().get(id, "doc").found());
                 node.writes().index(id, "doc", "{\"new_field\":\"second\",\"another_field\":7}");

@@ -17,7 +17,7 @@ import org.opensearch.serverless.cluster.ShardAssignment;
  * Activates writers for {@link ServerlessNode}: applies the metadata plane's truth, takes a shard's head and opens
  * it, and opens frozen views.
  */
-final class WriterActivation {
+public final class WriterActivation {
 
     private final ServerlessNode node;
 

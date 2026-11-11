@@ -61,7 +61,7 @@ public class ServerlessActivationCostTests extends OpenSearchTestCase {
                 final long[] stepsBefore = node.reconciler().writerOpenPhaseMillis();
                 final long startedAt = System.nanoTime();
                 for (int i = batch * BATCH; i < (batch + 1) * BATCH; i++) {
-                    node.activateWriter(plane, name(i), 0).orElseThrow();
+                    node.activation().activateWriter(plane, name(i), 0).orElseThrow();
                 }
                 final double perShard = (System.nanoTime() - startedAt) / 1e6 / BATCH;
                 final long[] views = node.localViewMillis();

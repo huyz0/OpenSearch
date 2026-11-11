@@ -136,7 +136,7 @@ public class BatchSearchOptionsTests extends OpenSearchTestCase {
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("docs", "uuid-docs", 2, "{\"properties\":{\"msg\":{\"type\":\"text\"}}}", null));
                 for (int i = 0; i < 2; i++) {
-                    final var shard = node.activateWriter(metadata, "docs", i).orElseThrow();
+                    final var shard = node.activation().activateWriter(metadata, "docs", i).orElseThrow();
                     node.writes().index(shard, "doc-" + i, "{\"msg\":\"visible\"}");
                     node.reconciler().shard(shard).refresh("search-options-test");
                 }

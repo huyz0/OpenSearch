@@ -118,7 +118,7 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p9-residency"))) {
             node.startup().start();
-            node.activateWriter(plane, "idx-7", 0);
+            node.activation().activateWriter(plane, "idx-7", 0);
 
             // A thousand indices exist. This node holds one shard of one of them.
             assertEquals("the node must hold exactly the shard it owns", 1, node.reconciler().openShards().size());
@@ -173,12 +173,12 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
         ) {
             a.startup().start();
             b.startup().start();
-            a.activateWriter(plane, "idx-0", 0);
+            a.activation().activateWriter(plane, "idx-0", 0);
             assertEquals(1, plane.truthFor(a.localNode().getId()).assignments().size());
 
             // B takes the shard once A's lease lapses. A's claim entry is now stale and still present.
             clock.set(1_000L + TTL);
-            assertTrue(b.activateWriter(plane, "idx-0", 0).isPresent());
+            assertTrue(b.activation().activateWriter(plane, "idx-0", 0).isPresent());
 
             assertTrue(
                 "a stale claim must not make a node believe it still owns a shard",
@@ -196,8 +196,8 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p9-deleted"))) {
             a.startup().start();
-            a.activateWriter(plane, "idx-0", 0);
-            a.activateWriter(plane, "idx-1", 0);
+            a.activation().activateWriter(plane, "idx-0", 0);
+            a.activation().activateWriter(plane, "idx-1", 0);
             assertEquals(2, plane.truthFor(a.localNode().getId()).assignments().size());
 
             plane.deleteIndex("idx-0");
@@ -314,7 +314,7 @@ public class ServerlessScaleTests extends OpenSearchTestCase {
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p9-truth-" + population))) {
             node.startup().start();
-            node.activateWriter(plane, "idx-3", 0);
+            node.activation().activateWriter(plane, "idx-3", 0);
             counter.reset();
             plane.truthFor(node.localNode().getId());
             return counter.total();

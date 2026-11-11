@@ -121,8 +121,8 @@ public class ServerlessForwardBoundTests extends OpenSearchTestCase {
             other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            other.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            other.activation().syncFrom(plane);
             assertTrue("the write must have to cross the wire", other.reconciler().openShards().isEmpty());
 
             // A successful forward first, so the connection is open when the owner goes quiet.

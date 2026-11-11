@@ -89,7 +89,7 @@ final class PublishedSweeps {
                                     opened.get(),
                                     "its index has been deleted"
                                 ) == ShardReconciler.ReaderRelease.RELEASED) {
-                            reconciler.node.forgetReader(shardId);
+                            reconciler.node.readers().forgetReader(shardId);
                             stale.add(shardId);
                         }
                         continue;
@@ -110,7 +110,7 @@ final class PublishedSweeps {
                     }
                     // And the node's own record of serving it, or a search node that cycles through readers
                     // carries every one it ever opened into every reader open for the rest of its life.
-                    reconciler.node.forgetReader(shardId);
+                    reconciler.node.readers().forgetReader(shardId);
                     stale.add(shardId);
                 } catch (Exception e) {
                     // Refreshing is an optimisation over being wrong, not a correctness step of its own: a

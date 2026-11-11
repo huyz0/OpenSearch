@@ -50,7 +50,7 @@ public class ServerlessShardTests extends OpenSearchTestCase {
             final IndexDescriptor alpha = descriptor("alpha", "uuid-alpha-00000000");
             final ShardAssignment assignment = new ShardAssignment("alpha", 0, 7L);
 
-            final Set<ShardId> opened = node.applyTruth(List.of(alpha), List.of(assignment));
+            final Set<ShardId> opened = node.activation().applyTruth(List.of(alpha), List.of(assignment));
             assertEquals("exactly one shard should have opened", 1, opened.size());
 
             final ShardId shardId = opened.iterator().next();
@@ -76,14 +76,17 @@ public class ServerlessShardTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p2-b"))) {
             node.startup().start();
             final IndexDescriptor alpha = descriptor("alpha", "uuid-alpha-00000000");
-            final ShardId shardId = node.applyTruth(List.of(alpha), List.of(new ShardAssignment("alpha", 0, 1L))).iterator().next();
+            final ShardId shardId = node.activation()
+                .applyTruth(List.of(alpha), List.of(new ShardAssignment("alpha", 0, 1L)))
+                .iterator()
+                .next();
             final IndexShard shard = node.reconciler().shard(shardId);
             ShardOps.indexDoc(shard, "1", "{\"msg\":\"still here\",\"n\":1}");
             shard.refresh("phase2");
             assertEquals(1L, ShardOps.hits(node.searchService(), shardId, "msg", "still"));
 
             // A projection naming nothing at all. Truth has not changed; the view simply forgot.
-            node.applyTruth(List.of(), List.of());
+            node.activation().applyTruth(List.of(), List.of());
 
             assertFalse(
                 "the view must omit the index for this test to mean anything",
@@ -104,7 +107,10 @@ public class ServerlessShardTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p2-c"))) {
             node.startup().start();
             final IndexDescriptor alpha = descriptor("alpha", "uuid-alpha-00000000");
-            final ShardId shardId = node.applyTruth(List.of(alpha), List.of(new ShardAssignment("alpha", 0, 1L))).iterator().next();
+            final ShardId shardId = node.activation()
+                .applyTruth(List.of(alpha), List.of(new ShardAssignment("alpha", 0, 1L)))
+                .iterator()
+                .next();
             assertEquals(1, node.reconciler().openShards().size());
 
             node.releaseShard(shardId, "shard-head says another node owns it now");
@@ -121,8 +127,8 @@ public class ServerlessShardTests extends OpenSearchTestCase {
             final IndexDescriptor alpha = descriptor("alpha", "uuid-alpha-00000000");
             final List<ShardAssignment> owned = List.of(new ShardAssignment("alpha", 0, 1L));
 
-            assertEquals(1, node.applyTruth(List.of(alpha), owned).size());
-            assertEquals("a second apply must open nothing", 0, node.applyTruth(List.of(alpha), owned).size());
+            assertEquals(1, node.activation().applyTruth(List.of(alpha), owned).size());
+            assertEquals("a second apply must open nothing", 0, node.activation().applyTruth(List.of(alpha), owned).size());
             assertEquals("the node must still hold exactly one shard", 1, node.reconciler().openShards().size());
         }
     }
@@ -136,7 +142,7 @@ public class ServerlessShardTests extends OpenSearchTestCase {
             node.startup().start();
             final IllegalStateException e = expectThrows(
                 IllegalStateException.class,
-                () -> node.applyTruth(List.of(), List.of(new ShardAssignment("ghost", 0, 1L)))
+                () -> node.activation().applyTruth(List.of(), List.of(new ShardAssignment("ghost", 0, 1L)))
             );
             assertTrue(
                 "the error must name the problem: " + e.getMessage(),
@@ -153,8 +159,14 @@ public class ServerlessShardTests extends OpenSearchTestCase {
             final IndexDescriptor alpha = descriptor("alpha", "uuid-alpha-00000000");
             final IndexDescriptor beta = descriptor("beta", "uuid-beta-000000000");
 
-            final ShardId alphaShard = a.applyTruth(List.of(alpha), List.of(new ShardAssignment("alpha", 0, 1L))).iterator().next();
-            final ShardId betaShard = b.applyTruth(List.of(beta), List.of(new ShardAssignment("beta", 0, 1L))).iterator().next();
+            final ShardId alphaShard = a.activation()
+                .applyTruth(List.of(alpha), List.of(new ShardAssignment("alpha", 0, 1L)))
+                .iterator()
+                .next();
+            final ShardId betaShard = b.activation()
+                .applyTruth(List.of(beta), List.of(new ShardAssignment("beta", 0, 1L)))
+                .iterator()
+                .next();
 
             ShardOps.indexDoc(a.reconciler().shard(alphaShard), "1", "{\"msg\":\"alpha doc\",\"n\":1}");
             ShardOps.indexDoc(b.reconciler().shard(betaShard), "1", "{\"msg\":\"beta doc\",\"n\":1}");

@@ -359,7 +359,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             loser.startup().start();
             winner.startup().start();
 
-            final ShardId onLoser = loser.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onLoser = loser.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             final long loserTerm = plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(loser.reconciler().shard(onLoser), "1", "{\"msg\":\"from the loser\",\"n\":1}");
             loser.reconciler().shard(onLoser).refresh("fence");
@@ -379,7 +379,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             assertTrue("the loser never reached the upload, so no window was opened", store.awaitPaused(2, TimeUnit.MINUTES));
 
             clock.set(1_000L + ttl);
-            final ShardId onWinner = winner.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onWinner = winner.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             final long winnerTerm = plane.heads().read("alpha", 0).orElseThrow().term();
             assertTrue("the successor must hold a higher term", winnerTerm > loserTerm);
             ShardOps.indexDoc(winner.reconciler().shard(onWinner), "2", "{\"msg\":\"from the winner\",\"n\":2}");
@@ -414,7 +414,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             )
         ) {
             reader.startup().start();
-            final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
+            final ShardId shardId = reader.readers().serveAsReader(plane, "alpha", 0);
             assertEquals("the winner's document must survive", 1L, ShardOps.hits(reader.searchService(), shardId, "msg", "winner"));
         }
     }

@@ -72,10 +72,10 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             a.startup().start();
             b.startup().start();
 
-            assertTrue("A should have acquired the shard", a.activateWriter(plane, "alpha", 0).isPresent());
+            assertTrue("A should have acquired the shard", a.activation().activateWriter(plane, "alpha", 0).isPresent());
 
             // Losing is a routing instruction, not a failure.
-            final Optional<ShardId> lost = b.activateWriter(plane, "alpha", 0);
+            final Optional<ShardId> lost = b.activation().activateWriter(plane, "alpha", 0);
             assertTrue("B must not acquire a shard A holds", lost.isEmpty());
             assertTrue("B must not have opened anything", b.reconciler().openShards().isEmpty());
             assertEquals(a.localNode().getId(), plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
@@ -92,7 +92,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
         ) {
             a.startup().start();
             b.startup().start();
-            assertTrue(a.activateWriter(plane, "alpha", 0).isPresent());
+            assertTrue(a.activation().activateWriter(plane, "alpha", 0).isPresent());
 
             // Three TTLs pass, but A keeps heartbeating.
             for (int i = 1; i <= 3; i++) {
@@ -100,7 +100,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
                 assertTrue("a live heartbeat must release nothing", a.leases().heartbeat(plane).isEmpty());
             }
 
-            assertTrue("B took a shard whose lease was being renewed", b.activateWriter(plane, "alpha", 0).isEmpty());
+            assertTrue("B took a shard whose lease was being renewed", b.activation().activateWriter(plane, "alpha", 0).isEmpty());
             assertEquals(1, a.reconciler().openShards().size());
         }
     }
@@ -115,11 +115,11 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
         ) {
             a.startup().start();
             b.startup().start();
-            final ShardId shardId = a.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId shardId = a.activation().activateWriter(plane, "alpha", 0).orElseThrow();
 
             // A stops heartbeating -- paused, partitioned, or simply busy. The clock does the rest.
             clock.set(1_000L + TTL);
-            assertTrue("B should take an expired shard", b.activateWriter(plane, "alpha", 0).isPresent());
+            assertTrue("B should take an expired shard", b.activation().activateWriter(plane, "alpha", 0).isPresent());
 
             // A is still holding the shard open at this instant. It finds out on its next heartbeat.
             assertEquals(1, a.reconciler().openShards().size());
@@ -135,7 +135,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("p6-kill", "ingest"));
         a.startup().start();
-        final ShardId shardId = a.activateWriter(plane, "alpha", 0).orElseThrow();
+        final ShardId shardId = a.activation().activateWriter(plane, "alpha", 0).orElseThrow();
         for (int i = 1; i <= 4; i++) {
             ShardOps.indexDoc(a.reconciler().shard(shardId), String.valueOf(i), "{\"msg\":\"durable\",\"n\":" + i + "}");
         }
@@ -148,7 +148,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("p6-kill2", "ingest"))) {
             b.startup().start();
-            final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onB = b.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals("published data did not survive an abrupt death", 4L, ShardOps.hits(b.searchService(), onB, "msg", "durable"));
         }
     }
@@ -168,7 +168,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             zombie.startup().start();
             successor.startup().start();
 
-            final ShardId onZombie = zombie.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onZombie = zombie.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             final long zombieTerm = plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"before the pause\",\"n\":1}");
             zombie.reconciler().shard(onZombie).refresh("p6");
@@ -176,7 +176,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
 
             // The JVM pauses. No heartbeat, no release, no awareness of anything.
             clock.set(1_000L + TTL);
-            final ShardId onSuccessor = successor.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onSuccessor = successor.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             final long successorTerm = plane.heads().read("alpha", 0).orElseThrow().term();
             assertTrue("the successor must hold a higher term", successorTerm > zombieTerm);
             ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"after takeover\",\"n\":2}");
@@ -207,7 +207,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
         // What survives is exactly what was published: the successor's view of the shard.
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("p6-verify", "search"))) {
             reader.startup().start();
-            final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
+            final ShardId shardId = reader.readers().serveAsReader(plane, "alpha", 0);
             assertEquals("the pre-pause document must survive", 1L, ShardOps.hits(reader.searchService(), shardId, "msg", "before"));
             assertEquals("the successor's document must survive", 1L, ShardOps.hits(reader.searchService(), shardId, "msg", "takeover"));
             assertEquals(
@@ -250,7 +250,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             loser.startup().start();
             winner.startup().start();
 
-            final ShardId onLoser = loser.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onLoser = loser.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             final long loserTerm = plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(loser.reconciler().shard(onLoser), "1", "{\"msg\":\"from the loser\",\"n\":1}");
             loser.reconciler().shard(onLoser).refresh("p6");
@@ -274,7 +274,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
 
             // While it is parked, its lease lapses and a successor takes the shard and publishes.
             clock.set(1_000L + TTL);
-            final ShardId onWinner = winner.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onWinner = winner.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             final long winnerTerm = plane.heads().read("alpha", 0).orElseThrow().term();
             assertTrue("the successor must hold a higher term", winnerTerm > loserTerm);
             ShardOps.indexDoc(winner.reconciler().shard(onWinner), "2", "{\"msg\":\"from the winner\",\"n\":2}");
@@ -308,7 +308,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
         // would look like the winner's document having never been written.
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("p6-window-verify", "search"))) {
             reader.startup().start();
-            final ShardId shardId = reader.serveAsReader(plane, "alpha", 0);
+            final ShardId shardId = reader.readers().serveAsReader(plane, "alpha", 0);
             assertEquals("the winner's document must survive", 1L, ShardOps.hits(reader.searchService(), shardId, "msg", "winner"));
         }
     }

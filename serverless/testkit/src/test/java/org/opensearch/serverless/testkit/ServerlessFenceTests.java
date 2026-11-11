@@ -124,7 +124,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             // Z pauses past its TTL. S takes the shard over and seals the log where Z's history ended.
             s.startup().start();
             clock.set(1_000L + TTL);
-            final ShardId onS = s.activateWriter(planeS, "alpha", 0).orElseThrow();
+            final ShardId onS = s.activation().activateWriter(planeS, "alpha", 0).orElseThrow();
             assertTrue(s.reads().get(onS, "before").found());
 
             // Z resumes and heartbeats. The store parks the first shard-head read of that heartbeat,
@@ -229,7 +229,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             beforeRelease.release();
             assertTrue("the head-release swap must complete", afterRelease.reached.await(30, TimeUnit.SECONDS));
             // Head released, shard still open on A: a successor acquires and seals here.
-            final ShardId onS = s.activateWriter(planeS, "alpha", 0).orElseThrow();
+            final ShardId onS = s.activation().activateWriter(planeS, "alpha", 0).orElseThrow();
             assertTrue("the published history must have reached the successor", s.reads().get(onS, "before").found());
 
             append.release();
@@ -277,7 +277,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             store.blobContainer(RegisterMap.assignments(plane.basePath(), a.localNode().getId()))
                 .deleteBlobsIgnoringIfNotExists(List.of(RegisterMap.assignmentBlob("alpha", 0)));
 
-            a.syncFrom(plane);
+            a.activation().syncFrom(plane);
             assertNotNull("the head names this node; a missing claim blob is no reason to let the shard go", a.reconciler().shard(onA));
             assertEquals(a.localNode().getId(), plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
             assertTrue("and it still serves", a.writes().index(onA, "still", "{\"msg\":\"still\"}").seqNo() >= 0);
@@ -314,7 +314,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             // By S's clock Z's lease has expired; by Z's, it has half a second left.
             clockS.set(1_000L + TTL);
             clockZ.set(1_000L + TTL - skew);
-            final ShardId onS = s.activateWriter(planeS, "alpha", 0).orElseThrow();
+            final ShardId onS = s.activation().activateWriter(planeS, "alpha", 0).orElseThrow();
             assertTrue(s.reads().get(onS, "before").found());
 
             expectThrows(
@@ -507,7 +507,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             // The head is given away underneath A -- what a deferred give-back or an operator does --
             // and B takes it while A's lease is still perfectly live.
             assertTrue(plane.heads().release("alpha", 0, a.localNode().getId()));
-            final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onB = b.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             assertTrue(b.writes().index(onB, "b", "{\"msg\":\"b\"}").seqNo() >= 0);
 
             clock.incrementAndGet();
