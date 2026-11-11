@@ -85,13 +85,18 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
     }
 
     private static long rollupSwaps(String byPlace) {
-        long swaps = 0;
+        return count(byPlace, "REGISTER_CAS rollups/");
+    }
+
+    /** The requests of the places a breakdown line names with this prefix. */
+    private static long count(String byPlace, String kindAndPlace) {
+        long requests = 0;
         for (String line : byPlace.split("\n")) {
-            if (line.contains("REGISTER_CAS rollups/")) {
-                swaps += Long.parseLong(line.substring(0, line.indexOf(' ')));
+            if (line.contains(kindAndPlace)) {
+                requests += Long.parseLong(line.substring(0, line.indexOf(' ')));
             }
         }
-        return swaps;
+        return requests;
     }
 
     private CountingBlobStore store() throws java.io.IOException {
@@ -152,6 +157,14 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
                 survivor.renewLease(plane);
                 plane.membership().refresh();
                 takeAll("crashed", store, survivor, plane, clock);
+                // The dead writer's lease is judged and revoked once for all its shards taken together, not read
+                // twice per shard and swapped by each.
+                final String where = store.byPlace();
+                assertTrue(
+                    "the dead lease is read less than once a shard\n" + where,
+                    count(where, "REGISTER_GET cluster/members/") < SHARDS
+                );
+                assertTrue("and revoked once\n" + where, count(where, "REGISTER_CAS cluster/members/") <= 2);
                 for (ShardId shardId : survivor.reconciler().openShards()) {
                     assertTrue(survivor.get(shardId, "unpublished-" + shardId.id()).found());
                 }
