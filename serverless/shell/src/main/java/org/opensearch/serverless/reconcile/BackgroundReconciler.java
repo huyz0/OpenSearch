@@ -99,6 +99,10 @@ public final class BackgroundReconciler implements Closeable {
     private final Set<Map.Entry<String, Integer>> wanted = ConcurrentHashMap.newKeySet();
     private final Map<ShardId, Long> lastPublishedMaxSeqNo = new ConcurrentHashMap<>();
     private final Map<ShardId, Long> lastPublishedAtMillis = new ConcurrentHashMap<>();
+    /** Per shard, when the oldest write its last publish did not cover was reported: for publishing by age. */
+    private final Map<ShardId, Long> unpublishedSinceMillis = new ConcurrentHashMap<>();
+    private volatile long lazyPublishMaxAgeMillis;
+    private volatile long lazyPublishMaxOperations;
     private final Set<ShardId> dirty = ConcurrentHashMap.newKeySet();
     private final Set<ShardId> fenced = ConcurrentHashMap.newKeySet();
     private final Set<String> pinnedIndices = ConcurrentHashMap.newKeySet();
@@ -292,7 +296,7 @@ public final class BackgroundReconciler implements Closeable {
             }
             final Set<ShardId> released = new java.util.LinkedHashSet<>(renewLeases());
             final Set<ShardId> activated = new java.util.LinkedHashSet<>(activateWanted());
-            final Set<ShardId> published = publishAll();
+            final Set<ShardId> published = lazyPublishMaxAgeMillis > 0 ? publishAllDue(nowMillis) : publishAll();
             // After publishing, so a shard released for idleness has just had its chance to flush.
             released.addAll(releaseIdle(nowMillis));
             trimToCap();
@@ -515,6 +519,51 @@ public final class BackgroundReconciler implements Closeable {
             }
         }
         return false;
+    }
+
+    /**
+     * Publishes each shard by the age of its oldest unpublished write, and by how much it holds unpublished, rather
+     * than soon after every write: for a node whose writes are durable in its own write log.
+     *
+     * <p>A publish of a commit that adds one small segment is five or more PUTs, and with one write log per node it is
+     * the largest request cost a busy shard has left. Durability does not need it, the log has every acknowledged write.
+     * What it buys is search freshness, since searches read published commits, and a shorter log: the log's trim point
+     * is the oldest record any shard has not published, so a shard that never publishes keeps every blob after its
+     * first unpublished write. Publishing by age bounds both, the delay before a write is searchable and how much of
+     * the log is kept; publishing by size bounds what a successor replays.
+     *
+     * <p>The edges and the backstop both follow it. A release, a hand-off and an idle release publish regardless.
+     *
+     * @param maxAgeMillis how long a write may wait to be published; zero or less to publish as before
+     * @param maxOperations how many unpublished operations make a shard due sooner; zero or less for never sooner
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setLazyPublish(long maxAgeMillis, long maxOperations) {
+        this.lazyPublishMaxAgeMillis = maxAgeMillis;
+        this.lazyPublishMaxOperations = maxOperations;
+        return this;
+    }
+
+    /**
+     * Publishes every open shard that is due by {@link #setLazyPublish}.
+     *
+     * @param nowMillis the plane's clock, now
+     * @return the shards published
+     * @throws Exception if the metadata plane cannot be reached
+     */
+    public Set<ShardId> publishAllDue(long nowMillis) throws Exception {
+        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
+            if (work == null) {
+                return Set.of();
+            }
+            final Set<ShardId> due = new LinkedHashSet<>();
+            for (ShardId shardId : node.reconciler().openShards()) {
+                if (publishDue(shardId, nowMillis, 0L, 0L)) {
+                    due.add(shardId);
+                }
+            }
+            return publish(due);
+        }
     }
 
     /**
@@ -2717,6 +2766,10 @@ public final class BackgroundReconciler implements Closeable {
     }
 
     private boolean publishDue(ShardId shardId, long nowMillis, long minIntervalMillis, long maxUnpublishedOperations) {
+        final long maxAge = lazyPublishMaxAgeMillis;
+        if (maxAge > 0) {
+            return lazyPublishDue(shardId, nowMillis, maxAge);
+        }
         if (minIntervalMillis <= 0) {
             return true;
         }
@@ -2743,6 +2796,38 @@ public final class BackgroundReconciler implements Closeable {
         return maxSeqNo - lastPublishedMaxSeqNo.getOrDefault(shardId, -1L) >= maxUnpublishedOperations;
     }
 
+    private boolean lazyPublishDue(ShardId shardId, long nowMillis, long maxAge) {
+        final var shard = node.reconciler().shard(shardId);
+        if (shard == null) {
+            // Closed since it was marked; publishOne drops it without a store request.
+            return true;
+        }
+        final long maxSeqNo;
+        try {
+            maxSeqNo = shard.seqNoStats().getMaxSeqNo();
+        } catch (RuntimeException e) {
+            return true;
+        }
+        final Long lastThrough = lastPublishedMaxSeqNo.get(shardId);
+        if (maxSeqNo < 0 || (lastThrough != null && maxSeqNo <= lastThrough)) {
+            // Nothing unpublished.
+            unpublishedSinceMillis.remove(shardId);
+            return false;
+        }
+        if (lastThrough == null) {
+            // Never published by this node: once, so a new index is searchable at once and the commit records where
+            // this node's writes begin.
+            return true;
+        }
+        // A write reported while a publish was in flight may have lost its stamp; it is aged from now.
+        final long since = unpublishedSinceMillis.computeIfAbsent(shardId, ignored -> nowMillis);
+        if (nowMillis - since >= maxAge) {
+            return true;
+        }
+        final long maxOperations = lazyPublishMaxOperations;
+        return maxOperations > 0 && maxSeqNo - lastThrough >= maxOperations;
+    }
+
     /**
      * Reports that a shard has been written to and should be published soon.
      *
@@ -2753,6 +2838,9 @@ public final class BackgroundReconciler implements Closeable {
             return;
         }
         dirty.add(shardId);
+        if (lazyPublishMaxAgeMillis > 0) {
+            unpublishedSinceMillis.putIfAbsent(shardId, plane.clock().getAsLong());
+        }
     }
 
     private Set<ShardId> publish(Collection<ShardId> candidates) throws Exception {
@@ -2868,6 +2956,8 @@ public final class BackgroundReconciler implements Closeable {
         }
         lastPublishedMaxSeqNo.put(shardId, covered);
         lastPublishedAtMillis.put(shardId, plane.clock().getAsLong());
+        // A write reported since the flush read its checkpoint is stamped again by the next look.
+        unpublishedSinceMillis.remove(shardId);
         return true;
     }
 
