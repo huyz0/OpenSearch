@@ -199,7 +199,7 @@ final class ReaderValidation {
         }
         // Then it has to cover the log on its own. One that does not say how far it reaches covers none of its own
         // term.
-        final boolean behind;
+        boolean behind;
         if (landed != null) {
             // How far the commit reaches is recorded: a listing answers.
             behind = awaitListing(landed);
@@ -210,6 +210,22 @@ final class ReaderValidation {
             final org.opensearch.index.shard.IndexShard opened = reconciler.get().shard(shardId);
             final long committed = opened == null ? -1L : opened.seqNoStats().getMaxSeqNo();
             behind = log.maxSeqNoFromTerm(commit.term()) > committed;
+        }
+        if (behind == false && head.isPresent()) {
+            // A write that went to a node's write log rather than the shard's own is in neither listing: the writers the
+            // head names, and a dead owner, hold such records until a successor replays and publishes them.
+            final java.util.List<String> nodeLogs = new java.util.ArrayList<>(head.get().writers());
+            if (owner != null && nodeLogs.contains(owner) == false) {
+                nodeLogs.add(owner);
+            }
+            behind = plane.nodeLogHolds(
+                nodeLogs,
+                indexName,
+                shardId.getIndex().getUUID(),
+                shardNumber,
+                headTerm,
+                java.util.Optional.of(commit)
+            );
         }
         if (behind) {
             readerChecks.remove(key);

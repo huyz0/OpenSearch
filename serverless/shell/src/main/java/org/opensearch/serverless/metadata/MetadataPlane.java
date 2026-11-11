@@ -1469,7 +1469,7 @@ public final class MetadataPlane {
         log.fenceOlderTerms(abandoned.get().released().term());
         final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
         if (unpublished(indexName, uuid, shard, commit, log)
-            || nodeLogHolds(abandoned.get().released().writers(), uuid, shard, abandoned.get().released().term())) {
+            || nodeLogHolds(abandoned.get().released().writers(), indexName, uuid, shard, abandoned.get().released().term(), commit)) {
             return Settled.NEEDS_REPLAY;
         }
         // Widened to the published commit as the mark goes: the dead writer's publishes skipped the rollup under it.
@@ -1509,7 +1509,7 @@ public final class MetadataPlane {
         final String uuid = descriptor.get().uuid();
         final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
         if (unpublished(indexName, uuid, shard, commit, walStore(indexName, uuid, shard))
-            || nodeLogHolds(head.get().writers(), uuid, shard, head.get().term())) {
+            || nodeLogHolds(head.get().writers(), indexName, uuid, shard, head.get().term(), commit)) {
             return Settled.NEEDS_REPLAY;
         }
         // A writer that takes the shard meanwhile marks it at a higher term first, which this clear leaves alone. Widened
@@ -1553,18 +1553,47 @@ public final class MetadataPlane {
     }
 
     /**
-     * Whether any of the nodes a head names holds records of a shard in its write log that it has not published.
+     * Whether any of the given nodes holds records of a shard in its write log that a published commit does not cover.
      *
-     * @param nodeIds the nodes, as {@link ShardHead#writers} names them
+     * <p>A record is covered when its sequence number is at or below the commit's local checkpoint. With no commit to
+     * judge against, any record the log names counts. The answer errs towards a replay: a log is judged by its blob
+     * headers alone, and a commit that records no checkpoint covers nothing.
+     *
+     * @param nodeIds the nodes, as {@link ShardHead#writers} names them, or a dead owner
+     * @param indexName the index
      * @param uuid the index's uuid
      * @param shard the shard number
      * @param term the term recorded in a fence, for diagnosis
-     * @return true if any of their logs may hold unpublished records of the shard
-     * @throws IOException if a lease or a log cannot be read, or a fence fails
+     * @param commit the shard's published commit, if any
+     * @return true if any of their logs may hold records of the shard the commit does not cover
+     * @throws IOException if a lease, a log or the commit cannot be read, or a fence fails
      */
-    public boolean nodeLogHolds(List<String> nodeIds, String uuid, int shard, long term) throws IOException {
+    public boolean nodeLogHolds(
+        List<String> nodeIds,
+        String indexName,
+        String uuid,
+        int shard,
+        long term,
+        Optional<org.opensearch.serverless.store.CommitManifest> commit
+    ) throws IOException {
+        java.util.OptionalLong covered = null;
+        final NodeLogBlob.ShardKey key = new NodeLogBlob.ShardKey(uuid, shard);
         for (String nodeId : nodeIds) {
-            if (nodeLogHolds(nodeId, uuid, shard, term)) {
+            final NodeLogTakeover reader = nodeLogReader(nodeId, term);
+            if (reader == null || reader.holds(key) == false) {
+                continue;
+            }
+            if (commit.isEmpty()) {
+                return true;
+            }
+            final long held = reader.maxSeqNoOf(key);
+            if (held == org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO) {
+                continue;
+            }
+            if (covered == null) {
+                covered = segmentPublisher(indexName, uuid, shard).committedLocalCheckpoint(commit.get());
+            }
+            if (covered.isEmpty() || held > covered.getAsLong()) {
                 return true;
             }
         }
@@ -1572,37 +1601,27 @@ public final class MetadataPlane {
     }
 
     /**
-     * Whether a node's write log may hold records of a shard that it has not published.
+     * A reader of a node's write log, or null if its lease names no epochs.
      *
      * <p>A node that is live let go of the shard itself and writes no more of it, so its log is read up to each epoch's
      * first free slot and nothing is fenced: fencing would fail the writes of every shard it still holds. A node that is
      * not live may not be as dead as it looks, and may still land records of the shard in an epoch it opened while it
      * held it, so its epochs are fenced first, as a takeover fences them.
-     *
-     * <p>The answer errs towards a replay: a shard published after the last header was written is still named.
-     *
-     * @param nodeId the node that last wrote the shard; null if none is known
-     * @param uuid the index's uuid
-     * @param shard the shard number
-     * @param term the term recorded in a fence, for diagnosis
-     * @return true if the node's log may hold unpublished records of the shard
-     * @throws IOException if the lease or the log cannot be read, or a fence fails
      */
-    public boolean nodeLogHolds(String nodeId, String uuid, int shard, long term) throws IOException {
+    private NodeLogTakeover nodeLogReader(String nodeId, long term) throws IOException {
         if (nodeId == null) {
-            return false;
+            return null;
         }
         final Optional<NodeLease> lease = membership().read(nodeId);
         final List<NodeLogEpoch> epochs = lease.map(NodeLease::nodeLog).orElse(List.of());
         if (epochs.isEmpty()) {
-            return false;
+            return null;
         }
         final NodeLogStore log = new NodeLogStore(blobStore, base, nodeId);
         final NodeLogTakeover.LeaseReader reread = () -> membership().read(nodeId).map(NodeLease::nodeLog).orElse(List.of());
-        final NodeLogTakeover reader = isLive(lease.get())
+        return isLive(lease.get())
             ? NodeLogTakeover.unfenced(log, epochs, reread)
             : new NodeLogTakeover(log, epochs, "settled-by-survivor", term, reread);
-        return reader.holds(new NodeLogBlob.ShardKey(uuid, shard));
     }
 
     /** What became of a node's write log when a survivor looked at it. */
@@ -1623,7 +1642,7 @@ public final class MetadataPlane {
      *
      * <p><b>When it is safe.</b> Every epoch is fenced first, so the node, if it is not as dead as it looks, can add
      * nothing after what is read. Each shard the last headers name is then judged: an index deleted or recreated
-     * needs nothing; otherwise its published commit must reach the highest sequence number this log holds of it,
+     * needs nothing; otherwise its published commit's local checkpoint must reach the highest sequence number this log holds of it,
      * which is read from blob headers alone. A shard whose new owner has not yet replayed and published keeps the log.
      * Only then does the lease stop naming the epochs, by a swap that a node coming back wins, and the blobs go.
      *
@@ -1692,7 +1711,7 @@ public final class MetadataPlane {
         if (commit.isEmpty()) {
             return false;
         }
-        final java.util.OptionalLong committed = publisher.committedMaxSeqNo(commit.get());
+        final java.util.OptionalLong committed = publisher.committedLocalCheckpoint(commit.get());
         return committed.isPresent() && committed.getAsLong() >= held;
     }
 
@@ -1733,7 +1752,7 @@ public final class MetadataPlane {
             if (walStore(indexName, uuid, shard).landedPast(0L, -1L)) {
                 return false;
             }
-            if (head.isPresent() && nodeLogHolds(head.get().writers(), uuid, shard, head.get().term())) {
+            if (head.isPresent() && nodeLogHolds(head.get().writers(), indexName, uuid, shard, head.get().term(), Optional.empty())) {
                 return false;
             }
         }
@@ -1767,7 +1786,15 @@ public final class MetadataPlane {
                 return List.of();
             }
             if (unpublished(indexName, uuid, shard, walStore(indexName, uuid, shard))
-                || (head.isPresent() && nodeLogHolds(head.get().writers(), uuid, shard, head.get().term()))) {
+                || (head.isPresent()
+                    && nodeLogHolds(
+                        head.get().writers(),
+                        indexName,
+                        uuid,
+                        shard,
+                        head.get().term(),
+                        segmentPublisher(indexName, uuid, shard).readManifest()
+                    ))) {
                 replay.add(shard);
                 continue;
             }

@@ -36,7 +36,12 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
 
     private Settings nodeSettings(String name) {
+        return nodeSettings(name, true);
+    }
+
+    private Settings nodeSettings(String name, boolean nodeLog) {
         return Settings.builder()
+            .put("serverless.wal.node_log.enabled", nodeLog)
             .put("node.name", name)
             .put("cluster.name", "serverless-takeover-requests")
             .put("path.home", createTempDir())
@@ -137,12 +142,16 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * With the per-shard log. With the node log, each shard's replay reads the dead writer's lease again after its head
+     * moved, so a later epoch of that writer is one its ownership check refuses: one lease read a shard, by design.
+     */
     public void testTakingACrashedWritersShards() throws Exception {
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         final CountingBlobStore store = store();
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
-        final ServerlessNode first = new ServerlessNode(nodeSettings("crashed-first"));
+        final ServerlessNode first = new ServerlessNode(nodeSettings("crashed-first", false));
         try {
             first.start();
             first.setMetadataPlane(plane);
@@ -151,7 +160,7 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
                 first.index(shardId, "unpublished-" + shardId.id(), "{\"msg\":\"first\",\"n\":" + shardId.id() + "}");
             }
             clock.addAndGet(2 * TTL);
-            try (ServerlessNode survivor = new ServerlessNode(nodeSettings("crashed-survivor"))) {
+            try (ServerlessNode survivor = new ServerlessNode(nodeSettings("crashed-survivor", false))) {
                 survivor.start();
                 survivor.setMetadataPlane(plane);
                 survivor.renewLease(plane);
