@@ -64,9 +64,16 @@ public final class ShardRouter {
     final TransportAuthenticator authenticator;
     /** Answers the work other nodes forward here. */
     final ForwardedWorkHandlers handlers = new ForwardedWorkHandlers(this);
+    /**
+     * Whether forwards to a peer in another zone are compressed, true by default. Forwarded documents and search hits
+     * are mostly JSON source, which compresses several times over, and traffic between zones is billed by the byte.
+     */
+    public static final String COMPRESS_CROSS_ZONE = "serverless.network.compress_cross_zone";
+
     /** Bytes exchanged with peers, by whether they stayed in this node's zone. */
     final ZoneTraffic zoneTraffic = new ZoneTraffic();
     private final boolean meterZones;
+    private final boolean compressCrossZone;
     private final String localZone;
 
     /**
@@ -91,6 +98,7 @@ public final class ShardRouter {
             node.settings().getAsInt("serverless.transport.replay_cache.capacity", 65_536)
         );
         this.meterZones = node.settings().getAsBoolean(ZoneTraffic.ENABLED, true);
+        this.compressCrossZone = node.settings().getAsBoolean(COMPRESS_CROSS_ZONE, true);
         this.localZone = org.opensearch.serverless.cluster.Zones.localZone(node.settings());
     }
 
@@ -110,6 +118,16 @@ public final class ShardRouter {
      */
     public ZoneTraffic zoneTraffic() {
         return zoneTraffic;
+    }
+
+    /**
+     * Returns the bytes this node's transport has put on the wire, compressed where compression applies: what the
+     * payload counts of {@link #zoneTraffic()} become once sent.
+     *
+     * @return bytes sent since start
+     */
+    public long transportBytesSent() {
+        return transportService.stats().getTxSize().getBytes();
     }
 
     /** Where an exchange with a peer goes, from the zone the peer's lease advertises. */
@@ -557,7 +575,13 @@ public final class ShardRouter {
                 peer,
                 new org.opensearch.transport.ConnectionProfile.Builder(
                     org.opensearch.transport.ConnectionProfile.buildDefaultConnectionProfile(org.opensearch.common.settings.Settings.EMPTY)
-                ).setConnectTimeout(timeout).setHandshakeTimeout(timeout).build()
+                ).setConnectTimeout(timeout)
+                    .setHandshakeTimeout(timeout)
+                    // Compressed only to a peer in another zone, where every byte is billed; the answer comes back
+                    // compressed too, because a node answers compressed what was asked compressed. Inside a zone the
+                    // bytes are free and the CPU is not.
+                    .setCompressionEnabled(compressCrossZone && pathTo(peer) == ZoneTraffic.Path.CROSS_ZONE)
+                    .build()
             );
         }
         return Optional.of(peer);
