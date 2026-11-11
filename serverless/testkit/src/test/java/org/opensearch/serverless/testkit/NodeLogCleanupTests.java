@@ -48,7 +48,7 @@ public class NodeLogCleanupTests extends OpenSearchTestCase {
             .put("serverless.wal.node_log.window_millis", 0)
             .build();
         try (ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             for (int shard = 0; shard < SHARDS; shard++) {
@@ -57,7 +57,7 @@ public class NodeLogCleanupTests extends OpenSearchTestCase {
             loop.tick(clock.get());
             final List<ShardId> held = new ArrayList<>(node.reconciler().openShards());
             for (int i = 0; i < 10; i++) {
-                node.index(held.get(i % SHARDS), "doc-" + i, "{\"msg\":\"m\"}");
+                node.writes().index(held.get(i % SHARDS), "doc-" + i, "{\"msg\":\"m\"}");
             }
             final NodeLogStore log = new NodeLogStore(plane.blobStore(), plane.basePath(), node.localNode().getId());
             final NodeLogEpoch before = node.nodeLogWriter().epochs().get(0);
@@ -71,7 +71,7 @@ public class NodeLogCleanupTests extends OpenSearchTestCase {
             assertEquals("nothing unpublished: the trim point is the next slot", published.landed(), published.trimPoint());
             assertTrue("not deleted before a lease records the trim point", log.readEntry(before.epoch(), 0L).isPresent());
 
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             for (long ordinal = 0; ordinal < published.trimPoint(); ordinal++) {
                 assertTrue(
                     "slot " + ordinal + " is deleted once the lease records the trim point",
@@ -85,7 +85,7 @@ public class NodeLogCleanupTests extends OpenSearchTestCase {
             );
 
             // Writing again goes on in the same epoch, above what was deleted.
-            node.index(held.get(0), "doc-after", "{\"msg\":\"m\"}");
+            node.writes().index(held.get(0), "doc-after", "{\"msg\":\"m\"}");
             assertTrue(log.readEntry(before.epoch(), published.landed()).isPresent());
         }
     }

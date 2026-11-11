@@ -86,7 +86,7 @@ public class ServerlessClientCompatibilityTests extends OpenSearchTestCase {
 
     private ServerlessNode serving(MetadataPlane plane, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         port = node.boundHttpAddress().publishAddress().getPort();
         return node;

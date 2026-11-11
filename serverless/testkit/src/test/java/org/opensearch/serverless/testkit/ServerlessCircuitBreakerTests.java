@@ -73,7 +73,7 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("bounded", "uuid-bounded-000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("breaker-agg", "1kb"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("bounded", 0);
@@ -119,7 +119,7 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("bounded", "uuid-bounded-000000", 2, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("breaker-none", "1kb"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("bounded", 0);
@@ -145,7 +145,7 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("ordinary", "uuid-ordinary-00000", 2, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("breaker-default", null))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("ordinary", 0);
@@ -194,7 +194,7 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
             .build();
 
         try (ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("pressed", 0);
@@ -251,7 +251,7 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
             .build();
 
         try (ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("recycled", 0);
@@ -287,7 +287,7 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("plenty", "uuid-plenty-0000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("pressure-default", null))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("plenty", 0);

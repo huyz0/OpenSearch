@@ -177,7 +177,7 @@ public class FieldCapabilitiesContractTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest,search")
                 .build();
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("enabled", "uuid-enabled", 3, """
                     {"properties": {

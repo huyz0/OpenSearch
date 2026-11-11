@@ -16,7 +16,7 @@ import java.util.concurrent.CountDownLatch;
  * Keeps {@link ServerlessNode}'s claims current: renews its lease, verifies the heads it holds, and lets go of
  * shards it has lost.
  */
-final class NodeLeases {
+public final class NodeLeases {
 
     private final ServerlessNode node;
 
@@ -417,7 +417,7 @@ final class NodeLeases {
         String reason,
         boolean forgetClaim
     ) throws Exception {
-        node.underShardFence(shardId, () -> {
+        node.fences().underShardFence(shardId, () -> {
             node.reconciler.releaseShard(shardId, reason);
             return null;
         });
@@ -455,7 +455,7 @@ final class NodeLeases {
         final var shardId = failed.shardId();
         ServerlessNode.logger.warn("shard " + shardId + " failed; closing it and taking it again from its published commit and log", cause);
         try {
-            final var released = node.underShardFence(shardId, () -> {
+            final var released = node.fences().underShardFence(shardId, () -> {
                 final var result = node.reconciler.releaseFailedShard(failed, "its engine failed");
                 if (result != ShardReconciler.FailedShardRelease.NOT_CURRENT) {
                     node.writeFenced.remove(shardId);

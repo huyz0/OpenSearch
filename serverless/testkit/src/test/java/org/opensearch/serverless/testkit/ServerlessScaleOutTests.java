@@ -83,9 +83,9 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
         }
 
         try (ServerlessNode full = new ServerlessNode(settings("full")); ServerlessNode roomy = new ServerlessNode(settings("roomy"))) {
-            full.start();
+            full.startup().start();
             full.setMetadataPlane(plane);
-            roomy.start();
+            roomy.startup().start();
             roomy.setMetadataPlane(plane);
             final BackgroundReconciler fullLoop = new BackgroundReconciler(full, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(4)
@@ -100,8 +100,8 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             roomy.setSignals(roomyScheduler);
             fullScheduler.start();
             roomyScheduler.start();
-            full.renewLease(plane);
-            roomy.renewLease(plane);
+            full.leases().renewLease(plane);
+            roomy.leases().renewLease(plane);
             for (String index : List.of("i0", "i1", "i2", "i3")) {
                 fullLoop.activateOnDemand(List.of(Map.entry(index, 0)));
             }
@@ -109,8 +109,8 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
 
             // A minute on, every shard on the full node is past its grace, and the other member holds nothing.
             clock.addAndGet(60_000L);
-            full.renewLease(plane);
-            roomy.renewLease(plane);
+            full.leases().renewLease(plane);
+            roomy.leases().renewLease(plane);
             plane.membership().refresh();
             assertTrue("the empty member has room", full.memberWithRoom(plane).isPresent());
             assertEquals("a tenth of the cap a pass, at least one", 1, fullLoop.handOffToMemberWithRoom());
@@ -119,7 +119,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
 
             // Full again, a write for a shard nobody holds is taken by the member with room.
             fullLoop.activateOnDemand(List.of(Map.entry("i4", 0)));
-            full.renewLease(plane);
+            full.leases().renewLease(plane);
             plane.membership().refresh();
             assertTrue(full.nearlyFull());
             final int status = send(full, "PUT", "/fresh/_doc/1", "{\"msg\":\"x\"}");
@@ -158,21 +158,21 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, MAPPING, null));
         }
         try (ServerlessNode a = new ServerlessNode(settings("a")); ServerlessNode b = new ServerlessNode(settings("b"))) {
-            a.start();
+            a.startup().start();
             a.setMetadataPlane(plane);
-            b.start();
+            b.startup().start();
             b.setMetadataPlane(plane);
             final BackgroundReconciler aLoop = new BackgroundReconciler(a, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(1)
                 .setEvictAfterMillis(30_000L);
             final BackgroundReconciler bLoop = new BackgroundReconciler(b, plane).setDemandDrivenActivation(true);
-            a.renewLease(plane);
-            b.renewLease(plane);
+            a.leases().renewLease(plane);
+            b.leases().renewLease(plane);
             aLoop.activateOnDemand(List.of(Map.entry("mine", 0)));
             bLoop.activateOnDemand(List.of(Map.entry("theirs", 0)));
             clock.addAndGet(60_000L);   // "mine" is past its grace: evictable
-            a.renewLease(plane);
-            b.renewLease(plane);
+            a.leases().renewLease(plane);
+            b.leases().renewLease(plane);
 
             assertTrue("not taken", aLoop.activateOnDemand(List.of(Map.entry("theirs", 0))).isEmpty());
             assertEquals("and nothing evicted for it", 0, a.capacity().evicted());
@@ -191,7 +191,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("orphan", "uuid-orphan", 1, MAPPING, null));
         try (ServerlessNode a = new ServerlessNode(settings("a")); ServerlessNode b = new ServerlessNode(settings("b"))) {
             for (ServerlessNode node : List.of(a, b)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
             }
             final BackgroundReconciler aLoop = new BackgroundReconciler(a, plane).setDemandDrivenActivation(true).setMaxShardsHeld(10);
@@ -204,15 +204,15 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             bScheduler.start();
             final String deadId;
             try (ServerlessNode dead = new ServerlessNode(settings("dead"))) {
-                dead.start();
+                dead.startup().start();
                 dead.setMetadataPlane(plane);
-                dead.renewLease(plane);
+                dead.leases().renewLease(plane);
                 new BackgroundReconciler(dead, plane).setDemandDrivenActivation(true).activateOnDemand(List.of(Map.entry("orphan", 0)));
                 deadId = dead.localNode().getId();
             }
             clock.addAndGet(TTL + 1);
-            a.renewLease(plane);
-            b.renewLease(plane);
+            a.leases().renewLease(plane);
+            b.leases().renewLease(plane);
             plane.membership().refresh();
 
             final String winnerId = a.takeoverWinner(plane, "orphan", 0, deadId).orElseThrow();
@@ -250,17 +250,17 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("orphan", "uuid-orphan", 1, MAPPING, null));
         try (ServerlessNode alone = new ServerlessNode(settings("alone"))) {
-            alone.start();
+            alone.startup().start();
             alone.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(alone, plane).setDemandDrivenActivation(true).setMaxShardsHeld(10);
             try (ServerlessNode dead = new ServerlessNode(settings("dead"))) {
-                dead.start();
+                dead.startup().start();
                 dead.setMetadataPlane(plane);
-                dead.renewLease(plane);
+                dead.leases().renewLease(plane);
                 new BackgroundReconciler(dead, plane).setDemandDrivenActivation(true).activateOnDemand(List.of(Map.entry("orphan", 0)));
             }
             clock.addAndGet(TTL + 1);
-            alone.renewLease(plane);
+            alone.leases().renewLease(plane);
             plane.membership().refresh();
             assertEquals(1, loop.activateOnDemand(List.of(Map.entry("orphan", 0))).size());
             assertEquals(0, alone.takeoverRouting()[1]);
@@ -286,7 +286,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             ServerlessNode empty = new ServerlessNode(settings("empty"))
         ) {
             for (ServerlessNode node : List.of(heavy, light, empty)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
             }
             final BackgroundReconciler heavyLoop = new BackgroundReconciler(heavy, plane).setDemandDrivenActivation(true)
@@ -311,7 +311,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
 
             clock.addAndGet(60_000L);   // every shard past its grace
             for (ServerlessNode node : List.of(heavy, light, empty)) {
-                node.renewLease(plane);
+                node.leases().renewLease(plane);
             }
             plane.membership().refresh();
             assertFalse("well short of its cap", heavy.nearlyFull());
@@ -328,12 +328,12 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             assertEquals(empty.localNode().getId(), plane.heads().read("fresh", 0).orElseThrow().ownerNodeId());
 
             // Down to the mean's band, and no further: it stops handing off once it is within it.
-            heavy.renewLease(plane);
-            empty.renewLease(plane);
+            heavy.leases().renewLease(plane);
+            empty.leases().renewLease(plane);
             plane.membership().refresh();
             int passes = 0;
             while (heavyLoop.handOffToMemberWithRoom() > 0 && passes++ < 10) {
-                heavy.renewLease(plane);
+                heavy.leases().renewLease(plane);
                 plane.membership().refresh();
             }
             final double mean = heavy.fleetMeanHeld(plane);
@@ -369,16 +369,16 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, MAPPING, null));
         }
         try (ServerlessNode survivor = new ServerlessNode(settings("survivor"))) {
-            survivor.start();
+            survivor.startup().start();
             survivor.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(survivor, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(cap)
                 .setEvictAfterMillis(30_000L);
-            survivor.renewLease(plane);
+            survivor.leases().renewLease(plane);
             try (ServerlessNode dead = new ServerlessNode(settings("dead"))) {
-                dead.start();
+                dead.startup().start();
                 dead.setMetadataPlane(plane);
-                dead.renewLease(plane);
+                dead.leases().renewLease(plane);
                 final BackgroundReconciler deadLoop = new BackgroundReconciler(dead, plane).setDemandDrivenActivation(true);
                 deadLoop.activateOnDemand(List.of(Map.entry("dead0", 0), Map.entry("dead1", 0)));
             }
@@ -389,7 +389,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
 
             // The dead member's lease runs out; the survivor's own shards are all past their grace.
             clock.addAndGet(TTL + 1);
-            survivor.renewLease(plane);
+            survivor.leases().renewLease(plane);
             plane.membership().refresh();
             assertEquals(2, loop.activateOnDemand(List.of(Map.entry("dead0", 0), Map.entry("dead1", 0))).size());
             assertEquals("past the cap, within the ceiling", cap + 2, survivor.capacity().held());
@@ -429,9 +429,9 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, MAPPING, null));
         }
         try (ServerlessNode node = new ServerlessNode(settings("lapsed"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(List.of(Map.entry("held", 0)));
 
@@ -449,7 +449,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             });
             final Thread leasePass = new Thread(() -> {
                 try {
-                    node.renewLease(plane);
+                    node.leases().renewLease(plane);
                 } catch (Exception e) {
                     throw new AssertionError(e);
                 }
@@ -491,20 +491,21 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             final List<String> prefixes = List.of("a", "b");
             for (int n = 0; n < 2; n++) {
                 final ServerlessNode node = nodes.get(n);
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
-                node.renewLease(plane);
+                node.leases().renewLease(plane);
                 final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
                     .setMaxShardsHeld(2)
                     .setEvictAfterMillis(0L);   // refuse rather than evict
                 for (int i = 0; i < 2; i++) {
                     final String index = prefixes.get(n) + i;
                     loop.activateOnDemand(List.of(Map.entry(index, 0)));
-                    node.index(
-                        node.reconciler().openShards().stream().filter(s -> s.getIndexName().equals(index)).findFirst().orElseThrow(),
-                        "doc",
-                        "{\"msg\":\"x\"}"
-                    );
+                    node.writes()
+                        .index(
+                            node.reconciler().openShards().stream().filter(s -> s.getIndexName().equals(index)).findFirst().orElseThrow(),
+                            "doc",
+                            "{\"msg\":\"x\"}"
+                        );
                 }
                 if (busy) {
                     assertTrue("full: refused", loop.activateOnDemand(List.of(Map.entry(prefixes.get(n) + "2", 0))).isEmpty());
@@ -514,7 +515,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
                 clock.addAndGet(120_000L);   // nothing used for two minutes
             }
             for (ServerlessNode node : nodes) {
-                node.renewLease(plane);
+                node.leases().renewLease(plane);
             }
             plane.membership().refresh();
             final FleetSize size = a.fleetSize(plane);
@@ -531,9 +532,9 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, MAPPING, null));
         }
         try (ServerlessNode a = new ServerlessNode(settings("a")); ServerlessNode b = new ServerlessNode(settings("b"))) {
-            a.start();
+            a.startup().start();
             a.setMetadataPlane(plane);
-            b.start();
+            b.startup().start();
             b.setMetadataPlane(plane);
             final BackgroundReconciler aLoop = new BackgroundReconciler(a, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(2)
@@ -541,13 +542,13 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             final BackgroundReconciler bLoop = new BackgroundReconciler(b, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(2)
                 .setEvictAfterMillis(30_000L);
-            a.renewLease(plane);
-            b.renewLease(plane);
+            a.leases().renewLease(plane);
+            b.leases().renewLease(plane);
             aLoop.activateOnDemand(List.of(Map.entry("a0", 0), Map.entry("a1", 0)));
             bLoop.activateOnDemand(List.of(Map.entry("b0", 0), Map.entry("b1", 0)));
             clock.addAndGet(60_000L);
-            a.renewLease(plane);
-            b.renewLease(plane);
+            a.leases().renewLease(plane);
+            b.leases().renewLease(plane);
             plane.membership().refresh();
             assertTrue(a.memberWithRoom(plane).isEmpty());
             assertEquals(0, aLoop.handOffToMemberWithRoom());

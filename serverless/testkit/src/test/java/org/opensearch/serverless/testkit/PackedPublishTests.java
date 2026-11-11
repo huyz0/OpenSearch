@@ -53,7 +53,7 @@ public class PackedPublishTests extends OpenSearchTestCase {
 
     private static void write(ServerlessNode node, ShardId shardId, String prefix, int count) throws Exception {
         for (int i = 0; i < count; i++) {
-            node.index(shardId, prefix + i, "{\"msg\":\"packed\",\"n\":" + i + "}");
+            node.writes().index(shardId, prefix + i, "{\"msg\":\"packed\",\"n\":" + i + "}");
         }
     }
 
@@ -91,9 +91,9 @@ public class PackedPublishTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
         final BlobPath shardBase = plane.shardData("alpha", 0);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("packed-one"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -155,7 +155,7 @@ public class PackedPublishTests extends OpenSearchTestCase {
 
             // Deleting a document adds files to a segment already published -- its deletions, and the soft-delete field's
             // updated values -- and those get a blob of their own beside the segment's.
-            node.delete(shardId, "first-3");
+            node.writes().delete(shardId, "first-3");
             loop.publishAll();
             final CommitManifest third = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
             final Set<String> thirdPacks = packsOf(third);
@@ -181,9 +181,9 @@ public class PackedPublishTests extends OpenSearchTestCase {
         final BlobPath shardBase = plane.shardData("alpha", 0);
         final CommitManifest before;
         try (ServerlessNode first = new ServerlessNode(nodeSettings("packed-first"))) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(plane);
-            first.renewLease(plane);
+            first.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
@@ -197,15 +197,15 @@ public class PackedPublishTests extends OpenSearchTestCase {
         }
         final Set<String> inheritedPacks = packsOf(before);
         try (ServerlessNode second = new ServerlessNode(nodeSettings("packed-second"))) {
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
-            second.renewLease(plane);
+            second.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(second, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final ShardId shardId = second.reconciler().openShards().iterator().next();
             for (int i = 0; i < 15; i++) {
-                assertTrue("first-" + i + " is read out of the inherited pack", second.get(shardId, "first-" + i).found());
+                assertTrue("first-" + i + " is read out of the inherited pack", second.reads().get(shardId, "first-" + i).found());
             }
             write(second, shardId, "second-", 15);
             loop.publishAll();

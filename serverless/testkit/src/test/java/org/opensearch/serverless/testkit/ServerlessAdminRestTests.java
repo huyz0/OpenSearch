@@ -74,7 +74,7 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p7-a"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -116,7 +116,7 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p7-b"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -175,7 +175,7 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p7-c"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -204,7 +204,7 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
     /** Without a metadata plane the admin surface says so, rather than behaving as if nothing exists. */
     public void testAdminEndpointsRefuseWithoutAMetadataPlane() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("p7-d"))) {
-            node.start();   // deliberately no setMetadataPlane
+            node.startup().start();   // deliberately no setMetadataPlane
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
             // /_serverless/indices is absent by design rather than unconfigured, so it is 501 either

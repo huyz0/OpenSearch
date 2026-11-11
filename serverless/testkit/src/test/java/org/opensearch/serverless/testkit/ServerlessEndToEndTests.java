@@ -55,7 +55,7 @@ public class ServerlessEndToEndTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("e2e-a"))) {
-            node.start();
+            node.startup().start();
             final String nodeId = node.localNode().getId();
 
             // Nothing exists yet, and a sync must say so rather than inventing something.
@@ -92,8 +92,8 @@ public class ServerlessEndToEndTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("e2e-b1")); ServerlessNode b = new ServerlessNode(nodeSettings("e2e-b2"))) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
             plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId());
 
@@ -119,8 +119,8 @@ public class ServerlessEndToEndTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("e2e-c1")); ServerlessNode b = new ServerlessNode(nodeSettings("e2e-c2"))) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
             plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId());
             assertEquals(1, a.syncFrom(plane).size());

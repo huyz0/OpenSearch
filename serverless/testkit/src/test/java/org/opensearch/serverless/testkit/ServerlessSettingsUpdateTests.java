@@ -84,7 +84,7 @@ public class ServerlessSettingsUpdateTests extends OpenSearchTestCase {
 
     private ServerlessNode running(MetadataPlane plane, AtomicLong clock, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         port = node.boundHttpAddress().publishAddress().getPort();
         call("PUT", "/alpha", "{\"settings\":{\"number_of_shards\":1},\"mappings\":{\"properties\":{\"msg\":{\"type\":\"text\"}}}}");
@@ -208,7 +208,7 @@ public class ServerlessSettingsUpdateTests extends OpenSearchTestCase {
         clock.set(clock.get() + TTL + 1);
 
         try (ServerlessNode second = new ServerlessNode(nodeSettings("settings-b"))) {
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(plane);
             port = second.boundHttpAddress().publishAddress().getPort();
             final BackgroundReconciler loop = new BackgroundReconciler(second, plane);

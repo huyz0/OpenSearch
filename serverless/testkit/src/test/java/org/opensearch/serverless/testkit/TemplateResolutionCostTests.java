@@ -42,7 +42,7 @@ public class TemplateResolutionCostTests extends OpenSearchTestCase {
         try (var store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false))) {
             final var metadata = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, 30_000L);
             try (var node = new ServerlessNode(settings())) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 work.accept(node, metadata, store);
             }
@@ -89,7 +89,7 @@ public class TemplateResolutionCostTests extends OpenSearchTestCase {
             // A fresh plane has none of the writer's configuration caches.
             final var reader = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, 30_000L);
             try (var node = new ServerlessNode(settings())) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(reader);
                 store.reset();
                 final var answer = send(node, "PUT", "/logs-1", "{}");

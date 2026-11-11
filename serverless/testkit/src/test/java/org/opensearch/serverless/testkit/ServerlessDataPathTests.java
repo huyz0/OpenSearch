@@ -74,7 +74,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m11-a"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -108,7 +108,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("m11-durable"));
-        a.start();
+        a.startup().start();
         a.setMetadataPlane(plane);
         final TransportAddress http = a.boundHttpAddress().publishAddress();
         send(http, "PUT", "/library?shards=1", MAPPING);
@@ -121,7 +121,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
 
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("m11-successor"))) {
-            b.start();
+            b.startup().start();
             b.setMetadataPlane(plane);
             final var shardId = b.activateWriter(plane, "library", 0).orElseThrow();
             assertEquals(
@@ -138,7 +138,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m11-partial"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -163,8 +163,8 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("m11-owner"));
             ServerlessNode other = new ServerlessNode(nodeSettings("m11-other"))
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
             final TransportAddress ownerHttp = owner.boundHttpAddress().publishAddress();
@@ -193,7 +193,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m11-routing"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/spread?shards=3", MAPPING);
@@ -227,8 +227,8 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             ServerlessNode a = new ServerlessNode(nodeSettings("m11-fan-a"));
             ServerlessNode b = new ServerlessNode(nodeSettings("m11-fan-b"))
         ) {
-            a.start();
-            b.start();
+            a.startup().start();
+            b.startup().start();
             a.setMetadataPlane(plane);
             b.setMetadataPlane(plane);
             final TransportAddress aHttp = a.boundHttpAddress().publishAddress();
@@ -269,7 +269,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         final ServerlessNode writer = new ServerlessNode(nodeSettings("m11-w"));
-        writer.start();
+        writer.startup().start();
         writer.setMetadataPlane(plane);
         final TransportAddress writerHttp = writer.boundHttpAddress().publishAddress();
         send(writerHttp, "PUT", "/cold?shards=1", MAPPING);
@@ -289,7 +289,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             .put("serverless.roles", "search")
             .build();
         try (ServerlessNode searcher = new ServerlessNode(searchOnly)) {
-            searcher.start();
+            searcher.startup().start();
             searcher.setMetadataPlane(plane);
             final Response found = send(searcher.boundHttpAddress().publishAddress(), "GET", "/cold/_search?q=msg:cached", null);
             assertEquals(200, found.status());
@@ -303,7 +303,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m11-bad"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -337,7 +337,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m15-fresh-get"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
@@ -373,7 +373,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("m15-conditional"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/conditional?shards=1", MAPPING);

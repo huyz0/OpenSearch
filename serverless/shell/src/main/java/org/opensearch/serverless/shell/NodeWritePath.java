@@ -11,7 +11,7 @@ package org.opensearch.serverless.shell;
  * Writes documents for {@link ServerlessNode}: single index and delete operations and batches, each applied under
  * the shard's fence and appended to its log before it is acknowledged.
  */
-final class NodeWritePath {
+public final class NodeWritePath {
 
     private final ServerlessNode node;
 
@@ -165,7 +165,7 @@ final class NodeWritePath {
         // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
         // and settings up to the descriptor, so a change made on another node is in force for the first operation
         // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
-        node.ensureIncarnationLive(shardId);
+        node.fences().ensureIncarnationLive(shardId);
         node.markUsed(shardId);
         // Apply first, then log. This is the reverse of what this path used to do, and the reason is the
         // whole point of carrying sequence numbers: the engine assigns one, so there is nothing worth
@@ -302,7 +302,7 @@ final class NodeWritePath {
             // member of a group independently establishes that its record sits ahead of any seal.
             if (node.nodeLogEnabled) {
                 // One blob per window for every shard of this node, rather than one per shard.
-                node.nodeLog(node.metadataPlane).commit(shardId, shard.getOperationPrimaryTerm(), records);
+                node.startup().nodeLog(node.metadataPlane).commit(shardId, shard.getOperationPrimaryTerm(), records);
             } else {
                 node.walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
             }
@@ -330,7 +330,7 @@ final class NodeWritePath {
         // serverless/rfc-fencing-closure.md.
         node.fences.releaseIfLeaseLapsed(shardId);
         // After the PUT, so the confirmation is of the index as it stood once the record was down.
-        node.ensureIncarnationLive(shardId);
+        node.fences().ensureIncarnationLive(shardId);
     }
 
     /**
@@ -393,7 +393,7 @@ final class NodeWritePath {
         // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
         // and settings up to the descriptor, so a change made on another node is in force for the first operation
         // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
-        node.ensureIncarnationLive(shardId);
+        node.fences().ensureIncarnationLive(shardId);
         node.markUsed(shardId);
         // Apply, then log -- the same reordering, for the same reason, as the index path above.
         final var result = shard.applyDeleteOperationOnPrimary(
@@ -500,7 +500,7 @@ final class NodeWritePath {
         // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
         // and settings up to the descriptor, so a change made on another node is in force for the first operation
         // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
-        node.ensureIncarnationLive(shardId);
+        node.fences().ensureIncarnationLive(shardId);
         node.markUsed(shardId);
 
         // Applied first, then logged once for the whole batch -- the same reordering the single-document

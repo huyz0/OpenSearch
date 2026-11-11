@@ -68,8 +68,8 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
             ServerlessNode writer = new ServerlessNode(nodeSettings("stale-writer", "ingest"));
             ServerlessNode reader = new ServerlessNode(nodeSettings("stale-reader", "search"))
         ) {
-            writer.start();
-            reader.start();
+            writer.startup().start();
+            reader.startup().start();
             writer.setMetadataPlane(plane);
             reader.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
@@ -112,8 +112,8 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
             ServerlessNode writer = new ServerlessNode(nodeSettings("dead-writer", "ingest"));
             ServerlessNode reader = new ServerlessNode(nodeSettings("dead-reader", "search"))
         ) {
-            writer.start();
-            reader.start();
+            writer.startup().start();
+            reader.startup().start();
             writer.setMetadataPlane(plane);
             reader.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);
@@ -130,7 +130,7 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
             assertEquals(201, send(writer, "PUT", "/alpha/_doc/unpublished", "{\"msg\":\"needle\",\"n\":2}").status());
             // The writer dies: its lease runs out and nobody has taken the shard, so the head still names it.
             clock.addAndGet(2 * TTL);
-            reader.renewLease(plane);
+            reader.leases().renewLease(plane);
 
             final Response after = send(reader, "POST", "/alpha/_search", "{\"query\":{\"match\":{\"msg\":\"needle\"}}}");
             final long hits = after.status() == 200 ? number(after.body(), "value") : -1L;
@@ -158,12 +158,12 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
             ServerlessNode writer = new ServerlessNode(nodeSettings("came-and-went-writer", "ingest"));
             ServerlessNode reader = new ServerlessNode(nodeSettings("came-and-went-reader", "search"))
         ) {
-            writer.start();
-            reader.start();
+            writer.startup().start();
+            reader.startup().start();
             writer.setMetadataPlane(plane);
             reader.setMetadataPlane(plane);
-            writer.renewLease(plane);
-            reader.renewLease(plane);
+            writer.leases().renewLease(plane);
+            reader.leases().renewLease(plane);
             // Re-checked on every search here, so the test needs no sleep; the production bound is a second.
             reader.setReaderCheckMillis(0);
             final BackgroundReconciler loop = new BackgroundReconciler(writer, plane).setDemandDrivenActivation(true);
@@ -212,12 +212,12 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
             ServerlessNode writer = new ServerlessNode(nodeSettings("superseded-writer", "ingest"));
             ServerlessNode reader = new ServerlessNode(nodeSettings("superseded-reader", "search"))
         ) {
-            writer.start();
-            reader.start();
+            writer.startup().start();
+            reader.startup().start();
             writer.setMetadataPlane(plane);
             reader.setMetadataPlane(plane);
-            writer.renewLease(plane);
-            reader.renewLease(plane);
+            writer.leases().renewLease(plane);
+            reader.leases().renewLease(plane);
             reader.setReaderCheckMillis(0);
             final BackgroundReconciler loop = new BackgroundReconciler(writer, plane).setDemandDrivenActivation(true);
             loop.activateOnDemand(java.util.List.of(java.util.Map.entry("alpha", 0)));
@@ -277,8 +277,8 @@ public class ServerlessStaleReadTests extends OpenSearchTestCase {
             ServerlessNode writer = new ServerlessNode(nodeSettings("legacy-writer", "ingest"));
             ServerlessNode reader = new ServerlessNode(nodeSettings("legacy-reader", "search"))
         ) {
-            writer.start();
-            reader.start();
+            writer.startup().start();
+            reader.startup().start();
             writer.setMetadataPlane(plane);
             reader.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(writer, plane);

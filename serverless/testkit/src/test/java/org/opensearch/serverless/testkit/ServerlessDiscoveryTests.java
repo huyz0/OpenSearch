@@ -104,7 +104,7 @@ public class ServerlessDiscoveryTests extends OpenSearchTestCase {
 
     private ServerlessNode running(MetadataPlane plane, String name) throws Exception {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
-        node.start();
+        node.startup().start();
         node.setMetadataPlane(plane);
         port = node.boundHttpAddress().publishAddress().getPort();
         call(
@@ -168,7 +168,7 @@ public class ServerlessDiscoveryTests extends OpenSearchTestCase {
         final AtomicLong tight = new AtomicLong(1_000L);
         final MetadataPlane plane = plane(tight, createTempDir());
         try (ServerlessNode node = new ServerlessNode(nodeSettings("list-over-cap", 2))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             port = node.boundHttpAddress().publishAddress().getPort();
             call("PUT", "/logs-a", "{\"settings\":{\"number_of_shards\":1}}");
@@ -259,7 +259,7 @@ public class ServerlessDiscoveryTests extends OpenSearchTestCase {
         final MetadataPlane plane = plane(clock, createTempDir());
         final Settings capped = Settings.builder().put(nodeSettings("list-capped")).put("serverless.search.pattern.max_indices", 2).build();
         try (ServerlessNode node = new ServerlessNode(capped)) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             port = node.boundHttpAddress().publishAddress().getPort();
             for (String name : new String[] { "logs-a", "logs-b", "logs-c" }) {

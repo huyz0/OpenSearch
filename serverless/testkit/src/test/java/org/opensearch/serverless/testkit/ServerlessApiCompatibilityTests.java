@@ -67,7 +67,7 @@ public class ServerlessApiCompatibilityTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("compat-error"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
 
             // A deliberate refusal (conditional write), not an uncaught exception -- the case this fix is
@@ -105,7 +105,7 @@ public class ServerlessApiCompatibilityTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("compat-search"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, "alpha", 1);
             assertEquals(201, send(node, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"hello\"}").status());
@@ -131,7 +131,7 @@ public class ServerlessApiCompatibilityTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("compat-shards"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, "alpha", 1);
 
@@ -162,7 +162,7 @@ public class ServerlessApiCompatibilityTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("compat-bulk"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, "alpha", 1);
 
@@ -186,7 +186,7 @@ public class ServerlessApiCompatibilityTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("compat-create"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final Response created = send(node, "PUT", "/alpha?shards=1", MAPPING);
             assertEquals(created.body(), 200, created.status());
@@ -204,7 +204,7 @@ public class ServerlessApiCompatibilityTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("compat-settings"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
 
             final Response before = send(node, "GET", "/_cluster/settings", null);

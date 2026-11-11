@@ -38,7 +38,7 @@ public class FilesystemShardLayoutTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 final var answer = put(node, index);
                 assertEquals("an acknowledged index must have a usable physical shard key: " + answer.body(), 400, answer.statusCode());
@@ -83,7 +83,7 @@ public class FilesystemShardLayoutTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 final var answer = put(node, index);
                 assertEquals(answer.body(), 200, answer.statusCode());

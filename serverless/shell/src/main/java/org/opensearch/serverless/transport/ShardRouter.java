@@ -250,18 +250,12 @@ public final class ShardRouter {
         requireLiveOwnership(shardId);
         final org.opensearch.serverless.shell.WriteOutcome outcome;
         if (request.deletion()) {
-            outcome = node.delete(shardId, request.id(), request.ifSeqNo(), request.ifPrimaryTerm());
+            outcome = node.writes().delete(shardId, request.id(), request.ifSeqNo(), request.ifPrimaryTerm());
         } else {
             // requireAbsent travels on the wire and used to be dropped here, so a forwarded _create was an
             // overwrite -- and a data-stream write, which is create-only, was one too.
-            outcome = node.index(
-                shardId,
-                request.id(),
-                request.source(),
-                request.ifSeqNo(),
-                request.ifPrimaryTerm(),
-                request.requireAbsent()
-            );
+            outcome = node.writes()
+                .index(shardId, request.id(), request.source(), request.ifSeqNo(), request.ifPrimaryTerm(), request.requireAbsent());
         }
         if (request.refresh()) {
             node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
@@ -300,7 +294,7 @@ public final class ShardRouter {
             );
         }
         requireLiveOwnership(shardId);
-        final var outcomes = node.bulkOperations(shardId, request.batch());
+        final var outcomes = node.writes().bulkOperations(shardId, request.batch());
         if (request.refresh()) {
             node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
         }
@@ -322,7 +316,7 @@ public final class ShardRouter {
                 whyNotHeld(request.index(), request.shard(), request.indexUuid())
             );
         }
-        channel.sendResponse(new ForwardedGetResponse(node.localNode().getId(), node.get(shardId, request.id())));
+        channel.sendResponse(new ForwardedGetResponse(node.localNode().getId(), node.reads().get(shardId, request.id())));
     }
 
     private void handleExplain(ForwardedExplainRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
@@ -339,7 +333,7 @@ public final class ShardRouter {
                 whyNotHeld(request.index(), request.shard(), request.indexUuid())
             );
         }
-        final ShardExplain.Outcome outcome = node.explain(shardId, request.id(), request.query());
+        final ShardExplain.Outcome outcome = node.reads().explain(shardId, request.id(), request.query());
         channel.sendResponse(new ForwardedExplainResponse(node.localNode().getId(), outcome.exists(), outcome.explanation()));
     }
 
@@ -360,8 +354,8 @@ public final class ShardRouter {
             // Opened now, so used now; one already held is used only if it matches, below -- see SearchFanout.
             node.markUsed(shardId);
         }
-        // Before the query too, so it runs on the mapping in force now; see ServerlessNode#ensureIncarnationLive.
-        node.ensureIncarnationLive(shardId);
+        // Before the query too, so it runs on the mapping in force now; see WriteFences#ensureIncarnationLive.
+        node.fences().ensureIncarnationLive(shardId);
         // The coordinator's instant for "now", so this shard scores against the same clock as every other
         // shard of the same search. Entered and exited around the query so the reconciler cannot release
         // the reader from under a running query.
@@ -372,7 +366,7 @@ public final class ShardRouter {
         } finally {
             node.reconciler().exit(shardId);
         }
-        node.ensureIncarnationLive(shardId);
+        node.fences().ensureIncarnationLive(shardId);
         if (result.total() > 0) {
             node.markUsed(shardId);
         }
@@ -564,7 +558,7 @@ public final class ShardRouter {
      * it read most recently, and a head older than a lease is no answer at all.
      */
     private void requireLiveOwnership(ShardId shardId) {
-        if (node.holdsAsWriter(shardId, headAgeBoundMillis()) == false) {
+        if (node.fences().holdsAsWriter(shardId, headAgeBoundMillis()) == false) {
             throw new NotShardOwnerException(
                 shardId.getIndexName(),
                 shardId.id(),

@@ -11,7 +11,7 @@ package org.opensearch.serverless.shell;
  * Decides for {@link ServerlessNode} whether a write may go ahead: the shard's fence, its incarnation, and this
  * node's lease and head.
  */
-final class WriteFences {
+public final class WriteFences {
 
     private final ServerlessNode node;
 
@@ -251,7 +251,7 @@ final class WriteFences {
      *
      * <p>For the node a write was forwarded to. Being open here was the only check, and "open here" is
      * true of a shard whose head has named another node since the last heartbeat: the lease fences a
-     * write only once the lapsed-lease rule in {@link ServerlessNode#renewLease} holds, and the head is the truth the
+     * write only once the lapsed-lease rule in {@link NodeLeases#renewLease} holds, and the head is the truth the
      * rule approximates. The heartbeat notes every held head once per renewal, so with an age of one
      * renewal this costs no register read on a healthy node; a head older than that is read fresh, and
      * one that names another node closes the shard here on the spot.

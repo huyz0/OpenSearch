@@ -96,7 +96,7 @@ public class ServerlessSearchSemanticsTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("slow", "uuid-slow-0000000000", 2, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("search-timeout"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "slow", 2);
 
@@ -135,7 +135,7 @@ public class ServerlessSearchSemanticsTests extends OpenSearchTestCase {
         plane.createAlias(new AliasRecord("policy", List.of("policy-a", "policy-b")));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("client-coverage"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("policy-a", 0);
@@ -199,7 +199,7 @@ public class ServerlessSearchSemanticsTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor(".hidden_state", "uuid-hidden-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("pattern-system"), List.of(new HiddenStatePlugin()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("visible", 0);
@@ -239,7 +239,7 @@ public class ServerlessSearchSemanticsTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("counted", "uuid-counted-0000000", 3, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("total-ceiling"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "counted", 3);
             for (int i = 0; i < 30; i++) {

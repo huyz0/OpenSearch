@@ -66,7 +66,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         }
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-lru"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(2)
@@ -102,14 +102,14 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         }
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-scanned"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
-            node.renewLease(plane);
+            node.leases().renewLease(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(2)
                 .setEvictAfterMillis(30_000L);
             loop.activateOnDemand(List.of(Map.entry("first", 0), Map.entry("second", 0)));
-            node.index(shard(node, "first"), "doc", "{\"msg\":\"hay\"}");
+            node.writes().index(shard(node, "first"), "doc", "{\"msg\":\"hay\"}");
 
             clock.addAndGet(60_000L);
             node.markUsed(shard(node, "second"));
@@ -155,7 +155,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("other", "uuid-other-000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-unserved"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(1)
@@ -195,7 +195,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         }
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-busy"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(2)
@@ -226,7 +226,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         }
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-off"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(2)
@@ -261,7 +261,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         }
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-headroom"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(10)
@@ -304,7 +304,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         }
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-zero-headroom"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(2)
@@ -328,7 +328,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         }
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-pinned"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(2)
@@ -355,7 +355,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("ordinary", "uuid-ordinary", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-pinned-idle"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setIdleAfterMillis(30_000L);
             loop.pin("pinned");
@@ -380,7 +380,7 @@ public class ServerlessEvictionTests extends OpenSearchTestCase {
         }
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("evict-unpin"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setDemandDrivenActivation(true)
                 .setMaxShardsHeld(2)

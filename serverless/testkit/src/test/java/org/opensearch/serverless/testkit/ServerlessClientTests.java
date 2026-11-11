@@ -72,7 +72,7 @@ public class ServerlessClientTests extends OpenSearchTestCase {
         final MetadataPlane metadata = plane(clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("client-roundtrip"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(metadata);
             final Client client = node.client();
 
@@ -107,8 +107,8 @@ public class ServerlessClientTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("client-get-owner"));
             ServerlessNode peer = new ServerlessNode(nodeSettings("client-get-peer"))
         ) {
-            owner.start();
-            peer.start();
+            owner.startup().start();
+            peer.startup().start();
             owner.setMetadataPlane(metadata);
             peer.setMetadataPlane(metadata);
             final BackgroundReconciler loop = new BackgroundReconciler(owner, metadata);
@@ -116,7 +116,7 @@ public class ServerlessClientTests extends OpenSearchTestCase {
             loop.tick(clock.get());
             final var shard = owner.reconciler().openShards().iterator().next();
             for (int i = 0; i < 2; i++) {
-                final var written = owner.index(shard, "doc", "{\"msg\":\"kept\",\"n\":" + i + "}");
+                final var written = owner.writes().index(shard, "doc", "{\"msg\":\"kept\",\"n\":" + i + "}");
                 for (ServerlessNode via : java.util.List.of(owner, peer)) {
                     final var got = via.client().get(new GetRequest("alpha", "doc")).actionGet();
                     assertEquals(written.seqNo(), got.getSeqNo());
@@ -151,7 +151,7 @@ public class ServerlessClientTests extends OpenSearchTestCase {
         final MetadataPlane metadata = plane(clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("client-missing"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(metadata);
             metadata.createIndex(new IndexDescriptor(".plugin_config", "uuid-cfg-000000000", 1, MAPPING, null));
             final BackgroundReconciler loop = new BackgroundReconciler(node, metadata);
@@ -176,7 +176,7 @@ public class ServerlessClientTests extends OpenSearchTestCase {
         final MetadataPlane metadata = plane(clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("client-refuse"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(metadata);
             metadata.createIndex(new IndexDescriptor(".plugin_config", "uuid-cfg-000000000", 1, MAPPING, null));
 
@@ -196,7 +196,7 @@ public class ServerlessClientTests extends OpenSearchTestCase {
         final MetadataPlane metadata = plane(clock);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("client-twice"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(metadata);
             node.client().admin().indices().create(new CreateIndexRequest(".plugin_config").mapping(MAPPING)).actionGet();
             // Asserted on the type, not the message: ResourceAlreadyExistsException carries the index name
@@ -226,8 +226,8 @@ public class ServerlessClientTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("client-owner"));
             ServerlessNode other = new ServerlessNode(nodeSettings("client-other"))
         ) {
-            owner.start();
-            other.start();
+            owner.startup().start();
+            other.startup().start();
             owner.setMetadataPlane(metadata);
             other.setMetadataPlane(metadata);
             final BackgroundReconciler loop = new BackgroundReconciler(owner, metadata);
@@ -262,7 +262,7 @@ public class ServerlessClientTests extends OpenSearchTestCase {
         metadata.createIndex(new IndexDescriptor(".plugin_config", "uuid-cfg-000000000", 2, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("client-search"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(metadata);
             final BackgroundReconciler loop = new BackgroundReconciler(node, metadata);
             loop.want(".plugin_config", 0);

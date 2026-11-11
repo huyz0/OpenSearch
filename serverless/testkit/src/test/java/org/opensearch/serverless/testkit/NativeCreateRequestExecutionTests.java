@@ -213,7 +213,7 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
                 .put("serverless.roles", "ingest")
                 .build();
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 work.accept(node, metadata);
             }
@@ -233,8 +233,8 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
             );
             node.client().admin().indices().create(request).actionGet();
             final var shard = node.activateWriter(metadata, "events-1", 0).orElseThrow();
-            node.index(shard, "doc", "{\"n\":9,\"tag\":\"valid\"}");
-            assertTrue(node.get(shard, "doc").found());
+            node.writes().index(shard, "doc", "{\"n\":9,\"tag\":\"valid\"}");
+            assertTrue(node.reads().get(shard, "doc").found());
         });
     }
 

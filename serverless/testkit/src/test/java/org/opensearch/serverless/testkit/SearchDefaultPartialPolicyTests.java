@@ -130,12 +130,12 @@ public class SearchDefaultPartialPolicyTests extends OpenSearchTestCase {
                 .put(org.opensearch.search.SearchService.DEFAULT_ALLOW_PARTIAL_SEARCH_RESULTS.getKey(), false)
                 .build();
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("docs", "uuid-docs", 2, "{\"properties\":{\"msg\":{\"type\":\"text\"}}}", null));
                 for (int i = 0; i < 2; i++) {
                     final var shard = node.activateWriter(metadata, "docs", i).orElseThrow();
-                    node.index(shard, "doc-" + i, "{\"msg\":\"visible\"}");
+                    node.writes().index(shard, "doc-" + i, "{\"msg\":\"visible\"}");
                     node.reconciler().shard(shard).refresh("search-options-test");
                 }
                 work.accept(node, metadata);

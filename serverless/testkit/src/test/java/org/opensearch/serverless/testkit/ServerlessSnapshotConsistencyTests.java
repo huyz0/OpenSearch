@@ -238,7 +238,7 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("original", "uuid-original-0000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("restore-conflict"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "original", 1);
             assertEquals(201, send(node, "PUT", "/original/_doc/1?refresh=true", "{\"msg\":\"doc\",\"n\":1}").status());
@@ -274,7 +274,7 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("original", "uuid-rollback-original", 1, MAPPING, null));
             try (var node = new ServerlessNode(nodeSettings("restore-rollback-incarnation"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var loop = hold(node, plane, clock, "original", 1);
                 assertEquals(201, send(node, "PUT", "/original/_doc/1?refresh=true", "{\"msg\":\"doc\",\"n\":1}").status());
@@ -307,7 +307,7 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("settings-roundtrip"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final Response created = send(
                 node,
@@ -363,7 +363,7 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("delete-during-capture"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "alpha", 1);
             assertEquals(201, send(node, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"doc\",\"n\":1}").status());
@@ -410,7 +410,7 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
         final Settings settings = nodeSettings("snapshot-system-index");
 
         try (ServerlessNode node = new ServerlessNode(settings, List.of(new SecretKeeperPlugin()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = hold(node, plane, clock, "plain", 1);
             assertEquals(201, send(node, "PUT", "/plain/_doc/1?refresh=true", "{\"msg\":\"doc\",\"n\":1}").status());
@@ -470,7 +470,7 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-copy-cost", 1, MAPPING, null));
             try (ServerlessNode node = new ServerlessNode(nodeSettings("snapshot-copy-cost"))) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var loop = hold(node, plane, clock, "alpha", 1);
                 assertEquals(201, send(node, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"copied\",\"n\":1}").status());

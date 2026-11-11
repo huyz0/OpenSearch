@@ -44,7 +44,7 @@ public class SearchRetainedPayloadBudgetTests extends OpenSearchTestCase {
                 .put("indices.breaker.request.limit", "128kb")
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(metadata);
                 final var loop = new BackgroundReconciler(node, metadata);
                 loop.want("docs", 0);

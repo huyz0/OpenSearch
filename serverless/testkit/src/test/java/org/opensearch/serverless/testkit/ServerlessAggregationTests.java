@@ -88,7 +88,7 @@ public class ServerlessAggregationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("stock", "uuid-stock-00000000", SHARDS, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("aggs-terms"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "stock");
             fill(node, "stock");
@@ -120,7 +120,7 @@ public class ServerlessAggregationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("totals", "uuid-totals-0000000", SHARDS, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("aggs-sum"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "totals");
             fill(node, "totals");
@@ -144,7 +144,7 @@ public class ServerlessAggregationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("quiet", "uuid-quiet-00000000", SHARDS, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("aggs-quiet"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "quiet");
             fill(node, "quiet");
@@ -172,8 +172,8 @@ public class ServerlessAggregationTests extends OpenSearchTestCase {
             ServerlessNode first = new ServerlessNode(nodeSettings("aggs-wire-1"));
             ServerlessNode second = new ServerlessNode(nodeSettings("aggs-wire-2"))
         ) {
-            first.start();
-            second.start();
+            first.startup().start();
+            second.startup().start();
             first.setMetadataPlane(plane);
             second.setMetadataPlane(plane);
 
@@ -212,7 +212,7 @@ public class ServerlessAggregationTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("filtered", "uuid-filtered-00000", SHARDS, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("aggs-filtered"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             hold(node, plane, clock, "filtered");
             fill(node, "filtered");

@@ -112,7 +112,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("digest", Settings.EMPTY))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, days(1));
             final CommitManifest manifest = plane.segmentPublisher(day(1), "uuid-" + day(1), 0).readManifest().orElseThrow();
@@ -135,7 +135,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
             + "{\"gte\":\"2026-09-03\",\"lte\":\"2026-09-04T12:00:00Z\"}}}]}},\"aggs\":{\"most\":{\"max\":{\"field\":\"n\"}}}}";
         final String pruned;
         try (ServerlessNode node = new ServerlessNode(nodeSettings("prune", Settings.EMPTY))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, days(8));
             final Response answer = send(node, "POST", "/logs-*/_search", query);
@@ -153,7 +153,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
                 nodeSettings("no-prune", Settings.builder().put("serverless.search.prune", false).build())
             )
         ) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(again);
             final Response unpruned = send(node, "POST", "/logs-*/_search", query);
             assertEquals(unpruned.body(), 200, unpruned.status());
@@ -196,7 +196,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         }
         long skippedOverall = 0;
         try (ServerlessNode node = new ServerlessNode(nodeSettings("canary", extra))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, docs);
             for (int q = 0; q < 40; q++) {
@@ -245,7 +245,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("recreate", ROLLUPS_ALWAYS))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, days(4));
             final String query = "{\"size\":0,\"track_total_hits\":true,\"query\":{\"range\":{\"@timestamp\":{\"gte\":\"2026-09-20\"}}}}";
@@ -271,7 +271,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("planted", ROLLUPS_ALWAYS))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, days(4));
             final String query =
@@ -317,7 +317,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("writer-mark", ROLLUPS_ALWAYS))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, days(3));
             final String query = "{\"size\":0,\"query\":{\"range\":{\"@timestamp\":{\"gte\":\"2026-09-20\"}}}}";
@@ -377,7 +377,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("restore-reuse", ROLLUPS_ALWAYS))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, days(3));
             assertEquals(4L, first(TOTAL, send(node, "POST", "/logs-*/_search", DAY_TWO).body()));
@@ -406,7 +406,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("alias-stale", ROLLUPS_ALWAYS))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final Map<String, List<long[]>> docs = days(3);
             docs.put("other-index", days(2).get(day(2)));
@@ -436,7 +436,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         final HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("no-listing", ROLLUPS_ALWAYS))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, days(3));
             // Created and never written: nothing in it to find, and no entry.
@@ -459,7 +459,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("ghost-entry", ROLLUPS_ALWAYS))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, days(3));
             plane.rollups().markAlias("logs-ghost");
@@ -479,7 +479,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         final HookedBlobStore store = new HookedBlobStore(new FsBlobStore(1024, createTempDir(), false));
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("no-entry", ROLLUPS_ALWAYS))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, days(1));
             plane.createIndex(new IndexDescriptor(day(2), "uuid-" + day(2), 1, MAPPING, null));
@@ -537,9 +537,9 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
             ServerlessNode writer = new ServerlessNode(nodeSettings("owner", Settings.builder().put("serverless.roles", "ingest").build()));
             ServerlessNode coordinator = new ServerlessNode(nodeSettings("coordinator", Settings.EMPTY))
         ) {
-            writer.start();
+            writer.startup().start();
             writer.setMetadataPlane(plane);
-            coordinator.start();
+            coordinator.startup().start();
             coordinator.setMetadataPlane(coordinatorPlane);
             seed(writer, plane, clock, days(2));
             // Day 2 taken back by a writer, which then holds it: its head has an owner again.
@@ -568,7 +568,7 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
                 nodeSettings("budget", Settings.builder().put("serverless.search.max_activations_per_query", 2).build())
             )
         ) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             seed(node, plane, clock, days(5));
             final Response refused = send(node, "POST", "/logs-*/_search", "{\"query\":{\"match_all\":{}}}");

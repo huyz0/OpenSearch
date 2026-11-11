@@ -23,7 +23,7 @@ import java.util.Map;
 /**
  * Starts {@link ServerlessNode}: its write log, its own lease, the services it runs and the local view.
  */
-final class NodeStartup {
+public final class NodeStartup {
 
     private final ServerlessNode node;
 

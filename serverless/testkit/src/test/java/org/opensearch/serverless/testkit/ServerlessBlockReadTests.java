@@ -74,7 +74,7 @@ public class ServerlessBlockReadTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("bulky", "uuid-bulky-00000000", 1, MAPPING, null));
 
         try (ServerlessNode writer = new ServerlessNode(nodeSettings("blocks-w", "ingest"))) {
-            writer.start();
+            writer.startup().start();
             final ShardId shardId = writer.activateWriter(plane, "bulky", 0).orElseThrow();
             // Enough documents that the segments are meaningfully larger than one block.
             for (int i = 0; i < 20_000; i++) {
@@ -113,7 +113,7 @@ public class ServerlessBlockReadTests extends OpenSearchTestCase {
         assertTrue("the test needs segments spanning many blocks: " + published, published > 256 * 1024);
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("blocks-r", "search"))) {
-            reader.start();
+            reader.startup().start();
             final ShardId onReader = reader.serveAsReader(plane, "bulky", 0);
             final long afterOpen = reader.blockCache().bytesFetched();
 
@@ -159,17 +159,17 @@ public class ServerlessBlockReadTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("warm", "uuid-warm-000000000", 1, MAPPING, null));
 
         try (ServerlessNode writer = new ServerlessNode(nodeSettings("blocks-w2", "ingest"))) {
-            writer.start();
+            writer.startup().start();
             final ShardId shardId = writer.activateWriter(plane, "warm", 0).orElseThrow();
             for (int i = 0; i < 500; i++) {
-                writer.index(shardId, "d" + i, "{\"msg\":\"repeated\",\"n\":" + i + "}");
+                writer.writes().index(shardId, "d" + i, "{\"msg\":\"repeated\",\"n\":" + i + "}");
             }
             writer.reconciler().shard(shardId).refresh("blocks");
             writer.publishShard(shardId, plane.heads().read("warm", 0).orElseThrow().term());
         }
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("blocks-r2", "search"))) {
-            reader.start();
+            reader.startup().start();
             final ShardId onReader = reader.serveAsReader(plane, "warm", 0);
             assertEquals(500L, ShardOps.hits(reader.searchService(), onReader, "msg", "repeated"));
 

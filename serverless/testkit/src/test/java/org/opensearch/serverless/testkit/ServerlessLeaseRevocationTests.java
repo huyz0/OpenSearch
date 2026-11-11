@@ -69,7 +69,7 @@ public class ServerlessLeaseRevocationTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(nodeSettings("revocation-owner"));
             ServerlessNode taker = new ServerlessNode(nodeSettings("revocation-taker"))
         ) {
-            owner.start();
+            owner.startup().start();
             owner.setMetadataPlane(ownerPlane);
             // Never scans on its own: only the renewal can tell it.
             owner.setHeadVerifyIntervalMillis(Long.MAX_VALUE);
@@ -79,7 +79,7 @@ public class ServerlessLeaseRevocationTests extends OpenSearchTestCase {
             final ShardId held = owner.reconciler().openShards().iterator().next();
 
             // The taker's clock runs a whole lease ahead of the owner's.
-            taker.start();
+            taker.startup().start();
             takerClock.set(ownerClock.get() + TTL + 1);
             assertTrue("the taker judges the owner dead and takes the shard", taker.activateWriter(takerPlane, "alpha", 0).isPresent());
             assertTrue(
@@ -87,7 +87,7 @@ public class ServerlessLeaseRevocationTests extends OpenSearchTestCase {
                 ownerPlane.membership().selfLeaseValidAt(ownerClock.get())
             );
 
-            final Set<ShardId> released = owner.renewLease(ownerPlane);
+            final Set<ShardId> released = owner.leases().renewLease(ownerPlane);
             assertTrue("the renewal must reveal the takeover and release the shard: " + released, released.contains(held));
             assertFalse("and the shard must be closed here", owner.reconciler().openShards().contains(held));
         }
@@ -130,7 +130,7 @@ public class ServerlessLeaseRevocationTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", shards, MAPPING, null));
         try (ServerlessNode node = new ServerlessNode(nodeSettings("revocation-cost-" + shards))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             node.setHeadVerifyIntervalMillis(ServerlessBootstrap.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS);
             node.setDescriptorRefreshIntervalMillis(ServerlessBootstrap.DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS);
@@ -141,10 +141,10 @@ public class ServerlessLeaseRevocationTests extends OpenSearchTestCase {
             loop.tick(clock.get());
             assertEquals(shards, node.reconciler().openShards().size());
             // The first pass scans and reads; the ones after it, inside both intervals, are what is measured.
-            node.verifyHeadsIfDue(plane);
+            node.leases().verifyHeadsIfDue(plane);
             store.reset();
             for (int pass = 0; pass < 4; pass++) {
-                node.verifyHeadsIfDue(plane);
+                node.leases().verifyHeadsIfDue(plane);
             }
             return store.registerReads();
         }

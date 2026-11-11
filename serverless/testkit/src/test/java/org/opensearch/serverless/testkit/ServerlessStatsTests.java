@@ -124,7 +124,7 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
             try (
                 var node = new ServerlessNode(nodeSettings("stats-denied-" + after, null), java.util.List.of(new DenyStatsPlugin(after)))
             ) {
-                node.start();
+                node.startup().start();
                 for (String path : java.util.List.of("/_serverless/stats", "/_serverless/stats?nodes=_all")) {
                     final var response = send(node, "GET", path, null);
                     assertEquals(response.body(), 403, response.status());
@@ -142,9 +142,9 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
             var first = new ServerlessNode(nodeSettings("stats-sender", null));
             var second = new ServerlessNode(nodeSettings("stats-receiver", null), java.util.List.of(new DenyStatsPlugin(true)))
         ) {
-            first.start();
+            first.startup().start();
             first.setMetadataPlane(metadata);
-            second.start();
+            second.startup().start();
             second.setMetadataPlane(metadata);
             new BackgroundReconciler(first, metadata).tick(clock.get());
             new BackgroundReconciler(second, metadata).tick(clock.get());
@@ -164,7 +164,7 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("counted", "uuid-counted-000000", 3, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("stats-shards", null))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
 
             final Response before = send(node, "GET", "/_serverless/stats", null);
@@ -197,7 +197,7 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
             .build();
 
         try (ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             final Response got = send(node, "GET", "/_serverless/stats", null);
             assertEquals(got.body(), 200, got.status());
             assertTrue("the request breaker must be reported: " + got.body(), got.body().contains("\"request\""));
@@ -221,7 +221,7 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("pressed", "uuid-pressed-000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("stats-pressure", "40b"))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("pressed", 0);
@@ -263,9 +263,9 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
         try (ServerlessNode first = new ServerlessNode(nodeSettings("fleet-stats-a", null))) {
             final String secondId;
             try (ServerlessNode second = new ServerlessNode(nodeSettings("fleet-stats-b", null))) {
-                first.start();
+                first.startup().start();
                 first.setMetadataPlane(plane);
-                second.start();
+                second.startup().start();
                 second.setMetadataPlane(plane);
                 secondId = second.localNode().getId();
                 // Each publishes a lease, which is what a reconcile pass does in a running deployment and

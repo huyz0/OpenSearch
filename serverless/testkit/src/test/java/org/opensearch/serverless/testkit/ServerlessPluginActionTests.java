@@ -243,7 +243,7 @@ public class ServerlessPluginActionTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-action"), List.of(new CountingPlugin()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -278,7 +278,7 @@ public class ServerlessPluginActionTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-action-shadow"), List.of(new ShadowingPlugin()))) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
@@ -341,7 +341,7 @@ public class ServerlessPluginActionTests extends OpenSearchTestCase {
      */
     public void testAnActionThatCannotBeBuiltFailsTheStart() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-action-unbuildable"), List.of(new UnbuildablePlugin()))) {
-            final IllegalStateException thrown = expectThrows(IllegalStateException.class, node::start);
+            final IllegalStateException thrown = expectThrows(IllegalStateException.class, node.startup()::start);
             final String reported = thrown.getMessage() + (thrown.getCause() == null ? "" : " / " + thrown.getCause().getMessage());
             assertTrue("the failure must name the action: " + reported, reported.contains("TransportUnbuildableAction"));
             assertTrue(
@@ -394,7 +394,7 @@ public class ServerlessPluginActionTests extends OpenSearchTestCase {
      */
     public void testTwoSatisfiableConstructorsAreRefused() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-action-ambiguous"), List.of(new AmbiguousPlugin()))) {
-            final IllegalStateException thrown = expectThrows(IllegalStateException.class, node::start);
+            final IllegalStateException thrown = expectThrows(IllegalStateException.class, node.startup()::start);
             final String reported = thrown.getMessage() + (thrown.getCause() == null ? "" : " / " + thrown.getCause().getMessage());
             assertTrue("the failure must say why it will not choose: " + reported, reported.contains("reflection order"));
         }

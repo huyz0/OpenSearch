@@ -69,14 +69,14 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
             .put("indexing_pressure.memory.limit", deletion ? "256b" : "1kb")
             .build();
         try (ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final String id = deletion ? "x".repeat(400) : "doc";
             if (deletion) {
-                node.index(node.reconciler().openShards().iterator().next(), id, "{\"msg\":\"retained\"}");
+                node.writes().index(node.reconciler().openShards().iterator().next(), id, "{\"msg\":\"retained\"}");
             }
             final String source = deletion ? null : "{\"msg\":\"" + "漢".repeat(600) + "\"}";
             final Response refused = send(node, deletion ? "DELETE" : "PUT", "/alpha/_doc/" + id, source);
@@ -103,13 +103,13 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
                 .put("serverless.write.backpressure.max_in_flight", 1)
                 .build();
             try (var node = new ServerlessNode(settings)) {
-                node.start();
+                node.startup().start();
                 node.setMetadataPlane(plane);
                 final var id = node.activateWriter(plane, "alpha", 0).orElseThrow();
-                node.index(id, "doc", "{\"new_field\":\"first\"}");
-                assertTrue(node.get(id, "doc").found());
-                node.index(id, "doc", "{\"new_field\":\"second\",\"another_field\":7}");
-                assertTrue(node.get(id, "doc").source().contains("second"));
+                node.writes().index(id, "doc", "{\"new_field\":\"first\"}");
+                assertTrue(node.reads().get(id, "doc").found());
+                node.writes().index(id, "doc", "{\"new_field\":\"second\",\"another_field\":7}");
+                assertTrue(node.reads().get(id, "doc").source().contains("second"));
             }
         }
     }
@@ -226,7 +226,7 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
             .put("serverless.write.backpressure.max_in_flight", 4)
             .build();
         try (ServerlessNode node = new ServerlessNode(settings)) {
-            node.start();
+            node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);

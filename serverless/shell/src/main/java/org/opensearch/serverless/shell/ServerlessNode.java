@@ -161,7 +161,7 @@ public final class ServerlessNode implements Closeable {
      * One fence per shard. The write path holds the read side from applying an operation to the engine
      * until it is acknowledged; anything that gives the shard away -- an idle release, a lost head, a
      * lapsed lease -- holds the write side from before the publish until after the close. See
-     * {@link #underShardFence}.
+     * {@link WriteFences#underShardFence}.
      */
     final Map<org.opensearch.core.index.shard.ShardId, java.util.concurrent.locks.ReentrantReadWriteLock> shardFences =
         new java.util.concurrent.ConcurrentHashMap<>();
@@ -225,7 +225,7 @@ public final class ServerlessNode implements Closeable {
     /**
      * True from the moment this node's lease is found lapsed until a head verification that began after
      * the renewal has read every head. While set, no write is acknowledged and no forwarded write is
-     * accepted. See {@link #renewLease}.
+     * accepted. See {@link NodeLeases#renewLease}.
      */
     volatile boolean ownershipUnverified;
     /** Bumped on every lapse, so a verification that began before the renewal cannot lift the suspension. */
@@ -605,7 +605,52 @@ public final class ServerlessNode implements Closeable {
     final NodeStartup startup = new NodeStartup(this);
 
     /**
-     * Constructs a node. Nothing is started until {@link #start()} is called.
+     * Writes documents on this node: single index and delete operations and batches.
+     *
+     * @return the NodeWritePath
+     */
+    public NodeWritePath writes() {
+        return writes;
+    }
+
+    /**
+     * Reads documents held on this node: get and explain.
+     *
+     * @return the NodeDocumentReads
+     */
+    public NodeDocumentReads reads() {
+        return reads;
+    }
+
+    /**
+     * Decides whether a write may go ahead on this node: the shard fence, its incarnation, and the lease and head.
+     *
+     * @return the WriteFences
+     */
+    public WriteFences fences() {
+        return fences;
+    }
+
+    /**
+     * Keeps this node's lease and heads current.
+     *
+     * @return the NodeLeases
+     */
+    public NodeLeases leases() {
+        return leases;
+    }
+
+    /**
+     * Starts this node, and owns its write log.
+     *
+     * @return the NodeStartup
+     */
+    public NodeStartup startup() {
+        return startup;
+    }
+
+    /**
+     * Constructs a node. Nothing is started until {@link NodeStartup#start()} is called.
      *
      * @param settings must carry {@code node.name}, {@code cluster.name} and {@code path.home}
      * @throws Exception if the node environment cannot be created or the data plane cannot be built
@@ -1080,14 +1125,10 @@ public final class ServerlessNode implements Closeable {
     void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
         if (nodeLogEnabled) {
             // Through the log, which names its epochs and writes under the lock a new epoch's recording takes.
-            nodeLog(plane).renew();
+            startup.nodeLog(plane).renew();
             return;
         }
         startup.writeOwnLease(plane, java.util.List.of());
-    }
-
-    NodeLogWriter nodeLog(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
-        return startup.nodeLog(plane);
     }
 
     /**
@@ -1145,7 +1186,7 @@ public final class ServerlessNode implements Closeable {
     /**
      * Returns this node's shard router, which forwards work to the node that owns a shard.
      *
-     * @return the router, or null before {@link #start()}
+     * @return the router, or null before {@link NodeStartup#start()}
      */
     public org.opensearch.serverless.transport.ShardRouter router() {
         return router;
@@ -1159,11 +1200,6 @@ public final class ServerlessNode implements Closeable {
      */
     public void setMembershipSource(MembershipSource source) {
         this.membershipSource = source;
-    }
-
-    /** Starts the node. */
-    public void start() {
-        startup.start();
     }
 
     PluginActions pluginActions = PluginActions.none();
@@ -1319,31 +1355,6 @@ public final class ServerlessNode implements Closeable {
         return activation.activateWriter(plane, indexName, shardNumber);
     }
 
-    /** Renews this node's lease and lets go of anything it has lost: {@link #renewLease} then {@link #verifyHeads}, as one pass. */
-    public java.util.Set<org.opensearch.core.index.shard.ShardId> heartbeat(org.opensearch.serverless.metadata.MetadataPlane plane)
-        throws Exception {
-        return leases.heartbeat(plane);
-    }
-
-    /** Renews this node's lease -- and, if the lease had already lapsed, re-verifies every held head before a single write can be acknowledged again. */
-    public java.util.Set<org.opensearch.core.index.shard.ShardId> renewLease(org.opensearch.serverless.metadata.MetadataPlane plane)
-        throws Exception {
-        return leases.renewLease(plane);
-    }
-
-    java.util.Set<org.opensearch.core.index.shard.ShardId> renewLease(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        boolean verifyAfterLapse
-    ) throws Exception {
-        return leases.renewLease(plane, verifyAfterLapse);
-    }
-
-    /** Reads the head of every writer shard this node holds and lets go of the ones it has lost. */
-    public java.util.Set<org.opensearch.core.index.shard.ShardId> verifyHeads(org.opensearch.serverless.metadata.MetadataPlane plane)
-        throws Exception {
-        return leases.verifyHeads(plane);
-    }
-
     /**
      * How long a node may go without re-reading the head of every writer shard it holds.
      *
@@ -1389,7 +1400,7 @@ public final class ServerlessNode implements Closeable {
      * is swapped, does not: the taker's swap of the lease and the owner's renewal of it contend on one
      * register, so either the owner renewed first and the taker backs off, or the revocation landed first
      * and the owner's next renewal fails, which it treats as a lapse -- suspend, re-read every head (see
-     * {@code BlobLeaseMembership#revoke} and {@link #renewLease}). A node whose renewals keep succeeding has
+     * {@code BlobLeaseMembership#revoke} and {@link NodeLeases#renewLease}). A node whose renewals keep succeeding has
      * therefore lost no head to a takeover, at one write per renewal however many shards it holds, and
      * {@code ServerlessBootstrap#HEAD_VERIFY_INTERVAL} runs this scan every five minutes as a backstop for a
      * head released by someone other than its owner. The library default below stays per pass, because the
@@ -1409,12 +1420,6 @@ public final class ServerlessNode implements Closeable {
     public ServerlessNode setHeadVerifyIntervalMillis(long millis) {
         this.headVerifyIntervalMillis = Math.max(0L, millis);
         return this;
-    }
-
-    /** Verifies every held head, but only if {@link #DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS} has passed since the last time. */
-    public java.util.Set<org.opensearch.core.index.shard.ShardId> verifyHeadsIfDue(org.opensearch.serverless.metadata.MetadataPlane plane)
-        throws Exception {
-        return leases.verifyHeadsIfDue(plane);
     }
 
     /** Serves a shard as a reader: opens the published commit without owning the shard. */
@@ -1478,42 +1483,6 @@ public final class ServerlessNode implements Closeable {
         readerServing.forgetReader(shardId);
     }
 
-    /** Indexes a document durably: the write reaches the object store's log before it is acknowledged. */
-    public WriteOutcome index(org.opensearch.core.index.shard.ShardId shardId, String id, String source) throws java.io.IOException {
-        return writes.index(shardId, id, source);
-    }
-
-    /** Indexes a document, optionally only if it is still at the sequence number the caller expects. */
-    public WriteOutcome index(org.opensearch.core.index.shard.ShardId shardId, String id, String source, long ifSeqNo, long ifPrimaryTerm)
-        throws java.io.IOException {
-        return writes.index(shardId, id, source, ifSeqNo, ifPrimaryTerm);
-    }
-
-    /** Indexes a document, optionally only if no document with that id exists. */
-    public WriteOutcome index(
-        org.opensearch.core.index.shard.ShardId shardId,
-        String id,
-        String source,
-        long ifSeqNo,
-        long ifPrimaryTerm,
-        boolean requireAbsent
-    ) throws java.io.IOException {
-        return writes.index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent);
-    }
-
-    /** Indexes a document, optionally growing the mapping to fit it. */
-    public WriteOutcome index(
-        org.opensearch.core.index.shard.ShardId shardId,
-        String id,
-        String source,
-        long ifSeqNo,
-        long ifPrimaryTerm,
-        boolean requireAbsent,
-        boolean mayGrowMapping
-    ) throws java.io.IOException {
-        return writes.index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
-    }
-
     /**
      * How long a read confirming that an index incarnation still exists licenses answering from its shards.
      *
@@ -1566,16 +1535,6 @@ public final class ServerlessNode implements Closeable {
         this.incarnationFenceMillis = Math.max(0L, millis);
     }
 
-    /** Refuses to answer from a shard unless its index incarnation was confirmed to exist within the window. */
-    public void ensureIncarnationLive(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
-        fences.ensureIncarnationLive(shardId);
-    }
-
-    /** Reports whether a writer shard is refusing writes after a failed log append. */
-    public boolean isWriteFenced(org.opensearch.core.index.shard.ShardId shardId) {
-        return fences.isWriteFenced(shardId);
-    }
-
     final Map<org.opensearch.core.index.Index, MappingGrowthPath.MappingGrowth> mappingGrowth =
         new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -1585,31 +1544,6 @@ public final class ServerlessNode implements Closeable {
     void growMapping(org.opensearch.core.index.shard.ShardId shardId, org.opensearch.index.mapper.Mapping addition)
         throws java.io.IOException {
         mappings.growMapping(shardId, addition);
-    }
-
-    /** Deletes a document durably: the deletion reaches the object store's log before it is acknowledged. */
-    public WriteOutcome delete(org.opensearch.core.index.shard.ShardId shardId, String id) throws java.io.IOException {
-        return writes.delete(shardId, id);
-    }
-
-    /** Deletes a document, optionally only if it is still at the sequence number the caller expects. */
-    public WriteOutcome delete(org.opensearch.core.index.shard.ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm)
-        throws java.io.IOException {
-        return writes.delete(shardId, id, ifSeqNo, ifPrimaryTerm);
-    }
-
-    /** Applies a batch to one shard: one log append for all of it, then each operation in order. */
-    public java.util.List<BulkOutcome> bulk(
-        org.opensearch.core.index.shard.ShardId shardId,
-        java.util.List<org.opensearch.serverless.store.WalRecord> operations
-    ) throws java.io.IOException {
-        return writes.bulk(shardId, operations);
-    }
-
-    /** Applies a batch whose items may carry conditions. */
-    public java.util.List<BulkOutcome> bulkOperations(org.opensearch.core.index.shard.ShardId shardId, java.util.List<BulkOperation> batch)
-        throws java.io.IOException {
-        return writes.bulkOperations(shardId, batch);
     }
 
     /**
@@ -1792,20 +1726,6 @@ public final class ServerlessNode implements Closeable {
         reconciler.markUsed(shardId, plane == null ? System.currentTimeMillis() : plane.clock().getAsLong());
     }
 
-    /** Explains a document using this incarnation's current mapping and records the shard as in use. */
-    public org.opensearch.serverless.shard.ShardExplain.Outcome explain(
-        org.opensearch.core.index.shard.ShardId shardId,
-        String id,
-        org.opensearch.index.query.QueryBuilder query
-    ) throws java.io.IOException {
-        return reads.explain(shardId, id, query);
-    }
-
-    /** Reads one document by id, from this node's own copy of the shard. */
-    public Document get(org.opensearch.core.index.shard.ShardId shardId, String id) throws java.io.IOException {
-        return reads.get(shardId, id);
-    }
-
     /**
      * Publishes a shard's current commit to the object store, fenced by the owning term.
      *
@@ -1865,7 +1785,7 @@ public final class ServerlessNode implements Closeable {
     /**
      * Returns this node's shard reconciler.
      *
-     * @return the reconciler, or null before {@link #start()}
+     * @return the reconciler, or null before {@link NodeStartup#start()}
      */
     public ShardReconciler reconciler() {
         return reconciler;
@@ -1874,7 +1794,7 @@ public final class ServerlessNode implements Closeable {
     /**
      * Returns this node's view projector.
      *
-     * @return the projector, or null before {@link #start()}
+     * @return the projector, or null before {@link NodeStartup#start()}
      */
     public LocalViewProjector projector() {
         return projector;
@@ -2036,17 +1956,6 @@ public final class ServerlessNode implements Closeable {
         return indexName + "#" + shardNumber;
     }
 
-    /** Runs an action that gives a shard away while holding the shard's write fence. */
-    public <T> T underShardFence(org.opensearch.core.index.shard.ShardId shardId, java.util.concurrent.Callable<T> action)
-        throws Exception {
-        return fences.underShardFence(shardId, action);
-    }
-
-    /** Reports whether this node holds a shard as its writer, by evidence no older than the given age. */
-    public boolean holdsAsWriter(org.opensearch.core.index.shard.ShardId shardId, long maxHeadAgeMillis) {
-        return fences.holdsAsWriter(shardId, maxHeadAgeMillis);
-    }
-
     /** Of two copies of one descriptor, the one with the newer mapping and settings. */
     static IndexDescriptor newerOf(IndexDescriptor a, IndexDescriptor b) {
         if (b.mappingVersion() != a.mappingVersion()) {
@@ -2112,7 +2021,7 @@ public final class ServerlessNode implements Closeable {
     /**
      * Reports whether the node has been started.
      *
-     * @return true once {@link #start()} has been called and before {@link #close()}
+     * @return true once {@link NodeStartup#start()} has been called and before {@link #close()}
      */
     public boolean isStarted() {
         return started;
