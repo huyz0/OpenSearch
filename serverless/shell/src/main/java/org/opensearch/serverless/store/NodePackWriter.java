@@ -36,6 +36,14 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class NodePackWriter {
 
+    /**
+     * The longest a publish may take from its pack landing to its manifest swap. Past it the swap is refused, which is
+     * what lets collection delete a pack no manifest names once it is older than {@link #COLLECTABLE_AFTER_MILLIS}.
+     */
+    public static final long SWAP_DEADLINE_MILLIS = 5L * 60 * 1000;
+    /** How old a pack must be, since collection first saw it, before collection may judge it unreferenced. */
+    public static final long COLLECTABLE_AFTER_MILLIS = 3 * SWAP_DEADLINE_MILLIS;
+
     /** Where one blob landed: the pack and the block. */
     public record Landed(String nodeId, long epoch, long ordinal, NodePackBlob.Block block) {
 
@@ -56,6 +64,23 @@ public final class NodePackWriter {
         }
     }
 
+    /** Told of every pack this writer writes or fails to, so collection learns of new packs without reading them. */
+    public interface Listener {
+        /**
+         * A pack landed.
+         *
+         * @param header its header
+         */
+        void written(NodePackBlob.Header header);
+
+        /**
+         * A pack's write failed; the pack may or may not exist.
+         *
+         * @param ordinal the slot it was written to
+         */
+        void failed(long ordinal);
+    }
+
     private static final class Pending {
         final NodePackStore.Part part;
         final CompletableFuture<Landed> landed = new CompletableFuture<>();
@@ -70,6 +95,9 @@ public final class NodePackWriter {
     private final long lingerMillis;
     private final long maxPackBytes;
     private final AtomicLong nextOrdinal = new AtomicLong();
+    private volatile Listener listener;
+    private volatile NodePackLedger ledger;
+    private volatile boolean recorded;
 
     private final Object lock = new Object();
     private List<Pending> batch = new ArrayList<>();
@@ -109,6 +137,34 @@ public final class NodePackWriter {
      */
     public long epoch() {
         return epoch;
+    }
+
+    /**
+     * Records this writer's epoch in the node's ledger before its first pack, so collection always knows of every
+     * epoch with packs in it. A node that never writes a pack never writes the ledger either.
+     *
+     * @param ledger the node's ledger
+     */
+    public void recordIn(NodePackLedger ledger) {
+        this.ledger = ledger;
+    }
+
+    /**
+     * Sets who is told of each pack this writer writes.
+     *
+     * @param listener the listener, or null for none
+     */
+    public void setListener(Listener listener) {
+        this.listener = listener;
+    }
+
+    /**
+     * Returns the next ordinal this writer will use: every pack it has written, or tried to, is below it.
+     *
+     * @return the next ordinal
+     */
+    public long nextOrdinal() {
+        return nextOrdinal.get();
     }
 
     /**
@@ -154,6 +210,19 @@ public final class NodePackWriter {
         return landed;
     }
 
+    private void recordEpoch() throws IOException {
+        final NodePackLedger into = ledger;
+        if (into == null || recorded) {
+            return;
+        }
+        synchronized (into) {
+            if (recorded == false) {
+                into.addEpoch(epoch);
+                recorded = true;
+            }
+        }
+    }
+
     private void lead() {
         final List<Pending> taken;
         synchronized (lock) {
@@ -177,11 +246,20 @@ public final class NodePackWriter {
             parts.add(pending.part);
         }
         try {
+            recordEpoch();
             final NodePackBlob.Header header = store.write(epoch, ordinal, parts);
+            final Listener told = listener;
+            if (told != null) {
+                told.written(header);
+            }
             for (int i = 0; i < taken.size(); i++) {
                 taken.get(i).landed.complete(new Landed(store.nodeId(), epoch, ordinal, header.blocks().get(i)));
             }
         } catch (Throwable t) {
+            final Listener told = listener;
+            if (told != null) {
+                told.failed(ordinal);
+            }
             for (Pending pending : taken) {
                 pending.landed.completeExceptionally(t);
             }

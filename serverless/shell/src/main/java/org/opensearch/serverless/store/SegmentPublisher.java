@@ -55,6 +55,7 @@ public final class SegmentPublisher {
 
     /** Where small segment blobs go instead of the shard's term container, or null to keep them there (the default). */
     private volatile NodePackWriter nodePacks;
+    private volatile String nodePackIndexName;
     private volatile String nodePackIndexUuid;
     private volatile int nodePackShard = -1;
     private volatile long nodePackMaxBlobBytes;
@@ -101,15 +102,17 @@ public final class SegmentPublisher {
      * blob of their own, so no shard's large files sit in a pack beside other shards' small ones.
      *
      * @param writer the node's pack writer, or null to turn node packs off
+     * @param indexName this shard's index name, recorded in each pack's header so collection can find the manifest
      * @param indexUuid this shard's index, recorded in each pack's header
      * @param shard this shard's number
      * @param maxBlobBytes the largest segment blob that goes into a node pack
      * @return this publisher
      */
-    public SegmentPublisher nodePacks(NodePackWriter writer, String indexUuid, int shard, long maxBlobBytes) {
-        if (writer != null && (indexUuid == null || shard < 0 || maxBlobBytes <= 0L)) {
+    public SegmentPublisher nodePacks(NodePackWriter writer, String indexName, String indexUuid, int shard, long maxBlobBytes) {
+        if (writer != null && (indexName == null || indexUuid == null || shard < 0 || maxBlobBytes <= 0L)) {
             throw new IllegalArgumentException("node packs need the shard's index, number and a size limit");
         }
+        this.nodePackIndexName = indexName;
         this.nodePackIndexUuid = indexUuid;
         this.nodePackShard = shard;
         this.nodePackMaxBlobBytes = maxBlobBytes;
@@ -257,6 +260,7 @@ public final class SegmentPublisher {
 
         final Map<String, String> published = new LinkedHashMap<>();
         final Map<String, Long> lengths = new LinkedHashMap<>();
+        Long nodePackLandedNanos = null;
         final Map<String, String> inherited = existing == null ? Map.of() : existing.files();
         final Directory directory = store.directory();
 
@@ -270,7 +274,7 @@ public final class SegmentPublisher {
                 }
             }
             if (packing) {
-                writeSegmentBlobs(directory, termSegment(term), fresh, inherited.keySet(), published, lengths);
+                nodePackLandedNanos = writeSegmentBlobs(directory, termSegment(term), fresh, inherited.keySet(), published, lengths);
             }
             for (String fileName : snapshot.asMap().keySet()) {
                 if (published.containsKey(fileName)) {
@@ -304,6 +308,16 @@ public final class SegmentPublisher {
             store.decRef();
         }
 
+        if (nodePackLandedNanos != null
+            && System.nanoTime() - nodePackLandedNanos > java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(
+                NodePackWriter.SWAP_DEADLINE_MILLIS
+            )) {
+            // Collection deletes a pack that no manifest has named for longer than this, by a wide margin. A swap that
+            // comes later could name a pack already gone, so it is refused, and the next publish packs the files anew.
+            throw new IOException(
+                "this publish's node pack landed more than " + NodePackWriter.SWAP_DEADLINE_MILLIS + " ms before its swap"
+            );
+        }
         final CommitManifest manifest = new CommitManifest(term, published, writerId, lengths, digest, walOrdinal);
         final long expected = remembered != null && rememberedGeneration != BlobRegister.ABSENT_GENERATION
             ? rememberedGeneration
@@ -371,8 +385,10 @@ public final class SegmentPublisher {
      *
      * <p>Every blob is written only if absent, so neither a retry nor a zombie of the same term can overwrite one a
      * manifest names.
+     *
+     * @return when the publish's node pack landed, by {@link System#nanoTime}, or null if it wrote none
      */
-    private void writeSegmentBlobs(
+    private Long writeSegmentBlobs(
         Directory directory,
         String termDir,
         java.util.List<String> fileNames,
@@ -396,7 +412,7 @@ public final class SegmentPublisher {
             }
         }
         if (bySegment.isEmpty()) {
-            return;
+            return null;
         }
         final java.util.Set<String> publishedSegments = new java.util.HashSet<>();
         for (String name : alreadyPublished) {
@@ -432,9 +448,11 @@ public final class SegmentPublisher {
             }
             writeSegmentBlob(directory, termDir, uniqueSegmentBlob(segment.getKey()), files, published, lengths);
         }
-        if (toNodePack.isEmpty() == false) {
-            writeToNodePack(packs, directory, toNodePack, published, lengths);
+        if (toNodePack.isEmpty()) {
+            return null;
         }
+        writeToNodePack(packs, directory, toNodePack, published, lengths);
+        return System.nanoTime();
     }
 
     /** A segment blob laid out but not yet written: its name, header, files in blob order and their sizes. */
@@ -471,7 +489,14 @@ public final class SegmentPublisher {
         final java.util.List<NodePackStore.Part> parts = new java.util.ArrayList<>(blobs.size());
         for (SegmentBlob blob : blobs) {
             parts.add(
-                new NodePackStore.Part(nodePackIndexUuid, nodePackShard, blob.name(), blob.length(), () -> openSegmentBlob(directory, blob))
+                new NodePackStore.Part(
+                    nodePackIndexUuid,
+                    nodePackShard,
+                    blob.name(),
+                    blob.length(),
+                    () -> openSegmentBlob(directory, blob),
+                    nodePackIndexName
+                )
             );
         }
         final java.util.List<NodePackWriter.Landed> landed = packs.add(parts);

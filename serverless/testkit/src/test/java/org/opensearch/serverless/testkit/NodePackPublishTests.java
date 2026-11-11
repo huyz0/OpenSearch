@@ -129,6 +129,11 @@ public class NodePackPublishTests extends OpenSearchTestCase {
             }
             loop.publishAll();
             final String nodeId = node.localNode().getId();
+            assertEquals(
+                "the writer's epoch was recorded before its first pack",
+                1,
+                new org.opensearch.serverless.store.NodePackLedger(store, BlobPath.cleanPath(), nodeId).read().epochs().size()
+            );
             for (String[] shard : shards) {
                 final int number = Integer.parseInt(shard[1]);
                 final CommitManifest manifest = plane.segmentPublisher(shard[0], number).readManifest().orElseThrow();
@@ -205,7 +210,8 @@ public class NodePackPublishTests extends OpenSearchTestCase {
                 assertFalse(file + ": " + manifest.files().get(file), location.isNodePacked());
                 assertTrue(location.termDir(), location.termDir().startsWith("t="));
             }
-            assertFalse("no node packs at all", Files.exists(root.resolve(NodePackStore.ROOT)));
+            // The filesystem store makes directories as containers are opened; what matters is that no blob is written.
+            assertEquals("no node packs at all", Set.of(), shardBlobs(root, BlobPath.cleanPath().add(NodePackStore.ROOT)));
             assertFalse(segmentBlobsIn(shardBlobs(root, plane.shardData("alpha", 0))).isEmpty());
             assertEquals(10, docsIn(store, plane.shardData("alpha", 0), manifest));
         }
