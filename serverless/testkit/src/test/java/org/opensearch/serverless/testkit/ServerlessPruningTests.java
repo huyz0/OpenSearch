@@ -282,11 +282,11 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
             plane.rollups()
                 .plantForTest(
                     day(3),
-                    new org.opensearch.serverless.metadata.DigestRollups.Entry(
+                    new org.opensearch.serverless.metadata.RollupEntry(
                         "uuid-" + day(3),
                         1,
                         List.of(
-                            new org.opensearch.serverless.metadata.DigestRollups.ShardState(
+                            new org.opensearch.serverless.metadata.RollupShardState(
                                 0L,
                                 new PruningDigest(
                                     Map.of(
@@ -349,12 +349,12 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
     private static final String DAY_TWO = "{\"size\":0,\"track_total_hits\":true,\"query\":{\"range\":{\"@timestamp\":"
         + "{\"gte\":\"2026-09-02\",\"lt\":\"2026-09-03\"}}}}";
 
-    private static org.opensearch.serverless.metadata.DigestRollups.Entry staleEntry(String uuid, int day) {
-        return new org.opensearch.serverless.metadata.DigestRollups.Entry(
+    private static org.opensearch.serverless.metadata.RollupEntry staleEntry(String uuid, int day) {
+        return new org.opensearch.serverless.metadata.RollupEntry(
             uuid,
             1,
             List.of(
-                new org.opensearch.serverless.metadata.DigestRollups.ShardState(
+                new org.opensearch.serverless.metadata.RollupShardState(
                     0L,
                     new PruningDigest(
                         Map.of(

@@ -21,7 +21,6 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
-import org.opensearch.index.query.QueryBuilder;
 import org.opensearch.serverless.store.PruningDigest;
 
 import java.io.IOException;
@@ -93,7 +92,7 @@ public final class DigestRollups {
     private final BlobStore blobStore;
     private final BlobPath base;
     /** The last value this node read or wrote per register, so a publish that widens nothing costs nothing. */
-    private final Map<String, Map<String, Entry>> known = new ConcurrentHashMap<>();
+    private final Map<String, Map<String, RollupEntry>> known = new ConcurrentHashMap<>();
 
     /**
      * Creates the rollup store.
@@ -104,72 +103,6 @@ public final class DigestRollups {
     public DigestRollups(BlobStore blobStore, BlobPath base) {
         this.blobStore = blobStore;
         this.base = base;
-    }
-
-    /** One shard's part of an entry: the term of a writer holding it, zero if none; and its digest, null if never published. */
-    public record ShardState(long ownerTerm, PruningDigest digest) {
-    }
-
-    /**
-     * What a bucket knows of one index.
-     *
-     * @param uuid the incarnation the entry was written for
-     * @param shards the incarnation's shard count
-     * @param states one per shard
-     */
-    public record Entry(String uuid, int shards, List<ShardState> states, boolean alias) {
-
-        /**
-         * An index's entry.
-         *
-         * @param uuid the incarnation the entry was written for
-         * @param shards the incarnation's shard count
-         * @param states one per shard
-         */
-        public Entry(String uuid, int shards, List<ShardState> states) {
-            this(uuid, shards, states, false);
-        }
-
-        /**
-         * Whether this entry settles that the index may match: every shard unowned and published, and not all of
-         * them ruled out. A shard's own digest is never wider than its entry, so reading it could rule out nothing
-         * more -- the per-shard check can be skipped.
-         *
-         * @param query the query
-         * @param nowMillis the request's single now
-         * @return true when the entry alone has decided the index is to be searched
-         */
-        public boolean judgedMatchable(QueryBuilder query, long nowMillis) {
-            if (alias || states.size() != shards) {
-                return false;
-            }
-            for (ShardState state : states) {
-                if (state.ownerTerm() != 0L || state.digest() == null) {
-                    return false;
-                }
-            }
-            return rulesOut(query, nowMillis) == false;
-        }
-
-        /**
-         * Whether this entry proves the query can match nothing the index holds.
-         *
-         * @param query the query
-         * @param nowMillis the request's single now
-         * @return true only when every shard is unowned, published and ruled out by its digest
-         */
-        public boolean rulesOut(QueryBuilder query, long nowMillis) {
-            // An alias resolves to indices the pattern may not name; what they hold is not here to judge.
-            if (alias || states.size() != shards) {
-                return false;
-            }
-            for (ShardState state : states) {
-                if (state.ownerTerm() != 0L || state.digest() == null || state.digest().canMatch(query, nowMillis)) {
-                    return false;
-                }
-            }
-            return true;
-        }
     }
 
     /**
@@ -218,13 +151,13 @@ public final class DigestRollups {
     public void widen(String name, String uuid, int shards, int shard, PruningDigest digest) throws IOException {
         final PruningDigest coarse = digest.coarsened();
         update(name, entry -> {
-            final Entry base = entry == null || entry.uuid().equals(uuid) == false ? fresh(uuid, shards) : entry;
-            final ShardState was = base.states().get(shard);
+            final RollupEntry base = covering(entry, uuid, shards);
+            final RollupShardState was = base.states().get(shard);
             final PruningDigest merged = was.digest() == null ? coarse : was.digest().union(coarse);
             if (entry != null && merged.equals(was.digest()) && entry == base) {
                 return null;
             }
-            return with(base, shard, new ShardState(was.ownerTerm(), merged));
+            return with(base, shard, new RollupShardState(was.ownerTerm(), merged));
         });
     }
 
@@ -248,8 +181,8 @@ public final class DigestRollups {
      */
     public void widenUnlessMarked(String name, String uuid, int shards, int shard, long term, PruningDigest digest) throws IOException {
         if (term > 0L) {
-            final Map<String, Entry> remembered = known.get(key(name));
-            final Entry entry = remembered == null ? null : remembered.get(name);
+            final Map<String, RollupEntry> remembered = known.get(key(name));
+            final RollupEntry entry = remembered == null ? null : remembered.get(name);
             // This writer's own mark, exactly: a higher one is a successor's, which says nothing about this writer.
             //
             // Trusted from this node's copy because nothing else clears it while this writer can still publish
@@ -280,15 +213,15 @@ public final class DigestRollups {
      */
     public void markOwned(String name, String uuid, int shards, int shard, long term) throws IOException {
         final Change change = entry -> {
-            final Entry base = entry == null || entry.uuid().equals(uuid) == false ? fresh(uuid, shards) : entry;
-            final ShardState was = base.states().get(shard);
+            final RollupEntry base = covering(entry, uuid, shards);
+            final RollupShardState was = base.states().get(shard);
             if (entry == base && was.ownerTerm() >= term) {
                 return null;
             }
-            return with(base, shard, new ShardState(Math.max(was.ownerTerm(), term), was.digest()));
+            return with(base, shard, new RollupShardState(Math.max(was.ownerTerm(), term), was.digest()));
         };
         final String key = key(name);
-        final Map<String, Entry> remembered = known.get(key);
+        final Map<String, RollupEntry> remembered = known.get(key);
         if (remembered != null && change.apply(remembered.get(name)) == null) {
             return;
         }
@@ -381,12 +314,12 @@ public final class DigestRollups {
             if (entry == null || entry.alias() || entry.uuid().equals(uuid) == false || shard >= entry.states().size()) {
                 return null;
             }
-            final ShardState was = entry.states().get(shard);
+            final RollupShardState was = entry.states().get(shard);
             if (was.ownerTerm() != term) {
                 return null;
             }
             final PruningDigest digest = coarse == null ? was.digest() : was.digest() == null ? coarse : was.digest().union(coarse);
-            return with(entry, shard, new ShardState(0L, digest));
+            return with(entry, shard, new RollupShardState(0L, digest));
         });
     }
 
@@ -422,8 +355,8 @@ public final class DigestRollups {
     }
 
     /** Whether an entry records no owner and no published digest for any shard. */
-    public static boolean recordsNothing(Entry entry) {
-        for (ShardState state : entry.states()) {
+    public static boolean recordsNothing(RollupEntry entry) {
+        for (RollupShardState state : entry.states()) {
             if (state.ownerTerm() != 0L || state.digest() != null) {
                 return false;
             }
@@ -432,7 +365,7 @@ public final class DigestRollups {
     }
 
     /** What a change returns to remove the entry rather than replace it. */
-    private static final Entry REMOVED = new Entry("_removed", 0, List.of());
+    private static final RollupEntry REMOVED = new RollupEntry("_removed", 0, List.of());
 
     /** The uuid an alias's entry carries: never an index's, so an index's first event replaces it. */
     static final String ALIAS_UUID = "_alias";
@@ -445,11 +378,11 @@ public final class DigestRollups {
      * @throws IOException if the register cannot be updated; the caller must not write the alias
      */
     public void markAlias(String name) throws IOException {
-        update(name, entry -> entry != null && entry.alias() ? null : new Entry(ALIAS_UUID, 0, List.of(), true));
+        update(name, entry -> entry != null && entry.alias() ? null : new RollupEntry(ALIAS_UUID, 0, List.of(), true));
     }
 
     /** One group's entries as this node last read them, and when. */
-    private record Snapshot(Map<String, Entry> entries, long readAtNanos) {
+    private record Snapshot(Map<String, RollupEntry> entries, long readAtNanos) {
     }
 
     private final Map<String, Snapshot> groups = new ConcurrentHashMap<>();
@@ -467,7 +400,7 @@ public final class DigestRollups {
      * @return entries by index name
      * @throws IOException if a register cannot be read
      */
-    public Map<String, Entry> readGroup(String group, DescriptorStore.Reads reads, long maxAgeMillis) throws IOException {
+    public Map<String, RollupEntry> readGroup(String group, DescriptorStore.Reads reads, long maxAgeMillis) throws IOException {
         final Snapshot cached = groups.get(group);
         final long now = System.nanoTime();
         if (cached != null
@@ -475,7 +408,7 @@ public final class DigestRollups {
             && now - cached.readAtNanos() < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(maxAgeMillis)) {
             return cached.entries();
         }
-        final Map<String, Entry> read = java.util.Collections.unmodifiableMap(readGroup(group, reads));
+        final Map<String, RollupEntry> read = java.util.Collections.unmodifiableMap(readGroup(group, reads));
         groups.put(group, new Snapshot(read, now));
         return read;
     }
@@ -488,9 +421,9 @@ public final class DigestRollups {
      * @return entries by index name
      * @throws IOException if a register cannot be read
      */
-    public Map<String, Entry> readGroup(String group, DescriptorStore.Reads reads) throws IOException {
+    public Map<String, RollupEntry> readGroup(String group, DescriptorStore.Reads reads) throws IOException {
         final ConditionalBlobContainer container = container(group);
-        final List<Callable<Map<String, Entry>>> tasks = new ArrayList<>();
+        final List<Callable<Map<String, RollupEntry>>> tasks = new ArrayList<>();
         for (int bucket = 0; bucket < BUCKETS; bucket++) {
             final String blob = blob(bucket);
             tasks.add(() -> {
@@ -498,14 +431,14 @@ public final class DigestRollups {
                 return register.isEmpty() ? Map.of() : parse(register.get().value());
             });
         }
-        final List<Map<String, Entry>> read;
+        final List<Map<String, RollupEntry>> read;
         try {
             read = reads.runAll(tasks);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted reading the digest rollups of [" + group + "]", e);
         }
-        final Map<String, Entry> all = new LinkedHashMap<>();
+        final Map<String, RollupEntry> all = new LinkedHashMap<>();
         for (int i = 0; i < read.size(); i++) {
             if (read.get(i) == null) {
                 throw new IOException("could not read digest rollup " + i + " of [" + group + "]");
@@ -533,7 +466,7 @@ public final class DigestRollups {
      * @return entries by index name
      * @throws IOException if the register cannot be read
      */
-    public Map<String, Entry> readBucket(String group, int bucket) throws IOException {
+    public Map<String, RollupEntry> readBucket(String group, int bucket) throws IOException {
         final Optional<BlobRegister> register = container(group).readRegister(blob(bucket));
         return register.isEmpty() ? Map.of() : parse(register.get().value());
     }
@@ -541,7 +474,7 @@ public final class DigestRollups {
     @FunctionalInterface
     private interface Change {
         /** The new entry, or null to leave the register as it is. */
-        Entry apply(Entry current);
+        RollupEntry apply(RollupEntry current);
     }
 
     /** A read-change-swap loop on the name's bucket, skipping the read when this node's last copy says nothing changes. */
@@ -562,7 +495,7 @@ public final class DigestRollups {
     private void updateAll(String group, int bucket, List<Map.Entry<String, Change>> changes, boolean trustRemembered) throws IOException {
         final String key = group + "/" + blob(bucket);
         final ConditionalBlobContainer container = container(group);
-        final Map<String, Entry> remembered = known.get(key);
+        final Map<String, RollupEntry> remembered = known.get(key);
         if (trustRemembered && remembered != null) {
             // Nothing this node knows of would change. The copy may be stale, but a register only ever widens
             // within an incarnation, so if the stale copy already covers the change the current one does too.
@@ -579,12 +512,12 @@ public final class DigestRollups {
         }
         for (int attempt = 0; attempt < CAS_ATTEMPTS; attempt++) {
             final Optional<BlobRegister> register = container.readRegister(blob(bucket));
-            final Map<String, Entry> current = register.isEmpty()
+            final Map<String, RollupEntry> current = register.isEmpty()
                 ? new LinkedHashMap<>()
                 : new LinkedHashMap<>(parse(register.get().value()));
             boolean changed = false;
             for (Map.Entry<String, Change> each : changes) {
-                final Entry next = each.getValue().apply(current.get(each.getKey()));
+                final RollupEntry next = each.getValue().apply(current.get(each.getKey()));
                 if (next == null) {
                     continue;
                 }
@@ -617,25 +550,44 @@ public final class DigestRollups {
         );
     }
 
-    private static Entry fresh(String uuid, int shards) {
-        final List<ShardState> states = new ArrayList<>(shards);
-        for (int i = 0; i < shards; i++) {
-            states.add(new ShardState(0L, null));
+    /**
+     * The entry a change to one shard starts from: the one stored when it is this incarnation's and covers
+     * every shard, a fresh one for a new incarnation, and the stored one widened with empty states when the
+     * index has gained shard slots since it was written -- a split adds units above every existing id.
+     */
+    private static RollupEntry covering(RollupEntry entry, String uuid, int shards) {
+        if (entry == null || entry.uuid().equals(uuid) == false) {
+            return fresh(uuid, shards);
         }
-        return new Entry(uuid, shards, List.copyOf(states));
+        if (entry.states().size() >= shards) {
+            return entry;
+        }
+        final List<RollupShardState> states = new ArrayList<>(entry.states());
+        while (states.size() < shards) {
+            states.add(new RollupShardState(0L, null));
+        }
+        return new RollupEntry(entry.uuid(), shards, java.util.Collections.unmodifiableList(states), entry.alias());
     }
 
-    private static Entry with(Entry entry, int shard, ShardState state) {
-        final List<ShardState> states = new ArrayList<>(entry.states());
+    private static RollupEntry fresh(String uuid, int shards) {
+        final List<RollupShardState> states = new ArrayList<>(shards);
+        for (int i = 0; i < shards; i++) {
+            states.add(new RollupShardState(0L, null));
+        }
+        return new RollupEntry(uuid, shards, List.copyOf(states));
+    }
+
+    private static RollupEntry with(RollupEntry entry, int shard, RollupShardState state) {
+        final List<RollupShardState> states = new ArrayList<>(entry.states());
         states.set(shard, state);
-        return new Entry(entry.uuid(), entry.shards(), java.util.Collections.unmodifiableList(states), entry.alias());
+        return new RollupEntry(entry.uuid(), entry.shards(), java.util.Collections.unmodifiableList(states), entry.alias());
     }
 
-    static BytesReference encode(Map<String, Entry> entries) throws IOException {
+    static BytesReference encode(Map<String, RollupEntry> entries) throws IOException {
         try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
             builder.startObject();
             builder.startObject("entries");
-            for (Map.Entry<String, Entry> e : entries.entrySet()) {
+            for (Map.Entry<String, RollupEntry> e : entries.entrySet()) {
                 builder.startObject(e.getKey());
                 if (e.getValue().alias()) {
                     builder.field("alias", true);
@@ -643,7 +595,7 @@ public final class DigestRollups {
                 builder.field("uuid", e.getValue().uuid());
                 builder.field("shards", e.getValue().shards());
                 builder.startArray("states");
-                for (ShardState state : e.getValue().states()) {
+                for (RollupShardState state : e.getValue().states()) {
                     builder.startObject();
                     builder.field("owner", state.ownerTerm());
                     if (state.digest() != null) {
@@ -661,8 +613,8 @@ public final class DigestRollups {
         }
     }
 
-    static Map<String, Entry> parse(BytesReference bytes) throws IOException {
-        final Map<String, Entry> entries = new LinkedHashMap<>();
+    static Map<String, RollupEntry> parse(BytesReference bytes) throws IOException {
+        final Map<String, RollupEntry> entries = new LinkedHashMap<>();
         try (
             InputStream in = bytes.streamInput();
             XContentParser parser = XContentType.JSON.xContent()
@@ -693,14 +645,14 @@ public final class DigestRollups {
         return entries;
     }
 
-    private static Entry parseEntry(XContentParser parser) throws IOException {
+    private static RollupEntry parseEntry(XContentParser parser) throws IOException {
         if (parser.currentToken() != XContentParser.Token.START_OBJECT) {
             throw new IOException("digest rollup entry must be an object");
         }
         String uuid = null;
         int shards = 0;
         boolean alias = false;
-        final List<ShardState> states = new ArrayList<>();
+        final List<RollupShardState> states = new ArrayList<>();
         String field = null;
         XContentParser.Token token;
         while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
@@ -729,7 +681,7 @@ public final class DigestRollups {
                             owner = parser.longValue();
                         }
                     }
-                    states.add(new ShardState(owner, digest));
+                    states.add(new RollupShardState(owner, digest));
                 }
             } else if (token == XContentParser.Token.START_OBJECT || token == XContentParser.Token.START_ARRAY) {
                 parser.skipChildren();
@@ -741,7 +693,7 @@ public final class DigestRollups {
                 alias = parser.booleanValue();
             }
         }
-        return new Entry(uuid, shards, java.util.Collections.unmodifiableList(states), alias);
+        return new RollupEntry(uuid, shards, java.util.Collections.unmodifiableList(states), alias);
     }
 
     /**
@@ -752,7 +704,7 @@ public final class DigestRollups {
      * @param entry what to write
      * @throws IOException if the register cannot be written
      */
-    public void plantForTest(String name, Entry entry) throws IOException {
+    public void plantForTest(String name, RollupEntry entry) throws IOException {
         update(name, current -> entry);
     }
 }

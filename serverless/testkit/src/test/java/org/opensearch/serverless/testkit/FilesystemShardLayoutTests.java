@@ -14,7 +14,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.RegisterMap;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.store.ObjectStores;
+import org.opensearch.serverless.store.MeteredBlobStore;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.net.URI;
@@ -59,7 +59,7 @@ public class FilesystemShardLayoutTests extends OpenSearchTestCase {
     public void testValidationThroughDecoratorsDoesNotTouchTheStore() throws Exception {
         final var root = createTempDir();
         final var counting = new CountingBlobStore(new FsBlobStore(1024, root, false));
-        try (BlobStore store = new ObjectStores.Metered(new HookedBlobStore(counting))) {
+        try (BlobStore store = new MeteredBlobStore(new HookedBlobStore(counting))) {
             expectThrows(
                 IllegalArgumentException.class,
                 () -> store.validateKey(BlobPath.cleanPath().add("not-created").add("x".repeat(256)), "manifest")

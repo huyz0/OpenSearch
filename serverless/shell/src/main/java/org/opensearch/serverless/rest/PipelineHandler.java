@@ -15,6 +15,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.TemplateStore;
+import org.opensearch.serverless.metadata.TooManyTemplatesException;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -172,7 +173,7 @@ public final class PipelineHandler extends BaseRestHandler {
                 }
             } catch (IndexAdminHandler.RefusedException e) {
                 sendQuietly(channel, e.status, e.type, e.getMessage());
-            } catch (TemplateStore.TooManyTemplatesException e) {
+            } catch (TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_pipelines", e.getMessage());
             } catch (Exception e) {
                 try {

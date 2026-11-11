@@ -165,7 +165,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
                         channel.sendResponse(new BytesRestResponse(response.status(), builder));
                     }
                 }
-            } catch (org.opensearch.serverless.metadata.TemplateStore.TooManyTemplatesException e) {
+            } catch (org.opensearch.serverless.metadata.TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_scripts", e.getMessage());
             } catch (IllegalArgumentException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());

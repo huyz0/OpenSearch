@@ -64,6 +64,9 @@ public final class IndexDescriptor {
     private final long createdAtMillis;
     private final int createdVersionId;
     private final List<String> aliasedBy;
+    private final org.opensearch.serverless.routing.UnitLayout layout;
+    /** The live unit ids, sorted; null for an index without a layout, whose shards are all live. */
+    private final int[] unitIds;
 
     /**
      * This descriptor rendered for routing, built once on demand.
@@ -171,6 +174,56 @@ public final class IndexDescriptor {
         int createdVersionId,
         List<String> aliasedBy
     ) {
+        this(
+            name,
+            uuid,
+            numberOfShards,
+            mapping,
+            extraSettings,
+            mappingVersion,
+            settingsVersion,
+            createdAtMillis,
+            createdVersionId,
+            aliasedBy,
+            null
+        );
+    }
+
+    /**
+     * Creates a descriptor with a unit layout: an index created with a shard mode.
+     *
+     * <p>{@code numberOfShards} is then the number of physical shard <em>slots</em>: the layout's next
+     * unit id, so every unit the index has ever had, live or retired by a split, is a shard below it.
+     * Housekeeping that must reach every slot (purging, reclaiming, releasing) keeps enumerating
+     * {@code 0..numberOfShards-1}; serving (search fan-out, health, catalog, points in time) enumerates
+     * {@link #unitIds()}, the live units only. The layout's declared count is what the user asked for. In
+     * fixed mode all three are equal; an adaptive index starts as one unit whatever it declared.
+     *
+     * @param name the index name
+     * @param uuid the index uuid
+     * @param numberOfShards the physical shard slots; with a layout, its next unit id
+     * @param mapping the mapping, or null
+     * @param extraSettings the settings beyond the shard count
+     * @param mappingVersion how many times the mapping has changed
+     * @param settingsVersion how many times the settings have changed
+     * @param createdAtMillis when the index was created, or 0 when not recorded
+     * @param createdVersionId the id of the OpenSearch version that created it, or 0 when not recorded
+     * @param aliasedBy the aliases believed to name this index
+     * @param layout the range map from routing hashes to units, or null for an index without a shard mode
+     */
+    public IndexDescriptor(
+        String name,
+        String uuid,
+        int numberOfShards,
+        String mapping,
+        Settings extraSettings,
+        long mappingVersion,
+        long settingsVersion,
+        long createdAtMillis,
+        int createdVersionId,
+        List<String> aliasedBy,
+        org.opensearch.serverless.routing.UnitLayout layout
+    ) {
         this.name = Objects.requireNonNull(name);
         this.uuid = Objects.requireNonNull(uuid);
         if (numberOfShards < 1) {
@@ -194,6 +247,84 @@ public final class IndexDescriptor {
         this.createdAtMillis = createdAtMillis;
         this.createdVersionId = createdVersionId;
         this.aliasedBy = List.copyOf(aliasedBy);
+        if (layout != null && layout.nextUnitId() != numberOfShards) {
+            // Every unit id is below the next one, so this also puts every unit inside the slots.
+            throw new IllegalArgumentException(
+                "[" + name + "] has " + numberOfShards + " shard slots but its layout's next unit id is " + layout.nextUnitId()
+            );
+        }
+        this.layout = layout;
+        if (layout == null) {
+            this.unitIds = null;
+        } else {
+            final int[] ids = new int[layout.unitCount()];
+            for (int i = 0; i < ids.length; i++) {
+                ids[i] = layout.units().get(i).id();
+            }
+            java.util.Arrays.sort(ids);
+            this.unitIds = ids;
+        }
+    }
+
+    /**
+     * Returns the shards that hold documents now, in ascending order: {@code 0..numberOfShards-1} for an
+     * index without a shard mode, the live unit ids otherwise. What a search fans out over, and what health,
+     * the catalog and a point in time cover. A unit retired by a split keeps its slot until its data is
+     * collected, but is not here.
+     *
+     * @return the live shard ids; a fresh array the caller may keep
+     */
+    public int[] unitIds() {
+        if (unitIds == null) {
+            final int[] all = new int[numberOfShards];
+            for (int i = 0; i < all.length; i++) {
+                all[i] = i;
+            }
+            return all;
+        }
+        return unitIds.clone();
+    }
+
+    /**
+     * Returns the range map from routing hashes to units, or null for an index created without a shard mode.
+     *
+     * @return the layout, or null
+     */
+    public org.opensearch.serverless.routing.UnitLayout layout() {
+        return layout;
+    }
+
+    /**
+     * Returns the shard count the user declared, which every user-facing shard count reports.
+     *
+     * <p>The same as {@link #numberOfShards()} for an index without a shard mode, and for a fixed one.
+     *
+     * @return the declared shard count
+     */
+    public int declaredShards() {
+        return layout == null ? numberOfShards : layout.declaredShards();
+    }
+
+    /**
+     * Returns this descriptor with a unit layout, its shard slots set to the layout's next unit id.
+     *
+     * @param newLayout the layout, or null to route as an index without a shard mode
+     * @return the new descriptor
+     */
+    public IndexDescriptor withLayout(org.opensearch.serverless.routing.UnitLayout newLayout) {
+        return new IndexDescriptor(
+            name,
+            uuid,
+            newLayout == null ? numberOfShards : newLayout.nextUnitId(),
+            mapping,
+            extraSettings,
+            mappingVersion,
+            settingsVersion,
+            createdAtMillis,
+            createdVersionId,
+            aliasedBy,
+            newLayout
+        );
     }
 
     /**
@@ -247,7 +378,8 @@ public final class IndexDescriptor {
             settingsVersion,
             createdAtMillis,
             createdVersionId,
-            aliasedBy
+            aliasedBy,
+            layout
         );
     }
 
@@ -268,7 +400,8 @@ public final class IndexDescriptor {
             settingsVersion,
             createdAtMillis,
             createdVersionId,
-            aliases
+            aliases,
+            layout
         );
     }
 
@@ -403,7 +536,8 @@ public final class IndexDescriptor {
             settingsVersion,
             createdAtMillis,
             createdVersionId,
-            aliasedBy
+            aliasedBy,
+            layout
         );
     }
 
@@ -433,7 +567,8 @@ public final class IndexDescriptor {
             settingsVersion + 1,
             createdAtMillis,
             createdVersionId,
-            aliasedBy
+            aliasedBy,
+            layout
         );
     }
 
@@ -474,6 +609,13 @@ public final class IndexDescriptor {
             }
             if (aliasedBy.isEmpty() == false) {
                 builder.field("aliased_by", aliasedBy);
+            }
+            // Only for an index created with a shard mode, so every other descriptor is byte-identical to
+            // what this class wrote before layouts existed.
+            if (layout != null) {
+                builder.startObject("unit_layout");
+                org.opensearch.serverless.routing.UnitLayoutFormat.toXContent(layout, builder);
+                builder.endObject();
             }
             // Core's own settings serialization, rather than a flat key-to-string loop.
             //
@@ -516,6 +658,7 @@ public final class IndexDescriptor {
             int createdVersionId = 0;
             final List<String> aliasedBy = new java.util.ArrayList<>();
             Settings parsedSettings = Settings.EMPTY;
+            org.opensearch.serverless.routing.UnitLayout layout = null;
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
@@ -523,6 +666,8 @@ public final class IndexDescriptor {
                     field = parser.currentName();
                 } else if (token == XContentParser.Token.START_OBJECT && "settings".equals(field)) {
                     parsedSettings = Settings.fromXContent(parser);
+                } else if (token == XContentParser.Token.START_OBJECT && "unit_layout".equals(field)) {
+                    layout = org.opensearch.serverless.routing.UnitLayoutFormat.fromXContent(parser);
                 } else if (token == XContentParser.Token.START_ARRAY && "aliased_by".equals(field)) {
                     while ((token = parser.nextToken()) != XContentParser.Token.END_ARRAY) {
                         aliasedBy.add(parser.text());
@@ -560,7 +705,8 @@ public final class IndexDescriptor {
                 settingsVersion,
                 createdAtMillis,
                 createdVersionId,
-                aliasedBy
+                aliasedBy,
+                layout
             );
         }
     }
@@ -577,14 +723,15 @@ public final class IndexDescriptor {
                 && Objects.equals(mapping, other.mapping)
                 && mappingVersion == other.mappingVersion
                 && settingsVersion == other.settingsVersion
-                && extraSettings.equals(other.extraSettings);
+                && extraSettings.equals(other.extraSettings)
+                && Objects.equals(layout, other.layout);
         }
         return false;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(name, uuid, numberOfShards, mapping, extraSettings, mappingVersion, settingsVersion);
+        return Objects.hash(name, uuid, numberOfShards, mapping, extraSettings, mappingVersion, settingsVersion, layout);
     }
 
     @Override

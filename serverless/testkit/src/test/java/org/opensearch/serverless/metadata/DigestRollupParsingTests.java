@@ -38,7 +38,7 @@ public class DigestRollupParsingTests extends OpenSearchTestCase {
             }},"later":[{}]}
             """;
         assertEquals(
-            Map.of("logs-a", new DigestRollups.Entry("uuid-a", 1, java.util.List.of(new DigestRollups.ShardState(7L, null)))),
+            Map.of("logs-a", new RollupEntry("uuid-a", 1, java.util.List.of(new RollupShardState(7L, null)))),
             DigestRollups.parse(new BytesArray(json))
         );
     }

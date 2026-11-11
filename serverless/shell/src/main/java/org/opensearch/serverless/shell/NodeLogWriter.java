@@ -335,6 +335,36 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
     }
 
     /**
+     * Streams the records of a shard this node holds that its node log still keeps and a commit does not, oldest first:
+     * those past {@code afterSeqNo}, the local checkpoint of the commit the caller started from. For a caller that
+     * moves part of a shard elsewhere and filters what it is handed, such as a shard split. It reads only; it fences
+     * nothing a live writer uses, and changes nothing.
+     *
+     * <p>The node log keeps a shard's records only until a commit holding them is published, so {@code afterSeqNo} must
+     * be at or past the local checkpoint of the shard's latest published commit; records the log has let go of are not
+     * streamed. Records of a write not yet acknowledged are not streamed either: a caller that needs every write holds
+     * the shard's writes first.
+     *
+     * @param shardId the shard
+     * @param term the term this node holds it at
+     * @param afterSeqNo the highest sequence number the caller already has; negative for every record the log keeps
+     * @param consumer what takes each record
+     * @return how many records were streamed
+     * @throws IOException if a read fails
+     */
+    public long forEachRecordSince(ShardId shardId, long term, long afterSeqNo, CheckedConsumer<WalRecord, IOException> consumer)
+        throws IOException {
+        final long[] count = { 0 };
+        replay(shardId, null, term, record -> {
+            if (record.seqNo() > afterSeqNo) {
+                count[0]++;
+                consumer.accept(record);
+            }
+        });
+        return count[0];
+    }
+
+    /**
      * Stops the shard's head naming the logs the open replayed, now that what they held of it is published.
      *
      * @param shardId the shard
