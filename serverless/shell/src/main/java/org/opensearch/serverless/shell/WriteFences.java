@@ -15,8 +15,55 @@ public final class WriteFences {
 
     private final ServerlessNode node;
 
+    /** The shards whose writes are held or forwarded; see {@link WriteHold}. Empty unless a caller takes a hold. */
+    private final java.util.Map<org.opensearch.core.index.shard.ShardId, WriteHold> holds = new java.util.concurrent.ConcurrentHashMap<>();
+
     WriteFences(ServerlessNode node) {
         this.node = node;
+    }
+
+    /**
+     * Holds a shard's writes, for a caller that hands the shard's documents elsewhere; see {@link WriteHold}.
+     *
+     * <p>Returns once every write already under way on the shard is acknowledged, so the node log holds each of them,
+     * and no later write is applied until the hold ends. Nothing in the node takes a hold by itself.
+     *
+     * @param shardId the shard
+     * @param maxMillis how long the hold may last before writes go on here regardless; at least 1
+     * @return the hold, which the caller resumes, forwards or closes
+     * @throws IllegalStateException if the shard's writes are already held
+     */
+    public WriteHold hold(org.opensearch.core.index.shard.ShardId shardId, long maxMillis) {
+        if (maxMillis < 1) {
+            throw new IllegalArgumentException("a hold lasts at least 1 ms, not " + maxMillis);
+        }
+        final WriteHold hold = new WriteHold(shardId, maxMillis, holds);
+        if (holds.putIfAbsent(shardId, hold) != null) {
+            throw new IllegalStateException("the writes to " + shardId + " are already held");
+        }
+        // The write side waits out every write that holds the read side, and a write that takes the read side after
+        // this finds the hold and waits.
+        final java.util.concurrent.locks.ReentrantReadWriteLock fence = node.shardFences.computeIfAbsent(
+            shardId,
+            k -> new java.util.concurrent.locks.ReentrantReadWriteLock()
+        );
+        fence.writeLock().lock();
+        fence.writeLock().unlock();
+        return hold;
+    }
+
+    /**
+     * Waits out a hold on a shard's writes before a write is admitted. Free when the shard's writes are not held.
+     *
+     * @param shardId the shard
+     * @throws WriteHold.Forwarded if the write goes to the hold's target instead
+     * @throws java.io.IOException if the wait is interrupted
+     */
+    void awaitHold(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
+        final WriteHold hold = holds.get(shardId);
+        if (hold != null) {
+            hold.await();
+        }
     }
 
     /**
@@ -286,14 +333,26 @@ public final class WriteFences {
         }
     }
 
-    /** Takes the read side of a shard's fence; the caller unlocks what is returned. */
-    java.util.concurrent.locks.Lock enterWritePath(org.opensearch.core.index.shard.ShardId shardId) {
+    /**
+     * Takes the read side of a shard's fence; the caller unlocks what is returned.
+     *
+     * @throws WriteHold.Forwarded if a hold taken since {@link #awaitHold} sends the write to its target
+     * @throws java.io.IOException if waiting out such a hold is interrupted
+     */
+    java.util.concurrent.locks.Lock enterWritePath(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
         while (true) {
             final java.util.concurrent.locks.ReentrantReadWriteLock fence = node.shardFences.computeIfAbsent(
                 shardId,
                 k -> new java.util.concurrent.locks.ReentrantReadWriteLock()
             );
             fence.readLock().lock();
+            final WriteHold hold = holds.get(shardId);
+            if (hold != null) {
+                // Taken between this write's awaitHold and here: waited out like any other, never written past.
+                fence.readLock().unlock();
+                hold.await();
+                continue;
+            }
             if (node.shardFences.get(shardId) == fence) {
                 return fence.readLock();
             }

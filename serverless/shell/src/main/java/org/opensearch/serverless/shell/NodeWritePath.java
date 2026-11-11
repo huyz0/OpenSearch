@@ -132,16 +132,21 @@ public final class NodeWritePath {
         boolean mayGrowMapping
     ) throws java.io.IOException {
         node.ensureStarted();
-        // Admitted before anything is applied, so a write refused for back-pressure is in neither the engine nor the log.
-        try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
-            // Under the shard's fence from before the engine applies the operation until after it is
-            // acknowledged. See appendOrRelease for the interleaving this closes.
-            final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
-            try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
-                return indexUnderFence(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
-            } finally {
-                fence.unlock();
+        try {
+            node.fences.awaitHold(shardId);
+            // Admitted before anything is applied, so a write refused for back-pressure is in neither the engine nor the log.
+            try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
+                // Under the shard's fence from before the engine applies the operation until after it is
+                // acknowledged. See appendOrRelease for the interleaving this closes.
+                final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
+                try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
+                    return indexUnderFence(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
+                } finally {
+                    fence.unlock();
+                }
             }
+        } catch (WriteHold.Forwarded forwarded) {
+            return forwarded.target.index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
         }
     }
 
@@ -370,13 +375,18 @@ public final class NodeWritePath {
     public WriteOutcome delete(org.opensearch.core.index.shard.ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm)
         throws java.io.IOException {
         node.ensureStarted();
-        try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
-            final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
-            try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
-                return deleteUnderFence(shardId, id, ifSeqNo, ifPrimaryTerm);
-            } finally {
-                fence.unlock();
+        try {
+            node.fences.awaitHold(shardId);
+            try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
+                final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
+                try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
+                    return deleteUnderFence(shardId, id, ifSeqNo, ifPrimaryTerm);
+                } finally {
+                    fence.unlock();
+                }
             }
+        } catch (WriteHold.Forwarded forwarded) {
+            return forwarded.target.delete(shardId, id, ifSeqNo, ifPrimaryTerm);
         }
     }
 
@@ -472,13 +482,18 @@ public final class NodeWritePath {
     public java.util.List<BulkOutcome> bulkOperations(org.opensearch.core.index.shard.ShardId shardId, java.util.List<BulkOperation> batch)
         throws java.io.IOException {
         node.ensureStarted();
-        try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
-            final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
-            try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
-                return bulkOperationsUnderFence(shardId, batch);
-            } finally {
-                fence.unlock();
+        try {
+            node.fences.awaitHold(shardId);
+            try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
+                final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
+                try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
+                    return bulkOperationsUnderFence(shardId, batch);
+                } finally {
+                    fence.unlock();
+                }
             }
+        } catch (WriteHold.Forwarded forwarded) {
+            return forwarded.target.bulk(shardId, batch);
         }
     }
 
