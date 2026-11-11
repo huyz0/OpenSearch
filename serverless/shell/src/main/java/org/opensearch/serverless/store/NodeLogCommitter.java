@@ -56,7 +56,13 @@ import java.util.concurrent.locks.ReentrantLock;
 public final class NodeLogCommitter {
 
     /** How long a window stays open after its first record arrives. */
-    public static final long DEFAULT_WINDOW_MILLIS = 200L;
+    public static final long DEFAULT_WINDOW_MILLIS = 250L;
+
+    /**
+     * The windows a deployment may choose: long enough that a node writing many shards pays one PUT for all of them,
+     * short enough that a write is acknowledged within a quarter of a second.
+     */
+    public static final java.util.Set<Long> ALLOWED_WINDOW_MILLIS = java.util.Set.of(100L, 200L, 250L);
     /** Roughly the most bytes of id and source one window takes before the next arrival opens another. */
     public static final long DEFAULT_MAX_BYTES = 8L * 1024 * 1024;
     /** The most records one window takes before the next arrival opens another. */

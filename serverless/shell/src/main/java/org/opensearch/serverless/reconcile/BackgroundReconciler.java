@@ -103,6 +103,7 @@ public final class BackgroundReconciler implements Closeable {
     private final Map<ShardId, Long> unpublishedSinceMillis = new ConcurrentHashMap<>();
     private volatile long lazyPublishMaxAgeMillis;
     private volatile long lazyPublishMaxOperations;
+    private volatile long lazyPublishTickMillis = 1L;
     private final Set<ShardId> dirty = ConcurrentHashMap.newKeySet();
     private final Set<ShardId> fenced = ConcurrentHashMap.newKeySet();
     private final Set<String> pinnedIndices = ConcurrentHashMap.newKeySet();
@@ -534,13 +535,22 @@ public final class BackgroundReconciler implements Closeable {
      *
      * <p>The edges and the backstop both follow it. A release, a hand-off and an idle release publish regardless.
      *
-     * @param maxAgeMillis how long a write may wait to be published; zero or less to publish as before
+     * <p><b>By the index's refresh interval.</b> An index that sets {@code index.refresh_interval} is published once its
+     * oldest unpublished write is that old, and so never more often than that, except by size; one that sets
+     * {@code -1} is published only by size or on release; one that sets nothing waits {@code maxAgeMillis}. Every due
+     * time is rounded up to the node's tick, the window its write log ships on, so the shards that come due together
+     * go out in one pass.
+     *
+     * @param maxAgeMillis how long a write to an index that sets no refresh interval may wait to be published; zero or
+     *     less to publish as before
      * @param maxOperations how many unpublished operations make a shard due sooner; zero or less for never sooner
+     * @param tickMillis the node's tick, which every due time is rounded up to; one or less for none
      * @return this, for chaining
      */
-    public BackgroundReconciler setLazyPublish(long maxAgeMillis, long maxOperations) {
+    public BackgroundReconciler setLazyPublish(long maxAgeMillis, long maxOperations, long tickMillis) {
         this.lazyPublishMaxAgeMillis = maxAgeMillis;
         this.lazyPublishMaxOperations = maxOperations;
+        this.lazyPublishTickMillis = Math.max(1L, tickMillis);
         return this;
     }
 
@@ -2821,11 +2831,28 @@ public final class BackgroundReconciler implements Closeable {
         }
         // A write reported while a publish was in flight may have lost its stamp; it is aged from now.
         final long since = unpublishedSinceMillis.computeIfAbsent(shardId, ignored -> nowMillis);
-        if (nowMillis - since >= maxAge) {
-            return true;
+        final long age = publishAgeOf(shard, maxAge);
+        if (age >= 0) {
+            final long tick = lazyPublishTickMillis;
+            final long dueAt = since + age;
+            final long alignedDueAt = dueAt % tick == 0 ? dueAt : (dueAt / tick + 1) * tick;
+            if (nowMillis >= alignedDueAt) {
+                return true;
+            }
         }
         final long maxOperations = lazyPublishMaxOperations;
         return maxOperations > 0 && maxSeqNo - lastThrough >= maxOperations;
+    }
+
+    /** How old a shard's oldest unpublished write may get: its index's refresh interval, or the node's default. */
+    private static long publishAgeOf(org.opensearch.index.shard.IndexShard shard, long defaultMillis) {
+        final org.opensearch.index.IndexSettings settings = shard.indexSettings();
+        if (org.opensearch.index.IndexSettings.INDEX_REFRESH_INTERVAL_SETTING.exists(settings.getSettings()) == false) {
+            return defaultMillis;
+        }
+        final long refresh = settings.getRefreshInterval().millis();
+        // Refresh turned off: published by size or on release only.
+        return refresh < 0 ? -1L : refresh;
     }
 
     /**

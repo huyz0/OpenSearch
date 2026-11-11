@@ -55,7 +55,7 @@ public class NodeLogLazyPublishTests extends OpenSearchTestCase {
             node.start();
             node.setMetadataPlane(plane);
             node.renewLease(plane);
-            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setLazyPublish(MAX_AGE, 5);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setLazyPublish(MAX_AGE, 5, 1L);
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final ShardId shardId = node.reconciler().openShards().iterator().next();
@@ -82,6 +82,55 @@ public class NodeLogLazyPublishTests extends OpenSearchTestCase {
             write(node, loop, shardId, "burst-4");
             assertEquals("at it, it is published at once", Set.of(shardId), loop.publishDirty(clock.get(), 0L, 0L));
             assertEquals("and nothing is left to publish", Set.of(), loop.tick(clock.get() + 2 * MAX_AGE).published());
+        }
+    }
+
+    private static ShardId openOne(ServerlessNode node, MetadataPlane plane, BackgroundReconciler loop, AtomicLong clock, String index)
+        throws Exception {
+        loop.want(index, 0);
+        loop.tick(clock.get());
+        for (ShardId shardId : node.reconciler().openShards()) {
+            if (shardId.getIndexName().equals(index)) {
+                return shardId;
+            }
+        }
+        throw new AssertionError(index + " did not open");
+    }
+
+    public void testAnIndexsRefreshIntervalIsItsPublishAgeLinedUpWithTheNodesTick() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(
+            new IndexDescriptor("fresh", "uuid-fresh-00000000", 1, MAPPING, Settings.builder().put("index.refresh_interval", "5s").build())
+        );
+        plane.createIndex(
+            new IndexDescriptor("off", "uuid-off-0000000000", 1, MAPPING, Settings.builder().put("index.refresh_interval", "-1").build())
+        );
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("node-log-refresh"))) {
+            node.start();
+            node.setMetadataPlane(plane);
+            node.renewLease(plane);
+            final long tick = 250L;
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setLazyPublish(MAX_AGE, 0L, tick);
+            final ShardId fresh = openOne(node, plane, loop, clock, "fresh");
+            final ShardId off = openOne(node, plane, loop, clock, "off");
+            write(node, loop, fresh, "first");
+            write(node, loop, off, "first");
+            assertEquals("each is published once at once", Set.of(fresh, off), loop.publishDirty(clock.get(), 0L, 0L));
+
+            clock.addAndGet(100L);
+            write(node, loop, fresh, "second");
+            write(node, loop, off, "second");
+            clock.addAndGet(5_000L);
+            assertEquals("five seconds on, but the tick after them is not yet here", Set.of(), loop.publishDirty(clock.get(), 0L, 0L));
+            clock.addAndGet(tick);
+            assertEquals(
+                "published at the node's tick after its refresh interval; refresh off waits for size or release",
+                Set.of(fresh),
+                loop.publishDirty(clock.get(), 0L, 0L)
+            );
+            clock.addAndGet(2 * MAX_AGE);
+            assertEquals("not even the node's default age applies to it", Set.of(), loop.publishDirty(clock.get(), 0L, 0L));
         }
     }
 }
