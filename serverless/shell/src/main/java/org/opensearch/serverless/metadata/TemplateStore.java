@@ -102,31 +102,13 @@ public final class TemplateStore {
     private static final int MARKER_ATTEMPTS = 10;
 
     private final ConditionalBlobContainer container;
-    private final Cache cache;
+    private final TemplateCache cache;
 
     /** The register that moves on every change, so a reader can tell whether its copy is current. */
     static final String VERSION_BLOB = "_version";
 
-    /**
-     * A node's copy of one store's contents, valid while the marker has not moved.
-     *
-     * <p>Shared across the {@code TemplateStore} instances the plane hands out for one container, which
-     * is what makes reading every template on every index creation cost one small register read rather
-     * than a listing and a read per template. One reference, replaced whole, so a reader never sees a
-     * version labelled with another version's contents.
-     */
-    public static final class Cache {
-        private volatile Snapshot snapshot;
-        private final org.opensearch.common.cache.Cache<String, String> content = org.opensearch.common.cache.CacheBuilder.<
-            String,
-            String>builder().setMaximumWeight(MAX_CACHED_BYTES).weigher((key, value) -> retainedBytes(key, value)).build();
-
-        /** Creates an empty cache, which the first read fills. */
-        public Cache() {}
-    }
-
     /** One consistent reading of the store: the marker's version, the hashes it named, their contents. */
-    private record Snapshot(long version, Map<String, String> hashes, Map<String, String> contents) {
+    record Snapshot(long version, Map<String, String> hashes, Map<String, String> contents) {
     }
 
     /** The register as read: a change count, and the index of names to hashes once the store carries one. */
@@ -149,7 +131,7 @@ public final class TemplateStore {
      * @param container the register container holding these templates
      */
     public TemplateStore(BlobContainer container) {
-        this(container, new Cache());
+        this(container, new TemplateCache());
     }
 
     /**
@@ -158,7 +140,7 @@ public final class TemplateStore {
      * @param container the container
      * @param cache the cache shared by every store over this container on this node
      */
-    public TemplateStore(BlobContainer container, Cache cache) {
+    public TemplateStore(BlobContainer container, TemplateCache cache) {
         this.container = ConditionalBlobContainer.of(container);
         this.cache = cache;
     }
@@ -596,7 +578,7 @@ public final class TemplateStore {
         }
     }
 
-    private static long retainedBytes(String key, String value) {
+    static long retainedBytes(String key, String value) {
         return 128L + 2L * (key.length() + (long) value.length());
     }
 
@@ -698,24 +680,6 @@ public final class TemplateStore {
     private static boolean missing(IOException e) {
         final String message = e.getMessage();
         return message != null && (message.contains("NoSuchKey") || message.contains("does not exist") || message.contains("Not Found"));
-    }
-
-    /** More templates than a deployment may hold. */
-    public static final class TooManyTemplatesException extends IOException {
-        /**
-         * Creates the exception.
-         *
-         * @param cap the limit that was reached
-         */
-        public TooManyTemplatesException(int cap) {
-            super(
-                "this deployment already holds "
-                    + cap
-                    + " templates, which is the most it will hold: index creation reads every template to find "
-                    + "the ones that match, so an unbounded number of them would make index creation "
-                    + "unboundedly slow. Delete one before adding another"
-            );
-        }
     }
 
     /** Renders a stored template as raw JSON bytes for a response. */

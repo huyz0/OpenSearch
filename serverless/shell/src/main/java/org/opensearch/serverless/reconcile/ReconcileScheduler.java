@@ -62,7 +62,7 @@ import java.util.function.LongSupplier;
  */
 public final class ReconcileScheduler implements ReconcileSignals, Closeable {
 
-    private static final Logger logger = LogManager.getLogger(ReconcileScheduler.class);
+    static final Logger logger = LogManager.getLogger(ReconcileScheduler.class);
 
     /**
      * How many renewals fit inside one lease TTL.
@@ -124,39 +124,37 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     /** How often the full pass runs regardless of what any edge did or failed to do. */
     public static final TimeValue DEFAULT_BACKSTOP_INTERVAL = TimeValue.timeValueSeconds(30);
 
-    private final ReconcileActivity activity = new ReconcileActivity();
-    private final BackgroundReconciler loop;
-    private final ThreadPool threadPool;
-    private final LongSupplier clock;
-    private final TimeValue renewalInterval;
-    private final TimeValue publishDebounce;
-    private final TimeValue backstopInterval;
+    final ReconcileActivity activity = new ReconcileActivity();
+    /** Takes over departed nodes' shards. */
+    final DeadNodeTakeover takeovers = new DeadNodeTakeover(this);
+    final BackgroundReconciler loop;
+    final ThreadPool threadPool;
+    final LongSupplier clock;
+    final TimeValue renewalInterval;
+    final TimeValue publishDebounce;
+    final TimeValue backstopInterval;
 
-    private volatile TimeValue publishMinInterval = TimeValue.ZERO;
-    private volatile long publishMaxUnpublishedOperations;
+    volatile TimeValue publishMinInterval = TimeValue.ZERO;
+    volatile long publishMaxUnpublishedOperations;
 
-    private final AtomicBoolean publishPending = new AtomicBoolean();
-    private final AtomicBoolean activationPending = new AtomicBoolean();
-    private final java.util.Set<Map.Entry<String, Integer>> doubted = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    private final AtomicLong renewals = new AtomicLong();
-    private final AtomicLong publishes = new AtomicLong();
-    private final AtomicLong activations = new AtomicLong();
-    private final AtomicLong backstops = new AtomicLong();
+    final AtomicBoolean publishPending = new AtomicBoolean();
+    final AtomicBoolean activationPending = new AtomicBoolean();
+    final java.util.Set<Map.Entry<String, Integer>> doubted = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    final AtomicLong renewals = new AtomicLong();
+    final AtomicLong publishes = new AtomicLong();
+    final AtomicLong activations = new AtomicLong();
+    final AtomicLong backstops = new AtomicLong();
 
-    private volatile Scheduler.ScheduledCancellable renewalTask;
-    private volatile Scheduler.Cancellable backstopTask;
-    private volatile Scheduler.Cancellable janitorTask;
-    private volatile TimeValue janitorInterval;
-    private final AtomicLong janitorPasses = new AtomicLong();
-    private final AtomicLong janitorRequests = new AtomicLong();
-    private final AtomicLong janitorExamined = new AtomicLong();
-    private final AtomicLong janitorReleased = new AtomicLong();
-    private final AtomicLong janitorReplays = new AtomicLong();
-    private final AtomicLong janitorForgotten = new AtomicLong();
-
-    /** What the janitor has done since the node started, and the store requests its passes made. */
-    public record JanitorStats(long passes, long storeRequests, long examined, long released, long replays, long claimsForgotten) {
-    }
+    volatile Scheduler.ScheduledCancellable renewalTask;
+    volatile Scheduler.Cancellable backstopTask;
+    volatile Scheduler.Cancellable janitorTask;
+    volatile TimeValue janitorInterval;
+    final AtomicLong janitorPasses = new AtomicLong();
+    final AtomicLong janitorRequests = new AtomicLong();
+    final AtomicLong janitorExamined = new AtomicLong();
+    final AtomicLong janitorReleased = new AtomicLong();
+    final AtomicLong janitorReplays = new AtomicLong();
+    final AtomicLong janitorForgotten = new AtomicLong();
 
     /**
      * Returns the janitor's counters. Store requests are those its passes made on their own thread; the replays it
@@ -233,7 +231,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         }
     }
 
-    private volatile boolean closed;
+    volatile boolean closed;
 
     /**
      * Builds a scheduler for a node, wires it as that node's signal sink, and starts its timers.
@@ -368,11 +366,11 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                         final long sinceExpiry = clock.getAsLong() - left.expiresAtMillis();
                         if (closed == false && sinceExpiry <= RECENT_DEPARTURE_TTLS * leaseTtlMillis()) {
                             final String incarnation = left.nodeId() + "/" + left.ephemeralId();
-                            final Departure departure = departures.computeIfAbsent(
+                            final DeadNodeTakeover.Departure departure = departures.computeIfAbsent(
                                 incarnation,
-                                key -> new Departure(left, clock.getAsLong())
+                                key -> new DeadNodeTakeover.Departure(left, clock.getAsLong())
                             );
-                            threadPool.generic().execute(() -> takeOverIfGone(departure, 0));
+                            threadPool.generic().execute(() -> takeovers.takeOverIfGone(departure, 0));
                         }
                     }
 
@@ -476,66 +474,14 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     /** How long ago a lease may have run out and still be a departure whose shards are taken at once, in TTLs. */
     static final int RECENT_DEPARTURE_TTLS = 3;
 
-    /** One observed absence, discarded on rejoin so a later absence of the same process is independent. */
-    private record Departure(org.opensearch.serverless.membership.NodeLease lease, long noticedAt, AtomicBoolean takenOver) {
-        Departure(org.opensearch.serverless.membership.NodeLease lease, long noticedAt) {
-            this(lease, noticedAt, new AtomicBoolean());
-        }
-    }
+    final java.util.Map<String, DeadNodeTakeover.Departure> departures = new java.util.concurrent.ConcurrentHashMap<>();
 
-    private final java.util.Map<String, Departure> departures = new java.util.concurrent.ConcurrentHashMap<>();
-
-    private void pruneDepartureHistory() {
-        final long now = clock.getAsLong();
-        departures.entrySet().removeIf(entry -> now - entry.getValue().noticedAt() > RECENT_DEPARTURE_TTLS * leaseTtlMillis());
-    }
-
-    private long leaseTtlMillis() {
+    long leaseTtlMillis() {
         return Math.max(1L, renewalInterval.millis() * RENEWALS_PER_TTL);
     }
 
     /** How many times a departure whose lease was still live is looked at again, just after that lease would run out. */
     static final int DEPARTURE_RECHECKS = 2;
-
-    /**
-     * Takes a departed node's shards once its lease, read from the store, has run out.
-     *
-     * <p>A node leaves the membership view when its lease read fails or comes back late, as well as when it dies, and a
-     * live node's shards taken on that evidence is a storm of contested activations. So the lease is read first; a
-     * live one is looked at again just after it would expire, which is when a dead node's departure is real. The
-     * absence is marked taken over only when the takeover happens, so a false departure does not use up the
-     * proactive takeover a later real departure gets.
-     */
-    private void takeOverIfGone(Departure departure, int rechecks) {
-        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
-            if (work == null) {
-                return;
-            }
-            final var left = departure.lease();
-            final String incarnation = left.nodeId() + "/" + left.ephemeralId();
-            if (closed || departure.takenOver().get() || departures.get(incarnation) != departure) {
-                return;
-            }
-            long liveUntil;
-            try {
-                liveUntil = loop.leaseLiveUntil(left.nodeId()).orElse(Long.MIN_VALUE);
-            } catch (Exception e) {
-                // Unknown, not gone: look again shortly.
-                liveUntil = clock.getAsLong();
-            }
-            if (liveUntil == Long.MIN_VALUE) {
-                if (departure.takenOver().compareAndSet(false, true)) {
-                    takeOver(left.nodeId());
-                }
-                return;
-            }
-            if (rechecks >= DEPARTURE_RECHECKS) {
-                return;
-            }
-            final long delay = Math.max(0L, liveUntil - clock.getAsLong()) + renewalInterval.millis();
-            threadPool.schedule(() -> takeOverIfGone(departure, rechecks + 1), TimeValue.timeValueMillis(delay), ThreadPool.Names.GENERIC);
-        }
-    }
 
     /**
      * Returns the activation queue's figures; see {@link BackgroundReconciler#activationStats}.
@@ -555,45 +501,12 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         return loop.activationSources();
     }
 
-    /** The two looks at a departed node's shards; see BackgroundReconciler#takeOverFrom. */
-    private void takeOver(String deadNodeId) {
-        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
-            if (work == null) {
-                return;
-            }
-            try {
-                final java.util.List<Map.Entry<String, Integer>> later = loop.takeOverFrom(deadNodeId);
-                if (later.isEmpty() == false && closed == false) {
-                    threadPool.schedule(() -> takeOverRemaining(deadNodeId, later, false), renewalInterval, ThreadPool.Names.GENERIC);
-                }
-            } catch (Exception e) {
-                logger.warn("could not take over the shards of departed node " + deadNodeId, e);
-            }
-        }
-    }
-
-    private void takeOverRemaining(String deadNodeId, java.util.List<Map.Entry<String, Integer>> claims, boolean last) {
-        try (org.opensearch.common.lease.Releasable work = activity.enter()) {
-            if (work == null) {
-                return;
-            }
-            final java.util.List<Map.Entry<String, Integer>> deferred = loop.takeOverRemaining(deadNodeId, claims, last);
-            if (last == false && deferred.isEmpty() == false && closed == false) {
-                threadPool.schedule(
-                    () -> takeOverRemaining(deadNodeId, deferred, true),
-                    TimeValue.timeValueMillis(renewalInterval.millis() * RENEWALS_PER_TTL),
-                    ThreadPool.Names.GENERIC
-                );
-            }
-        }
-    }
-
     private java.util.Set<ShardId> renewLeaseNow() {
         try (org.opensearch.common.lease.Releasable work = activity.enter()) {
             if (work == null) {
                 return java.util.Set.of();
             }
-            pruneDepartureHistory();
+            takeovers.pruneDepartureHistory();
             renewals.incrementAndGet();
             try {
                 return loop.renewLease();
@@ -707,7 +620,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         }
     }
 
-    private final java.util.concurrent.atomic.AtomicBoolean publishRunning = new java.util.concurrent.atomic.AtomicBoolean();
+    final java.util.concurrent.atomic.AtomicBoolean publishRunning = new java.util.concurrent.atomic.AtomicBoolean();
 
     /**
      * Publishes the shards written to since the last publish, now.
@@ -820,8 +733,8 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      *
      * @return the counts
      */
-    public Counts counts() {
-        return new Counts(renewals.get(), publishes.get(), activations.get(), backstops.get());
+    public SchedulerCounts counts() {
+        return new SchedulerCounts(renewals.get(), publishes.get(), activations.get(), backstops.get());
     }
 
     @Override
@@ -843,68 +756,4 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
         }
     }
 
-    /** How many times each driver has run. */
-    public static final class Counts {
-
-        private final long renewals;
-        private final long publishes;
-        private final long activations;
-        private final long backstops;
-
-        Counts(long renewals, long publishes, long activations, long backstops) {
-            this.renewals = renewals;
-            this.publishes = publishes;
-            this.activations = activations;
-            this.backstops = backstops;
-        }
-
-        /**
-         * Returns how many lease renewals have run.
-         *
-         * @return the count
-         */
-        public long renewals() {
-            return renewals;
-        }
-
-        /**
-         * Returns how many edge-triggered publishes have run.
-         *
-         * @return the count
-         */
-        public long publishes() {
-            return publishes;
-        }
-
-        /**
-         * Returns how many failure-triggered activation passes have run.
-         *
-         * @return the count
-         */
-        public long activations() {
-            return activations;
-        }
-
-        /**
-         * Returns how many full backstop passes have run.
-         *
-         * @return the count
-         */
-        public long backstops() {
-            return backstops;
-        }
-
-        @Override
-        public String toString() {
-            return "Counts[renewals="
-                + renewals
-                + ", publishes="
-                + publishes
-                + ", activations="
-                + activations
-                + ", backstops="
-                + backstops
-                + "]";
-        }
-    }
 }

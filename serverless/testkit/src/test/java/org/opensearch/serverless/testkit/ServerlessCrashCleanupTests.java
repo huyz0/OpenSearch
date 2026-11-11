@@ -18,6 +18,7 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.DigestRollups;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.RollupEntry;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.JanitorPass;
 import org.opensearch.serverless.shell.ServerlessNode;
@@ -68,7 +69,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
     }
 
     /** The index's rollup entry, or null if it has none. */
-    private static DigestRollups.Entry entryOf(MetadataPlane plane, String index) throws Exception {
+    private static RollupEntry entryOf(MetadataPlane plane, String index) throws Exception {
         return plane.rollups().readGroup(DigestRollups.group(index), new DescriptorStore.Reads() {
             @Override
             public <T> List<T> runAll(List<Callable<T>> tasks) throws InterruptedException {
@@ -112,7 +113,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             assertNotNull("a writer enters it again before it opens", entryOf(plane, "hollow"));
             node.writes().index(shardId, "doc", "{\"msg\":\"x\",\"n\":1}");
             loop.releaseIdle(System.currentTimeMillis() + 120_000L);
-            final DigestRollups.Entry entry = entryOf(plane, "hollow");
+            final RollupEntry entry = entryOf(plane, "hollow");
             assertNotNull("given back with something written, it keeps its entry", entry);
             assertNotNull("with a digest", entry.states().get(0).digest());
         }
@@ -196,7 +197,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
             final var never = org.opensearch.index.query.QueryBuilders.rangeQuery("n").gte(1_000);
             assertBusy(() -> {
                 for (String index : List.of("digested", "undigested")) {
-                    final DigestRollups.Entry entry = entryOf(plane, index);
+                    final RollupEntry entry = entryOf(plane, index);
                     assertNotNull(index, entry.states().get(0).digest());
                     assertTrue(index + " is ruled out by its digest: " + entry, entry.rulesOut(never, System.currentTimeMillis()));
                 }
@@ -230,7 +231,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
 
     /** The term the rollups mark the shard owned at; zero if none. */
     private static long markedTerm(MetadataPlane plane, String index) throws Exception {
-        final Map<String, DigestRollups.Entry> group = plane.rollups().readGroup(DigestRollups.group(index), new DescriptorStore.Reads() {
+        final Map<String, RollupEntry> group = plane.rollups().readGroup(DigestRollups.group(index), new DescriptorStore.Reads() {
             @Override
             public <T> List<T> runAll(List<Callable<T>> tasks) throws InterruptedException {
                 final List<T> out = new ArrayList<>();
@@ -244,7 +245,7 @@ public class ServerlessCrashCleanupTests extends OpenSearchTestCase {
                 return out;
             }
         });
-        final DigestRollups.Entry entry = group.get(index);
+        final RollupEntry entry = group.get(index);
         return entry == null ? 0L : entry.states().get(0).ownerTerm();
     }
 

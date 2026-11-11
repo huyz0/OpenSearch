@@ -15,6 +15,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.TemplateStore;
+import org.opensearch.serverless.metadata.TooManyTemplatesException;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -258,7 +259,7 @@ public final class TemplateHandler extends BaseRestHandler {
                 }
             } catch (IndexAdminHandler.RefusedException e) {
                 sendQuietly(channel, e.status, e.type, e.getMessage());
-            } catch (TemplateStore.TooManyTemplatesException e) {
+            } catch (TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_templates", e.getMessage());
             } catch (IllegalArgumentException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());

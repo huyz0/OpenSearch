@@ -21,6 +21,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.PointInTime;
 import org.opensearch.serverless.metadata.RegisterMap;
 import org.opensearch.serverless.metadata.SnapshotRecord;
+import org.opensearch.serverless.metadata.TemplateCache;
 import org.opensearch.serverless.metadata.TemplateResolver;
 import org.opensearch.serverless.metadata.TemplateStore;
 import org.opensearch.serverless.reconcile.GarbageCollector;
@@ -627,8 +628,8 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
     public void testATemplateWrittenWithoutItsMarkerIsInvisibleEverywhereAndAMarkedOneIsSeenEverywhere() throws Exception {
         final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
         final BlobContainer container = store.blobContainer(RegisterMap.indexTemplates(BlobPath.cleanPath()));
-        final TemplateStore writer = new TemplateStore(container, new TemplateStore.Cache());
-        final TemplateStore warm = new TemplateStore(container, new TemplateStore.Cache());
+        final TemplateStore writer = new TemplateStore(container, new TemplateCache());
+        final TemplateStore warm = new TemplateStore(container, new TemplateCache());
 
         final String first = "{\"index_patterns\":[\"a-*\"]}";
         writer.put("t1", first);
@@ -638,7 +639,7 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
         final String orphan = "{\"index_patterns\":[\"b-*\"]}";
         write(container, "template-t2", orphan);
         write(container, "blob-" + sha256(orphan), orphan);
-        final TemplateStore cold = new TemplateStore(container, new TemplateStore.Cache());
+        final TemplateStore cold = new TemplateStore(container, new TemplateCache());
         assertEquals("a warm node does not see it", Set.of("t1"), warm.all().keySet());
         assertEquals("and neither does a cold one", Set.of("t1"), cold.all().keySet());
         assertTrue("nor a read by name", cold.get("t2").isEmpty());

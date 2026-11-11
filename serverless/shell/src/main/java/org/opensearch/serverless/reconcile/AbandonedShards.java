@@ -10,6 +10,8 @@ package org.opensearch.serverless.reconcile;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.DigestRollups;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.RollupEntry;
+import org.opensearch.serverless.metadata.RollupShardState;
 
 import java.io.IOException;
 import java.util.List;
@@ -338,7 +340,7 @@ final class AbandonedShards {
                 final String group = groups.get((int) (slot / DigestRollups.BUCKETS));
                 final int bucket = (int) (slot % DigestRollups.BUCKETS);
                 read = group + "/" + bucket;
-                for (Map.Entry<String, DigestRollups.Entry> entry : reconciler.plane.rollups().readBucket(group, bucket).entrySet()) {
+                for (Map.Entry<String, RollupEntry> entry : reconciler.plane.rollups().readBucket(group, bucket).entrySet()) {
                     if (entry.getValue().alias() || counts[0] >= budget) {
                         continue;
                     }
@@ -368,7 +370,7 @@ final class AbandonedShards {
                         }
                         continue;
                     }
-                    final List<DigestRollups.ShardState> states = entry.getValue().states();
+                    final List<RollupShardState> states = entry.getValue().states();
                     for (int shard = 0; shard < states.size() && counts[0] < budget; shard++) {
                         final long marked = states.get(shard).ownerTerm();
                         if (marked == 0L) {

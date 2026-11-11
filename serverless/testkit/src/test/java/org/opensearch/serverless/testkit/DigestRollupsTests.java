@@ -13,6 +13,7 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.DigestRollups;
+import org.opensearch.serverless.metadata.RollupEntry;
 import org.opensearch.serverless.store.PruningDigest;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -53,14 +54,14 @@ public class DigestRollupsTests extends OpenSearchTestCase {
         return new DigestRollups(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath().add("rollups"));
     }
 
-    private static DigestRollups.Entry entry(DigestRollups rollups, String name) throws Exception {
+    private static RollupEntry entry(DigestRollups rollups, String name) throws Exception {
         return rollups.readGroup(DigestRollups.group(name), IN_SEQUENCE).get(name);
     }
 
     public void testAPublishedShardIsRuledOutOnlyByWhatItsDigestExcludes() throws Exception {
         final DigestRollups rollups = rollups();
         rollups.widen("logs-a", "uuid-a", 1, 0, n(100, 200));
-        final DigestRollups.Entry entry = entry(rollups, "logs-a");
+        final RollupEntry entry = entry(rollups, "logs-a");
         assertTrue(entry.rulesOut(QueryBuilders.rangeQuery("n").gte(10_000), NOW));
         assertFalse(entry.rulesOut(QueryBuilders.rangeQuery("n").gte(150), NOW));
         assertFalse("an undigested field is a maybe", entry.rulesOut(QueryBuilders.rangeQuery("other").gte(10_000), NOW));
@@ -70,7 +71,7 @@ public class DigestRollupsTests extends OpenSearchTestCase {
         final DigestRollups rollups = rollups();
         rollups.widen("logs-a", "uuid-a", 1, 0, n(100, 200));
         rollups.widen("logs-a", "uuid-a", 1, 0, n(150, 160));
-        final DigestRollups.Entry entry = entry(rollups, "logs-a");
+        final RollupEntry entry = entry(rollups, "logs-a");
         assertFalse("a later, narrower commit does not narrow the record", entry.rulesOut(QueryBuilders.rangeQuery("n").lte(120), NOW));
         rollups.widen("logs-a", "uuid-a", 1, 0, n(5_000, 6_000));
         assertFalse(entry(rollups, "logs-a").rulesOut(QueryBuilders.rangeQuery("n").gte(5_500), NOW));
@@ -81,7 +82,7 @@ public class DigestRollupsTests extends OpenSearchTestCase {
         final DigestRollups rollups = rollups();
         rollups.widen("logs-a", "uuid-old", 1, 0, n(100, 200));
         rollups.widen("logs-a", "uuid-new", 1, 0, n(9_000, 9_100));
-        final DigestRollups.Entry entry = entry(rollups, "logs-a");
+        final RollupEntry entry = entry(rollups, "logs-a");
         assertEquals("uuid-new", entry.uuid());
         assertTrue("the deleted incarnation's range is gone with it", entry.rulesOut(QueryBuilders.rangeQuery("n").lte(500), NOW));
     }
@@ -134,9 +135,9 @@ public class DigestRollupsTests extends OpenSearchTestCase {
         } finally {
             terminate(pool);
         }
-        final Map<String, DigestRollups.Entry> all = shared.readGroup("logs-", IN_SEQUENCE);
+        final Map<String, RollupEntry> all = shared.readGroup("logs-", IN_SEQUENCE);
         for (int w = 0; w < writers; w++) {
-            final DigestRollups.Entry entry = all.get("logs-" + w);
+            final RollupEntry entry = all.get("logs-" + w);
             assertNotNull("logs-" + w + " lost its entry", entry);
             assertFalse(entry.rulesOut(QueryBuilders.rangeQuery("n").gte(w * 1_000L).lte(w * 1_000L + 4), NOW));
         }
@@ -183,7 +184,7 @@ public class DigestRollupsTests extends OpenSearchTestCase {
         } finally {
             terminate(pool);
         }
-        final Map<String, DigestRollups.Entry> all = node.readGroup(DigestRollups.group("logs-a"), IN_SEQUENCE);
+        final Map<String, RollupEntry> all = node.readGroup(DigestRollups.group("logs-a"), IN_SEQUENCE);
         for (int shard = 0; shard < shards; shard++) {
             assertEquals("shard " + shard + " keeps its mark", 7L, all.get("logs-a").states().get(shard).ownerTerm());
         }
@@ -200,7 +201,7 @@ public class DigestRollupsTests extends OpenSearchTestCase {
         probe.markOwned(a, "uuid", 1, 0, 1L);
         probe.markOwned(b, "uuid", 1, 0, 1L);
         for (int bucket = 0; bucket < DigestRollups.BUCKETS; bucket++) {
-            final Map<String, DigestRollups.Entry> held = probe.readBucket(DigestRollups.group(a), bucket);
+            final Map<String, RollupEntry> held = probe.readBucket(DigestRollups.group(a), bucket);
             if (held.containsKey(a)) {
                 return held.containsKey(b);
             }

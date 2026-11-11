@@ -18,7 +18,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.Capacity;
 import org.opensearch.serverless.shell.FleetSize;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.store.ObjectStores;
+import org.opensearch.serverless.store.MeteredBlobStore;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -484,9 +484,7 @@ public final class StatsHandler extends BaseRestHandler {
     /** The object store's request counters since this node started, when the store is the metered one. */
     private static void objectStore(XContentBuilder builder, MetadataPlane metadata) throws IOException {
         builder.startObject("object_store");
-        final ObjectStores.Metered metered = metadata != null && metadata.blobStore() instanceof ObjectStores.Metered counted
-            ? counted
-            : null;
+        final MeteredBlobStore metered = metadata != null && metadata.blobStore() instanceof MeteredBlobStore counted ? counted : null;
         if (metered == null) {
             // Said rather than reported as zeros: a zero would be a claim that no request was made.
             builder.field("metered", false);

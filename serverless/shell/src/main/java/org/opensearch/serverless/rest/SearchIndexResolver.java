@@ -144,7 +144,7 @@ final class SearchIndexResolver {
         final java.util.Set<String> fromPattern = new java.util.HashSet<>();
         int prunedShards = 0;
         final java.util.Set<String> judged = new java.util.HashSet<>();
-        final java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> rolledUp = new java.util.HashMap<>();
+        final java.util.Map<String, org.opensearch.serverless.metadata.RollupEntry> rolledUp = new java.util.HashMap<>();
         for (String name : requested) {
             if (isPrefixPattern(name) == false) {
                 names.add(name);
@@ -152,7 +152,7 @@ final class SearchIndexResolver {
             }
             final String prefix = name.substring(0, name.length() - 1);
             final java.util.List<String> matched;
-            java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> groupEntries = null;
+            java.util.Map<String, org.opensearch.serverless.metadata.RollupEntry> groupEntries = null;
             if (serving.searchSettings().resolveFromRollups() && org.opensearch.serverless.metadata.DigestRollups.coversGroup(prefix)) {
                 // The group's entries are its name list: every index that can hold a document has one, so the
                 // names the listing would add are indices with nothing to find. See DigestRollups.
@@ -376,9 +376,9 @@ final class SearchIndexResolver {
         java.util.List<String> matched,
         SearchSourceBuilder source,
         long nowMillis,
-        java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> rolledUp,
+        java.util.Map<String, org.opensearch.serverless.metadata.RollupEntry> rolledUp,
         java.util.Set<String> judged,
-        java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> alreadyRead
+        java.util.Map<String, org.opensearch.serverless.metadata.RollupEntry> alreadyRead
     ) {
         if (source == null
             || serving.searchSettings().searchPruning() == false
@@ -389,7 +389,7 @@ final class SearchIndexResolver {
             || SearchFanout.hasGlobalAggregation(source)) {
             return java.util.Set.of();
         }
-        final java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> entries;
+        final java.util.Map<String, org.opensearch.serverless.metadata.RollupEntry> entries;
         try {
             entries = alreadyRead != null ? alreadyRead : readRollups(metadata, serving, prefix);
         } catch (Exception e) {
@@ -401,7 +401,7 @@ final class SearchIndexResolver {
         final java.util.Set<String> ruledOut = new java.util.LinkedHashSet<>();
         String kept = null;
         for (String name : matched) {
-            final org.opensearch.serverless.metadata.DigestRollups.Entry entry = entries.get(name);
+            final org.opensearch.serverless.metadata.RollupEntry entry = entries.get(name);
             if (entry != null && entry.rulesOut(source.query(), nowMillis)) {
                 ruledOut.add(name);
                 rolledUp.put(name, entry);
@@ -424,7 +424,7 @@ final class SearchIndexResolver {
     }
 
     /** Reads a prefix's rollup group on GENERIC, reusing this node's copy within the routing cache's window. */
-    static java.util.Map<String, org.opensearch.serverless.metadata.DigestRollups.Entry> readRollups(
+    static java.util.Map<String, org.opensearch.serverless.metadata.RollupEntry> readRollups(
         MetadataPlane metadata,
         ServerlessNode serving,
         String prefix
