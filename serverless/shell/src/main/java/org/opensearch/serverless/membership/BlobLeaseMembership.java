@@ -134,6 +134,12 @@ public final class BlobLeaseMembership implements MembershipSource {
 
     private volatile long ownGeneration = BlobRegister.ABSENT_GENERATION;
 
+    /** When this node last read the lease digest, or wrote it; see {@link LeaseDigest}. */
+    private volatile long digestReadAt = Long.MIN_VALUE;
+    private volatile long digestWrittenAt = Long.MIN_VALUE;
+    /** The live leases the last digest read named, the ones a newer digest may renew without a read of each. */
+    private volatile Set<String> digestIds = Set.of();
+
     /**
      * Creates a membership source over a container of lease registers.
      *
@@ -734,6 +740,12 @@ public final class BlobLeaseMembership implements MembershipSource {
                 // Another node may be writing it at the same moment; either copy is a full listing.
             }
         }
+        // One node writes every live lease into the digest each third of a lifetime and reads them all to do it; the
+        // rest take the leases from the digest, so the loop below finds them unexpired and reads nothing.
+        final boolean writingDigest = writesDigest(now);
+        if (writingDigest == false) {
+            mergeDigest(ids, now);
+        }
         for (String nodeId : ids) {
             // A register is NOT a plain blob: its bytes carry a generation frame ahead of the value,
             // so a lease written with compareAndSwapRegister must be read with readRegister. Reading it
@@ -753,7 +765,7 @@ public final class BlobLeaseMembership implements MembershipSource {
             // ShardHeadStore reads the lease directly, and so does ShardRouter when it resolves an address
             // to forward to, precisely so that being wrong here costs a retry rather than a shard.
             final NodeLease known = lastRead.get(nodeId);
-            if (known != null && known.isExpiredAt(now) == false) {
+            if (writingDigest == false && known != null && known.isExpiredAt(now) == false) {
                 live.add(known);
                 continue;
             }
@@ -827,6 +839,9 @@ public final class BlobLeaseMembership implements MembershipSource {
         }
         lastRead.keySet().retainAll(ids);
         lastRefreshedAt = now;
+        if (writingDigest) {
+            writeDigest(live, now);
+        }
 
         final Set<NodeLease> previous = observed;
         final Set<NodeLease> joined = new HashSet<>(live);
@@ -842,6 +857,94 @@ public final class BlobLeaseMembership implements MembershipSource {
             }
         }
         return observed;
+    }
+
+    /**
+     * Whether this node writes the digest on this refresh: it holds a live lease, no member live at the last refresh
+     * has a lower id, and a third of a lifetime has passed since it last wrote. Two nodes that both think so for a moment
+     * each write a correct digest; the swap makes one of them a no-op.
+     */
+    private boolean writesDigest(long now) {
+        final NodeLease self = ownLease;
+        if (self == null || self.isExpiredAt(now) || (digestWrittenAt != Long.MIN_VALUE && now - digestWrittenAt < ttlMillis / 3)) {
+            return false;
+        }
+        for (NodeLease member : observed) {
+            // Live at the last refresh, judged with a lifetime of slack: the copy held may have run out since without the
+            // node having gone, and a second writer reads every lease for nothing. A writer that did go is replaced
+            // within a lifetime or so, during which readers read leases one by one.
+            if (member.revoked() == false && now - member.expiresAtMillis() < ttlMillis && member.nodeId().compareTo(self.nodeId()) < 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Takes from the digest every listed lease later than the copy held. Read only when a lease the last digest held
+     * has run out here, since that is when a newer digest saves a read, and at most once a tenth of a lifetime. A node
+     * the digest did not name, a new or a dead one, is read directly as before.
+     */
+    private void mergeDigest(Set<String> ids, long now) {
+        // Due when some lease would otherwise be read: while no digest covers anything any, and after that only one it named.
+        boolean due = false;
+        for (String nodeId : digestIds.isEmpty() ? ids : digestIds) {
+            final NodeLease held = lastRead.get(nodeId);
+            if (ids.contains(nodeId) && (held == null || held.isExpiredAt(now))) {
+                due = true;
+                break;
+            }
+        }
+        if (due == false || (digestReadAt != Long.MIN_VALUE && now - digestReadAt < ttlMillis / 10)) {
+            return;
+        }
+        digestReadAt = now;
+        try {
+            final Optional<BlobRegister> register = container.readRegister(LeaseDigest.NAME);
+            if (register.isEmpty()) {
+                digestIds = Set.of();
+                return;
+            }
+            final Set<String> named = new HashSet<>();
+            for (NodeLease lease : LeaseDigest.decode(register.get().value()).leases()) {
+                if (ids.contains(lease.nodeId()) == false || lease.isExpiredAt(now)) {
+                    continue;
+                }
+                named.add(lease.nodeId());
+                lastRead.merge(
+                    lease.nodeId(),
+                    lease,
+                    (held, digested) -> digested.expiresAtMillis() > held.expiresAtMillis() ? digested : held
+                );
+            }
+            digestIds = Set.copyOf(named);
+        } catch (Exception e) {
+            // An unreadable digest is no digest: every lease is read one by one, as before there was one.
+            digestIds = Set.of();
+        }
+    }
+
+    /** Writes what this refresh read, against whatever digest is stored; losing the swap means another node wrote. */
+    private void writeDigest(Set<NodeLease> live, long now) {
+        digestWrittenAt = now;
+        // What it wrote is what it would read back.
+        digestReadAt = now;
+        final Set<String> written = new HashSet<>();
+        for (NodeLease lease : live) {
+            written.add(lease.nodeId());
+        }
+        digestIds = Set.copyOf(written);
+        try {
+            final org.opensearch.core.common.bytes.BytesReference value = LeaseDigest.encode(now, live);
+            final Optional<BlobRegister> current = container.readRegister(LeaseDigest.NAME);
+            if (current.isEmpty()) {
+                container.createRegisterIfAbsent(LeaseDigest.NAME, value);
+            } else {
+                container.compareAndSwapRegister(LeaseDigest.NAME, current.get().generation(), value);
+            }
+        } catch (Exception e) {
+            // Readers fall back to the leases themselves once the stamps they hold run out.
+        }
     }
 
     @Override

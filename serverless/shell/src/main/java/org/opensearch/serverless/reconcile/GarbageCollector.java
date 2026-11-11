@@ -185,7 +185,6 @@ public final class GarbageCollector {
         }
     }
 
-
     /**
      * Sweeps one shard, deleting only what was already unreferenced last time.
      *
@@ -387,7 +386,9 @@ public final class GarbageCollector {
         final Map<String, Long> firstSeen = tracked == null ? null : tracked.times();
         final long now = plane.clock().getAsLong();
         final org.opensearch.common.blobstore.BlobPath shardPath = RegisterMap.shardData(plane.basePath(), indexName, uuid, shardId);
-        final boolean fromKnown = known != null && known.term() == liveTerm && now - known.listedAtMillis() < SweepScope.RELIST_AFTER_MILLIS;
+        final boolean fromKnown = known != null
+            && known.term() == liveTerm
+            && now - known.listedAtMillis() < SweepScope.RELIST_AFTER_MILLIS;
         final Map<String, Set<String>> toJudge = fromKnown
             ? SweepScope.olderTermBlobs(known.blobs(), previousCandidates, liveTerm)
             : SweepScope.listOlderTerms(blobStore.blobContainer(shardPath), liveTerm);
@@ -436,7 +437,6 @@ public final class GarbageCollector {
         final SweepScope next = new SweepScope(liveTerm, fromKnown ? known.listedAtMillis() : now, SweepScope.olderOnly(named, liveTerm));
         return new ShardSweep(deleted, candidates, next);
     }
-
 
     /**
      * Sweeps every shard of every index, deleting on first sight.

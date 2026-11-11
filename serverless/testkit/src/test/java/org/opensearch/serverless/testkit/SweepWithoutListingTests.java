@@ -107,7 +107,10 @@ public class SweepWithoutListingTests extends OpenSearchTestCase {
                     }
                     assertFalse("the merge dropped inherited blobs", inheritedBlobs.isEmpty());
                     assertTrue("every dropped inherited blob went: " + deleted, deleted.containsAll(inheritedBlobs));
-                    assertTrue("and the zombie's upload, found by the first listing: " + deleted, deleted.contains("t=" + term1 + "/_zz.seg"));
+                    assertTrue(
+                        "and the zombie's upload, found by the first listing: " + deleted,
+                        deleted.contains("t=" + term1 + "/_zz.seg")
+                    );
                     for (Map.Entry<String, String> file : merged.files().entrySet()) {
                         assertTrue(
                             "the sweep deleted a file the live commit names: " + file.getKey(),
