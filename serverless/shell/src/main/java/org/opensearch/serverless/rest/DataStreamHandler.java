@@ -16,9 +16,9 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.AliasRecord;
 import org.opensearch.serverless.cluster.IndexDescriptor;
-import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.TemplateResolver;
+import org.opensearch.serverless.metadata.TooManyMatchesException;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -234,7 +234,7 @@ public final class DataStreamHandler extends BaseRestHandler {
             try {
                 if (failure instanceof IndexAdminHandler.RefusedException refused) {
                     sendQuietly(channel, refused.status, refused.type, refused.getMessage());
-                } else if (failure instanceof DescriptorStore.TooManyMatchesException matches) {
+                } else if (failure instanceof TooManyMatchesException matches) {
                     sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", matches.getMessage());
                 } else {
                     channel.sendResponse(IndexAdminHandler.failure(channel, failure));

@@ -16,7 +16,7 @@ import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.ConditionalDeleteProbe;
-import org.opensearch.serverless.metadata.DescriptorStore;
+import org.opensearch.serverless.metadata.DescriptorResolution;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.ReclaimQueue;
 import org.opensearch.serverless.metadata.RegisterMap;
@@ -78,7 +78,7 @@ public class ServerlessConditionalDeleteTests extends OpenSearchTestCase {
         final MetadataPlane slow = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         final MetadataPlane fast = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         slow.createIndex(index("alpha", "uuid-alpha-old"));
-        final DescriptorStore.Resolution before = slow.descriptors().resolve("alpha");
+        final DescriptorResolution before = slow.descriptors().resolve("alpha");
 
         assertTrue(fast.deleteIndex("alpha"));
         fast.createIndex(index("alpha", "uuid-alpha-new"));
