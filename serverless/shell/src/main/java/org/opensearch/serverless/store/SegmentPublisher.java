@@ -379,11 +379,21 @@ public final class SegmentPublisher {
             if (segment.getKey().equals(last)) {
                 files.addAll(commitPoints);
             }
-            final String blob = publishedSegments.contains(segment.getKey())
-                ? segment.getKey() + "-" + org.opensearch.common.UUIDs.randomBase64UUID() + ".seg"
-                : segment.getKey() + ".seg";
-            writeSegmentBlob(directory, termDir, blob, files, published, lengths);
+            if (publishedSegments.contains(segment.getKey()) == false) {
+                try {
+                    writeSegmentBlob(directory, termDir, segment.getKey() + ".seg", files, published, lengths);
+                    continue;
+                } catch (java.nio.file.FileAlreadyExistsException taken) {
+                    // An earlier attempt of this term, or a writer that reused the segment's name, left a blob by it.
+                }
+            }
+            writeSegmentBlob(directory, termDir, uniqueSegmentBlob(segment.getKey()), files, published, lengths);
         }
+    }
+
+    /** A blob name for a segment that cannot take its plain name: its files are already published, or the name is taken. */
+    private static String uniqueSegmentBlob(String segment) {
+        return segment + "-" + org.opensearch.common.UUIDs.randomBase64UUID() + ".seg";
     }
 
     /** Writes one segment's blob: the header, then the files, smallest first so an open's first reads sit together. */

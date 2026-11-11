@@ -17,7 +17,6 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
-import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -56,10 +55,13 @@ public class ServerlessBlockReadTests extends OpenSearchTestCase {
         final var store = new FsBlobStore(1024, dir, false);
         final var manifest = plane.segmentPublisher(index, shard).readManifest().orElseThrow();
         long total = 0;
-        for (Map.Entry<String, String> file : manifest.files().entrySet()) {
-            final var meta = store.blobContainer(plane.shardData(index, shard).add(file.getValue())).listBlobs().get(file.getKey());
-            if (meta != null) {
-                total += meta.length();
+        for (String file : manifest.files().keySet()) {
+            final Long length = manifest.lengthOf(file);
+            if (length != null) {
+                total += length;
+            } else {
+                final var meta = store.blobContainer(plane.shardData(index, shard).add(manifest.files().get(file))).listBlobs().get(file);
+                total += meta == null ? 0 : meta.length();
             }
         }
         return total;

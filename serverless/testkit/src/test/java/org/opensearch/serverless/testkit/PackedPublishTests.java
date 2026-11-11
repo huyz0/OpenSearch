@@ -107,7 +107,10 @@ public class PackedPublishTests extends OpenSearchTestCase {
             assertEquals("one blob per segment: " + first.files(), segmentsOf(first), blobSegments(firstPacks));
             final Set<String> listed = new HashSet<>();
             for (String blob : store.blobContainer(shardBase.add(termDir)).listBlobs().keySet()) {
-                listed.add(termDir + "/" + blob);
+                // The test filesystem drops stray extraN files into directories; they are not ours.
+                if (blob.startsWith("extra") == false) {
+                    listed.add(termDir + "/" + blob);
+                }
             }
             assertEquals("the term container holds the segment blobs and nothing else", firstPacks, listed);
             assertEquals(20, docsIn(store, shardBase, first));

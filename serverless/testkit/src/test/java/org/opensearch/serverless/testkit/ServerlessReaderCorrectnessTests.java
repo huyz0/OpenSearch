@@ -229,7 +229,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             final CommitManifest published = b.publishShard(onB, termB);
             assertTrue(
                 "the fixture needs the successor to publish a segment under its own term: " + published.files(),
-                published.files().values().stream().anyMatch(t -> t.equals("t=" + termB))
+                published.files().keySet().stream().anyMatch(f -> ShardOps.termDirOf(published, f).equals("t=" + termB))
             );
 
             // A discovers it lost the shard and lets go, then serves the very same shard as a reader from
@@ -257,7 +257,12 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(store, clock);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
-        try (ServerlessNode a = new ServerlessNode(nodeSettings("rc-first", "ingest"))) {
+        // Each file in a blob of its own, so the fixture can fail the commit point's reads and nothing else.
+        final Settings unpacked = Settings.builder()
+            .put(nodeSettings("rc-first", "ingest"))
+            .put("serverless.segments.pack.enabled", false)
+            .build();
+        try (ServerlessNode a = new ServerlessNode(unpacked)) {
             a.start();
             final ShardId onA = a.activateWriter(plane, "alpha", 0).orElseThrow();
             for (int i = 1; i <= 3; i++) {

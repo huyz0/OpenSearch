@@ -144,13 +144,15 @@ public class PublishSpacingTests extends OpenSearchTestCase {
         // Every write still pays its own log append, so neither run can go below one PUT per write.
         assertTrue("a write costs at least its log append: " + spaced.putsPerWrite(), spaced.putsPerWrite() >= 1.0);
         // Publishing every pass costs a publish per write on top of the append. Spaced, the publish is shared by the
-        // writes of one interval, so the total must fall by at least half; on this pattern it falls by more.
+        // writes of one interval, so what a write pays beyond its append must fall by at least half; on this pattern
+        // it falls by more. The append is left out because spacing cannot touch it, and a publish cheap enough --
+        // one blob per segment -- would otherwise leave the halving to the append alone.
         assertTrue(
-            "spacing publishes must at least halve PUTs per write: every pass "
+            "spacing publishes must at least halve the PUTs a write pays beyond its append: every pass "
                 + everyPass.putsPerWrite()
                 + ", spaced "
                 + spaced.putsPerWrite(),
-            spaced.putsPerWrite() * 2 <= everyPass.putsPerWrite()
+            (spaced.putsPerWrite() - 1.0) * 2 <= everyPass.putsPerWrite() - 1.0
         );
     }
 

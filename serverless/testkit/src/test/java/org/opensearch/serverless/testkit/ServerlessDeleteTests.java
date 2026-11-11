@@ -288,9 +288,12 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             final var manifest = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
             assertTrue("the successor must have published at a higher term", manifest.term() > firstTerm);
             final long inherited = manifest.files()
-                .values()
+                .keySet()
                 .stream()
-                .filter(container -> container.equals(org.opensearch.serverless.store.SegmentPublisher.termSegment(firstTerm)))
+                .filter(
+                    file -> ShardOps.termDirOf(manifest, file)
+                        .equals(org.opensearch.serverless.store.SegmentPublisher.termSegment(firstTerm))
+                )
                 .count();
             logger.info(
                 "delete + gc: live commit at term {} names {} file(s) inherited from term {}",
@@ -305,7 +308,7 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             for (var file : manifest.files().entrySet()) {
                 assertTrue(
                     "the sweep deleted a file the live commit depends on: " + file.getValue() + "/" + file.getKey(),
-                    store.blobContainer(plane.shardData("alpha", 0).add(file.getValue())).blobExists(file.getKey())
+                    ShardOps.stored(store, plane.shardData("alpha", 0), manifest, file.getKey())
                 );
             }
             b.reconciler().shard(recovered).refresh("test");
