@@ -218,6 +218,39 @@ public class NodeLogStoreTests extends OpenSearchTestCase {
         }
     }
 
+    public void testAHeaderNamesEachIndexOnceSoADeadNodesLogCanBeMatchedToItsShards() throws Exception {
+        final ShardKey logs0 = new ShardKey("uuid-logs", 0, "logs");
+        final ShardKey logs1 = new ShardKey("uuid-logs", 1, "logs");
+        final ShardKey metrics = new ShardKey("uuid-metrics", 4, "metrics");
+        final NodeLogBlob.Encoded first = NodeLogBlob.encode(
+            "node-1",
+            0L,
+            0L,
+            0L,
+            List.of(new ShardBatch(logs0, 1L, List.of(record("a", 1))), new ShardBatch(metrics, 1L, List.of(record("b", 1)))),
+            Map.of()
+        );
+        final NodeLogBlob.Encoded second = NodeLogBlob.encode(
+            "node-1",
+            0L,
+            1L,
+            0L,
+            List.of(new ShardBatch(logs1, 1L, List.of(record("c", 1)))),
+            first.header().index()
+        );
+        final NodeLogBlob.Header decoded = (NodeLogBlob.Header) NodeLogBlob.decode(second.bytes());
+        final Map<String, String> named = new java.util.TreeMap<>();
+        for (ShardKey key : decoded.index().keySet()) {
+            named.put(key.toString(), key.indexName());
+        }
+        assertEquals(Map.of("logs/uuid-logs[0]", "logs", "logs/uuid-logs[1]", "logs", "metrics/uuid-metrics[4]", "metrics"), named);
+        assertEquals(
+            "a key without its name is the same shard",
+            decoded.ordinalsOf(logs0),
+            decoded.ordinalsOf(new ShardKey("uuid-logs", 0))
+        );
+    }
+
     private static byte[] blob(long ordinal) throws Exception {
         return NodeLogBlob.encode(
             "node-1",
