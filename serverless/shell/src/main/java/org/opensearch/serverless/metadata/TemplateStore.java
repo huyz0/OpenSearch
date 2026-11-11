@@ -11,6 +11,7 @@ package org.opensearch.serverless.metadata;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.bytes.BytesArray;
@@ -100,7 +101,7 @@ public final class TemplateStore {
     /** How many times a change re-reads the register and tries again when another writer moved it. */
     private static final int MARKER_ATTEMPTS = 10;
 
-    private final BlobContainer container;
+    private final ConditionalBlobContainer container;
     private final Cache cache;
 
     /** The register that moves on every change, so a reader can tell whether its copy is current. */
@@ -158,7 +159,7 @@ public final class TemplateStore {
      * @param cache the cache shared by every store over this container on this node
      */
     public TemplateStore(BlobContainer container, Cache cache) {
-        this.container = container;
+        this.container = ConditionalBlobContainer.of(container);
         this.cache = cache;
     }
 

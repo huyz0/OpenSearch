@@ -12,6 +12,7 @@ import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.serverless.cluster.IndexDescriptor;
@@ -82,7 +83,7 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
             final BlobPath data = plane.shardData("pinned", 0);
             write(store.blobContainer(data.add("t=1")), "_0.cfs", "frozen data");
             final var frozen = new CommitManifest(1L, Map.of("_0.cfs", "t=1"));
-            store.blobContainer(data).createRegisterIfAbsent(SegmentPublisher.MANIFEST, frozen.toBytes());
+            ConditionalBlobContainer.of(store.blobContainer(data)).createRegisterIfAbsent(SegmentPublisher.MANIFEST, frozen.toBytes());
             final String pitId = UUIDs.randomBase64UUID();
             store.onNextListing(RegisterMap.pointsInTime(BlobPath.cleanPath()).buildAsString(), () -> {
                 try {
@@ -92,13 +93,15 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
                         assertTrue(plane.deleteIndex("pinned"));
                     } else {
                         final var container = store.blobContainer(data);
-                        final var current = container.readRegister(SegmentPublisher.MANIFEST).orElseThrow();
+                        final var current = ConditionalBlobContainer.of(container).readRegister(SegmentPublisher.MANIFEST).orElseThrow();
                         assertTrue(
-                            container.compareAndSwapRegister(
-                                SegmentPublisher.MANIFEST,
-                                current.generation(),
-                                new CommitManifest(2L, Map.of()).toBytes()
-                            ).applied()
+                            ConditionalBlobContainer.of(container)
+                                .compareAndSwapRegister(
+                                    SegmentPublisher.MANIFEST,
+                                    current.generation(),
+                                    new CommitManifest(2L, Map.of()).toBytes()
+                                )
+                                .applied()
                         );
                     }
                 } catch (Exception e) {
@@ -141,7 +144,8 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor("recreated", "uuid-grace-old", 1, MAPPING, null));
             final BlobPath oldData = plane.shardData("recreated", 0);
             write(store.blobContainer(oldData.add("t=1")), "_0.cfs", "old orphan");
-            store.blobContainer(oldData).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
+            ConditionalBlobContainer.of(store.blobContainer(oldData))
+                .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
             final var first = collector.sweepShard(plane, "recreated", 0, Set.of());
             assertTrue(first.candidates().contains("t=1/_0.cfs"));
             assertTrue(store.blobContainer(oldData.add("t=1")).blobExists("_0.cfs"));
@@ -149,7 +153,8 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
             plane.createIndex(new IndexDescriptor("recreated", "uuid-grace-new", 1, MAPPING, null));
             final BlobPath newData = plane.shardData("recreated", 0);
             write(store.blobContainer(newData.add("t=1")), "_0.cfs", "new orphan");
-            store.blobContainer(newData).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
+            ConditionalBlobContainer.of(store.blobContainer(newData))
+                .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
             clock.addAndGet(200L);
             final var replacement = collector.sweepShard(plane, "recreated", 0, first.candidates());
             assertTrue("the previous incarnation's timestamps must not shorten the replacement's grace", replacement.deleted().isEmpty());
@@ -168,14 +173,15 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
             final String newUuid = "uuid-new-generation";
             plane.createIndex(new IndexDescriptor(index, oldUuid, 1, MAPPING, null));
             final BlobPath oldData = RegisterMap.shardData(BlobPath.cleanPath(), index, oldUuid, 0);
-            store.blobContainer(oldData).createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(9L, Map.of()).toBytes());
+            ConditionalBlobContainer.of(store.blobContainer(oldData))
+                .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(9L, Map.of()).toBytes());
             final BlobPath newData = RegisterMap.shardData(BlobPath.cleanPath(), index, newUuid, 0);
             store.onNextRegisterRead(oldData.buildAsString(), SegmentPublisher.MANIFEST, () -> {
                 try {
                     assertTrue(plane.deleteIndex(index));
                     plane.createIndex(new IndexDescriptor(index, newUuid, 1, MAPPING, null));
                     write(store.blobContainer(newData.add("t=1")), "_0.cfs", "live replacement data");
-                    store.blobContainer(newData)
+                    ConditionalBlobContainer.of(store.blobContainer(newData))
                         .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(1L, Map.of("_0.cfs", "t=1")).toBytes());
                 } catch (Exception e) {
                     throw new RuntimeException(e);
@@ -424,7 +430,7 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         // Published at term 2, with a file left behind under term 1 that the live commit does not name.
-        final BlobContainer shard = store.blobContainer(plane.shardData("alpha", 0));
+        final ConditionalBlobContainer shard = ConditionalBlobContainer.of(store.blobContainer(plane.shardData("alpha", 0)));
         shard.compareAndSwapRegister(
             SegmentPublisher.MANIFEST,
             BlobRegister.ABSENT_GENERATION,
@@ -576,7 +582,7 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
         // A published commit at term 2, and a blob under term 1 that nothing names: an orphan on any other day.
-        final BlobContainer shard = store.blobContainer(plane.shardData("alpha", 0));
+        final ConditionalBlobContainer shard = ConditionalBlobContainer.of(store.blobContainer(plane.shardData("alpha", 0)));
         shard.compareAndSwapRegister(
             SegmentPublisher.MANIFEST,
             BlobRegister.ABSENT_GENERATION,

@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
@@ -712,7 +713,7 @@ public final class GarbageCollector {
         if (budget < 1) {
             throw new IllegalArgumentException("budget must be positive, got " + budget);
         }
-        final BlobContainer gc = blobStore.blobContainer(base.add("gc"));
+        final ConditionalBlobContainer gc = ConditionalBlobContainer.of(blobStore.blobContainer(base.add("gc")));
         final Optional<org.opensearch.common.blobstore.BlobRegister> stored = gc.readRegister(ORPHAN_CURSOR);
         final String from = stored.map(r -> r.value().utf8ToString()).orElse("");
 
@@ -885,7 +886,7 @@ public final class GarbageCollector {
      * @throws IOException if listing or deleting fails
      */
     public List<String> collectExpiredLeases(MetadataPlane plane, long nowMillis) throws IOException {
-        final BlobContainer members = blobStore.blobContainer(RegisterMap.members(base));
+        final ConditionalBlobContainer members = ConditionalBlobContainer.of(blobStore.blobContainer(RegisterMap.members(base)));
         final List<String> removed = new ArrayList<>();
         for (String blobName : members.listBlobsByPrefix(org.opensearch.serverless.membership.BlobLeaseMembership.LEASE_PREFIX).keySet()) {
             final String nodeId = blobName.substring(org.opensearch.serverless.membership.BlobLeaseMembership.LEASE_PREFIX.length());

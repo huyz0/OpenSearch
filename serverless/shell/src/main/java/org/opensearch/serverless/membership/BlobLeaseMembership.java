@@ -11,6 +11,7 @@ package org.opensearch.serverless.membership;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -102,7 +103,7 @@ public final class BlobLeaseMembership implements MembershipSource {
      */
     public static final int DEAD_LEASE_PRUNE_TTLS = 10;
 
-    private final BlobContainer container;
+    private final ConditionalBlobContainer container;
     private final LongSupplier clock;
     private java.util.function.BooleanSupplier conditionalDeletes = () -> false;
     private final long ttlMillis;
@@ -144,7 +145,7 @@ public final class BlobLeaseMembership implements MembershipSource {
         if (ttlMillis <= 0L) {
             throw new IllegalArgumentException("lease TTL must be positive, got " + ttlMillis);
         }
-        this.container = container;
+        this.container = ConditionalBlobContainer.of(container);
         this.clock = clock;
         this.ttlMillis = ttlMillis;
         this.skewMarginMillis = Math.max(0L, ttlMillis / SKEW_MARGIN_DIVISOR);

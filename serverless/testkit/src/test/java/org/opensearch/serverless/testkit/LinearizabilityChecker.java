@@ -29,7 +29,7 @@ import java.util.Set;
  *   <li>A compare-and-swap against the current generation applies, stores the new value, and reports a
  *       generation that is <em>different</em> from the one it replaced.</li>
  *   <li>A compare-and-swap against any other generation does not apply, changes nothing, and reports the
- *       generation actually stored — which is what {@code BlobContainer#compareAndSwapRegister} promises
+ *       generation actually stored — which is what {@code ConditionalBlobContainer#compareAndSwapRegister} promises
  *       and what a caller re-reading after a lost race depends on.</li>
  * </ul>
  *

@@ -13,8 +13,8 @@ import org.opensearch.core.common.bytes.BytesReference;
 
 /**
  * The current value of a "register" blob together with its generation, as read via
- * {@link BlobContainer#readRegister}. A register is a small blob whose writes are arbitrated by
- * {@link BlobContainer#compareAndSwapRegister}, giving callers a generic compare-and-swap
+ * {@link ConditionalBlobContainer#readRegister}. A register is a small blob whose writes are arbitrated by
+ * {@link ConditionalBlobContainer#compareAndSwapRegister}, giving callers a generic compare-and-swap
  * primitive over whatever atomicity the underlying blob store natively provides (e.g. S3
  * If-Match, GCS generation preconditions, or local file locking on a filesystem repository).
  *

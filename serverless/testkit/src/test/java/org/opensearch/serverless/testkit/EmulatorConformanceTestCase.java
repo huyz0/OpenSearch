@@ -12,6 +12,7 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.serverless.metadata.ConditionalDeleteProbe;
@@ -101,8 +102,8 @@ public abstract class EmulatorConformanceTestCase extends BlobContainerConforman
                 return BlobRegisterCasResult.applied(expectedGeneration + 1);
             }
         };
-        liar.createRegisterIfAbsent("head", bytes("initial"));
-        final long generation = liar.readRegister("head").orElseThrow().generation();
+        ConditionalBlobContainer.of(liar).createRegisterIfAbsent("head", bytes("initial"));
+        final long generation = ConditionalBlobContainer.of(liar).readRegister("head").orElseThrow().generation();
 
         final CountDownLatch start = new CountDownLatch(1);
         final AtomicInteger winners = new AtomicInteger();
@@ -112,7 +113,7 @@ public abstract class EmulatorConformanceTestCase extends BlobContainerConforman
             threads[i] = new Thread(() -> {
                 try {
                     start.await();
-                    if (liar.compareAndSwapRegister("head", generation, bytes("w" + id)).applied()) {
+                    if (ConditionalBlobContainer.of(liar).compareAndSwapRegister("head", generation, bytes("w" + id)).applied()) {
                         winners.incrementAndGet();
                     }
                 } catch (Exception e) {
