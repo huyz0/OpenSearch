@@ -154,6 +154,40 @@ public class UnitLayoutTests extends OpenSearchTestCase {
         }
     }
 
+    /** A pending split reserves its halves' ids without making them live, round-trips, and allows one split at a time. */
+    public void testAPendingSplitReservesItsHalves() throws IOException {
+        final UnitLayout layout = UnitLayout.initial(ShardMode.FIXED, 3);
+        final UnitLayout.Split split = layout.planSplit(1);
+        final UnitLayout reserved = layout.withPending(split);
+        assertEquals(split, reserved.pending());
+        assertEquals(5, reserved.nextUnitId());
+        assertEquals(layout.units(), reserved.units());
+        assertEquals(reserved, UnitLayoutFormat.fromJson(UnitLayoutFormat.toJson(reserved)));
+        assertFalse(UnitLayoutFormat.toJson(layout).contains("pending"));
+        expectThrows(IllegalStateException.class, () -> reserved.planSplit(0));
+        expectThrows(IllegalStateException.class, () -> reserved.merge(0, 1));
+
+        final IndexDescriptor descriptor = new IndexDescriptor("pend", "uuid-pend-0000000000", 3, null, null).withLayout(reserved);
+        assertEquals(5, descriptor.numberOfShards());
+        assertArrayEquals(new int[] { 0, 1, 2 }, descriptor.unitIds());
+
+        final UnitLayout applied = reserved.apply(split);
+        assertNull(applied.pending());
+        assertEquals(List.of(0, 3, 4, 2), applied.units().stream().map(UnitLayout.Unit::id).toList());
+        final UnitLayout dropped = reserved.withoutPending();
+        assertNull(dropped.pending());
+        assertEquals("a dropped plan's ids are never handed out again", 5, dropped.nextUnitId());
+        assertEquals(5, dropped.planSplit(0).left().id());
+
+        // A pending split must halve one live unit into two new ids.
+        final UnitLayout.Split wrong = new UnitLayout.Split(
+            split.retired(),
+            split.left(),
+            new UnitLayout.Unit(0, split.right().first(), split.right().last())
+        );
+        expectThrows(IllegalArgumentException.class, () -> layout.withPending(wrong));
+    }
+
     /** A unit holding part of one declared shard and any of another breaks the shape rule and is refused. */
     public void testALayoutBreakingTheShapeRuleIsRefused() {
         final long mid = RoutingHash.firstHashOf(1, 4) / 2;

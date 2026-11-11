@@ -95,13 +95,20 @@ public class UnitSplitBuildTests extends OpenSearchTestCase {
             }
         }
 
-        final IndexDescriptor before = plane.describe("grow").orElseThrow();
-        final UnitLayout.Split split = before.layout().planSplit(0);
+        final IndexDescriptor planned = plane.describe("grow").orElseThrow();
+        final UnitLayout.Split split = planned.layout().planSplit(0);
+        // The plan is recorded first: the halves' ids become shard slots, but only the old unit is live.
+        final IndexDescriptor before = planned.withLayout(planned.layout().withPending(split));
+        assertTrue(plane.updateDescriptor(before, plane.descriptorGeneration("grow")).isPresent());
+        assertEquals(split, plane.describe("grow").orElseThrow().layout().pending());
+        assertEquals(3, before.numberOfShards());
+        assertArrayEquals(new int[] { 0 }, before.unitIds());
         final UnitSplitBuilder.Built built = UnitSplitBuilder.build(plane, before, split, createTempDir());
         assertEquals("every live document lands in exactly one half", DOCS - 1, built.leftDocs() + built.rightDocs());
         assertTrue("both halves hold something: " + built, built.leftDocs() > 0 && built.rightDocs() > 0);
 
         final IndexDescriptor after = before.withLayout(before.layout().apply(split));
+        assertNull("applying the split clears it", after.layout().pending());
         assertTrue(plane.updateDescriptor(after, plane.descriptorGeneration("grow")).isPresent());
         int expectedLeft = 0;
         for (int doc = 0; doc < DOCS; doc++) {

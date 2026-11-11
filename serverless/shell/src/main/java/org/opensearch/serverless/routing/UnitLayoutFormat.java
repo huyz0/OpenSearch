@@ -40,13 +40,25 @@ public final class UnitLayoutFormat {
         builder.field("next_unit_id", layout.nextUnitId());
         builder.startArray("units");
         for (UnitLayout.Unit unit : layout.units()) {
-            builder.startObject();
-            builder.field("id", unit.id());
-            builder.field("first", Long.toHexString(unit.first()));
-            builder.field("last", Long.toHexString(unit.last()));
-            builder.endObject();
+            writeUnit(unit, builder);
         }
         builder.endArray();
+        // Only while a split is pending, so a layout without one is written exactly as before.
+        if (layout.pending() != null) {
+            builder.startArray("pending_split");
+            writeUnit(layout.pending().retired(), builder);
+            writeUnit(layout.pending().left(), builder);
+            writeUnit(layout.pending().right(), builder);
+            builder.endArray();
+        }
+    }
+
+    private static void writeUnit(UnitLayout.Unit unit, XContentBuilder builder) throws IOException {
+        builder.startObject();
+        builder.field("id", unit.id());
+        builder.field("first", Long.toHexString(unit.first()));
+        builder.field("last", Long.toHexString(unit.last()));
+        builder.endObject();
     }
 
     /**
@@ -61,6 +73,7 @@ public final class UnitLayoutFormat {
         int declared = -1;
         int nextId = -1;
         final List<UnitLayout.Unit> units = new ArrayList<>();
+        final List<UnitLayout.Unit> pendingUnits = new ArrayList<>();
         String field = null;
         XContentParser.Token token;
         while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
@@ -69,6 +82,10 @@ public final class UnitLayoutFormat {
             } else if (token == XContentParser.Token.START_ARRAY && "units".equals(field)) {
                 while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
                     units.add(parseUnit(parser));
+                }
+            } else if (token == XContentParser.Token.START_ARRAY && "pending_split".equals(field)) {
+                while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
+                    pendingUnits.add(parseUnit(parser));
                 }
             } else if (token == XContentParser.Token.START_ARRAY || token == XContentParser.Token.START_OBJECT) {
                 parser.skipChildren();
@@ -87,7 +104,13 @@ public final class UnitLayoutFormat {
             throw new IOException("malformed unit layout: missing a required field");
         }
         try {
-            return new UnitLayout(mode, declared, units, nextId);
+            if (pendingUnits.isEmpty() == false && pendingUnits.size() != 3) {
+                throw new IOException("malformed unit layout: a pending split names three units, got " + pendingUnits.size());
+            }
+            final UnitLayout.Split pending = pendingUnits.isEmpty()
+                ? null
+                : new UnitLayout.Split(pendingUnits.get(0), pendingUnits.get(1), pendingUnits.get(2));
+            return new UnitLayout(mode, declared, units, nextId, pending);
         } catch (IllegalArgumentException e) {
             throw new IOException("malformed unit layout: " + e.getMessage(), e);
         }
