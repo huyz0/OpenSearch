@@ -158,6 +158,16 @@ public final class ServerlessBootstrap implements Closeable {
      */
     public static final String PUBLISH_MAX_UNPUBLISHED_OPERATIONS = "serverless.publish.max_unpublished_operations";
 
+    /**
+     * With one write log per node, how long a write may wait to be published: the longest a write takes to be
+     * searchable, and what bounds how much of the log is kept. Zero publishes as without the log. See
+     * {@link BackgroundReconciler#setLazyPublish}.
+     */
+    public static final String NODE_LOG_PUBLISH_MAX_AGE = "serverless.wal.node_log.publish_max_age_millis";
+
+    /** The default {@link #NODE_LOG_PUBLISH_MAX_AGE}: a minute. */
+    public static final long DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS = 60_000L;
+
     /** The first token of the readiness line, so the file is self-describing. */
     public static final String READY_MARKER = "SERVERLESS_READY";
 
@@ -318,6 +328,12 @@ public final class ServerlessBootstrap implements Closeable {
 
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             openedLoop = loop;
+            if (complete.getAsBoolean("serverless.wal.node_log.enabled", false)) {
+                loop.setLazyPublish(
+                    complete.getAsLong(NODE_LOG_PUBLISH_MAX_AGE, DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS),
+                    complete.getAsLong(PUBLISH_MAX_UNPUBLISHED_OPERATIONS, ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS)
+                );
+            }
             loop.setDemandDrivenActivation(complete.getAsBoolean(ON_DEMAND, true))
                 .setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD))
                 .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS))
