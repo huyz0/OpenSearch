@@ -114,7 +114,7 @@ public class PointInTimeRequestExecutionTests extends OpenSearchTestCase {
                 node.setMetadataPlane(metadata);
                 for (String index : List.of("private-index", "public-index", ".pit_owned")) {
                     metadata.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, "{}", null));
-                    final var shard = node.activateWriter(metadata, index, 0).orElseThrow();
+                    final var shard = node.activation().activateWriter(metadata, index, 0).orElseThrow();
                     node.writes().index(shard, "doc", "{}");
                     node.publishShard(shard, metadata.heads().read(index, 0).orElseThrow().term());
                 }
@@ -304,7 +304,7 @@ public class PointInTimeRequestExecutionTests extends OpenSearchTestCase {
         }, (node, metadata) -> {
             metadata.createIndex(new IndexDescriptor("two-shards", "uuid-two-shards", 2, "{}", null));
             for (int id = 0; id < 2; id++) {
-                final var shard = node.activateWriter(metadata, "two-shards", id).orElseThrow();
+                final var shard = node.activation().activateWriter(metadata, "two-shards", id).orElseThrow();
                 node.writes().index(shard, "doc-" + id, "{}");
                 node.publishShard(shard, metadata.heads().read("two-shards", id).orElseThrow().term());
             }

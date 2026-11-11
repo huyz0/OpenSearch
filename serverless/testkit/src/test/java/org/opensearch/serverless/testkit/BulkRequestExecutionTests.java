@@ -50,8 +50,8 @@ public class BulkRequestExecutionTests extends OpenSearchTestCase {
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("original", "uuid-original", 1, "{}", null));
                 metadata.createIndex(new IndexDescriptor("selected", "uuid-selected", 1, "{}", null));
-                node.activateWriter(metadata, "original", 0).orElseThrow();
-                node.activateWriter(metadata, "selected", 0).orElseThrow();
+                node.activation().activateWriter(metadata, "original", 0).orElseThrow();
+                node.activation().activateWriter(metadata, "selected", 0).orElseThrow();
                 work.accept(node, metadata);
             }
         }
@@ -186,7 +186,7 @@ public class BulkRequestExecutionTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(settings, List.of(plugin))) {
                 node.startup().start();
                 node.setMetadataPlane(metadata);
-                node.activateWriter(metadata, "original", 0).orElseThrow();
+                node.activation().activateWriter(metadata, "original", 0).orElseThrow();
                 final var read = new java.util.concurrent.atomic.AtomicBoolean();
                 store.onNextRegisterRead("pipelines", "_version", () -> read.set(true));
                 final var answer = send(node, "POST", "/_bulk?pipeline=shape", indexBody("original", "original"));

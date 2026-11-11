@@ -81,7 +81,10 @@ public class ServerlessLeaseRevocationTests extends OpenSearchTestCase {
             // The taker's clock runs a whole lease ahead of the owner's.
             taker.startup().start();
             takerClock.set(ownerClock.get() + TTL + 1);
-            assertTrue("the taker judges the owner dead and takes the shard", taker.activateWriter(takerPlane, "alpha", 0).isPresent());
+            assertTrue(
+                "the taker judges the owner dead and takes the shard",
+                taker.activation().activateWriter(takerPlane, "alpha", 0).isPresent()
+            );
             assertTrue(
                 "and the owner, by its own clock, still believes its lease valid",
                 ownerPlane.membership().selfLeaseValidAt(ownerClock.get())

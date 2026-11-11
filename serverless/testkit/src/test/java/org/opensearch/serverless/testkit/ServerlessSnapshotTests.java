@@ -357,7 +357,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
             // Move the shard to a new term and publish there, so the captured commit's files are in a dead
             // term container and unreferenced by the live manifest -- the exact condition the sweep deletes.
             assertTrue(plane.heads().release("swept", 0, node.localNode().getId()));
-            node.activateWriter(plane, "swept", 0);
+            node.activation().activateWriter(plane, "swept", 0);
             for (int i = 5; i <= 12; i++) {
                 assertEquals(201, send(node, "PUT", "/swept/_doc/s" + i + "?refresh=true", body(i)).status());
             }

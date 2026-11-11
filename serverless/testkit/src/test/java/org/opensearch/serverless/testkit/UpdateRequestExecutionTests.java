@@ -48,8 +48,8 @@ public class UpdateRequestExecutionTests extends OpenSearchTestCase {
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("original", "uuid-original", 1, "{}", null));
                 metadata.createIndex(new IndexDescriptor("selected", "uuid-selected", 1, "{}", null));
-                node.activateWriter(metadata, "original", 0).orElseThrow();
-                node.activateWriter(metadata, "selected", 0).orElseThrow();
+                node.activation().activateWriter(metadata, "original", 0).orElseThrow();
+                node.activation().activateWriter(metadata, "selected", 0).orElseThrow();
                 work.accept(node, metadata);
             }
         }

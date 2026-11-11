@@ -93,7 +93,7 @@ public class ServerlessSearchSpillTests extends OpenSearchTestCase {
             for (String full : ranked.subList(0, 2)) {
                 final ServerlessNode node = byId(searchers, full);
                 new BackgroundReconciler(node, plane).setMaxShardsHeld(1).setEvictAfterMillis(0L);
-                node.serveAsReader(plane, "filler", 0);
+                node.readers().serveAsReader(plane, "filler", 0);
             }
             final ServerlessNode coordinator = byId(searchers, ranked.get(0));
 

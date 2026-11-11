@@ -96,7 +96,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "update-merge")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
 
             assertEquals(
                 201,
@@ -131,7 +131,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (var node = started(metadata, "update-validation")) {
             final var http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(metadata, "alpha", 0);
+            node.activation().activateWriter(metadata, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1", "{\"n\":1}");
             for (String body : java.util.List.of(
                 "{\"doc\":{\"n\":99},\"script\":\"ctx._source.n = 99\"}",
@@ -157,7 +157,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (var node = started(metadata, "update-retry-overflow")) {
             final var http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(metadata, "alpha", 0);
+            node.activation().activateWriter(metadata, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1", "{\"n\":1}");
             final var response = send(http, "POST", "/alpha/_update/1?retry_on_conflict=2147483647", "{\"doc\":{\"n\":2}}");
             assertEquals(response.body(), 200, response.status());
@@ -171,7 +171,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (var node = started(metadata, "update-body-condition")) {
             final var http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(metadata, "alpha", 0);
+            node.activation().activateWriter(metadata, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1", "{\"n\":1}");
             final var before = new org.opensearch.serverless.shard.ShardOperations(node, metadata).get("alpha", "1").document();
             send(http, "PUT", "/alpha/_doc/1", "{\"n\":2}");
@@ -196,7 +196,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "update-missing")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
 
             final Response missing = send(http, "POST", "/alpha/_update/ghost", "{\"doc\":{\"n\":1}}");
             assertEquals(missing.body(), 404, missing.status());
@@ -212,7 +212,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "update-doc-upsert")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
 
             final Response created = send(
                 http,
@@ -238,7 +238,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "update-upsert")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
 
             final Response created = send(
                 http,
@@ -274,7 +274,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "update-noop")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"same\",\"n\":1}");
             final var shardId = node.reconciler().openShards().iterator().next();
             final long before = node.reconciler().shard(shardId).seqNoStats().getMaxSeqNo();
@@ -302,7 +302,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "update-noop-off")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"same\",\"n\":1}");
             final var shardId = node.reconciler().openShards().iterator().next();
             final long before = node.reconciler().shard(shardId).seqNoStats().getMaxSeqNo();
@@ -324,7 +324,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "update-script")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"x\",\"n\":1}");
 
             // A scripted update runs: an engine is registered, chosen by name the same way the
@@ -352,7 +352,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "update-conditional")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"x\",\"n\":1}");
 
             // External versioning is still refused -- it asks for a model this system does not keep.
@@ -374,7 +374,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "update-empty")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
 
             final Response rejected = send(http, "POST", "/alpha/_update/1", "{}");
             assertEquals(rejected.body(), 400, rejected.status());
@@ -397,7 +397,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
         ) {
             final TransportAddress ownerHttp = owner.boundHttpAddress().publishAddress();
             send(ownerHttp, "PUT", "/alpha?shards=1", MAPPING);
-            owner.activateWriter(plane, "alpha", 0);
+            owner.activation().activateWriter(plane, "alpha", 0);
             send(ownerHttp, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"original\",\"n\":1}");
 
             other.startup().start();

@@ -62,7 +62,7 @@ public class RolloverRequestExecutionTests extends OpenSearchTestCase {
             assertTrue(rollover.getCreateIndexRequest().mappings().contains("chosen"));
             return request;
         }), (node, metadata) -> {
-            node.activateWriter(metadata, "logs-000001", 0).orElseThrow();
+            node.activation().activateWriter(metadata, "logs-000001", 0).orElseThrow();
             final var response = send(
                 node,
                 "POST",
@@ -180,7 +180,7 @@ public class RolloverRequestExecutionTests extends OpenSearchTestCase {
             selected.addMaxIndexDocsCondition(1000L);
             return selected;
         }), (node, metadata) -> {
-            node.activateWriter(metadata, "logs-000001", 0).orElseThrow();
+            node.activation().activateWriter(metadata, "logs-000001", 0).orElseThrow();
             final var response = send(node, "POST", "/logs/_rollover", "{}");
             assertEquals(response.body(), 200, response.statusCode());
             assertTrue(response.body(), response.body().contains("\"rolled_over\":false"));

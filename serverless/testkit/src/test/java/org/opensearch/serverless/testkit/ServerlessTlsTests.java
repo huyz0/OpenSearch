@@ -221,8 +221,8 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
             other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            other.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            other.activation().syncFrom(plane);
             assertTrue("the other node must not own the shard", other.reconciler().openShards().isEmpty());
 
             // Forwarded over TLS: this node does not own the shard, so the write crosses the wire.
@@ -256,8 +256,8 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
             other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            other.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            other.activation().syncFrom(plane);
 
             other.client().index(new IndexRequest("alpha").id("k").source("{\"msg\":\"mutual\",\"n\":1}", XContentType.JSON)).actionGet();
             assertTrue(
@@ -286,8 +286,8 @@ public class ServerlessTlsTests extends OpenSearchTestCase {
             stranger.startup().start();
             owner.setMetadataPlane(plane);
             stranger.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            stranger.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            stranger.activation().syncFrom(plane);
 
             final Exception refused = expectThrows(
                 Exception.class,

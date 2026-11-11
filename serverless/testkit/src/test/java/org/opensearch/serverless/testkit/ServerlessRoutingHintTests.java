@@ -100,7 +100,7 @@ public class ServerlessRoutingHintTests extends OpenSearchTestCase {
             // never talked to takes the shard.
             owner.close();
             clock.set(clock.get() + TTL + 1_000);
-            final ShardId onSuccessor = successor.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onSuccessor = successor.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals(successor.localNode().getId(), plane.heads().read("alpha", 0).orElseThrow().ownerNodeId());
             // A hint older than a lease is dropped by age, which is right and is not the case under test.
             // The case is a hint refreshed a moment before the owner died -- the coordinator's own hint

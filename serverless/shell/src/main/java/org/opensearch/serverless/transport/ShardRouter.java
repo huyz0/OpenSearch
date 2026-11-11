@@ -345,10 +345,10 @@ public final class ShardRouter {
             // Open it. This is the property that makes placement a hint rather than a requirement: a
             // node asked for a shard it does not have fetches the manifest and serves, so a stale or
             // unlucky routing decision costs a cold read and never a wrong answer.
-            shardId = node.serveAsReader(plane.get(), request.index(), request.shard(), request.indexUuid());
+            shardId = node.readers().serveAsReader(plane.get(), request.index(), request.shard(), request.indexUuid());
         } else {
             // Open already, perhaps as a reader whose writer has since died: checked like a fresh one.
-            node.ensureReaderCurrent(plane.get(), request.index(), request.shard(), shardId);
+            node.readers().ensureReaderCurrent(plane.get(), request.index(), request.shard(), shardId);
         }
         if (openedForThis) {
             // Opened now, so used now; one already held is used only if it matches, below -- see SearchFanout.
@@ -380,7 +380,7 @@ public final class ShardRouter {
         // and openFrozenView is idempotent -- opening it here for the first time is exactly what placement
         // being a hint means. plane.get() rather than the request: the view travelled the wire, but which
         // object store to open its files from is this node's own configuration, never the sender's.
-        final ShardId shardId = node.openFrozenView(plane.get(), request.pit(), request.shard());
+        final ShardId shardId = node.activation().openFrozenView(plane.get(), request.pit(), request.shard());
         node.reconciler().enter(shardId);
         final ShardQuery.Result result;
         try {

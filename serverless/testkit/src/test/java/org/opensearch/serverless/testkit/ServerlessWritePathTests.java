@@ -75,7 +75,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
 
             final var acquired = plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId());
             assertTrue(acquired.acquired());
-            final ShardId shardId = a.syncFrom(plane).iterator().next();
+            final ShardId shardId = a.activation().syncFrom(plane).iterator().next();
             final IndexShard shardOnA = a.reconciler().shard(shardId);
 
             ShardOps.indexDoc(shardOnA, "1", "{\"msg\":\"written on A\",\"n\":1}");
@@ -94,7 +94,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
             assertTrue(failedOver.acquired());
             assertEquals(2L, failedOver.head().term());
 
-            assertEquals("B did not take the shard over", 1, b.syncFrom(plane).size());
+            assertEquals("B did not take the shard over", 1, b.activation().syncFrom(plane).size());
             final ShardId onB = b.reconciler().openShards().iterator().next();
 
             // The number that is zero when this is broken. B never spoke to A.
@@ -115,7 +115,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
             a.startup().start();
             b.startup().start();
             final long termA = plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId()).head().term();
-            final ShardId shardId = a.syncFrom(plane).iterator().next();
+            final ShardId shardId = a.activation().syncFrom(plane).iterator().next();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"from A\",\"n\":1}");
             a.reconciler().shard(shardId).refresh("p4");
             a.publishShard(shardId, termA);
@@ -124,7 +124,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
             clock.set(1_000L + TTL);
             final long termB = plane.activate("alpha", 0, b.localNode().getId(), b.localNode().getEphemeralId()).head().term();
             assertTrue(termB > termA);
-            final ShardId onB = b.syncFrom(plane).iterator().next();
+            final ShardId onB = b.activation().syncFrom(plane).iterator().next();
             ShardOps.indexDoc(b.reconciler().shard(onB), "2", "{\"msg\":\"from B\",\"n\":2}");
             b.reconciler().shard(onB).refresh("p4");
             b.publishShard(onB, termB);
@@ -154,7 +154,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
         try (ServerlessNode a = new ServerlessNode(nodeSettings("p4-r", null))) {
             a.startup().start();
             final long term = plane.activate("alpha", 0, a.localNode().getId(), a.localNode().getEphemeralId()).head().term();
-            final ShardId shardId = a.syncFrom(plane).iterator().next();
+            final ShardId shardId = a.activation().syncFrom(plane).iterator().next();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"one\",\"n\":1}");
             a.reconciler().shard(shardId).refresh("p4");
 
@@ -185,7 +185,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
 
             // Truth says it owns the shard -- someone activated it here -- but its role says otherwise.
             plane.activate("alpha", 0, searchOnly.localNode().getId(), searchOnly.localNode().getEphemeralId());
-            assertTrue("a search-only node opened a writer shard", searchOnly.syncFrom(plane).isEmpty());
+            assertTrue("a search-only node opened a writer shard", searchOnly.activation().syncFrom(plane).isEmpty());
             assertTrue(searchOnly.reconciler().openShards().isEmpty());
         }
     }
@@ -199,7 +199,7 @@ public class ServerlessWritePathTests extends OpenSearchTestCase {
         try (ServerlessNode ingest = new ServerlessNode(nodeSettings("p4-ingest", "ingest"))) {
             ingest.startup().start();
             plane.activate("alpha", 0, ingest.localNode().getId(), ingest.localNode().getEphemeralId());
-            assertEquals(1, ingest.syncFrom(plane).size());
+            assertEquals(1, ingest.activation().syncFrom(plane).size());
         }
     }
 }

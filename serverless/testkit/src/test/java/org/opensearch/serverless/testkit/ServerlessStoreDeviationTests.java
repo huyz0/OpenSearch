@@ -110,7 +110,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
         ) {
             a.startup().start();
             b.startup().start();
-            assertTrue("A takes the shard", a.activateWriter(deviating.plane(), "alpha", 0).isPresent());
+            assertTrue("A takes the shard", a.activation().activateWriter(deviating.plane(), "alpha", 0).isPresent());
 
             // Now every read of the shard-head is one version out of date -- B is about to be told the
             // shard is still free.
@@ -118,7 +118,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
 
             assertTrue(
                 "B must still lose, because the swap decides and the read does not",
-                b.activateWriter(deviating.plane(), "alpha", 0).isEmpty()
+                b.activation().activateWriter(deviating.plane(), "alpha", 0).isEmpty()
             );
             assertTrue("and B must not be serving anything", b.reconciler().openShards().isEmpty());
         }
@@ -142,7 +142,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("dev-ambiguous"))) {
             a.startup().start();
-            expectThrows(Exception.class, () -> a.activateWriter(deviating.plane(), "alpha", 0));
+            expectThrows(Exception.class, () -> a.activation().activateWriter(deviating.plane(), "alpha", 0));
             assertTrue("the node must not be serving a shard it believes it failed to take", a.reconciler().openShards().isEmpty());
 
             // And the head says otherwise, which is exactly the asymmetry: the store took the write.
@@ -197,8 +197,8 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             a.startup().start();
             b.startup().start();
 
-            final var onA = a.activateWriter(planeA, "alpha", 0);
-            final var onB = b.activateWriter(planeB, "alpha", 0);
+            final var onA = a.activation().activateWriter(planeA, "alpha", 0);
+            final var onB = b.activation().activateWriter(planeB, "alpha", 0);
             assertTrue("A must have been told it owns the shard", onA.isPresent());
             assertTrue("B must have been told the same thing; that is the deviation", onB.isPresent());
             assertEquals(
@@ -224,7 +224,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             // not recoverable and never was -- but it is gone with an exception rather than in silence.
             try (ServerlessNode reader = new ServerlessNode(readerSettings("dev-two-reader"))) {
                 reader.startup().start();
-                final ShardId served = reader.serveAsReader(planeA, "alpha", 0);
+                final ShardId served = reader.readers().serveAsReader(planeA, "alpha", 0);
                 assertEquals(
                     "the first writer's document must be in the published commit",
                     1L,
@@ -273,8 +273,8 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
         ) {
             a.startup().start();
             b.startup().start();
-            final var onA = a.activateWriter(planeA, "alpha", 0).orElseThrow();
-            final var onB = b.activateWriter(planeB, "alpha", 0).orElseThrow();
+            final var onA = a.activation().activateWriter(planeA, "alpha", 0).orElseThrow();
+            final var onB = b.activation().activateWriter(planeB, "alpha", 0).orElseThrow();
 
             ShardOps.indexDoc(a.reconciler().shard(onA), "a1", "{\"msg\":\"aaa\"}");
             a.reconciler().shard(onA).refresh("deviation");
@@ -310,7 +310,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
 
         try (ServerlessNode a = new ServerlessNode(nodeSettings("dev-legacy"))) {
             a.startup().start();
-            final var onA = a.activateWriter(plane, "alpha", 0).orElseThrow();
+            final var onA = a.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             ShardOps.indexDoc(a.reconciler().shard(onA), "a1", "{\"msg\":\"aaa\"}");
             a.reconciler().shard(onA).refresh("deviation");
             a.publishShard(onA, 1L);

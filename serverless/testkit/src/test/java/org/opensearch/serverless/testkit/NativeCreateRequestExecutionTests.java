@@ -232,7 +232,7 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
                 java.util.Map.of("properties", java.util.Map.of("n", java.util.Map.of("type", "long")))
             );
             node.client().admin().indices().create(request).actionGet();
-            final var shard = node.activateWriter(metadata, "events-1", 0).orElseThrow();
+            final var shard = node.activation().activateWriter(metadata, "events-1", 0).orElseThrow();
             node.writes().index(shard, "doc", "{\"n\":9,\"tag\":\"valid\"}");
             assertTrue(node.reads().get(shard, "doc").found());
         });

@@ -131,7 +131,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("m10-successor"))) {
             b.startup().start();
-            final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onB = b.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals(
                 "writes made after the last publication were lost: the WAL did not replay",
                 8L,
@@ -162,7 +162,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         clock.set(1_000L + TTL);
         try (ServerlessNode b = new ServerlessNode(nodeSettings("m10-idem2"))) {
             b.startup().start();
-            final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onB = b.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals(
                 "replay duplicated documents that were already committed",
                 4L,
@@ -304,7 +304,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
 
         final ServerlessNode a = new ServerlessNode(nodeSettings("m15-chain-a"));
         a.startup().start();
-        final ShardId onA = a.activateWriter(plane, "alpha", 0).orElseThrow();
+        final ShardId onA = a.activation().activateWriter(plane, "alpha", 0).orElseThrow();
         for (int i = 1; i <= 3; i++) {
             a.writes().index(onA, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}");
         }
@@ -313,7 +313,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         clock.set(1_000L + TTL);
         final ServerlessNode b = new ServerlessNode(nodeSettings("m15-chain-b"));
         b.startup().start();
-        final ShardId onB = b.activateWriter(plane, "alpha", 0).orElseThrow();
+        final ShardId onB = b.activation().activateWriter(plane, "alpha", 0).orElseThrow();
         assertEquals("the second writer did not replay", 3L, ShardOps.hits(b.searchService(), onB, "msg", "chain"));
         b.writes().index(onB, "4", "{\"msg\":\"chain\",\"n\":4}");
         b.writes().index(onB, "5", "{\"msg\":\"chain\",\"n\":5}");
@@ -354,7 +354,7 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         clock.set(1_000L + 3 * TTL);
         try (ServerlessNode d = new ServerlessNode(nodeSettings("m15-chain-d"))) {
             d.startup().start();
-            final ShardId onD = d.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId onD = d.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             assertEquals(
                 "reclaiming the older terms lost writes that were supposed to be in the commit",
                 6L,

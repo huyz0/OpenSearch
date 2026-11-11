@@ -650,6 +650,24 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * Activates writers on this node and opens frozen views.
+     *
+     * @return the WriterActivation
+     */
+    public WriterActivation activation() {
+        return activation;
+    }
+
+    /**
+     * Serves shards as readers on this node.
+     *
+     * @return the ReaderServing
+     */
+    public ReaderServing readers() {
+        return readerServing;
+    }
+
+    /**
      * Constructs a node. Nothing is started until {@link NodeStartup#start()} is called.
      *
      * @param settings must carry {@code node.name}, {@code cluster.name} and {@code path.home}
@@ -801,7 +819,7 @@ public final class ServerlessNode implements Closeable {
             () -> reconciler,
             () -> signals,
             threadPool,
-            this::forgetReader
+            readerServing::forgetReader
         );
         // An open fetches the blocks it will read concurrently rather than one round trip at a time, on GENERIC as
         // the log replay's reads do; the opening thread reads too, so a busy pool costs width only.
@@ -1323,38 +1341,6 @@ public final class ServerlessNode implements Closeable {
         return settings.getAsBoolean("serverless.search.prune", true);
     }
 
-    /** Opens one shard of a frozen view, so a search can read the commit it froze. */
-    public org.opensearch.core.index.shard.ShardId openFrozenView(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        org.opensearch.serverless.metadata.PointInTime pit,
-        int shardNumber
-    ) throws Exception {
-        return activation.openFrozenView(plane, pit, shardNumber);
-    }
-
-    /** Projects the given truth into this node's local view, applies it, and opens every shard this node owns. */
-    public java.util.Set<org.opensearch.core.index.shard.ShardId> applyTruth(
-        java.util.Collection<IndexDescriptor> descriptors,
-        java.util.Collection<ShardAssignment> owned
-    ) throws Exception {
-        return activation.applyTruth(descriptors, owned);
-    }
-
-    /** Reads this node's truth from the metadata plane and applies it. */
-    public java.util.Set<org.opensearch.core.index.shard.ShardId> syncFrom(org.opensearch.serverless.metadata.MetadataPlane plane)
-        throws Exception {
-        return activation.syncFrom(plane);
-    }
-
-    /** Takes ownership of a shard and opens it for writing. */
-    public java.util.Optional<org.opensearch.core.index.shard.ShardId> activateWriter(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        String indexName,
-        int shardNumber
-    ) throws Exception {
-        return activation.activateWriter(plane, indexName, shardNumber);
-    }
-
     /**
      * How long a node may go without re-reading the head of every writer shard it holds.
      *
@@ -1422,25 +1408,6 @@ public final class ServerlessNode implements Closeable {
         return this;
     }
 
-    /** Serves a shard as a reader: opens the published commit without owning the shard. */
-    public org.opensearch.core.index.shard.ShardId serveAsReader(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        String indexName,
-        int shardNumber
-    ) throws Exception {
-        return readerServing.serveAsReader(plane, indexName, shardNumber);
-    }
-
-    /** Opens a reader only for the incarnation this request resolved. */
-    public org.opensearch.core.index.shard.ShardId serveAsReader(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        String indexName,
-        int shardNumber,
-        String expectedUuid
-    ) throws Exception {
-        return readerServing.serveAsReader(plane, indexName, shardNumber, expectedUuid);
-    }
-
     /** How long a reader's check stands before the shard's head is read again, by default. See {@link ReaderValidation}. */
     public static final long READER_CHECK_MILLIS = ReaderValidation.READER_CHECK_MILLIS;
 
@@ -1451,16 +1418,6 @@ public final class ServerlessNode implements Closeable {
      */
     public void setReaderCheckMillis(long millis) {
         readerValidation.setReaderCheckMillis(millis);
-    }
-
-    /** Checks a shard open here before it answers, if it is open as a reader; see {@link ReaderServing#validateReader}. */
-    public void ensureReaderCurrent(
-        org.opensearch.serverless.metadata.MetadataPlane plane,
-        String indexName,
-        int shardNumber,
-        org.opensearch.core.index.shard.ShardId shardId
-    ) throws java.io.IOException {
-        readerServing.ensureReaderCurrent(plane, indexName, shardNumber, shardId);
     }
 
     /**
@@ -1477,11 +1434,6 @@ public final class ServerlessNode implements Closeable {
      * node may stand in for, from a shard nobody can open.
      */
     public static final String AT_THE_CAP = " shards, the cap; ";
-
-    /** Forgets that this node served a shard as a reader, once it no longer does. */
-    public void forgetReader(org.opensearch.core.index.shard.ShardId shardId) {
-        readerServing.forgetReader(shardId);
-    }
 
     /**
      * How long a read confirming that an index incarnation still exists licenses answering from its shards.
@@ -1752,7 +1704,7 @@ public final class ServerlessNode implements Closeable {
     /**
      * Closes a shard this node has stopped owning.
      *
-     * <p>Deliberately separate from {@link #applyTruth}: a shard is never closed because a view omitted
+     * <p>Deliberately separate from {@link WriterActivation#applyTruth}: a shard is never closed because a view omitted
      * it, only because truth says ownership is gone. See {@code ShardReconciler}.
      *
      * @param shardId the shard to release
@@ -1773,7 +1725,7 @@ public final class ServerlessNode implements Closeable {
         if (reconciler.shard(shardId) != null) {
             return;
         }
-        forgetReader(shardId);
+        readerServing.forgetReader(shardId);
         sightings.forgetOwner(shardId.getIndexName(), shardId.id());
         writerAssignments.remove(shardKey(shardId.getIndexName(), shardId.id()));
         if (reconciler.openShards().stream().noneMatch(open -> open.getIndexName().equals(shardId.getIndexName()))) {

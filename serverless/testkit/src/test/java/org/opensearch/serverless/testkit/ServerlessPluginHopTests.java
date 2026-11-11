@@ -356,8 +356,8 @@ public class ServerlessPluginHopTests extends OpenSearchTestCase {
             // And then the resync, which is what puts those members into the projected cluster state --
             // the reconcile pass runs it on a cadence of its own, every RESYNC_EVERY_PASSES backstops.
             // Called directly rather than waited for, because ten minutes is not a test.
-            first.syncFrom(plane);
-            second.syncFrom(plane);
+            first.activation().syncFrom(plane);
+            second.activation().syncFrom(plane);
 
             final Response elsewhere = get(first, "/_testkit/where/hop-b");
             assertEquals(elsewhere.body(), 200, elsewhere.status());

@@ -136,7 +136,7 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
             assertTrue(cold.body().contains("\"published\":false"));
 
             // Activate one and publish, then look again.
-            final ShardId shardId = node.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId shardId = node.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             ShardOps.indexDoc(node.reconciler().shard(shardId), "1", "{\"msg\":\"hello\"}");
             node.reconciler().shard(shardId).refresh("p7");
             node.publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());

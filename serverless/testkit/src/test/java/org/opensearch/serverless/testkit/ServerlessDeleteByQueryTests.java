@@ -264,7 +264,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
     private void prepareSelectionDocuments(ServerlessNode node, MetadataPlane plane) throws Exception {
         final var http = node.boundHttpAddress().publishAddress();
         assertEquals(200, send(http, "PUT", "/alpha?shards=1", MAPPING).status());
-        node.activateWriter(plane, "alpha", 0);
+        node.activation().activateWriter(plane, "alpha", 0);
         assertEquals(201, send(http, "PUT", "/alpha/_doc/both?refresh=true", "{\"msg\":\"red blue\",\"keep\":false}").status());
         assertEquals(201, send(http, "PUT", "/alpha/_doc/red?refresh=true", "{\"msg\":\"red\",\"keep\":true}").status());
         assertEquals(201, send(http, "PUT", "/alpha/_doc/blue?refresh=true", "{\"msg\":\"blue\",\"keep\":true}").status());
@@ -282,9 +282,9 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "dbq-basic")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=3", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
-            node.activateWriter(plane, "alpha", 1);
-            node.activateWriter(plane, "alpha", 2);
+            node.activation().activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 1);
+            node.activation().activateWriter(plane, "alpha", 2);
 
             for (int i = 1; i <= 30; i++) {
                 final boolean keep = i % 3 == 0;
@@ -330,7 +330,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "dbq-paged")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
 
             final int documents = 2137;
             for (int i = 1; i <= documents; i++) {
@@ -362,7 +362,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "dbq-nothing")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"x\",\"n\":1,\"keep\":true}");
             publish(node, plane, "alpha", 1);
 
@@ -391,7 +391,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "dbq-frozen")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
 
             // Published: the frozen view will see this one.
             send(http, "PUT", "/alpha/_doc/published?refresh=true", "{\"msg\":\"x\",\"n\":1,\"keep\":false}");
@@ -427,7 +427,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "dbq-maxdocs")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
             for (int i = 1; i <= 10; i++) {
                 send(http, "PUT", "/alpha/_doc/d" + i + "?refresh=true", "{\"msg\":\"x\",\"n\":" + i + ",\"keep\":false}");
             }
@@ -450,7 +450,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "dbq-noquery")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"x\",\"n\":1,\"keep\":true}");
 
             assertEquals(400, send(http, "POST", "/alpha/_delete_by_query", "{}").status());
@@ -466,7 +466,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "dbq-sort")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
 
             final Response refused = send(
                 http,
@@ -504,7 +504,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         try (ServerlessNode node = started(plane, "dbq-release")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
-            node.activateWriter(plane, "alpha", 0);
+            node.activation().activateWriter(plane, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"x\",\"n\":1,\"keep\":false}");
             publish(node, plane, "alpha", 1);
 

@@ -196,7 +196,7 @@ public class MultiGetRequestExecutionTests extends OpenSearchTestCase {
                     metadata.createIndex(
                         new IndexDescriptor("docs", "uuid-docs", 1, "{\"properties\":{\"msg\":{\"type\":\"keyword\"}}}", null)
                     );
-                    final var shard = node.activateWriter(metadata, "docs", 0).orElseThrow();
+                    final var shard = node.activation().activateWriter(metadata, "docs", 0).orElseThrow();
                     node.writes().index(shard, "private", "{\"msg\":\"private-value\"}");
                     node.writes().index(shard, "public", "{\"msg\":\"public-value\"}");
                 }

@@ -64,7 +64,7 @@ public class DocumentWriteRequestExecutionTests extends OpenSearchTestCase {
                 node.setMetadataPlane(metadata);
                 for (String index : List.of("original", "selected")) {
                     metadata.createIndex(new IndexDescriptor(index, "uuid-" + index, 1, "{}", null));
-                    node.activateWriter(metadata, index, 0).orElseThrow();
+                    node.activation().activateWriter(metadata, index, 0).orElseThrow();
                 }
                 work.accept(new Fixture(node, metadata, store));
             }
@@ -344,7 +344,7 @@ public class DocumentWriteRequestExecutionTests extends OpenSearchTestCase {
             final var created = send(fixture.node(), "PUT", "/_data_stream/events", "{}");
             assertEquals(created.body(), 200, created.statusCode());
             final var backing = fixture.metadata().writeTarget("events").orElseThrow().index();
-            fixture.node().activateWriter(fixture.metadata(), backing.name(), 0).orElseThrow();
+            fixture.node().activation().activateWriter(fixture.metadata(), backing.name(), 0).orElseThrow();
             final var result = send(
                 fixture.node(),
                 "PUT",

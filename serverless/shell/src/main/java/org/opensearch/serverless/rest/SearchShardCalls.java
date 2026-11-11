@@ -55,7 +55,7 @@ final class SearchShardCalls {
             try {
                 // A reader here is asked first whether its commit may be behind an acknowledged write nobody is
                 // writing; one that is answers for no document, and the next copy is tried.
-                serving.ensureReaderCurrent(metadata, index, shard, local);
+                serving.readers().ensureReaderCurrent(metadata, index, shard, local);
                 final org.opensearch.serverless.shard.ShardQuery.Result result = queryHere(serving, local, perShard, nowInMillis);
                 markUsedIfMatched(serving, local, result);
                 return new SearchFanout.ShardAnswer(result);
@@ -191,7 +191,7 @@ final class SearchShardCalls {
         if (serving.localNode().getId().equals(target)) {
             // We are the placement for this shard but do not hold it yet. Open it here rather
             // than asking ourselves over the network.
-            final ShardId opened = serving.serveAsReader(metadata, index, shard, descriptor.uuid());
+            final ShardId opened = serving.readers().serveAsReader(metadata, index, shard, descriptor.uuid());
             serving.markUsed(opened);
             return new SearchFanout.ShardAnswer(queryHere(serving, opened, perShard, nowInMillis));
         }
@@ -297,7 +297,7 @@ final class SearchShardCalls {
                 if (serving.localNode().getId().equals(target)) {
                     // We are the placement for this shard but had not opened it yet. Open it here rather
                     // than forwarding to ourselves over the network.
-                    final var shardId = serving.openFrozenView(metadata, pit, shard);
+                    final var shardId = serving.activation().openFrozenView(metadata, pit, shard);
                     return new SearchFanout.ShardAnswer(queryHere(serving, shardId, perShard, nowInMillis));
                 }
                 final var peer = serving.router().peer(target, serving.router().searchForwardTimeout());
@@ -320,7 +320,7 @@ final class SearchShardCalls {
         // No candidate answered -- empty membership, everyone unreachable, or this node holds no search
         // role at all. Open it here: the unconditional fallback every call used before placement existed,
         // so a stale or unlucky routing decision costs this node a cold open and never a wrong answer.
-        final var shardId = serving.openFrozenView(metadata, pit, shard);
+        final var shardId = serving.activation().openFrozenView(metadata, pit, shard);
         return new SearchFanout.ShardAnswer(queryHere(serving, shardId, perShard, nowInMillis));
     }
 

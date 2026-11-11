@@ -64,7 +64,7 @@ public class RolloverRequestValidationTests extends OpenSearchTestCase {
 
     public void testUnmetConditionStillPreservesTarget() throws Exception {
         withNode((node, metadata) -> {
-            node.activateWriter(metadata, "logs-000001", 0).orElseThrow();
+            node.activation().activateWriter(metadata, "logs-000001", 0).orElseThrow();
             final var answer = send(node, "/logs/_rollover", "{\"conditions\":{\"max_docs\":1000}}");
             assertEquals(answer.body(), 200, answer.statusCode());
             assertTrue(answer.body(), answer.body().contains("\"rolled_over\":false"));

@@ -90,7 +90,7 @@ final class DeleteByQueryExecution {
             long conflicts = 0;
             int batches = 0;
             for (Integer shard : shards.keySet()) {
-                final var frozenShardId = node.openFrozenView(plane, pit, shard);
+                final var frozenShardId = node.activation().openFrozenView(plane, pit, shard);
                 Object[] cursor = null;
                 while (visited < maxDocs) {
                     final var page = new org.opensearch.search.builder.SearchSourceBuilder().query(query)

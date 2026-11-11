@@ -450,7 +450,7 @@ public final class PointInTime {
      * Reads a view off the transport wire.
      *
      * <p>Carries the whole view, every shard's manifest included, rather than a reduced form with just the
-     * shard being asked for. {@link org.opensearch.serverless.shell.ServerlessNode#openFrozenView} needs
+     * shard being asked for. {@link org.opensearch.serverless.shell.WriterActivation#openFrozenView} needs
      * every shard's term to build the view's {@code IndexMetadata} even when opening one shard of it — see
      * that method for why — and sending the full view lets the node this is forwarded to call the exact
      * method the coordinating node would have called locally, rather than a second implementation that

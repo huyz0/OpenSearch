@@ -39,7 +39,7 @@ public class ShardAdmissionTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(settings)) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                final var id = node.activateWriter(plane, "index", 0).orElseThrow();
+                final var id = node.activation().activateWriter(plane, "index", 0).orElseThrow();
                 node.releaseShard(id, "closed before query admission");
                 expectThrows(org.opensearch.index.shard.IndexShardClosedException.class, () -> node.reconciler().enter(id));
                 assertEquals(0, node.reconciler().inFlight(id));
@@ -63,7 +63,7 @@ public class ShardAdmissionTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(settings)) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                final var id = node.activateWriter(plane, "index", 0).orElseThrow();
+                final var id = node.activation().activateWriter(plane, "index", 0).orElseThrow();
                 final var reconciler = node.reconciler();
                 final int workers = 8;
                 final var executor = Executors.newFixedThreadPool(workers);

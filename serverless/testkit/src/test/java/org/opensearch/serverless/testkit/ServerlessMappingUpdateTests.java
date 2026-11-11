@@ -67,7 +67,7 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(nodeSettings("mapping-growth-incarnation"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                final var id = node.activateWriter(plane, "alpha", 0).orElseThrow();
+                final var id = node.activation().activateWriter(plane, "alpha", 0).orElseThrow();
                 store.onNextRegisterSwap("indices/", "alpha", () -> {
                     try {
                         assertTrue(plane.deleteIndex("alpha"));
@@ -102,7 +102,7 @@ public class ServerlessMappingUpdateTests extends OpenSearchTestCase {
                 node.setMetadataPlane(plane);
                 final var shards = new java.util.ArrayList<org.opensearch.core.index.shard.ShardId>();
                 for (int shard = 0; shard < 8; shard++) {
-                    shards.add(node.activateWriter(plane, "alpha", shard).orElseThrow());
+                    shards.add(node.activation().activateWriter(plane, "alpha", shard).orElseThrow());
                 }
                 final var start = new java.util.concurrent.CountDownLatch(1);
                 final var writes = new java.util.ArrayList<java.util.concurrent.Future<?>>();

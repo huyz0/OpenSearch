@@ -73,10 +73,10 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
                 node.startup().start();
                 node.setMetadataPlane(plane);
                 if (succeeds) {
-                    final var shard = node.activateWriter(plane, "legacy", 0).orElseThrow();
+                    final var shard = node.activation().activateWriter(plane, "legacy", 0).orElseThrow();
                     assertTrue("a valid old record is still replayed", node.reads().get(shard, "logged").found());
                 } else {
-                    expectThrows(Exception.class, () -> node.activateWriter(plane, "legacy", 0));
+                    expectThrows(Exception.class, () -> node.activation().activateWriter(plane, "legacy", 0));
                     assertTrue("a rejected logged operation must prevent activation", node.reconciler().openShards().isEmpty());
                     assertTrue(
                         "the log must remain available for repair and retry",
@@ -172,7 +172,7 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             other.startup().start();
             other.setMetadataPlane(plane);
             other.leases().renewLease(plane);
-            final ShardId reader = other.serveAsReader(plane, "alpha", 0);
+            final ShardId reader = other.readers().serveAsReader(plane, "alpha", 0);
             other.reconciler().unrecordReaderForTesting(reader);
 
             expectThrows(java.io.IOException.class, () -> other.writes().index(reader, "b", "{\"msg\":\"b\"}"));
@@ -266,7 +266,7 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(nodeSettings("mixed-replay-order"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                final var shard = node.activateWriter(plane, "mixed", 0).orElseThrow();
+                final var shard = node.activation().activateWriter(plane, "mixed", 0).orElseThrow();
                 final var document = node.reads().get(shard, "logged");
                 assertEquals(expected != null, document.found());
                 assertEquals(expected, document.source());
@@ -331,7 +331,7 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(nodeSettings("payload-replay-conflict"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                final Exception failure = expectThrows(Exception.class, () -> node.activateWriter(plane, "conflict", 0));
+                final Exception failure = expectThrows(Exception.class, () -> node.activation().activateWriter(plane, "conflict", 0));
                 final String reason = org.opensearch.ExceptionsHelper.detailedMessage(failure);
                 assertTrue(reason, reason.contains("share a sequence number"));
                 assertTrue(node.reconciler().openShards().isEmpty());

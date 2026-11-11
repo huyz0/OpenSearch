@@ -252,7 +252,7 @@ final class ShardEviction {
             // must go the writer's way below.
             switch (reconciler.node.reconciler().releaseReader(shardId, null, reason)) {
                 case RELEASED -> {
-                    reconciler.node.forgetReader(shardId);
+                    reconciler.node.readers().forgetReader(shardId);
                     return true;
                 }
                 case BUSY -> {

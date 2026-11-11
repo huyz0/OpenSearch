@@ -299,7 +299,7 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
         try (ServerlessNode verifier = new ServerlessNode(nodeSettings(name, "search"))) {
             verifier.startup().start();
             verifier.setMetadataPlane(plane);
-            final ShardId shardId = verifier.serveAsReader(plane, "alpha", 0);
+            final ShardId shardId = verifier.readers().serveAsReader(plane, "alpha", 0);
             return org.opensearch.serverless.shard.ShardQuery.execute(verifier.searchService(), shardId, "msg", "flushed", 10).total();
         }
     }

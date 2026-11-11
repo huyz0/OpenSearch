@@ -90,7 +90,7 @@ public class FilesystemShardLayoutTests extends OpenSearchTestCase {
                 final var descriptor = metadata.describe(index).orElseThrow();
                 final var path = RegisterMap.shardData(BlobPath.cleanPath(), index, descriptor.uuid(), 0).toArray();
                 assertEquals(255, path[path.length - 1].getBytes(StandardCharsets.UTF_8).length);
-                node.activateWriter(metadata, index, 0);
+                node.activation().activateWriter(metadata, index, 0);
             }
         }
     }
