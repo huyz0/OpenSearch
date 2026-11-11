@@ -2532,11 +2532,12 @@ public final class BackgroundReconciler implements Closeable {
                 taken.ifPresent(shardId -> openedAt.put(shardId, plane.clock().getAsLong()));
                 // Opened from a commit that already holds everything it has: that commit is this node's last publish
                 // too, so neither the next pass nor an idle release publishes the same operations again.
-                taken.ifPresent(
-                    shardId -> node.reconciler()
-                        .takePublishedThroughAtOpen(shardId)
-                        .ifPresent(through -> lastPublishedMaxSeqNo.put(shardId, through))
-                );
+                taken.ifPresent(shardId -> node.reconciler().takePublishedThroughAtOpen(shardId).ifPresent(through -> {
+                    lastPublishedMaxSeqNo.put(shardId, through);
+                    // And spaced from now, as the publish it replaces would have been, so the first write
+                    // after the take does not publish at once.
+                    lastPublishedAtMillis.put(shardId, plane.clock().getAsLong());
+                }));
                 return taken;
             } finally {
                 if (reserved) {
