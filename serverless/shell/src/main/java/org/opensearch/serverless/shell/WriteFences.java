@@ -20,6 +20,63 @@ public final class WriteFences {
     }
 
     /**
+     * How long a read confirming that an index incarnation still exists licenses answering from its shards.
+     *
+     * <p><b>This is what makes routing from a cached descriptor safe.</b> A coordinator routes by a
+     * resolution up to {@code MetadataPlane#DEFAULT_ROUTING_CACHE_MILLIS} old, and a stale one carries the
+     * uuid of an incarnation another node has deleted. The uuid check where the request lands cannot catch
+     * that when the landing node still holds that incarnation's shard open -- the uuids match, because both
+     * are the old one -- and a write was acknowledged into a deleted index. So the landing node answers only
+     * if it has read the descriptor and found that very uuid within this window, by its own monotonic clock,
+     * and a delete answers only after waiting longer than the window ({@link #DELETE_SETTLE_MILLIS}). A write
+     * acknowledged here was therefore acknowledged before any delete of its index returned: concurrent with
+     * the delete, never after it.
+     *
+     * <p>The read is per index and per window, not per request: a shard written a thousand times a second
+     * pays one descriptor read a second, and an idle one pays nothing.
+     */
+    public static final long INCARNATION_FENCE_MILLIS = 1_000L;
+
+    /**
+     * How long a delete waits before answering: the fence, plus a margin for two clocks' rates.
+     *
+     * <p>Durations, not timestamps, are compared on each side, so skew between the nodes does not enter;
+     * only drift in how fast their clocks run does, and a quarter of the window is far beyond that.
+     */
+    public static final long DELETE_SETTLE_MILLIS = INCARNATION_FENCE_MILLIS + 250L;
+
+    volatile long incarnationFenceMillis = INCARNATION_FENCE_MILLIS;
+
+    /** When each incarnation was last confirmed to exist, by uuid, in {@link System#nanoTime} terms. */
+    final java.util.concurrent.ConcurrentHashMap<String, Long> incarnationConfirmedAtNanos = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Striped, so a burst of writes to one index pays one confirming read rather than one each. */
+    final Object[] incarnationLocks = newLocks(64);
+
+    private static Object[] newLocks(int n) {
+        final Object[] locks = new Object[n];
+        for (int i = 0; i < n; i++) {
+            locks[i] = new Object();
+        }
+        return locks;
+    }
+
+    /**
+     * Sets the incarnation fence window; zero confirms on every answer. For tests that need the check to
+     * run rather than be answered from a recent confirmation.
+     *
+     * @param millis the window
+     */
+    public void setIncarnationFenceMillis(long millis) {
+        this.incarnationFenceMillis = Math.max(0L, millis);
+    }
+
+    /** Records that an incarnation was read and found live at {@code startedAtNanos}, for the incarnation fence. */
+    void confirmIncarnation(String uuid, long startedAtNanos) {
+        incarnationConfirmedAtNanos.merge(uuid, startedAtNanos, Math::max);
+    }
+
+    /**
      * Refuses to answer from a shard unless its index incarnation was confirmed to exist within the window.
      *
      * @param shardId the shard about to answer
@@ -33,7 +90,7 @@ public final class WriteFences {
             return;
         }
         final String uuid = shardId.getIndex().getUUID();
-        final long window = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(node.incarnationFenceMillis);
+        final long window = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(incarnationFenceMillis);
         if (confirmedWithin(uuid, window)) {
             return;
         }
@@ -43,13 +100,13 @@ public final class WriteFences {
         // and once here.
         final var routed = plane.readConfirmingIncarnation(shardId.getIndexName(), uuid);
         if (routed.isPresent() && System.nanoTime() - routed.get().readStartedNanos() <= window) {
-            node.confirmIncarnation(uuid, routed.get().readStartedNanos());
+            confirmIncarnation(uuid, routed.get().readStartedNanos());
             // And it is a read of the mapping and settings like any other: a change made on another node reaches
             // this one's shards through whichever read sees it first, so the periodic refresh is only a backstop.
             node.descriptorRefresh.applyIfNewer(shardId.getIndexName(), routed.get().descriptor(), routed.get().readStartedNanos());
             return;
         }
-        synchronized (node.incarnationLocks[Math.floorMod(uuid.hashCode(), node.incarnationLocks.length)]) {
+        synchronized (incarnationLocks[Math.floorMod(uuid.hashCode(), incarnationLocks.length)]) {
             if (confirmedWithin(uuid, window)) {
                 return;
             }
@@ -58,10 +115,10 @@ public final class WriteFences {
             final long startedAt = System.nanoTime();
             final var descriptor = plane.describe(shardId.getIndexName());
             if (descriptor.isEmpty() || descriptor.get().uuid().equals(uuid) == false) {
-                node.incarnationConfirmedAtNanos.remove(uuid);
+                incarnationConfirmedAtNanos.remove(uuid);
                 throw new StaleIncarnationException(shardId);
             }
-            node.incarnationConfirmedAtNanos.put(uuid, startedAt);
+            incarnationConfirmedAtNanos.put(uuid, startedAt);
             // The read is the refresh's read too: apply it, and let the periodic refresh skip this index.
             try {
                 node.descriptorRefresh.applyDescriptor(shardId.getIndexName(), descriptor.get());
@@ -72,16 +129,16 @@ public final class WriteFences {
                     e
                 );
             }
-            if (node.incarnationConfirmedAtNanos.size() > 4096) {
+            if (incarnationConfirmedAtNanos.size() > 4096) {
                 // A confirmation older than the window licenses nothing, so those are all that is dropped.
                 final long now = System.nanoTime();
-                node.incarnationConfirmedAtNanos.values().removeIf(at -> now - at > window);
+                incarnationConfirmedAtNanos.values().removeIf(at -> now - at > window);
             }
         }
     }
 
     boolean confirmedWithin(String uuid, long windowNanos) {
-        final Long at = node.incarnationConfirmedAtNanos.get(uuid);
+        final Long at = incarnationConfirmedAtNanos.get(uuid);
         return at != null && System.nanoTime() - at <= windowNanos;
     }
 
@@ -92,7 +149,7 @@ public final class WriteFences {
      * @throws java.io.IOException if the shard is write-fenced
      */
     void refuseIfWriteFenced(org.opensearch.core.index.shard.ShardId shardId) throws java.io.IOException {
-        if (node.ownershipUnverified) {
+        if (node.leases().ownershipUnverified) {
             throw new java.io.IOException(
                 "refusing to write to "
                     + shardId
@@ -164,14 +221,14 @@ public final class WriteFences {
             return false;
         }
         final long now = plane.clock().getAsLong();
-        if (plane.membership().selfLeaseValidAt(now) && node.ownershipUnverified == false) {
+        if (plane.membership().selfLeaseValidAt(now) && node.leases().ownershipUnverified == false) {
             return false;
         }
         // Remembered so the next renewal gives the head back in the register: a closed shard whose head
         // still names this node, once the lease is renewed, is a shard nobody serves and nobody can take.
         final var shard = node.reconciler.shard(shardId);
         if (shard != null) {
-            node.headsToGiveBack.put(shardId, shard.getOperationPrimaryTerm());
+            node.leases().headsToGiveBack.put(shardId, shard.getOperationPrimaryTerm());
         }
         node.reconciler.releaseShard(shardId, "this node's own lease expired at or before " + now);
         node.writeFenced.remove(shardId);
@@ -268,7 +325,7 @@ public final class WriteFences {
         if (node.reconciler.shard(shardId) == null || node.reconciler.isReader(shardId) || node.writeFenced.contains(shardId)) {
             return false;
         }
-        if (node.ownershipUnverified) {
+        if (node.leases().ownershipUnverified) {
             // The lease lapsed and the heads have not been re-read since the renewal; see renewLease.
             return false;
         }
