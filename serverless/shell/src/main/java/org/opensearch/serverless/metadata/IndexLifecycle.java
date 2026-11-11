@@ -230,7 +230,7 @@ final class IndexLifecycle {
     public boolean deleteIndex(String indexName, String expectedUuid) throws IOException {
         // The descriptor and the generation it was read at, from one read: read separately, a change
         // landing between the two handed the delete a fresh generation for a stale descriptor.
-        final DescriptorStore.Resolution resolved = descriptors.resolve(indexName);
+        final DescriptorResolution resolved = descriptors.resolve(indexName);
         final Optional<IndexDescriptor> descriptor = Optional.ofNullable(resolved.index());
         if (descriptor.isEmpty() || (expectedUuid != null && expectedUuid.equals(descriptor.get().uuid()) == false)) {
             return false;
@@ -311,7 +311,7 @@ final class IndexLifecycle {
      * @throws IOException if the store cannot be reached; the intent is kept and tried again
      */
     public void reclaim(ReclaimQueue.Intent intent) throws IOException {
-        final DescriptorStore.Resolution current = descriptors.resolve(intent.name());
+        final DescriptorResolution current = descriptors.resolve(intent.name());
         if (current.index() != null && intent.uuid().equals(current.index().uuid())) {
             return;
         }

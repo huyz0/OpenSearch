@@ -20,7 +20,6 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -75,11 +74,13 @@ public final class DescriptorStore {
      */
     public static final long TOMBSTONE_REAP_HANDOFF_MILLIS = 60_000L;
 
-    private final ConditionalBlobContainer container;
-    private final DescriptorListing listing;
-    private final BlobStore blobStore;
-    private final BlobPath tombstonesPath;
-    private final LongSupplier clock;
+    final ConditionalBlobContainer container;
+    final DescriptorListing listing;
+    final BlobStore blobStore;
+    final BlobPath tombstonesPath;
+    final LongSupplier clock;
+    /** Sweeps the tombstones once their quarantine has passed. */
+    final TombstoneSweep tombstoneSweep = new TombstoneSweep(this);
 
     /**
      * Told the name of every record this store changes, so a cache over it cannot go stale through a
@@ -89,7 +90,7 @@ public final class DescriptorStore {
      * growing, and one of them forgetting is a routing cache serving a descriptor this very node has just
      * replaced. Announcing from the one class that does the writing makes that impossible to get wrong.
      */
-    private volatile java.util.function.Consumer<String> onChanged = name -> {};
+    volatile java.util.function.Consumer<String> onChanged = name -> {};
 
     /**
      * Creates a store.
@@ -265,28 +266,28 @@ public final class DescriptorStore {
      * @return what it names
      * @throws IOException if the register cannot be read or parsed
      */
-    public Resolution resolve(String name) throws IOException {
-        final Resolution resolved = resolveRaw(name);
+    public DescriptorResolution resolve(String name) throws IOException {
+        final DescriptorResolution resolved = resolveRaw(name);
         return resolved.alias() != null && resolved.alias().creationPending()
-            ? new Resolution(null, null, resolved.generation())
+            ? new DescriptorResolution(null, null, resolved.generation())
             : resolved;
     }
 
     /** Internal mutation state, including an unpublished alias creation. */
-    Resolution resolveRaw(String name) throws IOException {
+    DescriptorResolution resolveRaw(String name) throws IOException {
         Names.validateIndexOrAlias(name);
         final Optional<BlobRegister> register = container.readRegister(RegisterMap.descriptorBlob(name));
         final long generation = register.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
         if (register.isEmpty() || Tombstones.isTombstone(register.get().value())) {
-            return new Resolution(null, null, generation);
+            return new DescriptorResolution(null, null, generation);
         }
         if (isAlias(register.get().value())) {
             try (InputStream in = register.get().value().streamInput()) {
-                return new Resolution(null, org.opensearch.serverless.cluster.AliasRecord.fromStream(in), generation);
+                return new DescriptorResolution(null, org.opensearch.serverless.cluster.AliasRecord.fromStream(in), generation);
             }
         }
         try (InputStream in = register.get().value().streamInput()) {
-            return new Resolution(IndexDescriptor.fromStream(in), null, generation);
+            return new DescriptorResolution(IndexDescriptor.fromStream(in), null, generation);
         }
     }
 
@@ -328,62 +329,6 @@ public final class DescriptorStore {
                 throw new IOException("unexpected content after descriptor or alias");
             }
             return alias;
-        }
-    }
-
-    /** What a name turned out to be, and the register generation it was read at -- one read for both. */
-    public static final class Resolution {
-
-        private final IndexDescriptor index;
-        private final org.opensearch.serverless.cluster.AliasRecord alias;
-        private final long generation;
-
-        Resolution(IndexDescriptor index, org.opensearch.serverless.cluster.AliasRecord alias) {
-            this(index, alias, BlobRegister.ABSENT_GENERATION);
-        }
-
-        Resolution(IndexDescriptor index, org.opensearch.serverless.cluster.AliasRecord alias, long generation) {
-            this.index = index;
-            this.alias = alias;
-            this.generation = generation;
-        }
-
-        /**
-         * Returns the generation the register held when this was read, for a compare-and-swap on what
-         * was read -- never a generation read separately, which guards nothing (see
-         * {@code MetadataPlane.AliasAtGeneration}).
-         *
-         * @return the generation, or {@link BlobRegister#ABSENT_GENERATION} when the name is absent
-         */
-        public long generation() {
-            return generation;
-        }
-
-        /**
-         * Returns the index, if the name is one.
-         *
-         * @return the descriptor, or null
-         */
-        public IndexDescriptor index() {
-            return index;
-        }
-
-        /**
-         * Returns the alias, if the name is one.
-         *
-         * @return the alias, or null
-         */
-        public org.opensearch.serverless.cluster.AliasRecord alias() {
-            return alias;
-        }
-
-        /**
-         * Reports whether the name stands for nothing at all.
-         *
-         * @return true if absent
-         */
-        public boolean absent() {
-            return index == null && alias == null;
         }
     }
 
@@ -491,8 +436,8 @@ public final class DescriptorStore {
         return true;
     }
 
-    private volatile Boolean conditionalDelete;
-    private volatile BlobPath probePath;
+    volatile Boolean conditionalDelete;
+    volatile BlobPath probePath;
 
     /**
      * Says where the conditional-delete probe may write.
@@ -587,7 +532,7 @@ public final class DescriptorStore {
      * @throws IOException if listing, reading or deleting fails
      */
     public List<String> sweepTombstones(long nowMillis, long quarantineMillis) throws IOException {
-        return sweepTombstones(nowMillis, quarantineMillis, bucket -> true);
+        return tombstoneSweep.sweepTombstones(nowMillis, quarantineMillis);
     }
 
     /**
@@ -600,39 +545,13 @@ public final class DescriptorStore {
      * @throws IOException if listing, reading or deleting fails
      */
     public List<String> sweepTombstones(long nowMillis, long quarantineMillis, Predicate<String> ownsBucket) throws IOException {
-        // A deadline checked before a remote request does not bound when its delete is applied.
-        // Retain tombstones unless the backing store has proved it enforces the expected generation.
-        if (conditionalDelete() == false) {
-            return List.of();
-        }
-        final List<String> removed = new ArrayList<>();
-        for (String bucket : new ArrayList<>(blobStore.blobContainer(tombstonesPath).children().keySet())) {
-            final long start = Tombstones.tombstoneBucketStart(bucket);
-            // Only a bucket whose oldest possible name has passed the quarantine; younger ones are not
-            // listed at all. Not waiting for the whole bucket keeps the quarantine exact rather than up to
-            // a bucket late, and costs at most one more listing of it, since each name is still checked.
-            if (start < 0L || start + quarantineMillis > nowMillis || ownsBucket.test(bucket) == false) {
-                continue;
-            }
-            sweepBucket(bucket, start, nowMillis, quarantineMillis, removed);
-        }
-        return removed;
-    }
-
-    /** What a sweep did with one marker. */
-    private enum Reaped {
-        /** The tombstone is claimed and waiting on the batched delete. */
-        CLAIMED,
-        /** Nothing for this marker to do: the name is live, gone, or deleted again later. */
-        STALE,
-        /** Not now: inside its quarantine, or another sweep's claim. */
-        KEEP
+        return tombstoneSweep.sweepTombstones(nowMillis, quarantineMillis, ownsBucket);
     }
 
     /** The default number of markers a sweep lists and holds at once. */
     public static final int DEFAULT_MARKER_PAGE = 1000;
 
-    private volatile int markerPage = DEFAULT_MARKER_PAGE;
+    volatile int markerPage = DEFAULT_MARKER_PAGE;
 
     /**
      * Sets how many markers a sweep lists and holds at once; for tests that drain a bucket in several pages.
@@ -643,125 +562,6 @@ public final class DescriptorStore {
     public DescriptorStore setMarkerPage(int markers) {
         this.markerPage = Math.max(1, markers);
         return this;
-    }
-
-    private void sweepBucket(String bucket, long bucketStart, long nowMillis, long quarantineMillis, List<String> removed)
-        throws IOException {
-        final BlobContainer markers = blobStore.blobContainer(tombstonesPath.add(bucket));
-        final int page = markerPage;
-        boolean kept = false;
-        // In pages rather than one listing held whole: an hour's bucket at a thousand deletes a second is
-        // millions of names. There is no resuming a listing through BlobContainer, but there need not be --
-        // every page deletes the markers it finished, so listing the first page again lists the next ones.
-        while (true) {
-            final List<org.opensearch.common.blobstore.BlobMetadata> listed = markers.listBlobsByPrefixInSortedOrder(
-                "",
-                page,
-                BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC
-            );
-            final List<String> finished = new ArrayList<>();
-            final Map<String, Long> claimed = new LinkedHashMap<>();
-            long oldestClaim = 0L;
-            for (org.opensearch.common.blobstore.BlobMetadata marker : listed) {
-                final String blobName = marker.name();
-                // Deletes are batched, but a claim only licenses a delete for the deadline, so the batch is
-                // flushed well inside it rather than whenever it happens to fill.
-                if (claimed.isEmpty() == false
-                    && (claimed.size() >= 1000 || clock.getAsLong() >= oldestClaim + TOMBSTONE_REAP_DEADLINE_MILLIS / 2)) {
-                    kept |= flushClaims(claimed, oldestClaim, finished, removed) == false;
-                }
-                final long claimAt = clock.getAsLong();
-                switch (reap(blobName, bucketStart, nowMillis, quarantineMillis, claimAt, claimed)) {
-                    case CLAIMED -> {
-                        if (claimed.size() == 1) {
-                            oldestClaim = claimAt;
-                        }
-                    }
-                    case STALE -> finished.add(blobName);
-                    case KEEP -> kept = true;
-                }
-            }
-            kept |= flushClaims(claimed, oldestClaim, finished, removed) == false;
-            if (finished.isEmpty() == false) {
-                markers.deleteBlobsIgnoringIfNotExists(finished);
-            }
-            // A short page was the last. A page that finished nothing holds only markers kept for later,
-            // and listing again would return that same page.
-            if (listed.size() < page || finished.isEmpty()) {
-                break;
-            }
-        }
-        // An emptied bucket goes too, or a filesystem store would keep a directory an hour forever. Listed
-        // again first, so a marker a badly skewed clock dropped in meanwhile is not taken with it.
-        if (kept == false && markers.listBlobs().isEmpty()) {
-            markers.delete();
-        }
-    }
-
-    /**
-     * Deletes the claimed tombstones if the claims are still inside the deadline.
-     *
-     * @return false if they were not, and the markers are kept for a later sweep
-     */
-    private boolean flushClaims(Map<String, Long> claimed, long oldestClaim, List<String> finished, List<String> removed)
-        throws IOException {
-        if (claimed.isEmpty()) {
-            return true;
-        }
-        try {
-            if (clock.getAsLong() >= oldestClaim + TOMBSTONE_REAP_DEADLINE_MILLIS) {
-                // Too late to be sure no create has taken a claim over. Left claimed; a later sweep finds the
-                // marker, sees the claim has aged past the handoff, and claims it afresh.
-                return false;
-            }
-            boolean all = true;
-            for (Map.Entry<String, Long> claim : claimed.entrySet()) {
-                if (container.deleteRegisterIfUnchanged(claim.getKey(), claim.getValue())) {
-                    removed.add(claim.getKey());
-                    finished.add(claim.getKey());
-                } else {
-                    // A newer claim or lifecycle change still needs its discovery marker.
-                    all = false;
-                }
-            }
-            return all;
-        } finally {
-            claimed.clear();
-        }
-    }
-
-    private Reaped reap(String blobName, long bucketStart, long nowMillis, long quarantineMillis, long claimAt, Map<String, Long> claimed)
-        throws IOException {
-        final Optional<BlobRegister> register = container.readRegister(blobName);
-        if (register.isEmpty() || Tombstones.isTombstone(register.get().value()) == false) {
-            // Already removed, recreated since, or a delete whose swap lost after its marker was written.
-            return Reaped.STALE;
-        }
-        final org.opensearch.core.common.bytes.BytesReference value = register.get().value();
-        final long deletedAt = Tombstones.tombstoneDeletedAt(value);
-        if (deletedAt >= bucketStart + TOMBSTONE_BUCKET_MILLIS) {
-            // Recreated and deleted again later. That delete dropped its own marker in its own bucket.
-            return Reaped.STALE;
-        }
-        if (nowMillis - deletedAt < quarantineMillis) {
-            // Stamped by a clock running ahead of this one. Its quarantine is not this sweep's to shorten.
-            return Reaped.KEEP;
-        }
-        final long reapingAt = Tombstones.tombstoneReapingAt(value);
-        if (reapingAt != 0L && claimAt < reapingAt + TOMBSTONE_REAP_HANDOFF_MILLIS) {
-            // Another sweep's claim, not yet abandoned.
-            return Reaped.KEEP;
-        }
-        final BlobRegisterCasResult swapped = container.compareAndSwapRegister(
-            blobName,
-            register.get().generation(),
-            Tombstones.tombstone(deletedAt, claimAt)
-        );
-        if (swapped.applied()) {
-            claimed.put(blobName, swapped.currentGeneration());
-            return Reaped.CLAIMED;
-        }
-        return Reaped.KEEP;
     }
 
     /**
@@ -787,7 +587,7 @@ public final class DescriptorStore {
      * @return the page
      * @throws IOException if listing or reading fails
      */
-    public Page listPage(String after, int limit) throws IOException {
+    public DescriptorPage listPage(String after, int limit) throws IOException {
         return listing.listPage(after, limit);
     }
 
@@ -801,7 +601,7 @@ public final class DescriptorStore {
      * @throws IOException if listing or reading fails
      * @see #listPage(String, int)
      */
-    public Page listPage(String prefix, String after, int limit) throws IOException {
+    public DescriptorPage listPage(String prefix, String after, int limit) throws IOException {
         return listing.listPage(prefix, after, limit);
     }
 
@@ -846,93 +646,8 @@ public final class DescriptorStore {
      * @return the page
      * @throws IOException if listing or any read fails
      */
-    public Page listPage(String prefix, String after, int limit, Reads reads) throws IOException {
+    public DescriptorPage listPage(String prefix, String after, int limit, Reads reads) throws IOException {
         return listing.listPage(prefix, after, limit, reads);
-    }
-
-    /** A bounded page of descriptors, and where to resume. */
-    public static final class Page {
-
-        private final Map<String, IndexDescriptor> descriptors;
-        private final String nextAfter;
-
-        Page(Map<String, IndexDescriptor> descriptors, String nextAfter) {
-            this.descriptors = java.util.Collections.unmodifiableMap(new LinkedHashMap<>(descriptors));
-            this.nextAfter = nextAfter;
-        }
-
-        /**
-         * Returns the descriptors in this page.
-         *
-         * @return descriptors by index name, in name order
-         */
-        public Map<String, IndexDescriptor> descriptors() {
-            return descriptors;
-        }
-
-        /**
-         * Returns the cursor to resume from, or null when the walk is complete.
-         *
-         * @return the next cursor, or null
-         */
-        public String nextAfter() {
-            return nextAfter;
-        }
-
-        /**
-         * Reports whether another page follows.
-         *
-         * @return true when there is more
-         */
-        public boolean hasMore() {
-            return nextAfter != null;
-        }
-    }
-
-    /**
-     * More names share a prefix than a caller is willing to be handed.
-     *
-     * <p>A refusal rather than a truncation, and that is the whole point of the class existing: an answer
-     * cut off at a limit looks exactly like a complete one, and a search that quietly covered the first
-     * five hundred indices of a thousand is the confident partial answer this design refuses everywhere
-     * else.
-     */
-    public static final class TooManyMatchesException extends IOException {
-
-        private final String prefix;
-        private final int cap;
-
-        TooManyMatchesException(String prefix, int cap) {
-            super(
-                "more than "
-                    + cap
-                    + " indices begin with ["
-                    + prefix
-                    + "]. Narrowing the pattern or naming the indices is the answer; returning the first "
-                    + cap
-                    + " would be a partial result that looks complete."
-            );
-            this.prefix = prefix;
-            this.cap = cap;
-        }
-
-        /**
-         * Returns the prefix that matched too much.
-         *
-         * @return the prefix
-         */
-        public String prefix() {
-            return prefix;
-        }
-
-        /**
-         * Returns the cap that was exceeded.
-         *
-         * @return the cap
-         */
-        public int cap() {
-            return cap;
-        }
     }
 
     /**

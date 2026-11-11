@@ -210,7 +210,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                 render(channel, result);
             } catch (IndexAdminHandler.RefusedException e) {
                 sendQuietly(channel, e.status, e.type, e.getMessage());
-            } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
+            } catch (org.opensearch.serverless.metadata.TooManyMatchesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             } catch (Exception e) {
                 try {

@@ -121,7 +121,7 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
                         }
                     );
                 }
-            } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
+            } catch (org.opensearch.serverless.metadata.TooManyMatchesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             } catch (Exception e) {
                 try {

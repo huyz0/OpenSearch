@@ -21,7 +21,7 @@ import org.opensearch.rest.RestRequest;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.cluster.AliasRecord;
 import org.opensearch.serverless.cluster.IndexDescriptor;
-import org.opensearch.serverless.metadata.DescriptorStore;
+import org.opensearch.serverless.metadata.DescriptorResolution;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
@@ -205,7 +205,7 @@ public final class RolloverHandler extends BaseRestHandler {
     }
 
     private RolloverResponse rollover(ServerlessNode serving, MetadataPlane metadata, Ask ask) throws Exception {
-        final DescriptorStore.Resolution resolved = metadata.resolveForAliasMutation(ask.target());
+        final DescriptorResolution resolved = metadata.resolveForAliasMutation(ask.target());
         if (resolved.alias() == null) {
             throw new IndexAdminHandler.RefusedException(
                 resolved.index() != null ? RestStatus.BAD_REQUEST : RestStatus.NOT_FOUND,
