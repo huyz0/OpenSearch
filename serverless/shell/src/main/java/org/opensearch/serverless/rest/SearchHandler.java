@@ -1119,7 +1119,7 @@ public final class SearchHandler extends BaseRestHandler {
                         rewritten.allowPartialSearchResults(serving.searchService().defaultAllowPartialSearchResults());
                     }
                     final T result = work.apply(accepted);
-                    if (result instanceof org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome) {
+                    if (result instanceof org.opensearch.serverless.shard.SearchOutcome outcome) {
                         if (Boolean.FALSE.equals(rewritten.allowPartialSearchResults()) && outcome.failures().isEmpty() == false) {
                             final Throwable cause = outcome.failures().get(0).getCause();
                             if (cause instanceof Exception failure) {
@@ -1180,45 +1180,41 @@ public final class SearchHandler extends BaseRestHandler {
     }
 
     private static final org.opensearch.serverless.shell.ActionGate.ResponseView<
-        org.opensearch.serverless.shard.ShardOperations.SearchOutcome> SEARCH_VIEW =
-            new org.opensearch.serverless.shell.ActionGate.ResponseView<>() {
+        org.opensearch.serverless.shard.SearchOutcome> SEARCH_VIEW = new org.opensearch.serverless.shell.ActionGate.ResponseView<>() {
 
-                @Override
-                public org.opensearch.core.action.ActionResponse show(
-                    org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome
-                ) {
-                    return toResponse(outcome, null, 0L, null);
-                }
+            @Override
+            public org.opensearch.core.action.ActionResponse show(org.opensearch.serverless.shard.SearchOutcome outcome) {
+                return toResponse(outcome, null, 0L, null);
+            }
 
-                @Override
-                public org.opensearch.serverless.shard.ShardOperations.SearchOutcome read(
-                    org.opensearch.core.action.ActionResponse response,
-                    org.opensearch.serverless.shard.ShardOperations.SearchOutcome original
-                ) {
-                    if (response instanceof org.opensearch.action.search.SearchResponse answered) {
-                        final org.apache.lucene.search.TotalHits total = answered.getHits().getTotalHits();
-                        return new org.opensearch.serverless.shard.ShardOperations.SearchOutcome(
-                            total == null ? 0L : total.value(),
-                            java.util.List.of(answered.getHits().getHits()),
-                            original == null ? answered.getTotalShards() : original.shards(),
-                            original == null ? answered.getSuccessfulShards() : original.answered(),
-                            (org.opensearch.search.aggregations.InternalAggregations) answered.getAggregations(),
-                            total == null ? org.apache.lucene.search.TotalHits.Relation.EQUAL_TO : total.relation(),
-                            answered.getHits().getMaxScore(),
-                            original == null ? answered.isTimedOut() : original.timedOut(),
-                            original == null ? answered.isTerminatedEarly() : original.terminatedEarly(),
-                            original == null ? java.util.List.of(answered.getShardFailures()) : original.failures()
-                        ).withSkipped(original == null ? answered.getSkippedShards() : original.skipped())
-                            .withTotalHitsTracking(total != null);
-                    }
-                    // A filter that replaced the response with something that is not a search answer.
-                    // Taking the original would silently undo whatever it meant to do, so this refuses
-                    // instead: a filter doing something the shell cannot honour must be visible.
-                    throw new IllegalStateException(
-                        "an action filter answered a search with " + response.getClass().getName() + ", which is not a search response"
-                    );
+            @Override
+            public org.opensearch.serverless.shard.SearchOutcome read(
+                org.opensearch.core.action.ActionResponse response,
+                org.opensearch.serverless.shard.SearchOutcome original
+            ) {
+                if (response instanceof org.opensearch.action.search.SearchResponse answered) {
+                    final org.apache.lucene.search.TotalHits total = answered.getHits().getTotalHits();
+                    return new org.opensearch.serverless.shard.SearchOutcome(
+                        total == null ? 0L : total.value(),
+                        java.util.List.of(answered.getHits().getHits()),
+                        original == null ? answered.getTotalShards() : original.shards(),
+                        original == null ? answered.getSuccessfulShards() : original.answered(),
+                        (org.opensearch.search.aggregations.InternalAggregations) answered.getAggregations(),
+                        total == null ? org.apache.lucene.search.TotalHits.Relation.EQUAL_TO : total.relation(),
+                        answered.getHits().getMaxScore(),
+                        original == null ? answered.isTimedOut() : original.timedOut(),
+                        original == null ? answered.isTerminatedEarly() : original.terminatedEarly(),
+                        original == null ? java.util.List.of(answered.getShardFailures()) : original.failures()
+                    ).withSkipped(original == null ? answered.getSkippedShards() : original.skipped()).withTotalHitsTracking(total != null);
                 }
-            };
+                // A filter that replaced the response with something that is not a search answer.
+                // Taking the original would silently undo whatever it meant to do, so this refuses
+                // instead: a filter doing something the shell cannot honour must be visible.
+                throw new IllegalStateException(
+                    "an action filter answered a search with " + response.getClass().getName() + ", which is not a search response"
+                );
+            }
+        };
 
     /**
      * Reports whether a name is a pattern this system can answer.
@@ -1259,7 +1255,7 @@ public final class SearchHandler extends BaseRestHandler {
         java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess
     ) throws IOException {
         final long startNanos = System.nanoTime();
-        final org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome;
+        final org.opensearch.serverless.shard.SearchOutcome outcome;
         try {
             outcome = gated(
                 serving,
@@ -1453,7 +1449,7 @@ public final class SearchHandler extends BaseRestHandler {
      * @return the response
      */
     public static org.opensearch.action.search.SearchResponse toResponse(
-        org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome,
+        org.opensearch.serverless.shard.SearchOutcome outcome,
         SearchSourceBuilder source,
         long tookMillis,
         String pitId
@@ -1500,7 +1496,7 @@ public final class SearchHandler extends BaseRestHandler {
     private void render(
         org.opensearch.rest.RestChannel channel,
         java.util.List<String> skipped,
-        org.opensearch.serverless.shard.ShardOperations.SearchOutcome outcome,
+        org.opensearch.serverless.shard.SearchOutcome outcome,
         SearchSourceBuilder source,
         long tookMillis,
         boolean counting,
