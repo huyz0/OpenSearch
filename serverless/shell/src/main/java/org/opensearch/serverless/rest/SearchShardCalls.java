@@ -189,17 +189,9 @@ final class SearchShardCalls {
         }
     }
 
-    private static final java.util.Map<ServerlessNode, org.opensearch.serverless.cluster.HotShardSpread> SPREADS =
-        new java.util.WeakHashMap<>();
-
-    /** The node's spread of hot shards over readers, one per node, built from its settings on first use. */
+    /** The node's spread of hot shards over readers; see {@link org.opensearch.serverless.cluster.HotShardSpread#of}. */
     static org.opensearch.serverless.cluster.HotShardSpread spreadOf(ServerlessNode serving) {
-        synchronized (SPREADS) {
-            return SPREADS.computeIfAbsent(
-                serving,
-                node -> new org.opensearch.serverless.cluster.HotShardSpread(node.settings(), System::nanoTime)
-            );
-        }
+        return org.opensearch.serverless.cluster.HotShardSpread.of(serving, serving.settings());
     }
 
     /** Asks one node for a shard: this one by opening a reader, another over the wire; null if it cannot be reached. */

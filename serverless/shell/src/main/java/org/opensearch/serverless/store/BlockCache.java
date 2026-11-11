@@ -87,6 +87,7 @@ public final class BlockCache {
     private final AtomicLong coalesced = new AtomicLong();
     private final AtomicLong bytesFetched = new AtomicLong();
     private final AtomicLong bytesResident = new AtomicLong();
+    private final AtomicLong bytesCopied = new AtomicLong();
     private volatile java.util.concurrent.Executor prefetchExecutor;
 
     /**
@@ -149,6 +150,16 @@ public final class BlockCache {
     }
 
     /**
+     * Whether a block is held, without counting a hit or a miss.
+     *
+     * @param key the block's identity
+     * @return true if it is held
+     */
+    public boolean holds(String key) {
+        return peek(key) != null;
+    }
+
+    /**
      * Looks up a cached block.
      *
      * @param key the block's identity
@@ -175,6 +186,85 @@ public final class BlockCache {
         final long evicted = stripe.put(key, block);
         bytesFetched.addAndGet(block.length);
         bytesResident.addAndGet(block.length - evicted);
+    }
+
+    /**
+     * Stores a block copied from a peer's cache, if this cache does not already hold it.
+     *
+     * <p>Not counted as fetched: {@link #bytesFetched} is what the object store was asked for, and a copy from a peer
+     * cost it nothing. Counted in {@link #bytesCopied} instead, so a warm join can show what it was spared.
+     *
+     * @param key the block's identity, the same on every node
+     * @param block the bytes
+     * @return true if it was stored, false if a block was already held under the key
+     */
+    public boolean putCopied(String key, byte[] block) {
+        final Stripe stripe = stripeFor(key);
+        final long evicted = stripe.putIfAbsent(key, block);
+        if (evicted < 0) {
+            return false;
+        }
+        bytesCopied.addAndGet(block.length);
+        bytesResident.addAndGet(block.length - evicted);
+        return true;
+    }
+
+    /**
+     * Returns the keys held for each of some cache scopes, most recently used first.
+     *
+     * <p>What a node hands a joining peer so that it can copy the blocks searches actually touch rather than whole
+     * files. One pass over the cache for all the scopes asked about, since a node holding hundreds of shards would
+     * otherwise walk every block once per shard. Each stripe is its own least-recently-used list and the stripes are
+     * taken in turn, so the order is by recency within a stripe and close to it across them, which is as near as the
+     * cache keeps.
+     *
+     * @param scopes the scopes, the part of a key before its first {@code /}
+     * @return each scope's keys, hottest first; a scope holding nothing is absent
+     */
+    public Map<String, java.util.List<String>> residentByScope(java.util.Set<String> scopes) {
+        final java.util.List<java.util.List<String>> perStripe = new java.util.ArrayList<>(stripes.length);
+        for (Stripe stripe : stripes) {
+            perStripe.add(stripe.keysMostRecentFirst(scopes));
+        }
+        final Map<String, java.util.List<String>> byScope = new java.util.HashMap<>();
+        for (int i = 0, remaining = stripes.length; remaining > 0; i++) {
+            remaining = 0;
+            for (java.util.List<String> keys : perStripe) {
+                if (i < keys.size()) {
+                    final String key = keys.get(i);
+                    byScope.computeIfAbsent(scopeOf(key), s -> new java.util.ArrayList<>()).add(key);
+                }
+                if (i + 1 < keys.size()) {
+                    remaining++;
+                }
+            }
+        }
+        return byScope;
+    }
+
+    /**
+     * Returns the blocks held under some keys, leaving out any no longer held, without counting hits or misses: a
+     * peer copying the cache is not a reader of it. Like {@link #peek}, it does refresh their recency, which is
+     * harmless here since the keys a peer asks for are the ones {@link #residentByScope} named as the hottest.
+     *
+     * @param keys the blocks wanted
+     * @return the ones held, in the order asked
+     */
+    public Map<String, byte[]> copyOut(java.util.List<String> keys) {
+        final Map<String, byte[]> held = new LinkedHashMap<>();
+        for (String key : keys) {
+            final byte[] block = stripeFor(key).get(key);
+            if (block != null) {
+                held.put(key, block);
+            }
+        }
+        return held;
+    }
+
+    /** The scope a key belongs to: everything before its first {@code /}. */
+    static String scopeOf(String key) {
+        final int slash = key.indexOf('/');
+        return slash < 0 ? key : key.substring(0, slash);
     }
 
     /**
@@ -274,6 +364,15 @@ public final class BlockCache {
     }
 
     /**
+     * Returns how many bytes were copied in from peers' caches rather than fetched from the object store.
+     *
+     * @return bytes copied
+     */
+    public long bytesCopied() {
+        return bytesCopied.get();
+    }
+
+    /**
      * Returns the counters and the occupancy as one reading.
      *
      * @return the stats
@@ -297,6 +396,7 @@ public final class BlockCache {
         misses.set(0);
         coalesced.set(0);
         bytesFetched.set(0);
+        bytesCopied.set(0);
     }
 
     private long residentBlocks() {
@@ -339,6 +439,26 @@ public final class BlockCache {
             evictedBytes = 0;
             final byte[] replaced = blocks.put(key, block);
             return evictedBytes + (replaced == null ? 0 : replaced.length);
+        }
+
+        /** Stores a block unless one is held; returns the bytes evicted to make room, or -1 if one was held. */
+        synchronized long putIfAbsent(String key, byte[] block) {
+            if (blocks.containsKey(key)) {
+                return -1;
+            }
+            return put(key, block);
+        }
+
+        /** The keys in some scopes, most recently used first. */
+        synchronized java.util.List<String> keysMostRecentFirst(java.util.Set<String> scopes) {
+            final java.util.ArrayList<String> keys = new java.util.ArrayList<>();
+            for (String key : blocks.keySet()) {
+                if (scopes.contains(scopeOf(key))) {
+                    keys.add(key);
+                }
+            }
+            java.util.Collections.reverse(keys);
+            return keys;
         }
 
         synchronized int size() {
