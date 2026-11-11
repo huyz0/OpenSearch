@@ -21,6 +21,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.env.ShardLock;
 import org.opensearch.index.IndexSettings;
+import org.opensearch.index.seqno.SequenceNumbers;
 import org.opensearch.index.store.Store;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
@@ -74,9 +75,11 @@ public final class UnitSplitBuilder {
      * @param right the upper half's published commit
      * @param leftDocs documents the lower half holds
      * @param rightDocs documents the upper half holds
+     * @param checkpoint the local checkpoint of the old unit's commit, which both halves' commits carry: a record past it
+     *     is not in either half yet
      */
     public record Built(UnitLayout.Split split, CommitManifest source, CommitManifest left, CommitManifest right, long leftDocs,
-        long rightDocs) {
+        long rightDocs, long checkpoint) {
     }
 
     /**
@@ -106,7 +109,16 @@ public final class UnitSplitBuilder {
                 final Map<String, String> userData = reader.getIndexCommit().getUserData();
                 final Half left = buildHalf(plane, after, reader, userData, split.left(), scratch);
                 final Half right = buildHalf(plane, after, reader, userData, split.right(), scratch);
-                return new Built(split, commit.get(), left.published, right.published, left.docs, right.docs);
+                final String checkpoint = userData.get(SequenceNumbers.LOCAL_CHECKPOINT_KEY);
+                return new Built(
+                    split,
+                    commit.get(),
+                    left.published,
+                    right.published,
+                    left.docs,
+                    right.docs,
+                    checkpoint == null ? SequenceNumbers.NO_OPS_PERFORMED : Long.parseLong(checkpoint)
+                );
             }
         }
     }
