@@ -50,7 +50,11 @@ final class SearchShardCalls {
     ) throws IOException {
         final String index = descriptor.name();
         Exception lastFailure = null;
-        final ShardId local = localShard(serving, descriptor, shard);
+        // Not while this node warms or drains: a reader it opened to warm has a cache still filling, and the readers
+        // coordinators send searches to are the warm ones.
+        final ShardId local = org.opensearch.serverless.shell.SearchReadiness.of(serving).ready()
+            ? localShard(serving, descriptor, shard)
+            : null;
         if (local != null) {
             try {
                 // A reader here is asked first whether its commit may be behind an acknowledged write nobody is

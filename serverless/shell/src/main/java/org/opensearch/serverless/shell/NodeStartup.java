@@ -90,7 +90,8 @@ public final class NodeStartup {
                     node.localNode.getId(),
                     node.localNode.getEphemeralId(),
                     node.localNode.getAddress().toString(),
-                    node.roles,
+                    // Less the search role while the node warms or drains, so no coordinator ranks it as a reader.
+                    SearchReadiness.of(node).advertised(node.roles),
                     0L,
                     node.localNode.getName(),
                     org.opensearch.Version.CURRENT.toString()

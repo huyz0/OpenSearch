@@ -145,6 +145,10 @@ final class NodeWiring {
             )
         );
 
+        controller.registerHandler(
+            new org.opensearch.serverless.rest.ServerlessReadyHandler(() -> node.started, () -> SearchReadiness.of(node))
+        );
+
         // Then every endpoint a classic node serves and this one refuses, each with its reason.
         RefusedEndpoints.register(controller);
         return controller;
