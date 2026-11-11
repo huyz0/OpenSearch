@@ -113,10 +113,24 @@ final class ShardPublishing {
             if (hook != null) {
                 hook.accept(shardId, shard.indexSettings().getNumberOfShards(), term, digest);
             }
-            final org.opensearch.serverless.store.SegmentPublisher.Published done = reconciler.publisherCache.computeIfAbsent(
+            final org.opensearch.serverless.store.SegmentPublisher publisher = reconciler.publisherCache.computeIfAbsent(
                 shardId,
                 reconciler.publishers
-            ).publishCommit(shard.store(), commit.get(), term, reconciler.localNode.getId(), digest, walOrdinal, stages);
+            );
+            // Decided per publish: a placement changed at runtime applies from the next one, and moves nothing written.
+            final java.util.function.Predicate<IndexShard> placement = reconciler.nodePackPlacement;
+            if (placement != null) {
+                publisher.useNodePacks(placement.test(shard));
+            }
+            final org.opensearch.serverless.store.SegmentPublisher.Published done = publisher.publishCommit(
+                shard.store(),
+                commit.get(),
+                term,
+                reconciler.localNode.getId(),
+                digest,
+                walOrdinal,
+                stages
+            );
             manifest = done.manifest();
             if (done.checkpointed() == false) {
                 // The log is trimmed only behind the register: a successor restores it and replays the rest.
