@@ -318,6 +318,8 @@ final class ShardOpening {
             abandon(reconciler.indicesService.indexService(shardId.getIndex()), shardId, e);
             throw e;
         } finally {
+            // Handed in for this open only, used or not.
+            reconciler.preloadedReplay.remove(shardId);
             unmarkOpening(shardId);
         }
     }
