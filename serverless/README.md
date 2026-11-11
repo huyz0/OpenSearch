@@ -160,6 +160,105 @@ unpublished record of every shard is, so a successor reads it without a listing.
   takeover. A whole fleet down for longer than the rule loses what its logs held unpublished, so set it beyond any
   outage the deployment means to recover from.
 
+## Scaling search nodes without a cold cache
+
+A search node that joins cold reads every block its first searches touch from the object store. If you set
+`serverless.search.warm_on_join=true`, a new node first copies its share of the warm cache from the search nodes
+already serving it, and only then takes traffic. If you set `serverless.search.drain.on_shutdown`, which defaults to
+the same value, a stopping node hands its shards to their next readers before it goes.
+
+One flag decides whether a node is sent searches. The ingress learns it from the readiness probe, and coordinators
+learn it from the search role in the node's lease.
+
+- **Joining.** The node joins with its lease but without the search role, and `GET /_serverless/ready` answers 503.
+  It then does four things:
+  1. It asks each search peer which shards it will be ranked first for, counting as many readers as a hot shard is
+     spread over.
+  2. It copies the blocks the peer holds for those shards over the transport, hottest first. The copy is capped at
+     `serverless.search.warm_copy.max_bytes_per_second`, 128 MB/s by default.
+  3. It opens the shards, and reads anything a peer did not hand over from the object store in ranges of up to
+     8 MB.
+  4. It turns ready and renews its lease at once.
+
+  A node that is still warming after `serverless.search.warm_on_join.max_wait` (3 minutes by default) turns ready
+  anyway, with whatever cache it has.
+- **Draining.** Draining starts on `POST /_serverless/drain`, or on shutdown when draining on shutdown is enabled.
+  1. Readiness answers 503 and the lease drops the search role.
+  2. Each search peer copies, from the draining node, the shards it now ranks first for, and opens them.
+  3. The node keeps answering for `serverless.search.drain.settle` (two thirds of the lease TTL by default), while
+     coordinators notice. The call then returns.
+
+  All of this is bounded by `serverless.search.drain.max_wait`, 2 minutes by default.
+- **Discovery** goes through the leases in the object store, not through Kubernetes. A pod that is not ready is
+  still a member, so its peers find it to answer its copy requests. No control plane tells a node anything. Searches
+  reach a reader two ways, from the ingress to a coordinating node and from a coordinator to a reader, and the flag
+  covers both.
+
+In `WarmJoinMeterTests` every store request takes 20 ms. The first search on a shard (opening it and one query)
+took about 178 ms on a node that joined cold, after 11 to 17 block reads per shard. On a node that joined warm it
+took about 46 ms with no block reads. Most of the 46 ms is the commit check that every open makes. Warming took
+about a second for 4 to 7 shards of a small index. A drain handed over every shard of the draining node in under a
+second, and the successors read no blocks from the store.
+
+A search Deployment that scales one pod at a time:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: search
+spec:
+  replicas: 6
+  strategy:
+    rollingUpdate:
+      maxSurge: 1          # a new pod warms before an old one is stopped
+      maxUnavailable: 0
+  selector:
+    matchLabels: { app: search }
+  template:
+    metadata:
+      labels: { app: search }
+    spec:
+      terminationGracePeriodSeconds: 300   # drain.max_wait plus settle, with room to spare
+      containers:
+        - name: node
+          image: <your serverless image>
+          env:
+            # However your image passes -D settings to the JVM.
+            - name: OPENSEARCH_JAVA_OPTS
+              value: >-
+                -Dserverless.roles=search
+                -Dserverless.search.warm_on_join=true
+          ports:
+            - { name: http, containerPort: 9200 }
+            - { name: transport, containerPort: 9300 }
+          readinessProbe:            # 503 while starting, warming or draining
+            httpGet: { path: /_serverless/ready, port: http }
+            periodSeconds: 2
+            failureThreshold: 1
+          livenessProbe:             # a warming node is healthy, not ready
+            httpGet: { path: /_serverless/health, port: http }
+            periodSeconds: 10
+            failureThreshold: 6
+          lifecycle:
+            preStop:                 # returns once peers have taken the node's shards
+              exec:
+                command: ["curl", "-sf", "-XPOST", "--max-time", "280", "http://localhost:9200/_serverless/drain"]
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: search
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels: { app: search }
+```
+
+A HorizontalPodAutoscaler can drive `replicas` as usual. A scale-out adds pods that warm before they serve, and a
+scale-in drains the pods it removes. The Service in front of the pods needs nothing special, since it routes only to
+ready pods. The `preStop` drain and the shutdown drain are the same drain, and whichever runs second does nothing.
+
 ## Transport replay capacity
 
 `serverless.transport.replay_cache.capacity` limits the accepted, still-valid nonces
