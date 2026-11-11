@@ -119,7 +119,7 @@ public final class MultiGetHandler extends BaseRestHandler {
         }
         return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
             try (var budget = new ResponseBudget(serving)) {
-                final MultiGetResponse response = serving.actionGate().run(MultiGetAction.NAME, ask, admitted -> {
+                final MultiGetResponse response = serving.services().actionGate().run(MultiGetAction.NAME, ask, admitted -> {
                     if (admitted instanceof MultiGetRequest selected) {
                         return fetch(serving, metadata, selected, budget);
                     }

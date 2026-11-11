@@ -40,7 +40,7 @@ public class ResponseBudgetLifecycleTests extends OpenSearchTestCase {
 
     public void testClosingReturnsReservationsAndRejectsLateResults() throws Exception {
         withNode(node -> {
-            final var breaker = node.circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
+            final var breaker = node.services().circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
             final long before = breaker.getUsed();
             final var retained = new AtomicReference<String>();
             try (var budget = new ResponseBudget(node)) {
@@ -56,7 +56,7 @@ public class ResponseBudgetLifecycleTests extends OpenSearchTestCase {
 
     public void testAbandonedBatchCannotRetainAResultThatWasStillBeingEstimated() throws Exception {
         withNode(node -> {
-            final var breaker = node.circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
+            final var breaker = node.services().circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
             final long before = breaker.getUsed();
             final var retained = new AtomicReference<String>();
             final var entered = new CountDownLatch(1);
@@ -89,7 +89,7 @@ public class ResponseBudgetLifecycleTests extends OpenSearchTestCase {
 
     public void testAnActiveBatchObservesAnUpdatedBreakerLimit() throws Exception {
         withNode(node -> {
-            final var breaker = (ChildMemoryCircuitBreaker) node.circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
+            final var breaker = (ChildMemoryCircuitBreaker) node.services().circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
             final long before = breaker.getUsed();
             try (var budget = new ResponseBudget(node)) {
                 budget.keep(1024L, () -> {});

@@ -147,14 +147,18 @@ final class ShardEviction {
             if (reconciler.demandDriven == false || reconciler.evictAfterMillis <= 0) {
                 return 0;
             }
-            if (reconciler.node.nearlyFull() && reconciler.node.memberWithRoom(reconciler.plane).isPresent()) {
+            if (reconciler.node.nodeCapacity().nearlyFull()
+                && reconciler.node.nodeCapacity().memberWithRoom(reconciler.plane).isPresent()) {
                 final int floor = (int) Math.floor(reconciler.maxShardsHeld * BackgroundReconciler.HAND_OFF_DOWN_TO);
                 return evictDownTo(floor, Math.max(1, reconciler.maxShardsHeld / 10), true);
             }
             // Far above its share, near its cap or not, while a member is below the mean: down towards the mean, at the same
             // pace. The writes for what it lets go are steered to that member, so they do not come straight back.
-            if (reconciler.node.aboveFleetShare(reconciler.plane) && reconciler.node.memberBelowMean(reconciler.plane).isPresent()) {
-                final int floor = (int) Math.ceil(reconciler.node.fleetMeanHeld(reconciler.plane) * ServerlessNode.HAND_OFF_DOWN_TO_MEAN);
+            if (reconciler.node.nodeCapacity().aboveFleetShare(reconciler.plane)
+                && reconciler.node.nodeCapacity().memberBelowMean(reconciler.plane).isPresent()) {
+                final int floor = (int) Math.ceil(
+                    reconciler.node.nodeCapacity().fleetMeanHeld(reconciler.plane) * ServerlessNode.HAND_OFF_DOWN_TO_MEAN
+                );
                 return evictDownTo(floor, Math.max(1, reconciler.maxShardsHeld / 10), true);
             }
             return 0;
@@ -181,7 +185,7 @@ final class ShardEviction {
             if (reconciler.demandDriven) {
                 reconciler.wanted.remove(Map.entry(victim.getIndexName(), victim.id()));
             }
-            reconciler.node.noteEvicted(handOff);
+            reconciler.node.nodeCapacity().noteEvicted(handOff);
             evicted++;
         }
         if (evicted > 0) {

@@ -648,7 +648,7 @@ public final class BackgroundReconciler implements Closeable {
      */
     public BackgroundReconciler setTakeoverOvercommit(double fraction) {
         this.takeoverOvercommit = Math.max(0.0, fraction);
-        node.setTakeoverOvercommit(this.takeoverOvercommit);
+        node.nodeCapacity().setTakeoverOvercommit(this.takeoverOvercommit);
         return this;
     }
 

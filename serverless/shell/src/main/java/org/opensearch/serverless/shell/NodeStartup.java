@@ -97,8 +97,8 @@ public final class NodeStartup {
                 ).withLoad(
                     node.reconciler == null ? 0 : node.reconciler.heldShards().size(),
                     node.admission.maxShardsHeld(),
-                    node.inUseLastMinute(),
-                    node.refusedLastMinute()
+                    node.nodeCapacity().inUseLastMinute(),
+                    node.nodeCapacity().refusedLastMinute()
                 ).withNodeLog(nodeLogEpochs)
             );
         node.ownLeaseValidUntilMillis = startedAt + plane.leaseTtlMillis();

@@ -66,7 +66,7 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
             own(owner, plane, clock);
             int ordinal = 0;
             for (var via : List.of(owner, peer)) {
-                final var client = via.client();
+                final var client = via.services().client();
                 final String id = "doc-" + ordinal++;
                 final var created = client.index(index(id, "created")).actionGet();
                 assertEquals(DocWriteResponse.Result.CREATED, created.getResult());
@@ -122,10 +122,10 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
             own(owner, plane, clock);
             for (var via : List.of(owner, peer)) {
                 final var request = new IndexRequest("alpha").source("{\"msg\":\"generated\"}", XContentType.JSON);
-                final var created = via.client().index(request).actionGet();
+                final var created = via.services().client().index(request).actionGet();
                 assertNotNull(created.getId());
                 assertEquals("the caller must know the id even if it later needs to retry", created.getId(), request.id());
-                final var repeated = via.client().index(request).actionGet();
+                final var repeated = via.services().client().index(request).actionGet();
                 assertEquals(created.getId(), repeated.getId());
                 assertEquals(DocWriteResponse.Result.UPDATED, repeated.getResult());
                 assertEquals(2L, repeated.getVersion());
@@ -139,7 +139,7 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
         try (var node = new ServerlessNode(settings("native-refusals"))) {
             attach(node, plane);
             own(node, plane, clock);
-            final var client = node.client();
+            final var client = node.services().client();
             for (IndexRequest request : List.of(
                 index("routing", "blocked").routing("custom"),
                 index("version", "blocked").version(7).versionType(org.opensearch.index.VersionType.EXTERNAL),
@@ -241,24 +241,34 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
         try (var node = new ServerlessNode(settings("native-filter-contract"), List.of(new NativeWriteContractPlugin()))) {
             attach(node, plane);
             own(node, plane, clock);
-            final var created = node.client().index(index("rewrite", "original")).actionGet();
+            final var created = node.services().client().index(index("rewrite", "original")).actionGet();
             assertTrue(created.getSeqNo() >= 0L);
             assertEquals(
                 "approved",
-                node.client().get(new org.opensearch.action.get.GetRequest("alpha", "rewrite")).actionGet().getSourceAsMap().get("msg")
+                node.services()
+                    .client()
+                    .get(new org.opensearch.action.get.GetRequest("alpha", "rewrite"))
+                    .actionGet()
+                    .getSourceAsMap()
+                    .get("msg")
             );
             assertEquals(
                 DocWriteResponse.Result.DELETED,
-                node.client().delete(new DeleteRequest("alpha", "rewrite")).actionGet().getResult()
+                node.services().client().delete(new DeleteRequest("alpha", "rewrite")).actionGet().getResult()
             );
             try (var builder = org.opensearch.common.xcontent.XContentFactory.cborBuilder()) {
                 builder.startObject().field("msg", "binary-source").endObject();
                 final var binary = new IndexRequest("alpha").id("binary")
                     .source(org.opensearch.core.common.bytes.BytesReference.bytes(builder), XContentType.CBOR);
-                assertEquals(DocWriteResponse.Result.CREATED, node.client().index(binary).actionGet().getResult());
+                assertEquals(DocWriteResponse.Result.CREATED, node.services().client().index(binary).actionGet().getResult());
                 assertEquals(
                     "binary-source",
-                    node.client().get(new org.opensearch.action.get.GetRequest("alpha", "binary")).actionGet().getSourceAsMap().get("msg")
+                    node.services()
+                        .client()
+                        .get(new org.opensearch.action.get.GetRequest("alpha", "binary"))
+                        .actionGet()
+                        .getSourceAsMap()
+                        .get("msg")
                 );
             }
         }
@@ -274,16 +284,17 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
             attach(owner, plane);
             attach(peer, plane);
             own(owner, plane, clock);
-            owner.client().index(index("versioned", "first")).actionGet();
-            final var current = owner.client().index(index("versioned", "current")).actionGet();
+            owner.services().client().index(index("versioned", "first")).actionGet();
+            final var current = owner.services().client().index(index("versioned", "current")).actionGet();
             for (var via : List.of(owner, peer)) {
                 for (var type : org.opensearch.index.VersionType.values()) {
                     final var request = new org.opensearch.action.get.GetRequest("alpha", "versioned").version(current.getVersion())
                         .versionType(type);
-                    assertEquals(current.getVersion(), via.client().get(request).actionGet().getVersion());
+                    assertEquals(current.getVersion(), via.services().client().get(request).actionGet().getVersion());
                     expectThrows(
                         VersionConflictEngineException.class,
-                        () -> via.client()
+                        () -> via.services()
+                            .client()
                             .get(
                                 new org.opensearch.action.get.GetRequest("alpha", "versioned").version(current.getVersion() - 1)
                                     .versionType(type)
@@ -292,13 +303,17 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
                     );
                 }
                 assertFalse(
-                    via.client().get(new org.opensearch.action.get.GetRequest("alpha", "absent").version(1)).actionGet().isExists()
+                    via.services()
+                        .client()
+                        .get(new org.opensearch.action.get.GetRequest("alpha", "absent").version(1))
+                        .actionGet()
+                        .isExists()
                 );
                 for (var request : List.of(
                     new org.opensearch.action.get.GetRequest("alpha", "versioned").routing("custom"),
                     new org.opensearch.action.get.GetRequest("alpha", "versioned").storedFields("msg")
                 )) {
-                    expectThrows(UnsupportedOperationException.class, () -> via.client().get(request).actionGet());
+                    expectThrows(UnsupportedOperationException.class, () -> via.services().client().get(request).actionGet());
                 }
             }
         }
@@ -310,12 +325,12 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
         try (var node = new ServerlessNode(settings("native-get-filter-contract"), List.of(new NativeWriteContractPlugin()))) {
             attach(node, plane);
             own(node, plane, clock);
-            node.client().index(index("redirect", "private")).actionGet();
-            node.client().index(index("public", "visible")).actionGet();
-            final var redirected = node.client().get(new org.opensearch.action.get.GetRequest("alpha", "redirect")).actionGet();
+            node.services().client().index(index("redirect", "private")).actionGet();
+            node.services().client().index(index("public", "visible")).actionGet();
+            final var redirected = node.services().client().get(new org.opensearch.action.get.GetRequest("alpha", "redirect")).actionGet();
             assertEquals("public", redirected.getId());
             assertEquals("visible", redirected.getSourceAsMap().get("msg"));
-            final var cached = node.client().get(new org.opensearch.action.get.GetRequest("alpha", "cached")).actionGet();
+            final var cached = node.services().client().get(new org.opensearch.action.get.GetRequest("alpha", "cached")).actionGet();
             assertEquals("cached", cached.getSourceAsMap().get("msg"));
             assertEquals(7L, cached.getVersion());
             final var operations = new org.opensearch.serverless.shard.ShardOperations(node, plane);

@@ -100,7 +100,7 @@ public final class SearchPipelineHandler extends BaseRestHandler {
             try {
                 final TemplateStore store = metadata.searchPipelines();
                 if (method == RestRequest.Method.PUT) {
-                    final var response = serving.actionGate().run(action, ask, admitted -> {
+                    final var response = serving.services().actionGate().run(action, ask, admitted -> {
                         final var selected = require(admitted, org.opensearch.action.search.PutSearchPipelineRequest.class);
                         concreteId(selected.getId());
                         return put(serving, store, selected.getId(), jsonSource(selected.getSource(), selected.getMediaType()));
@@ -114,7 +114,7 @@ public final class SearchPipelineHandler extends BaseRestHandler {
                         channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                     }
                 } else if (method == RestRequest.Method.DELETE) {
-                    final var response = serving.actionGate().run(action, ask, admitted -> {
+                    final var response = serving.services().actionGate().run(action, ask, admitted -> {
                         final var selected = require(admitted, org.opensearch.action.search.DeleteSearchPipelineRequest.class);
                         concreteId(selected.getId());
                         return delete(store, selected.getId());
@@ -162,14 +162,14 @@ public final class SearchPipelineHandler extends BaseRestHandler {
         String body
     ) throws IOException, IndexAdminHandler.RefusedException {
         try {
-            serving.searchPipelines().validate(id, body);
+            serving.services().searchPipelines().validate(id, body);
         } catch (Exception e) {
             throw new IndexAdminHandler.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "invalid_pipeline",
                 (e.getMessage() == null ? e.toString() : e.getMessage())
                     + ". Available processors: "
-                    + String.join(", ", serving.searchPipelines().available())
+                    + String.join(", ", serving.services().searchPipelines().available())
             );
         }
         store.put(id, body);
@@ -265,7 +265,7 @@ public final class SearchPipelineHandler extends BaseRestHandler {
                 return original;
             }
         };
-        final var response = serving.actionGate().run(action, request, admitted -> {
+        final var response = serving.services().actionGate().run(action, request, admitted -> {
             final var pending = new PendingRestChannel(channel);
             work.accept(admitted, pending);
             return pending.response();

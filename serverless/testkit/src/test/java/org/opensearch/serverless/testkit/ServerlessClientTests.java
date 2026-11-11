@@ -74,7 +74,7 @@ public class ServerlessClientTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("client-roundtrip"))) {
             node.startup().start();
             node.setMetadataPlane(metadata);
-            final Client client = node.client();
+            final Client client = node.services().client();
 
             // A plugin bootstrapping its config index.
             client.admin().indices().create(new CreateIndexRequest(".plugin_config").mapping(MAPPING)).actionGet();
@@ -118,11 +118,12 @@ public class ServerlessClientTests extends OpenSearchTestCase {
             for (int i = 0; i < 2; i++) {
                 final var written = owner.writes().index(shard, "doc", "{\"msg\":\"kept\",\"n\":" + i + "}");
                 for (ServerlessNode via : java.util.List.of(owner, peer)) {
-                    final var got = via.client().get(new GetRequest("alpha", "doc")).actionGet();
+                    final var got = via.services().client().get(new GetRequest("alpha", "doc")).actionGet();
                     assertEquals(written.seqNo(), got.getSeqNo());
                     assertEquals(written.primaryTerm(), got.getPrimaryTerm());
                     assertEquals(written.version(), got.getVersion());
-                    final var hidden = via.client()
+                    final var hidden = via.services()
+                        .client()
                         .get(
                             new GetRequest("alpha", "doc").fetchSourceContext(
                                 org.opensearch.search.fetch.subphase.FetchSourceContext.DO_NOT_FETCH_SOURCE
@@ -131,7 +132,8 @@ public class ServerlessClientTests extends OpenSearchTestCase {
                         .actionGet();
                     assertTrue(hidden.isExists());
                     assertNull(hidden.getSourceAsString());
-                    final var selected = via.client()
+                    final var selected = via.services()
+                        .client()
                         .get(
                             new GetRequest("alpha", "doc").fetchSourceContext(
                                 new org.opensearch.search.fetch.subphase.FetchSourceContext(true, new String[] { "msg" }, new String[0])
@@ -158,7 +160,7 @@ public class ServerlessClientTests extends OpenSearchTestCase {
             loop.want(".plugin_config", 0);
             loop.tick(clock.get());
 
-            final var got = node.client().get(new GetRequest(".plugin_config", "nothing-here")).actionGet();
+            final var got = node.services().client().get(new GetRequest(".plugin_config", "nothing-here")).actionGet();
             assertFalse("absent must be absent, not an error: " + got, got.isExists());
             assertNull(got.getSourceAsString());
         }
@@ -182,7 +184,7 @@ public class ServerlessClientTests extends OpenSearchTestCase {
 
             final var failure = expectThrows(
                 Exception.class,
-                () -> node.client().bulk(new org.opensearch.action.bulk.BulkRequest()).actionGet()
+                () -> node.services().client().bulk(new org.opensearch.action.bulk.BulkRequest()).actionGet()
             );
             final String message = failure.getMessage() == null ? failure.toString() : failure.getMessage();
             assertTrue("the refusal must name the action it refused: " + message, message.contains("indices:data/write/bulk"));
@@ -198,13 +200,18 @@ public class ServerlessClientTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("client-twice"))) {
             node.startup().start();
             node.setMetadataPlane(metadata);
-            node.client().admin().indices().create(new CreateIndexRequest(".plugin_config").mapping(MAPPING)).actionGet();
+            node.services().client().admin().indices().create(new CreateIndexRequest(".plugin_config").mapping(MAPPING)).actionGet();
             // Asserted on the type, not the message: ResourceAlreadyExistsException carries the index name
             // as its message and the meaning in its class, which is the same contract classic OpenSearch
             // has -- and a plugin catches the type.
             final var failure = expectThrows(
                 org.opensearch.ResourceAlreadyExistsException.class,
-                () -> node.client().admin().indices().create(new CreateIndexRequest(".plugin_config").mapping(MAPPING)).actionGet()
+                () -> node.services()
+                    .client()
+                    .admin()
+                    .indices()
+                    .create(new CreateIndexRequest(".plugin_config").mapping(MAPPING))
+                    .actionGet()
             );
             assertTrue("and it must name the index: " + failure.getMessage(), failure.getMessage().contains(".plugin_config"));
         }
@@ -236,15 +243,16 @@ public class ServerlessClientTests extends OpenSearchTestCase {
             assertTrue("the other node must hold nothing", other.reconciler().openShards().isEmpty());
 
             // Written through the node that does NOT own the shard.
-            other.client()
+            other.services()
+                .client()
                 .index(new IndexRequest(".plugin_config").id("k").source("{\"msg\":\"routed\",\"n\":1}", XContentType.JSON))
                 .actionGet();
 
-            final var fromOther = other.client().get(new GetRequest(".plugin_config", "k")).actionGet();
+            final var fromOther = other.services().client().get(new GetRequest(".plugin_config", "k")).actionGet();
             assertTrue("a read through the non-owner must be forwarded, not answered empty: " + fromOther, fromOther.isExists());
             assertTrue(fromOther.getSourceAsString().contains("routed"));
 
-            final var fromOwner = owner.client().get(new GetRequest(".plugin_config", "k")).actionGet();
+            final var fromOwner = owner.services().client().get(new GetRequest(".plugin_config", "k")).actionGet();
             assertTrue("and the owner must have it too", fromOwner.isExists());
         }
     }
@@ -270,7 +278,7 @@ public class ServerlessClientTests extends OpenSearchTestCase {
             loop.tick(clock.get());
             assertEquals("both shards must be held for the merge to be exercised", 2, node.reconciler().openShards().size());
 
-            final Client client = node.client();
+            final Client client = node.services().client();
             for (int i = 0; i < 8; i++) {
                 client.index(
                     new IndexRequest(".plugin_config").id("cfg" + i)

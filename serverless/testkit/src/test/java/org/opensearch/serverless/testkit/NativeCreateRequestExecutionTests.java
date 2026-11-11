@@ -82,7 +82,8 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
     public void testNativeCreatePersistsSettings() throws Exception {
         withNode(new org.opensearch.plugins.Plugin() {
         }, (node, metadata) -> {
-            node.client()
+            node.services()
+                .client()
                 .admin()
                 .indices()
                 .create(
@@ -101,7 +102,8 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
     public void testNativeCreateNormalizesBareShardSettings() throws Exception {
         withNode(new org.opensearch.plugins.Plugin() {
         }, (node, metadata) -> {
-            node.client()
+            node.services()
+                .client()
                 .admin()
                 .indices()
                 .create(new CreateIndexRequest("configured").settings(Settings.builder().put("number_of_shards", 2)))
@@ -118,7 +120,7 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
                     "events",
                     "{\"index_patterns\":[\"events*\"],\"priority\":1,\"template\":{\"settings\":{\"number_of_shards\":2,\"refresh_interval\":\"30s\"},\"mappings\":{\"properties\":{\"tag\":{\"type\":\"keyword\"}}}}}"
                 );
-            node.client().admin().indices().create(new CreateIndexRequest("events-1")).actionGet();
+            node.services().client().admin().indices().create(new CreateIndexRequest("events-1")).actionGet();
             final var descriptor = metadata.describe("events-1").orElseThrow();
             assertEquals(2, descriptor.numberOfShards());
             assertEquals("30s", descriptor.extraSettings().get("index.refresh_interval"));
@@ -150,7 +152,7 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
         }, (node, metadata) -> {
             final var failure = expectThrows(
                 org.opensearch.OpenSearchStatusException.class,
-                () -> node.client().admin().indices().create(request).actionGet()
+                () -> node.services().client().admin().indices().create(request).actionGet()
             );
             assertEquals(failure.toString(), status, failure.status());
             assertTrue(metadata.describe(request.index()).isEmpty());
@@ -164,7 +166,7 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
             null
         );
         withNode(plugin, (node, metadata) -> {
-            final var response = node.client().admin().indices().create(new CreateIndexRequest("original")).actionGet();
+            final var response = node.services().client().admin().indices().create(new CreateIndexRequest("original")).actionGet();
             assertEquals("selected", response.index());
             assertTrue(metadata.describe("original").isEmpty());
             assertEquals("30s", metadata.describe("selected").orElseThrow().extraSettings().get("index.refresh_interval"));
@@ -180,7 +182,7 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
             return new CreateIndexResponse(false, false, "filtered");
         }, null);
         withNode(plugin, (node, metadata) -> {
-            final var response = node.client().admin().indices().create(new CreateIndexRequest("original")).actionGet();
+            final var response = node.services().client().admin().indices().create(new CreateIndexRequest("original")).actionGet();
             assertFalse(response.isAcknowledged());
             assertEquals("filtered", response.index());
             assertTrue(metadata.describe("original").isPresent());
@@ -190,7 +192,7 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
     public void testNativeCreateReturnsACachedResponseWithoutCreatingMetadata() throws Exception {
         final var plugin = new CreateFilterPlugin(null, null, new CreateIndexResponse(false, false, "cached"));
         withNode(plugin, (node, metadata) -> {
-            final var response = node.client().admin().indices().create(new CreateIndexRequest("original")).actionGet();
+            final var response = node.services().client().admin().indices().create(new CreateIndexRequest("original")).actionGet();
             assertNotNull(response);
             assertFalse(response.isAcknowledged());
             assertEquals("cached", response.index());
@@ -231,7 +233,7 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
             final var request = new CreateIndexRequest("events-1").mapping(
                 java.util.Map.of("properties", java.util.Map.of("n", java.util.Map.of("type", "long")))
             );
-            node.client().admin().indices().create(request).actionGet();
+            node.services().client().admin().indices().create(request).actionGet();
             final var shard = node.activation().activateWriter(metadata, "events-1", 0).orElseThrow();
             node.writes().index(shard, "doc", "{\"n\":9,\"tag\":\"valid\"}");
             assertTrue(node.reads().get(shard, "doc").found());
@@ -261,7 +263,8 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
                     "events",
                     "{\"index_patterns\":[\"events*\"],\"template\":{\"settings\":{\"number_of_shards\":5,\"refresh_interval\":\"60s\"}}}"
                 );
-            node.client()
+            node.services()
+                .client()
                 .admin()
                 .indices()
                 .create(

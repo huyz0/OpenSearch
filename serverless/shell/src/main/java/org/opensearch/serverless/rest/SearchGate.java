@@ -103,7 +103,7 @@ final class SearchGate {
         Boolean partialResults,
         org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
     ) throws IOException {
-        final var gate = serving.actionGate();
+        final var gate = serving.services().actionGate();
         final java.util.Set<String> resolvedScope = gate.isEmpty() ? null : java.util.Set.copyOf(indices);
         final var visible = nativeRequest == null
             ? new org.opensearch.action.search.SearchRequest(indices.toArray(new String[0]), source)

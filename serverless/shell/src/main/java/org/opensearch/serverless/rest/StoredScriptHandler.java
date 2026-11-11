@@ -102,7 +102,8 @@ public final class StoredScriptHandler extends BaseRestHandler {
                     final var ask = new org.opensearch.action.admin.cluster.storedscripts.PutStoredScriptRequest().id(id)
                         .context(context)
                         .content(content, mediaType);
-                    final var response = serving.actionGate()
+                    final var response = serving.services()
+                        .actionGate()
                         .run(org.opensearch.action.admin.cluster.storedscripts.PutStoredScriptAction.NAME, ask, admitted -> {
                             final var selected = require(
                                 admitted,
@@ -120,7 +121,8 @@ public final class StoredScriptHandler extends BaseRestHandler {
                         channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                     }
                 } else if (method == RestRequest.Method.DELETE) {
-                    final var response = serving.actionGate()
+                    final var response = serving.services()
+                        .actionGate()
                         .run(
                             org.opensearch.action.admin.cluster.storedscripts.DeleteStoredScriptAction.NAME,
                             new org.opensearch.action.admin.cluster.storedscripts.DeleteStoredScriptRequest(id),
@@ -141,7 +143,8 @@ public final class StoredScriptHandler extends BaseRestHandler {
                         channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                     }
                 } else {
-                    final var response = serving.actionGate()
+                    final var response = serving.services()
+                        .actionGate()
                         .run(
                             org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptAction.NAME,
                             new org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptRequest(id),
@@ -192,7 +195,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
         if (context != null && named == null) {
             throw new IllegalArgumentException("unknown script context [" + context + "]");
         }
-        if (serving.scriptService().isLangSupported(source.getLang()) == false) {
+        if (serving.services().scriptService().isLangSupported(source.getLang()) == false) {
             throw new IllegalArgumentException("script_lang not supported [" + source.getLang() + "]");
         }
         try {
@@ -211,13 +214,14 @@ public final class StoredScriptHandler extends BaseRestHandler {
             builder.endObject();
             store.put(id, org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString());
         }
-        serving.storedScripts().refresh(true);
+        serving.services().storedScripts().refresh(true);
         return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
 
     @SuppressWarnings({ "rawtypes", "unchecked" })
     private static void compile(ServerlessNode serving, StoredScriptSource source, ScriptContext context) {
-        serving.scriptService()
+        serving.services()
+            .scriptService()
             .compile(
                 new org.opensearch.script.Script(
                     org.opensearch.script.ScriptType.INLINE,
@@ -262,7 +266,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
         if (store.delete(id) == false) {
             throw new org.opensearch.ResourceNotFoundException("stored script [" + id + "] does not exist and cannot be deleted");
         }
-        serving.storedScripts().refresh(true);
+        serving.services().storedScripts().refresh(true);
         return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
 

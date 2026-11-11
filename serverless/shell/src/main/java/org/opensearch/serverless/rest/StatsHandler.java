@@ -105,7 +105,8 @@ public final class StatsHandler extends BaseRestHandler {
         // Filters may block or consult external authorization state, even for the local document.
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT).execute(() -> {
             try {
-                final org.opensearch.rest.RestResponse response = serving.actionGate()
+                final org.opensearch.rest.RestResponse response = serving.services()
+                    .actionGate()
                     .run(
                         org.opensearch.action.admin.cluster.node.stats.NodesStatsAction.NAME,
                         new org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest(targets).all(),
@@ -369,7 +370,7 @@ public final class StatsHandler extends BaseRestHandler {
             // What to scale on. Shards held against the cap says how full; the refusals and evictions say what being
             // full has cost -- a node can sit at its cap harmlessly, and these move only when it has turned work away
             // or given up shards to make room.
-            final Capacity capacity = serving.capacity();
+            final Capacity capacity = serving.nodeCapacity().capacity();
             // The heap, for setting the cap from memory: a held shard measured at 110-190 KB, so heap is rarely what bounds
             // how many a node can hold -- this is where to see whether it is.
             final java.lang.management.MemoryUsage heap = java.lang.management.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage();
@@ -387,17 +388,17 @@ public final class StatsHandler extends BaseRestHandler {
             builder.field("handed_off", capacity.handedOff());
             builder.field("writes_steered", capacity.writesSteered());
             builder.field("takeovers_overcommitted", serving.takeoversOvercommitted());
-            final long[] routing = serving.takeoverRouting();
+            final long[] routing = serving.nodeCapacity().takeoverRouting();
             builder.field("takeover_writes_routed", routing[0]);
             builder.field("takeover_doubts_left", routing[1]);
-            builder.field("in_use", serving.inUseLastMinute());
-            builder.field("refused_last_minute", serving.refusedLastMinute());
+            builder.field("in_use", serving.nodeCapacity().inUseLastMinute());
+            builder.field("refused_last_minute", serving.nodeCapacity().refusedLastMinute());
             builder.endObject();
 
             // The fleet as this node sees it from the members' leases: how many writer nodes report their load, and how many
             // the last minute's demand wants. One number for an autoscaler, the same from whichever node it asks.
             if (metadata != null) {
-                final FleetSize fleet = serving.fleetSize(metadata);
+                final FleetSize fleet = serving.nodeCapacity().fleetSize(metadata);
                 if (fleet.wanted() >= 0) {
                     builder.startObject("fleet");
                     builder.field("members", fleet.members());
@@ -408,7 +409,7 @@ public final class StatsHandler extends BaseRestHandler {
             }
 
             // Where a writer activation's time goes, summed: divide by opened for the average of each.
-            final long[] phases = serving.activationPhaseMillis();
+            final long[] phases = serving.nodeCapacity().activationPhaseMillis();
             builder.startObject("activation_phases");
             builder.field("describe_millis", phases[0]);
             builder.field("acquire_millis", phases[1]);
@@ -446,7 +447,7 @@ public final class StatsHandler extends BaseRestHandler {
             // From the service's own stats rather than by asking for breakers by name: the parent is
             // not a child in the registry, so a hand-written list of names silently omitted the one
             // that actually trips first. This is the same source _nodes/stats reads.
-            for (var breaker : serving.circuitBreakerService().stats().getAllStats()) {
+            for (var breaker : serving.services().circuitBreakerService().stats().getAllStats()) {
                 builder.startObject(breaker.getName());
                 builder.field("limit_bytes", breaker.getLimit());
                 builder.field("estimated_bytes", breaker.getEstimated());
@@ -457,7 +458,7 @@ public final class StatsHandler extends BaseRestHandler {
 
             // In-flight writes, which the breakers do not cover: these are the bytes of the writes
             // themselves rather than what computing an answer allocated.
-            final var pressure = serving.indexingPressure().stats();
+            final var pressure = serving.services().indexingPressure().stats();
             builder.startObject("indexing_pressure");
             builder.field("current_bytes", pressure.getCurrentCombinedCoordinatingAndPrimaryBytes());
             builder.field("total_bytes", pressure.getTotalCombinedCoordinatingAndPrimaryBytes());

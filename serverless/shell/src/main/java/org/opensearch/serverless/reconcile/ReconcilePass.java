@@ -100,7 +100,7 @@ final class ReconcilePass {
             }
             // One small register read: the stored scripts are re-read only when their marker has moved, which
             // is how a script put on another node reaches this one without a listing per pass.
-            reconciler.node.storedScripts().refresh(false);
+            reconciler.node.services().storedScripts().refresh(false);
             // The full re-read of this node's truth, rarely. Activation no longer goes through it -- taking
             // one shard used to re-read every held head -- so this is what reopens a shard whose head still
             // names this node but which is not open here: one closed after a failed log append, or one whose

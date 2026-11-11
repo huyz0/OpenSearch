@@ -223,7 +223,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
                 defaultIndex,
                 defaultSearchType,
                 requestIgnoreUnavailable,
-                serving0.searchXContentRegistry()
+                serving0.services().searchXContentRegistry()
             );
         } catch (BadBatch e) {
             return channel -> channel.sendResponse(

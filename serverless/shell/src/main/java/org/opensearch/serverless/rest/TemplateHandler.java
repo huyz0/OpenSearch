@@ -142,7 +142,7 @@ public final class TemplateHandler extends BaseRestHandler {
                         ).indexTemplate(parse(content, mediaType, org.opensearch.cluster.metadata.ComposableIndexTemplate::parse));
                         action = org.opensearch.action.admin.indices.template.put.PutComposableIndexTemplateAction.NAME;
                     }
-                    final var response = serving.actionGate().run(action, ask, admitted -> {
+                    final var response = serving.services().actionGate().run(action, ask, admitted -> {
                         if (component) {
                             final var selected = require(
                                 admitted,
@@ -172,7 +172,7 @@ public final class TemplateHandler extends BaseRestHandler {
                     final String action = component
                         ? org.opensearch.action.admin.indices.template.delete.DeleteComponentTemplateAction.NAME
                         : org.opensearch.action.admin.indices.template.delete.DeleteComposableIndexTemplateAction.NAME;
-                    final var response = serving.actionGate().run(action, ask, admitted -> {
+                    final var response = serving.services().actionGate().run(action, ask, admitted -> {
                         final String selected = component
                             ? require(
                                 admitted,
@@ -192,7 +192,8 @@ public final class TemplateHandler extends BaseRestHandler {
                     );
                     render(channel, response, request);
                 } else if (component) {
-                    final var response = serving.actionGate()
+                    final var response = serving.services()
+                        .actionGate()
                         .run(
                             org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.NAME,
                             new org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.Request(name),
@@ -222,7 +223,8 @@ public final class TemplateHandler extends BaseRestHandler {
                         render(channel, response, request);
                     }
                 } else {
-                    final var response = serving.actionGate()
+                    final var response = serving.services()
+                        .actionGate()
                         .run(
                             org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.NAME,
                             new org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.Request(name),

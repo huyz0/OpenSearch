@@ -56,7 +56,8 @@ final class DocumentWrites {
         );
         final boolean refresh = accepted.getRefreshPolicy() != org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
         try (
-            var ignored = node.indexingPressure()
+            var ignored = node.services()
+                .indexingPressure()
                 .markCoordinatingOperationStarted(org.opensearch.serverless.store.WalRecord.contentBytes(id, source), false)
         ) {
             final Written written = written(

@@ -140,7 +140,8 @@ public final class ShardRouter {
 
     private void handleStats(ForwardedStatsRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         requireMac(ForwardedStatsRequest.ACTION, request);
-        final ForwardedStatsResponse response = node.actionGate()
+        final ForwardedStatsResponse response = node.services()
+            .actionGate()
             .run(
                 org.opensearch.action.admin.cluster.node.stats.NodesStatsAction.NAME,
                 new org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest(node.localNode().getId()).all(),
@@ -206,7 +207,8 @@ public final class ShardRouter {
         // Accounted on the owner as a primary operation, the way core accounts a write that arrived from
         // a coordinating node: a flood of forwarded writes used to be invisible to this node's pressure.
         try (
-            org.opensearch.common.lease.Releasable primary = node.indexingPressure()
+            org.opensearch.common.lease.Releasable primary = node.services()
+                .indexingPressure()
                 .markPrimaryOperationStarted(org.opensearch.serverless.store.WalRecord.contentBytes(request.id(), request.source()), false)
         ) {
             handleIndexAccounted(request, channel, shardId);
@@ -277,7 +279,11 @@ public final class ShardRouter {
         requirePluginOriginForSystemIndex(request.index());
         final ShardId shardId = writerShard(request.index(), request.shard(), request.indexUuid());
         // Counted by the request as it was built, not by re-encoding every record here to measure it.
-        try (org.opensearch.common.lease.Releasable primary = node.indexingPressure().markPrimaryOperationStarted(request.bytes(), false)) {
+        try (
+            org.opensearch.common.lease.Releasable primary = node.services()
+                .indexingPressure()
+                .markPrimaryOperationStarted(request.bytes(), false)
+        ) {
             handleBulkAccounted(request, channel, shardId);
         }
     }

@@ -72,7 +72,7 @@ public class BatchRetainedPayloadBudgetTests extends OpenSearchTestCase {
                     assertEquals(written.body(), 201, written.statusCode());
                 }
                 work.accept(node);
-                assertBusy(() -> assertEquals(0L, node.circuitBreakerService().getBreaker(CircuitBreaker.REQUEST).getUsed()));
+                assertBusy(() -> assertEquals(0L, node.services().circuitBreakerService().getBreaker(CircuitBreaker.REQUEST).getUsed()));
             }
         }
     }

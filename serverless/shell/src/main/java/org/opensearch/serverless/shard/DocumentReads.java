@@ -156,7 +156,7 @@ final class DocumentReads {
         String expectedUuid,
         org.opensearch.serverless.shell.ShardBehindLogException behind
     ) throws IOException {
-        if (node.takeoverBelongsElsewhere(plane, index, shard)) {
+        if (node.nodeCapacity().takeoverBelongsElsewhere(plane, index, shard)) {
             // A dead member's shard another survivor is named to take: asking for it here queued it on every survivor
             // a get reached. The caller retries, and finds it taken there.
             throw NotHereException.behindLog(behind);

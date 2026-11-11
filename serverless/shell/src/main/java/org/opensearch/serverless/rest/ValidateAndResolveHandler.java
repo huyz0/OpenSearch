@@ -154,7 +154,7 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
         try (
             XContentParser parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
                 .createParser(
-                    serving.searchXContentRegistry(),
+                    serving.services().searchXContentRegistry(),
                     org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
                     new java.io.ByteArrayInputStream(body.getBytes(java.nio.charset.StandardCharsets.UTF_8))
                 )

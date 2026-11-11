@@ -18,7 +18,7 @@ final class ResponseBudget implements AutoCloseable {
     private volatile boolean closed;
 
     ResponseBudget(ServerlessNode serving) {
-        breaker = serving.circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
+        breaker = serving.services().circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
     }
 
     void keep(Writeable value, Runnable retain) {

@@ -293,13 +293,13 @@ public final class SearchTemplateHandler extends BaseRestHandler {
             template.getScript(),
             params
         );
-        return serving.scriptService().compile(script, TemplateScript.CONTEXT).newInstance(params).execute();
+        return serving.services().scriptService().compile(script, TemplateScript.CONTEXT).newInstance(params).execute();
     }
 
     private static SearchSourceBuilder parse(ServerlessNode serving, String rendered, SearchTemplateRequest template) throws IOException {
         try (
             XContentParser parser = XContentType.JSON.xContent()
-                .createParser(serving.searchXContentRegistry(), LoggingDeprecationHandler.INSTANCE, rendered)
+                .createParser(serving.services().searchXContentRegistry(), LoggingDeprecationHandler.INSTANCE, rendered)
         ) {
             final SearchSourceBuilder source = SearchSourceBuilder.searchSource();
             source.parseXContent(parser, false);

@@ -195,7 +195,7 @@ public class PointInTimeRequestExecutionTests extends OpenSearchTestCase {
             assertBusy(
                 () -> assertEquals(
                     0L,
-                    node.circuitBreakerService().getBreaker(org.opensearch.core.common.breaker.CircuitBreaker.REQUEST).getUsed()
+                    node.services().circuitBreakerService().getBreaker(org.opensearch.core.common.breaker.CircuitBreaker.REQUEST).getUsed()
                 )
             );
         });

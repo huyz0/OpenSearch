@@ -188,7 +188,7 @@ public final class SearchHandler extends BaseRestHandler {
                     XContentParser parser = body.v1()
                         .xContent()
                         .createParser(
-                            serving.searchXContentRegistry(),
+                            serving.services().searchXContentRegistry(),
                             DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
                             body.v2().streamInput()
                         )
@@ -329,7 +329,8 @@ public final class SearchHandler extends BaseRestHandler {
         if (searchRequest.pipeline() != null || parsedSource.searchPipelineSource() != null) {
             try {
                 if (parsedSource.searchPipelineSource() != null) {
-                    pipelined = serving.searchPipelines()
+                    pipelined = serving.services()
+                        .searchPipelines()
                         .transformRequest("_ad_hoc_pipeline", parsedSource.searchPipelineSource(), searchRequest);
                 } else {
                     final Optional<String> stored = metadata.searchPipelines().get(searchRequest.pipeline());
@@ -343,7 +344,9 @@ public final class SearchHandler extends BaseRestHandler {
                             )
                         );
                     }
-                    pipelined = serving.searchPipelines().transformRequest(searchRequest.pipeline(), stored.get(), searchRequest);
+                    pipelined = serving.services()
+                        .searchPipelines()
+                        .transformRequest(searchRequest.pipeline(), stored.get(), searchRequest);
                 }
             } catch (Exception e) {
                 return channel -> channel.sendResponse(IndexAdminHandler.failure(channel, e));
@@ -353,7 +356,7 @@ public final class SearchHandler extends BaseRestHandler {
         }
         final java.util.function.UnaryOperator<org.opensearch.action.search.SearchResponse> postProcess = pipelined == null
             ? response -> response
-            : response -> serving.searchPipelines().transformResponse(pipelined, response);
+            : response -> serving.services().searchPipelines().transformResponse(pipelined, response);
         // What the request processors left, when there were any: the pipelined request is a copy, and its
         // source is the one every shard must be asked with.
         final SearchSourceBuilder source = pipelined == null ? parsedSource : pipelined.source();
@@ -510,7 +513,7 @@ public final class SearchHandler extends BaseRestHandler {
             index,
             ignoreUnavailable,
             true,
-            serving.actionGate().isEmpty() ? source : null,
+            serving.services().actionGate().isEmpty() ? source : null,
             nowMillis
         );
         final SearchFanout.Options searchOptions = new SearchFanout.Options(

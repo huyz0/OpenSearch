@@ -102,7 +102,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
         org.opensearch.common.CheckedSupplier<T, Exception> work
     ) throws Exception {
         final var serving = node.get();
-        return serving == null ? work.get() : serving.actionGate().run(action, request, work);
+        return serving == null ? work.get() : serving.services().actionGate().run(action, request, work);
     }
 
     @Override
@@ -807,7 +807,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
         org.opensearch.action.ActionRequest request,
         org.opensearch.common.CheckedSupplier<T, Exception> work
     ) throws Exception {
-        return serving == null ? work.get() : serving.actionGate().run(action, request, work);
+        return serving == null ? work.get() : serving.services().actionGate().run(action, request, work);
     }
 
     /**

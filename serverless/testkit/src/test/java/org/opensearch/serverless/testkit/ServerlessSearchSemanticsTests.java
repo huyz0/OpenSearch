@@ -142,7 +142,7 @@ public class ServerlessSearchSemanticsTests extends OpenSearchTestCase {
             loop.want("policy-b", 0);
             loop.tick(clock.get());
 
-            final Client client = node.client();
+            final Client client = node.services().client();
             for (String index : List.of("policy-a", "policy-b")) {
                 client.index(
                     new IndexRequest(index).id("rule")

@@ -85,7 +85,9 @@ public class ServerlessSortTests extends OpenSearchTestCase {
                 for (int i = 0; i < 4; i++) {
                     assertEquals(201, send(node, "PUT", "/mixed-" + i + "/_doc/doc?refresh=true", "{\"rank\":10}").status());
                 }
-                final var breaker = node.circuitBreakerService().getBreaker(org.opensearch.core.common.breaker.CircuitBreaker.REQUEST);
+                final var breaker = node.services()
+                    .circuitBreakerService()
+                    .getBreaker(org.opensearch.core.common.breaker.CircuitBreaker.REQUEST);
                 // HTTP response buffers use this breaker too and are released by Netty's write callback.
                 assertBusy(() -> assertEquals(0L, breaker.getUsed()));
                 final long before = breaker.getUsed();

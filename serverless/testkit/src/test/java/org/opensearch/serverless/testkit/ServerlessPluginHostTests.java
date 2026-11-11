@@ -209,7 +209,10 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final long before = SAW.get();
-            node.client().index(new IndexRequest("alpha").id("1").source("{\"msg\":\"plugged\",\"n\":1}", XContentType.JSON)).actionGet();
+            node.services()
+                .client()
+                .index(new IndexRequest("alpha").id("1").source("{\"msg\":\"plugged\",\"n\":1}", XContentType.JSON))
+                .actionGet();
             assertEquals(200, send(node, "GET", "/alpha/_search?q=msg:plugged").status());
             assertTrue("the wrapper must see the shell's own requests too, not only the plugin's", SAW.get() > before);
         }
@@ -252,7 +255,7 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
             assertEquals(
                 "the default subject must be the unauthenticated one",
                 org.opensearch.identity.NamedPrincipal.UNAUTHENTICATED.getName(),
-                node.identityService().getCurrentSubject().getPrincipal().getName()
+                node.services().identityService().getCurrentSubject().getPrincipal().getName()
             );
         }
     }

@@ -142,7 +142,8 @@ public final class DataStreamHandler extends BaseRestHandler {
         final RestRequest.Method method = request.method();
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             switch (method) {
-                case PUT -> serving.actionGate()
+                case PUT -> serving.services()
+                    .actionGate()
                     .runAsync(
                         serving.threadPool(),
                         org.opensearch.action.admin.indices.datastream.CreateDataStreamAction.NAME,
@@ -160,7 +161,8 @@ public final class DataStreamHandler extends BaseRestHandler {
                         ),
                         answer(channel)
                     );
-                case GET -> serving.actionGate()
+                case GET -> serving.services()
+                    .actionGate()
                     .runAsync(
                         serving.threadPool(),
                         org.opensearch.action.admin.indices.datastream.GetDataStreamAction.NAME,
@@ -180,7 +182,8 @@ public final class DataStreamHandler extends BaseRestHandler {
                         ),
                         answer(channel)
                     );
-                case DELETE -> serving.actionGate()
+                case DELETE -> serving.services()
+                    .actionGate()
                     .runAsync(
                         serving.threadPool(),
                         org.opensearch.action.admin.indices.datastream.DeleteDataStreamAction.NAME,

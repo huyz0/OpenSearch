@@ -40,7 +40,7 @@ final class NodeWiring {
             // controller takes it at construction, which is why plugins are held before this runs.
             node.plugins.restHandlerWrapper(node.threadPool.getThreadContext(), Set.of()),
             node.nodeClient,
-            node.circuitBreakerService(),
+            node.services().circuitBreakerService(),
             new UsageService()
         );
         // Every shell handler is registered behind the system-index guard, rather than each one checking:
@@ -230,12 +230,12 @@ final class NodeWiring {
             node.transportService,
             node.transportService.getTaskManager(),
             node.threadPool,
-            node.client(),
+            node.services().client(),
             node.clusterService,
             node.settings,
-            node.namedWriteableRegistry(),
-            node.indexNameExpressionResolver(),
-            node.circuitBreakerService(),
+            node.services().namedWriteableRegistry(),
+            node.services().indexNameExpressionResolver(),
+            node.services().circuitBreakerService(),
             node.indicesService
         );
         // Each action's constructor is resolved against the node's services and the components *its own*

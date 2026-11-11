@@ -123,7 +123,7 @@ public final class MappingUpdateHandler extends BaseRestHandler {
             try {
                 final var nativeRequest = new PutMappingRequest(index).source(content, mediaType);
                 final var supportedOptions = nativeRequest.indicesOptions();
-                final var result = serving.actionGate().run(PutMappingAction.NAME, nativeRequest, admitted -> {
+                final var result = serving.services().actionGate().run(PutMappingAction.NAME, nativeRequest, admitted -> {
                     final var selected = (PutMappingRequest) admitted;
                     final var invalid = selected.validate();
                     if (invalid != null) {

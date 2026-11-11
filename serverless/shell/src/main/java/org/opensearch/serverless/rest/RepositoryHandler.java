@@ -348,7 +348,9 @@ public final class RepositoryHandler extends BaseRestHandler {
         CheckedFunction<ActionRequest, T, Exception> work
     ) throws Exception {
         final var serving = node.get();
-        return serving == null ? work.apply(request) : serving.actionGate().run(action, request, work, ActionGate.identity(responseType));
+        return serving == null
+            ? work.apply(request)
+            : serving.services().actionGate().run(action, request, work, ActionGate.identity(responseType));
     }
 
     private static BytesRestResponse error(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason)

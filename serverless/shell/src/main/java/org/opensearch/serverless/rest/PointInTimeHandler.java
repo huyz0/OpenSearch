@@ -240,7 +240,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
                         return original;
                     }
                 };
-                final var response = serving.actionGate().run(action, request, admitted -> {
+                final var response = serving.services().actionGate().run(action, request, admitted -> {
                     final var pending = new PendingRestChannel(channel);
                     work.accept(admitted, pending);
                     return pending.response();

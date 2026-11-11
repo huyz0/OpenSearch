@@ -247,7 +247,7 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
                 final var request = new org.opensearch.action.search.SearchRequest("alpha").source(
                     new org.opensearch.search.builder.SearchSourceBuilder().query(org.opensearch.index.query.QueryBuilders.matchAllQuery())
                 );
-                final var transformed = f.node().searchPipelines().transformRequest("inline", config, request);
+                final var transformed = f.node().services().searchPipelines().transformRequest("inline", config, request);
                 final var query = (org.opensearch.index.query.BoolQueryBuilder) transformed.source().query();
                 assertEquals(1, query.filter().size());
                 assertEquals(new org.opensearch.index.query.TermQueryBuilder("tag", "a"), query.filter().get(0));

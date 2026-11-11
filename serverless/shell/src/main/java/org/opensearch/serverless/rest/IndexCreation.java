@@ -215,7 +215,7 @@ final class IndexCreation {
                     .buildIndexSort(
                         validatedSettings.shouldWidenIndexSortType(),
                         mapper::fieldType,
-                        (field, lookup) -> field.fielddataBuilder(index, lookup).build(noCache, serving.circuitBreakerService())
+                        (field, lookup) -> field.fielddataBuilder(index, lookup).build(noCache, serving.services().circuitBreakerService())
                     );
             }
         }

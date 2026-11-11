@@ -119,16 +119,16 @@ public final class ServerlessPlugins {
     public void createComponents(ServerlessNode node, org.opensearch.env.Environment environment) throws Exception {
         for (Plugin plugin : plugins) {
             final java.util.Collection<Object> built = plugin.createComponents(
-                node.client(),
+                node.services().client(),
                 node.clusterService(),
                 node.threadPool(),
-                node.resourceWatcherService(),
-                node.scriptService(),
-                node.searchXContentRegistry(),
+                node.services().resourceWatcherService(),
+                node.services().scriptService(),
+                node.services().searchXContentRegistry(),
                 environment,
                 node.nodeEnvironment(),
-                node.namedWriteableRegistry(),
-                node.indexNameExpressionResolver(),
+                node.services().namedWriteableRegistry(),
+                node.services().indexNameExpressionResolver(),
                 () -> null                              // RepositoriesService: snapshots use the shell's own store
             );
             components.addAll(built);

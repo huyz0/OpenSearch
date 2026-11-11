@@ -161,7 +161,8 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
             assertTrue("the watching node must hold nothing, so its work has to be forwarded", other.reconciler().openShards().isEmpty());
 
             SENT.clear();
-            other.client()
+            other.services()
+                .client()
                 .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"forwarded\",\"n\":1}", XContentType.JSON))
                 .actionGet();
             assertTrue(
@@ -170,7 +171,7 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
             );
 
             SENT.clear();
-            assertTrue(other.client().get(new GetRequest("alpha", "k")).actionGet().isExists());
+            assertTrue(other.services().client().get(new GetRequest("alpha", "k")).actionGet().isExists());
             assertTrue("and the forwarded read: " + SENT, SENT.contains("internal:serverless/document/get"));
         }
     }
@@ -291,10 +292,14 @@ public class ServerlessNetworkPluginTests extends OpenSearchTestCase {
 
             // Through the node that does not own the shard, so the write has to cross the transport the
             // plugin supplied.
-            other.client()
+            other.services()
+                .client()
                 .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"substituted\",\"n\":1}", XContentType.JSON))
                 .actionGet();
-            assertTrue("and it must actually carry traffic", other.client().get(new GetRequest("alpha", "k")).actionGet().isExists());
+            assertTrue(
+                "and it must actually carry traffic",
+                other.services().client().get(new GetRequest("alpha", "k")).actionGet().isExists()
+            );
         }
     }
 

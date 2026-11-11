@@ -308,7 +308,7 @@ public final class ServerlessBootstrap implements Closeable {
         try {
             node.startup().start();
             node.projector().setReuseProjections(complete.getAsBoolean(VIEW_REUSE, true));
-            node.setRouteTakeovers(complete.getAsBoolean(ROUTE_TAKEOVERS, true));
+            node.nodeCapacity().setRouteTakeovers(complete.getAsBoolean(ROUTE_TAKEOVERS, true));
             logger.info("startup: node started at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
 
             final org.opensearch.serverless.store.ObjectStores.Handle store = org.opensearch.serverless.store.ObjectStores.create(

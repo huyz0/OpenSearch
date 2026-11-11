@@ -193,7 +193,7 @@ public final class ReaderServing {
             // node. The same ceiling demand-driven writers have applies -- the configured one, counting
             // views -- and the same eviction makes room before this refuses.
             node.readerOpensRefusedAtCap.incrementAndGet();
-            node.noteRefusedRecently(indexName, shardNumber);
+            node.nodeCapacity().noteRefusedRecently(indexName, shardNumber);
             throw new IllegalStateException(
                 "this node holds "
                     + node.reconciler.openShards().size()
