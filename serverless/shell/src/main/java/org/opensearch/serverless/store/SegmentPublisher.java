@@ -50,6 +50,9 @@ public final class SegmentPublisher {
     private final BlobPath shardBase;
     private final BlobContainer container;
 
+    /** Whether a publish writes the files it adds as one pack rather than a blob each. */
+    private volatile boolean packing;
+
     /** This instance's own last publish: the register need not be read to swap over what this wrote. */
     private volatile long lastPublishedGeneration = BlobRegister.ABSENT_GENERATION;
     private volatile CommitManifest lastPublished;
@@ -64,6 +67,23 @@ public final class SegmentPublisher {
         this.blobStore = blobStore;
         this.shardBase = shardBase;
         this.container = blobStore.blobContainer(shardBase);
+    }
+
+    /**
+     * Sets whether a publish writes the files it adds as one blob per segment rather than one blob per file.
+     *
+     * <p>A publish adds a refresh's new segment, or a merge's, and the commit point naming it. A segment's files are
+     * immutable and die together, so one blob holds them as well as several: a publish of one segment then costs one
+     * PUT for its files, not one per file -- four or more for every refresh, which at a one-second refresh was most
+     * of a node's PUTs. The manifest records each file's range of its blob (see {@link FileLocation}); a file
+     * already published keeps the location it has, in a segment blob or not.
+     *
+     * @param packing true to pack
+     * @return this publisher
+     */
+    public SegmentPublisher packing(boolean packing) {
+        this.packing = packing;
+        return this;
     }
 
     /**
@@ -212,7 +232,20 @@ public final class SegmentPublisher {
         store.incRef();
         try {
             final Store.MetadataSnapshot snapshot = commit == null ? store.getMetadata() : store.getMetadata(commit);
+            final java.util.List<String> fresh = new java.util.ArrayList<>();
             for (String fileName : snapshot.asMap().keySet()) {
+                if (inherited.containsKey(fileName) == false) {
+                    fresh.add(fileName);
+                }
+            }
+            if (packing) {
+                writeSegmentBlobs(directory, termSegment(term), fresh, inherited.keySet(), published, lengths);
+            }
+            for (String fileName : snapshot.asMap().keySet()) {
+                if (published.containsKey(fileName)) {
+                    // Packed above.
+                    continue;
+                }
                 final String alreadyAt = inherited.get(fileName);
                 if (alreadyAt != null) {
                     // Segment files are immutable once written; a name that is already published has the
@@ -287,6 +320,144 @@ public final class SegmentPublisher {
         }
         return Optional.of(parse(register.get()));
     }
+
+    /**
+     * Writes the files a publish adds as one blob per segment, and records where each file is in its blob.
+     *
+     * <p>A segment's files are written together and die together, when a merge or a delete of every document removes
+     * the segment from the commit, so one blob holds them with no bytes left dead inside it while the segment lives.
+     * The blob is named after the segment -- {@code _5.seg}, or {@code _5-<id>.seg} for files a later publish adds to
+     * a segment already published, such as its deletions -- so its name says what it holds.
+     *
+     * <p>The commit point, {@code segments_N}, belongs to no segment and changes on every publish. It rides in the
+     * blob of the last segment the publish writes: a publish that adds one segment is one PUT, and what that leaves
+     * dead is the old commit point, under a kilobyte, until the segment itself goes.
+     *
+     * <p>Each blob starts with a header listing its files' names, offsets and lengths, so it can be checked or its
+     * files recovered without the manifest. Readers do not read it: the manifest records every file's range, and a
+     * header read before every cold open would be a request each time. A file of no length stays out of every blob:
+     * it has no range to name, and is published as before.
+     *
+     * <p>Every blob is written only if absent, so neither a retry nor a zombie of the same term can overwrite one a
+     * manifest names.
+     */
+    private void writeSegmentBlobs(
+        Directory directory,
+        String termDir,
+        java.util.List<String> fileNames,
+        java.util.Set<String> alreadyPublished,
+        Map<String, String> published,
+        Map<String, Long> lengths
+    ) throws IOException {
+        final java.util.TreeMap<String, java.util.List<String>> bySegment = new java.util.TreeMap<>();
+        final java.util.List<String> commitPoints = new java.util.ArrayList<>();
+        for (String fileName : fileNames) {
+            if (directory.fileLength(fileName) <= 0L) {
+                continue;
+            }
+            if (fileName.startsWith(org.apache.lucene.index.IndexFileNames.SEGMENTS)) {
+                commitPoints.add(fileName);
+            } else {
+                bySegment.computeIfAbsent(
+                    org.apache.lucene.index.IndexFileNames.parseSegmentName(fileName),
+                    ignored -> new java.util.ArrayList<>()
+                ).add(fileName);
+            }
+        }
+        if (bySegment.isEmpty()) {
+            return;
+        }
+        final java.util.Set<String> publishedSegments = new java.util.HashSet<>();
+        for (String name : alreadyPublished) {
+            if (name.startsWith(org.apache.lucene.index.IndexFileNames.SEGMENTS) == false) {
+                publishedSegments.add(org.apache.lucene.index.IndexFileNames.parseSegmentName(name));
+            }
+        }
+        final String last = bySegment.lastKey();
+        for (Map.Entry<String, java.util.List<String>> segment : bySegment.entrySet()) {
+            final java.util.List<String> files = new java.util.ArrayList<>(segment.getValue());
+            if (segment.getKey().equals(last)) {
+                files.addAll(commitPoints);
+            }
+            final String blob = publishedSegments.contains(segment.getKey())
+                ? segment.getKey() + "-" + org.opensearch.common.UUIDs.randomBase64UUID() + ".seg"
+                : segment.getKey() + ".seg";
+            writeSegmentBlob(directory, termDir, blob, files, published, lengths);
+        }
+    }
+
+    /** Writes one segment's blob: the header, then the files, smallest first so an open's first reads sit together. */
+    private void writeSegmentBlob(
+        Directory directory,
+        String termDir,
+        String blob,
+        java.util.List<String> fileNames,
+        Map<String, String> published,
+        Map<String, Long> lengths
+    ) throws IOException {
+        final Map<String, Long> sizes = new LinkedHashMap<>();
+        for (String fileName : fileNames) {
+            sizes.put(fileName, directory.fileLength(fileName));
+        }
+        final java.util.List<String> ordered = new java.util.ArrayList<>(fileNames);
+        ordered.sort(java.util.Comparator.<String>comparingLong(sizes::get).thenComparing(java.util.Comparator.naturalOrder()));
+        final byte[] header = segmentBlobHeader(ordered, sizes);
+        final java.util.List<IndexInput> opened = new java.util.ArrayList<>();
+        try {
+            final java.util.List<PackInputStream.Part> parts = new java.util.ArrayList<>();
+            final Map<String, FileLocation> located = new LinkedHashMap<>();
+            long offset = header.length;
+            for (String fileName : ordered) {
+                final IndexInput input = directory.openInput(fileName, IOContext.READONCE);
+                opened.add(input);
+                final long size = input.length();
+                parts.add(new PackInputStream.Part(input, offset, size));
+                located.put(fileName, FileLocation.packed(termDir, blob, offset, size));
+                offset += size;
+            }
+            final PackInputStream stream = new PackInputStream(header, parts);
+            blobStore.blobContainer(shardBase.add(termDir)).writeBlob(blob, stream, stream.length(), true);
+            for (Map.Entry<String, FileLocation> file : located.entrySet()) {
+                published.put(file.getKey(), file.getValue().encode());
+                lengths.put(file.getKey(), file.getValue().length());
+            }
+        } finally {
+            org.opensearch.common.util.io.IOUtils.close(opened);
+        }
+    }
+
+    /**
+     * A segment blob's header: {@code SEG1}, the length of what follows as four bytes, then JSON naming each file's
+     * offset from the start of the blob and its length.
+     */
+    static byte[] segmentBlobHeader(java.util.List<String> ordered, Map<String, Long> sizes) throws IOException {
+        // The offsets count the header itself, whose length depends on how many digits they take: settle it by
+        // encoding until the length stops moving, which a second or third pass always does.
+        byte[] encoded = new byte[0];
+        for (int pass = 0; pass < 8; pass++) {
+            long offset = 8L + encoded.length;
+            try (org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+                builder.startObject().field("version", 1).startObject("files");
+                for (String fileName : ordered) {
+                    builder.startArray(fileName).value(offset).value(sizes.get(fileName)).endArray();
+                    offset += sizes.get(fileName);
+                }
+                builder.endObject().endObject();
+                final byte[] next = org.opensearch.core.common.bytes.BytesReference.toBytes(
+                    org.opensearch.core.common.bytes.BytesReference.bytes(builder)
+                );
+                if (next.length == encoded.length) {
+                    final java.nio.ByteBuffer header = java.nio.ByteBuffer.allocate(8 + next.length);
+                    header.put(SEGMENT_BLOB_MAGIC).putInt(next.length).put(next);
+                    return header.array();
+                }
+                encoded = next;
+            }
+        }
+        throw new IOException("a segment blob's header did not settle");
+    }
+
+    private static final byte[] SEGMENT_BLOB_MAGIC = { 'S', 'E', 'G', '1' };
 
     /**
      * Opens one published file's bytes, whether it is a blob of its own or a range of a pack.
