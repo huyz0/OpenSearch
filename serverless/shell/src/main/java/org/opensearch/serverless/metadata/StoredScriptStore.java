@@ -42,7 +42,7 @@ public final class StoredScriptStore {
      * @param container the scripts container
      */
     public StoredScriptStore(BlobContainer container) {
-        this(container, new TemplateStore.Cache());
+        this(container, new TemplateCache());
     }
 
     /**
@@ -51,7 +51,7 @@ public final class StoredScriptStore {
      * @param container the scripts container
      * @param cache the cache shared by every store over this container on this node
      */
-    public StoredScriptStore(BlobContainer container, TemplateStore.Cache cache) {
+    public StoredScriptStore(BlobContainer container, TemplateCache cache) {
         this.container = container;
         this.scripts = new TemplateStore(container, cache);
     }

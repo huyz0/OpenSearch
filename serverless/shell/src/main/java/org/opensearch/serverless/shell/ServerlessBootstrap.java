@@ -227,14 +227,14 @@ public final class ServerlessBootstrap implements Closeable {
     private final MetadataPlane plane;
     private final BackgroundReconciler loop;
     private final ReconcileScheduler scheduler;
-    private final org.opensearch.serverless.store.ObjectStores.Handle store;
+    private final org.opensearch.serverless.store.ObjectStoreHandle store;
 
     private ServerlessBootstrap(
         ServerlessNode node,
         MetadataPlane plane,
         BackgroundReconciler loop,
         ReconcileScheduler scheduler,
-        org.opensearch.serverless.store.ObjectStores.Handle store
+        org.opensearch.serverless.store.ObjectStoreHandle store
     ) {
         this.node = node;
         this.plane = plane;
@@ -301,7 +301,7 @@ public final class ServerlessBootstrap implements Closeable {
         final long bootAt = System.nanoTime();
         final ServerlessNode node = new ServerlessNode(complete);
         logger.info("startup: node built in {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
-        org.opensearch.serverless.store.ObjectStores.Handle openedStore = null;
+        org.opensearch.serverless.store.ObjectStoreHandle openedStore = null;
         MetadataPlane openedPlane = null;
         BackgroundReconciler openedLoop = null;
         ReconcileScheduler openedScheduler = null;
@@ -311,7 +311,7 @@ public final class ServerlessBootstrap implements Closeable {
             node.nodeCapacity().setRouteTakeovers(complete.getAsBoolean(ROUTE_TAKEOVERS, true));
             logger.info("startup: node started at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
 
-            final org.opensearch.serverless.store.ObjectStores.Handle store = org.opensearch.serverless.store.ObjectStores.create(
+            final org.opensearch.serverless.store.ObjectStoreHandle store = org.opensearch.serverless.store.ObjectStores.create(
                 complete,
                 node.clusterService(),
                 configPath

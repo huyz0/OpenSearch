@@ -32,7 +32,7 @@ public class TemplateReadCostTests extends OpenSearchTestCase {
             final var container = store.blobContainer(BlobPath.cleanPath());
             final var writer = new TemplateStore(container);
             writer.put("pipeline", "{\"version\":1}");
-            final var shared = new TemplateStore.Cache();
+            final var shared = new TemplateCache();
             store.reset();
             for (int i = 0; i < 5; i++) {
                 assertEquals("{\"version\":1}", new TemplateStore(container, shared).get("pipeline").orElseThrow());

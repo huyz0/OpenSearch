@@ -24,10 +24,10 @@ final class TemplateStores {
         this.base = base;
     }
 
-    final java.util.Map<String, TemplateStore.Cache> storeCaches = new java.util.concurrent.ConcurrentHashMap<>();
+    final java.util.Map<String, TemplateCache> storeCaches = new java.util.concurrent.ConcurrentHashMap<>();
 
-    TemplateStore.Cache cacheFor(org.opensearch.common.blobstore.BlobPath path) {
-        return storeCaches.computeIfAbsent(path.buildAsString(), key -> new TemplateStore.Cache());
+    TemplateCache cacheFor(org.opensearch.common.blobstore.BlobPath path) {
+        return storeCaches.computeIfAbsent(path.buildAsString(), key -> new TemplateCache());
     }
 
     /**
