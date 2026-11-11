@@ -182,8 +182,18 @@ public final class ShardRouter {
         org.opensearch.transport.TransportRequest request,
         org.opensearch.core.common.io.stream.Writeable.Reader<T> reader
     ) throws IOException {
+        return send(peer, action, request, reader, forwardTimeout());
+    }
+
+    /** {@link #send} with an explicit deadline, for an answer that takes longer than a write to come. */
+    <T extends org.opensearch.core.transport.TransportResponse> T send(
+        DiscoveryNode peer,
+        String action,
+        org.opensearch.transport.TransportRequest request,
+        org.opensearch.core.common.io.stream.Writeable.Reader<T> reader,
+        TimeValue timeout
+    ) throws IOException {
         final PlainActionFuture<T> future = PlainActionFuture.newFuture();
-        final TimeValue timeout = forwardTimeout();
         try (var ignored = withMac(action, request, peer)) {
             transportService.sendRequest(
                 peer,

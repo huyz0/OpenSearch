@@ -102,7 +102,34 @@ public final class SearchWarmup {
 
     private static Outcome warm(ServerlessNode node, MetadataPlane plane, AtomicBoolean done) throws java.io.IOException {
         final long started = System.nanoTime();
-        final CacheWarmCopy.Outcome copy = CacheWarmCopy.of(node).copyFromPeers();
+        final Outcome outcome = openShare(node, plane, CacheWarmCopy.of(node).copyFromPeers(), done, started);
+        if (done.compareAndSet(false, true)) {
+            turnReady(node, plane);
+        }
+        return outcome;
+    }
+
+    /**
+     * Takes over a draining peer's share of its readers: copies their warm blocks from it, opens them here, and reads
+     * what it did not hand over. The node stays as ready as it was; it was serving searches all along.
+     *
+     * @param node this node
+     * @param plane its metadata plane
+     * @param drainingId the draining peer
+     * @return what was done
+     */
+    public static Outcome takeOverFrom(ServerlessNode node, MetadataPlane plane, String drainingId) {
+        final long started = System.nanoTime();
+        return openShare(node, plane, CacheWarmCopy.of(node).copyFrom(List.of(drainingId)), new AtomicBoolean(), started);
+    }
+
+    private static Outcome openShare(
+        ServerlessNode node,
+        MetadataPlane plane,
+        CacheWarmCopy.Outcome copy,
+        AtomicBoolean done,
+        long started
+    ) {
         int opened = 0;
         int failed = 0;
         int ranged = 0;
@@ -116,11 +143,13 @@ public final class SearchWarmup {
                 ranged += fetchFromStore(node, id, copy.unheld().getOrDefault(shard, List.of()));
             } catch (Exception e) {
                 failed++;
-                LOG.debug("warm-up could not open shard [{}][{}]; it opens on its first search", shard.indexName(), shard.shard(), e);
+                LOG.debug(
+                    "could not open shard [{}][{}] ahead of its searches; it opens on its first",
+                    shard.indexName(),
+                    shard.shard(),
+                    e
+                );
             }
-        }
-        if (done.compareAndSet(false, true)) {
-            turnReady(node, plane);
         }
         return new Outcome(copy, opened, failed, ranged, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
     }
