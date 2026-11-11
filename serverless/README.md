@@ -259,6 +259,111 @@ A HorizontalPodAutoscaler can drive `replicas` as usual. A scale-out adds pods t
 scale-in drains the pods it removes. The Service in front of the pods needs nothing special, since it routes only to
 ready pods. The `preStop` drain and the shutdown drain are the same drain, and whichever runs second does nothing.
 
+## Keeping traffic inside a zone
+
+Traffic between availability zones is billed by the byte (on AWS, $0.01/GB in each direction; on GCP, about $0.01/GB),
+and traffic inside a zone is not. Traffic to the object store in the same region is free from every zone. So the shell
+keeps peer traffic inside a zone wherever there is a choice, and never makes it a rule: a peer in another zone is
+still a peer.
+
+**Each node declares its zone with the stock awareness attribute,** `node.attr.zone`. If your deployment names the
+attribute differently, list it first in `cluster.routing.allocation.awareness.attributes`. The zone travels in the
+node's lease. A node without one is in no zone, and is treated as neither near nor far.
+
+With zones set:
+
+- A search on a hot shard (at least `serverless.search.zone_local.min_per_second`, 1 by default, from one
+  coordinator) goes first to a reader in the coordinator's zone. Each zone keeps its own warm reader for such a
+  shard. A cold shard keeps its single reader wherever placement puts it. A zone's reader with
+  `serverless.search.zone_local.spill_in_flight` (8) more searches in flight than placement's own choice gives way
+  to it. Turn it off with `serverless.search.zone_local.enabled=false`.
+- A joining node copies warm blocks only from peers in its zone, and reads the rest from the object store. A copy
+  from another zone costs about 400 times the store reads it replaces. A drain hands over the same way.
+  `serverless.search.warm_copy.cross_zone=true` restores copying from any zone.
+- A dead writer's shards go to a survivor in its zone when one has room.
+- Forwards to a peer in another zone are compressed, and so are their answers
+  (`serverless.network.compress_cross_zone`, on by default). Forwards inside a zone are not compressed.
+- `GET /_serverless/stats` reports `zone_traffic`: bytes sent to and read back from peers in the same zone, in
+  another zone, or where a zone is unknown, with the cross-zone bytes broken down by action. Payload bytes are counted
+  before compression; `transport_tx_bytes` is what went on the wire. Any `unknown_zone_bytes` means some node has no
+  zone set.
+
+### Setting the zone on Kubernetes
+
+The zone is the node's `topology.kubernetes.io/zone` label on both EKS and GKE. A pod cannot read a node label
+directly, so pass it in one of these ways:
+
+- **One Deployment per zone** (works on any cluster). Pin each Deployment with
+  `nodeSelector: { topology.kubernetes.io/zone: us-east-1a }` and set `-Dnode.attr.zone=us-east-1a` to match. Each
+  zone then scales on its own HPA.
+- **Topology labels copied onto pods.** Where the cluster copies node topology labels onto pods (the
+  `PodTopologyLabelsAdmission` feature in newer Kubernetes releases), one Deployment can read the label through the
+  downward API:
+
+  ```yaml
+  env:
+    - name: NODE_ZONE
+      valueFrom:
+        fieldRef: { fieldPath: "metadata.labels['topology.kubernetes.io/zone']" }
+    - name: OPENSEARCH_JAVA_OPTS
+      value: "-Dserverless.roles=search -Dnode.attr.zone=$(NODE_ZONE)"
+  ```
+
+Spread pods evenly over zones either way, so each zone has readers and writers:
+
+```yaml
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    whenUnsatisfiable: ScheduleAnyway
+    labelSelector:
+      matchLabels: { app: search }
+```
+
+### Keeping client traffic in the client's zone
+
+A client in one zone that reaches a pod in another pays the same rate as a peer does. For clients that reach the pods
+through a Kubernetes Service (in-cluster clients, or an ingress controller in front of the Service), set
+`trafficDistribution` on the Service. This works with kube-proxy on both EKS and GKE:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: search
+spec:
+  selector: { app: search }
+  ports: [{ name: http, port: 9200, targetPort: http }]
+  trafficDistribution: PreferSameZone   # PreferClose before Kubernetes 1.34
+```
+
+The Service still falls back to other zones when a zone has no ready pod.
+
+### AWS (EKS)
+
+- **S3 gateway endpoint (prerequisite).** Add a gateway VPC endpoint for S3 to the route tables of the node subnets.
+  It is free. Without it, S3 traffic goes through a NAT gateway, which charges $0.045/GB processed, and at scale that
+  costs more than every other line here together. Check with
+  `aws ec2 describe-vpc-endpoints --filters Name=service-name,Values=com.amazonaws.<region>.s3`.
+- **ALB.** Traffic from an ALB to targets in the same VPC is not billed across zones, but traffic from a client to an
+  ALB node in another zone is. In-region clients reach every zone's ALB nodes, so about two thirds of that hop still
+  crosses. With the AWS Load Balancer Controller, use IP targets and turn cross-zone off on the target group
+  (`alb.ingress.kubernetes.io/target-group-attributes: load_balancing.cross_zone.enabled=false`), so each ALB node
+  sends only to pods in its own zone.
+- **NLB.** Cross-zone load balancing is off by default; keep it off. Point each client at the NLB's zonal DNS name
+  for its own zone (`<zone>.<nlb-dns-name>`), so neither hop crosses.
+- **Direct to the Service.** Use `trafficDistribution` as shown above.
+
+### GCP (GKE)
+
+- **GCS without Cloud NAT (prerequisite).** Turn on Private Google Access for the node subnet, so GCS traffic does not
+  go through Cloud NAT, which charges per GB processed. Reads from a GCS bucket in the same region as the nodes are not
+  billed for egress. Keep the bucket in the cluster's region, not multi-region.
+- **Load balancers.** A GKE internal passthrough Network Load Balancer, or container-native load balancing through
+  NEGs, sends to pods in any zone. For in-region clients, prefer in-cluster access through the Service with
+  `trafficDistribution`, or check your load balancer's zonal affinity option.
+- **Direct to the Service.** Use `trafficDistribution` as shown above.
+
 ## Transport replay capacity
 
 `serverless.transport.replay_cache.capacity` limits the accepted, still-valid nonces
