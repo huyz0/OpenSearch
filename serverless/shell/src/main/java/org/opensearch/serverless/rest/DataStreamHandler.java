@@ -79,16 +79,13 @@ public final class DataStreamHandler extends BaseRestHandler {
     }
 
     /** Applies the default timestamp mapping after templates and the request have been composed. */
-    static IndexAdminHandler.CreateRequest withTimestamp(
-        IndexAdminHandler.CreateRequest create,
-        String timestampField,
-        TemplateResolver.Inherited inherited
-    ) throws IOException {
-        return withTimestamp(create.withMapping(IndexAdminHandler.CreateRequest.mappingWith(create.mapping, inherited)), timestampField);
+    static IndexCreateRequest withTimestamp(IndexCreateRequest create, String timestampField, TemplateResolver.Inherited inherited)
+        throws IOException {
+        return withTimestamp(create.withMapping(IndexCreateRequest.mappingWith(create.mapping, inherited)), timestampField);
     }
 
     /** A create request with the timestamp field mapped as a date, over whatever else it carried. */
-    static IndexAdminHandler.CreateRequest withTimestamp(IndexAdminHandler.CreateRequest create, String timestampField) {
+    static IndexCreateRequest withTimestamp(IndexCreateRequest create, String timestampField) {
         final Map<String, Object> merged = new LinkedHashMap<>(Map.of("properties", Map.of(timestampField, Map.of("type", "date"))));
         try {
             if (create.mapping != null) {
@@ -320,7 +317,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                 serving,
                 metadata,
                 backing,
-                withTimestamp(new IndexAdminHandler.CreateRequest(1, null, Settings.EMPTY), inherited.timestampField(), inherited),
+                withTimestamp(new IndexCreateRequest(1, null, Settings.EMPTY), inherited.timestampField(), inherited),
                 inherited
             );
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {

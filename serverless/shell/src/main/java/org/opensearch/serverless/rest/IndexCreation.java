@@ -70,7 +70,7 @@ final class IndexCreation {
     }
 
     /** Shared native creation payload validation for create-index and rollover. */
-    static IndexAdminHandler.CreateRequest fromNative(org.opensearch.action.admin.indices.create.CreateIndexRequest request)
+    static IndexCreateRequest fromNative(org.opensearch.action.admin.indices.create.CreateIndexRequest request)
         throws IndexAdminHandler.RefusedException {
         final var invalid = request.validate();
         if (invalid != null) {
@@ -87,7 +87,7 @@ final class IndexCreation {
         }
         final Settings settings = Settings.builder().put(request.settings()).normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX).build();
         final String mapping = normalizeMapping(request.mappings());
-        return IndexAdminHandler.CreateRequest.fromSettings(settings, mapping, 1);
+        return IndexCreateRequest.fromSettings(settings, mapping, 1);
     }
 
     static String normalizeMapping(String source) {
@@ -144,7 +144,7 @@ final class IndexCreation {
         org.opensearch.serverless.shell.ServerlessNode serving,
         MetadataPlane metadata,
         String index,
-        IndexAdminHandler.CreateRequest create
+        IndexCreateRequest create
     ) throws IOException, IndexAdminHandler.RefusedException {
         return createIndex(
             serving,
@@ -180,10 +180,10 @@ final class IndexCreation {
         org.opensearch.serverless.shell.ServerlessNode serving,
         MetadataPlane metadata,
         String index,
-        IndexAdminHandler.CreateRequest create,
+        IndexCreateRequest create,
         org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited
     ) throws IOException, IndexAdminHandler.RefusedException {
-        final Settings settings = IndexAdminHandler.CreateRequest.settingsWith(create.settings, inherited);
+        final Settings settings = IndexCreateRequest.settingsWith(create.settings, inherited);
         // Parsed and validated before the descriptor exists, not by the first shard to open it. A value
         // core cannot parse used to land in the register and fail every node that later built
         // IndexSettings from it, with a 400 to the caller that read like a refusal.
@@ -191,8 +191,8 @@ final class IndexCreation {
         final IndexDescriptor descriptor = new IndexDescriptor(
             index,
             UUID.randomUUID().toString(),
-            IndexAdminHandler.CreateRequest.shardsWith(create.shards, create.explicitShards, inherited),
-            IndexAdminHandler.CreateRequest.mappingWith(create.mapping, inherited),
+            IndexCreateRequest.shardsWith(create.shards, create.explicitShards, inherited),
+            IndexCreateRequest.mappingWith(create.mapping, inherited),
             settings
         ).createdAt(metadata.clock().getAsLong(), org.opensearch.Version.CURRENT.id);
         if (serving == null) {
