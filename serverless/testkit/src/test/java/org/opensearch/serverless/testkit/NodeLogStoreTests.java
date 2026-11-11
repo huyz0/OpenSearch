@@ -129,6 +129,15 @@ public class NodeLogStoreTests extends OpenSearchTestCase {
     }
 
     public void testAFenceRacingTheWriterLandsAfterEverythingTheWriterLanded() throws Exception {
+        raceAFenceAgainstTheWriter(1);
+    }
+
+    /** Back to back, the writer's next PUT is always headed for the first free slot; the fence has to aim past it. */
+    public void testAFenceStopsAWriterAppendingBackToBack() throws Exception {
+        raceAFenceAgainstTheWriter(0);
+    }
+
+    private void raceAFenceAgainstTheWriter(long pauseMillis) throws Exception {
         for (int round = 0; round < 20; round++) {
             try (FsBlobStore store = new FsBlobStore(8192, createTempDir(), false)) {
                 final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
@@ -144,8 +153,9 @@ public class NodeLogStoreTests extends OpenSearchTestCase {
                             if (ordinal == 3) {
                                 started.countDown();
                             }
-                            // A writer appends once per window; this one is far faster, but not unboundedly so.
-                            Thread.sleep(1);
+                            if (pauseMillis > 0) {
+                                Thread.sleep(pauseMillis);
+                            }
                         }
                     } catch (Exception e) {
                         stopped.set(e);
