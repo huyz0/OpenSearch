@@ -50,6 +50,21 @@ public final class NodeShards {
     }
 
     /**
+     * Publishes a shard's current commit as a routine publish, which a node staging commits may stage rather than write
+     * to the register.
+     *
+     * @param shardId the shard to publish
+     * @param term the term this node owns the shard at
+     * @return the manifest published
+     * @throws java.io.IOException if the shard is not held here, or a newer term already published
+     */
+    public org.opensearch.serverless.store.CommitManifest publishRoutine(org.opensearch.core.index.shard.ShardId shardId, long term)
+        throws java.io.IOException {
+        node.ensureStarted();
+        return node.reconciler.publish(shardId, term, true);
+    }
+
+    /**
      * Closes a shard this node has stopped owning.
      *
      * <p>Deliberately separate from {@link WriterActivation#applyTruth}: a shard is never closed because a view omitted

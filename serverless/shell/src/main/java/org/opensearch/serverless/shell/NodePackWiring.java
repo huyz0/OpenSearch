@@ -14,6 +14,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.GarbageCollector;
 import org.opensearch.serverless.reconcile.NodePackCollector;
+import org.opensearch.serverless.store.CommitStaging;
 import org.opensearch.serverless.store.NodePackLedger;
 import org.opensearch.serverless.store.NodePackStore;
 import org.opensearch.serverless.store.NodePackWriter;
@@ -66,13 +67,41 @@ final class NodePackWiring {
      */
     static Function<ShardId, SegmentPublisher> publishers(ServerlessNode node, MetadataPlane plane) {
         final boolean enabled = node.packSegments && node.settings.getAsBoolean(ENABLED, false);
+        final long staged = logCommitsStagedMillis(node);
         if (enabled == false) {
-            return id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(node.packSegments);
+            return id -> staging(
+                plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(node.packSegments),
+                staged
+            );
         }
         final long maxBlobBytes = maxBlobBytes(node.settings);
-        return id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id())
-            .packing(true)
-            .nodePacks(writer(node, plane), id.getIndexName(), id.getIndex().getUUID(), id.id(), maxBlobBytes);
+        return id -> staging(
+            plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id())
+                .packing(true)
+                .nodePacks(writer(node, plane), id.getIndexName(), id.getIndex().getUUID(), id.id(), maxBlobBytes),
+            staged
+        );
+    }
+
+    /**
+     * Commits recorded with the node's write log: a routine publish keeps its commit on the writer and the manifest is
+     * written as a checkpoint; see {@link CommitStaging}. Part of the per-node write log, so only with it on, and for
+     * now behind its own rollout flag, off by default.
+     */
+    static final String LOG_COMMITS = "serverless.wal.node_log.commits";
+    /** How old a staged commit gets before its manifest is written. */
+    static final String LOG_COMMITS_CHECKPOINT_MILLIS = "serverless.wal.node_log.commits.checkpoint_millis";
+
+    /** The staging age for a node's shards, or zero when it does not stage. */
+    static long logCommitsStagedMillis(ServerlessNode node) {
+        if (node.nodeLogEnabled == false || node.settings.getAsBoolean(LOG_COMMITS, false) == false) {
+            return 0L;
+        }
+        return node.settings.getAsLong(LOG_COMMITS_CHECKPOINT_MILLIS, CommitStaging.DEFAULT_MAX_STAGED_MILLIS);
+    }
+
+    private static SegmentPublisher staging(SegmentPublisher publisher, long stagedMillis) {
+        return stagedMillis > 0L ? publisher.staging(new CommitStaging(stagedMillis)) : publisher;
     }
 
     static long maxBlobBytes(Settings settings) {

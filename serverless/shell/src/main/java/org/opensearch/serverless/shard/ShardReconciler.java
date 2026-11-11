@@ -241,6 +241,37 @@ public final class ShardReconciler {
         return publishing.publish(shardId, term);
     }
 
+    /** Publishes a shard's current commit, staging it if its publisher stages commits and the publish is routine. */
+    public CommitManifest publish(ShardId shardId, long term, boolean mayStage) throws IOException {
+        return publishing.publish(shardId, term, mayStage);
+    }
+
+    /**
+     * Writes a shard's staged commit to its manifest register, if it has one.
+     *
+     * @param shardId the shard
+     * @param dueOnly true to write it only once it has waited its time
+     * @return the commit written, or null if nothing was
+     * @throws IOException if the register cannot be written, or a newer term holds it
+     */
+    public CommitManifest checkpoint(ShardId shardId, boolean dueOnly) throws IOException {
+        return publishing.checkpoint(shardId, dueOnly);
+    }
+
+    /**
+     * Returns the newest commit this node holds for a shard it writes: a staged one, or what it last published.
+     *
+     * @param shardId the shard
+     * @return the commit, or null if this node does not write it or has published nothing for it
+     */
+    public CommitManifest newestCommit(ShardId shardId) {
+        if (open.containsKey(shardId) == false || readers.contains(shardId)) {
+            return null;
+        }
+        final org.opensearch.serverless.store.SegmentPublisher publisher = publisherCache.get(shardId);
+        return publisher == null ? null : publisher.newestCommit();
+    }
+
     volatile java.util.function.BiConsumer<IndexShard, Exception> onShardFailed;
 
     /**

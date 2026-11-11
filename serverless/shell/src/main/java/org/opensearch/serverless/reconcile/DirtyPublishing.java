@@ -313,7 +313,7 @@ final class DirtyPublishing {
                 return false;
             }
             synchronized (reconciler.publishLock(shardId)) {
-                reconciler.lastManifests.put(shardId, reconciler.node.shards().publishShard(shardId, head.get().term()));
+                reconciler.lastManifests.put(shardId, reconciler.node.shards().publishRoutine(shardId, head.get().term()));
             }
         } catch (org.opensearch.serverless.store.StaleWriterException e) {
             // A newer term has already published. This node is a zombie for this shard: it read a
@@ -347,6 +347,42 @@ final class DirtyPublishing {
         // A write reported since the flush read its checkpoint is stamped again by the next look.
         reconciler.unpublishedSinceMillis.remove(shardId);
         return true;
+    }
+
+    /**
+     * Writes to the register every staged commit that has waited its time, so none outlives its packs' deadline.
+     *
+     * <p>Run on every renewal: a shard that stops publishing still has its last staged commit written.
+     *
+     * @return the shards whose register was written
+     */
+    public Set<ShardId> checkpointDue() {
+        final Set<ShardId> written = new LinkedHashSet<>();
+        try (org.opensearch.common.lease.Releasable work = reconciler.activity.enter()) {
+            if (work == null) {
+                return written;
+            }
+            for (ShardId shardId : reconciler.node.reconciler().openShards()) {
+                if (reconciler.node.reconciler().isReader(shardId)) {
+                    continue;
+                }
+                try {
+                    synchronized (reconciler.publishLock(shardId)) {
+                        final var commit = reconciler.node.reconciler().checkpoint(shardId, true);
+                        if (commit != null) {
+                            reconciler.lastManifests.put(shardId, commit);
+                            written.add(shardId);
+                        }
+                    }
+                } catch (org.opensearch.serverless.store.StaleWriterException e) {
+                    // Fenced: the next pass's head check releases it, as a fenced publish does.
+                    reconciler.fenced.add(shardId);
+                } catch (Exception e) {
+                    BackgroundReconciler.logger.warn("could not write " + shardId + "'s staged commit; its next publish will", e);
+                }
+            }
+        }
+        return written;
     }
 
     /**

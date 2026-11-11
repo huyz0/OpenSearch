@@ -72,11 +72,17 @@ final class PublishedSweeps {
                     continue;
                 }
                 try {
-                    final var current = reconciler.plane.segmentPublisher(
+                    final var register = reconciler.plane.segmentPublisher(
                         shardId.getIndexName(),
                         shardId.getIndex().getUUID(),
                         shardId.id()
                     ).readManifest();
+                    // A writer that stages commits is asked for the newest: the register alone would hold the reader
+                    // back by up to a checkpoint, or let it go for being newer than the register.
+                    final var current = reconciler.node.router() == null
+                        ? register
+                        : org.opensearch.serverless.transport.NewestCommits.of(reconciler.node)
+                            .newerThan(register, shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id());
                     if (current.isEmpty()) {
                         // The commit this reader is serving is no longer published at all. A deleted index,
                         // most likely -- but a manifest read that came back empty is not proof of that on its
@@ -94,7 +100,8 @@ final class PublishedSweeps {
                         }
                         continue;
                     }
-                    if (sameCommit(opened.get(), current.get())) {
+                    if (sameCommit(opened.get(), current.get()) || opened.get().stagedAfter(current.get())) {
+                        // The same commit, or a newer staged one than the writer could be asked about just now.
                         continue;
                     }
                     // Only if it is still the reader judged above. The manifest read is a round trip, and a write during

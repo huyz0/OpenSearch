@@ -211,11 +211,15 @@ public final class ReaderServing {
         // Read once, and handed on: the reconciler and the directory factory each used to read the same
         // register again, so one reader open was three to four reads of one manifest. By the uuid already in
         // hand: the two-argument form resolves it with another descriptor read.
-        final java.util.Optional<org.opensearch.serverless.store.CommitManifest> manifest = plane.segmentPublisher(
+        // The register, or the newer commit its writer staged after it, asked of the writer rather than the store.
+        final java.util.Optional<org.opensearch.serverless.store.CommitManifest> register = plane.segmentPublisher(
             indexName,
             descriptor.uuid(),
             shardNumber
         ).readManifest();
+        final java.util.Optional<org.opensearch.serverless.store.CommitManifest> manifest = node.router() == null
+            ? register
+            : org.opensearch.serverless.transport.NewestCommits.of(node).newerThan(register, indexName, descriptor.uuid(), shardNumber);
         node.readerTerms.put(openingKey, manifest.map(org.opensearch.serverless.store.CommitManifest::term).orElse(1L));
         // The union of what this node serves and what it hosts, plus the reader being opened: a view
         // that described only the readers used to drop every writer index from the applied state on a

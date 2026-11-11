@@ -85,6 +85,7 @@ final class ShardRelease {
         reconciler.readerCommits.remove(shardId);
         reconciler.walCache.remove(shardId);
         reconciler.publisherCache.remove(shardId);
+        reconciler.publishing.forget(shardId);
         reconciler.lastUsed.remove(shardId);
         reconciler.writeGuards.remove(shardId);
         final Index index = shardId.getIndex();

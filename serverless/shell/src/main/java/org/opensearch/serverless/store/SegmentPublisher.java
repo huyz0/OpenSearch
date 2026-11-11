@@ -65,6 +65,18 @@ public final class SegmentPublisher {
     private volatile long lastPublishedGeneration = BlobRegister.ABSENT_GENERATION;
     private volatile CommitManifest lastPublished;
 
+    /** The commits published but not yet in the register, or null when every publish writes it. */
+    private volatile CommitStaging staging;
+
+    /**
+     * What a publish did: the commit, and whether it went into the register or was staged.
+     *
+     * @param manifest the commit published
+     * @param checkpointed true if the register now holds it
+     */
+    public record Published(CommitManifest manifest, boolean checkpointed) {
+    }
+
     /**
      * Creates a publisher for one shard.
      *
@@ -92,6 +104,81 @@ public final class SegmentPublisher {
     public SegmentPublisher packing(boolean packing) {
         this.packing = packing;
         return this;
+    }
+
+    /**
+     * Stages routine commits rather than writing each one to the register; see {@link CommitStaging}.
+     *
+     * @param staging the staging, or null to write the register on every publish (the default)
+     * @return this publisher
+     */
+    public SegmentPublisher staging(CommitStaging staging) {
+        this.staging = staging;
+        return this;
+    }
+
+    /**
+     * Returns the newest commit this writer holds: its staged commit if it has one, else what it last wrote to the
+     * register, else nothing. What a reader that asks this writer is handed.
+     *
+     * @return the commit, or null
+     */
+    public CommitManifest newestCommit() {
+        final CommitStaging stage = staging;
+        final CommitManifest commit = stage == null ? null : stage.staged();
+        return commit != null ? commit : lastPublished;
+    }
+
+    /**
+     * Whether a staged commit has waited long enough that the register should be written now.
+     *
+     * @return true if {@link #checkpoint} would write it
+     */
+    public boolean checkpointDue() {
+        final CommitStaging stage = staging;
+        return stage != null && stage.due();
+    }
+
+    /**
+     * Writes the newest staged commit to the register, if there is one. Callers serialise this with the shard's
+     * publishes.
+     *
+     * @return the commit written, or null if nothing was staged
+     * @throws IOException if the register cannot be written, or a newer term holds it
+     */
+    public CommitManifest checkpoint() throws IOException {
+        final CommitStaging stage = staging;
+        if (stage == null) {
+            return null;
+        }
+        if (stage.pastDeadline()) {
+            stage.clear();
+            throw new IOException("a staged commit outlived its packs' deadline; the next publish uploads its files again");
+        }
+        final CommitManifest commit = stage.staged();
+        final long expected = lastPublishedGeneration;
+        if (commit == null || expected == BlobRegister.ABSENT_GENERATION) {
+            return null;
+        }
+        final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, expected, commit.toBytes());
+        stage.clear();
+        if (result.applied()) {
+            lastPublishedGeneration = result.currentGeneration();
+            lastPublished = commit;
+            return commit;
+        }
+        lastPublishedGeneration = BlobRegister.ABSENT_GENERATION;
+        lastPublished = null;
+        final Optional<BlobRegister> now = container.readRegister(MANIFEST);
+        if (now.isPresent()) {
+            final CommitManifest current = parse(now.get());
+            if (current.term() == commit.term() && commit.writer() != null && commit.writer().equals(current.writer())) {
+                // This writer's own publish moved it, holding this commit or a newer one.
+                return null;
+            }
+            throw new StaleWriterException(commit.term(), current.term());
+        }
+        throw new StaleWriterException(commit.term(), -1L);
     }
 
     /**
@@ -227,6 +314,32 @@ public final class SegmentPublisher {
         PruningDigest digest,
         long walOrdinal
     ) throws IOException {
+        return publishCommit(store, commit, term, writerId, digest, walOrdinal, false).manifest();
+    }
+
+    /**
+     * Publishes a commit, staging it rather than writing the register when staging is on, the caller allows it, and
+     * the register this writer last wrote is of the same term; see {@link CommitStaging}.
+     *
+     * @param store the shard's store
+     * @param commit the commit, or null for the latest
+     * @param term the writer's term
+     * @param writerId the writer
+     * @param digest the commit's pruning digest
+     * @param walOrdinal how far into the log the commit reaches
+     * @param mayStage whether this publish is routine, so may be staged
+     * @return the commit, and whether the register holds it
+     * @throws IOException if publication fails, or a newer term has published
+     */
+    public Published publishCommit(
+        Store store,
+        org.apache.lucene.index.IndexCommit commit,
+        long term,
+        String writerId,
+        PruningDigest digest,
+        long walOrdinal,
+        boolean mayStage
+    ) throws IOException {
         // What this instance published last, if it has: the swap below is conditioned on that generation,
         // and a swap that fails re-reads. Reading before every publish was one register read per publish
         // per shard, paid to learn what this writer already knew.
@@ -262,7 +375,11 @@ public final class SegmentPublisher {
         final Map<String, String> published = new LinkedHashMap<>();
         final Map<String, Long> lengths = new LinkedHashMap<>();
         Long nodePackLandedNanos = null;
-        final Map<String, String> inherited = existing == null ? Map.of() : existing.files();
+        final CommitStaging stage = staging;
+        // A staged commit follows on from the register: inherit its files, so they are not uploaded again.
+        final CommitManifest stagedBase = stage == null ? null : stage.inheritFrom(remembered, term, writerId);
+        final CommitManifest base = stagedBase != null ? stagedBase : existing;
+        final Map<String, String> inherited = base == null ? Map.of() : base.files();
         final Directory directory = store.directory();
 
         store.incRef();
@@ -287,7 +404,7 @@ public final class SegmentPublisher {
                     // Segment files are immutable once written; a name that is already published has the
                     // same bytes. Re-uploading would make failover cost the size of the shard.
                     published.put(fileName, alreadyAt);
-                    final Long knownLength = existing.lengthOf(fileName);
+                    final Long knownLength = base.lengthOf(fileName);
                     if (knownLength != null) {
                         lengths.put(fileName, knownLength);
                     }
@@ -319,11 +436,21 @@ public final class SegmentPublisher {
                 "this publish's node pack landed more than " + NodePackWriter.SWAP_DEADLINE_MILLIS + " ms before its swap"
             );
         }
-        final CommitManifest manifest = new CommitManifest(term, published, writerId, lengths, digest, walOrdinal);
+        final CommitManifest unstaged = new CommitManifest(term, published, writerId, lengths, digest, walOrdinal);
+        if (stage != null && mayStage && stage.mayStage(remembered, term, writerId)) {
+            final CommitManifest staged = unstaged.withStageSequence(stage.next());
+            stage.stage(staged, nodePackLandedNanos);
+            return new Published(staged, false);
+        }
+        final CommitManifest manifest = stage == null ? unstaged : unstaged.withStageSequence(stage.next());
         final long expected = remembered != null && rememberedGeneration != BlobRegister.ABSENT_GENERATION
             ? rememberedGeneration
             : existingRegister.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
         final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, expected, manifest.toBytes());
+        if (stage != null) {
+            // Whatever was staged is in this commit, or was dropped with the register's move.
+            stage.clear();
+        }
         if (result.applied()) {
             lastPublishedGeneration = result.currentGeneration();
             lastPublished = manifest;
@@ -334,7 +461,7 @@ public final class SegmentPublisher {
         if (result.applied() == false && remembered != null) {
             // The register moved under what this instance remembered -- a repair, a restore, a manifest
             // rewritten by hand. Once, the way every publish used to begin: read it and publish over it.
-            return publish(store, commit, term, writerId, digest, walOrdinal);
+            return publishCommit(store, commit, term, writerId, digest, walOrdinal, mayStage);
         }
         if (result.applied() == false) {
             // Who moved it. A newer term is the fence this exception exists for. The same term and the
@@ -345,12 +472,12 @@ public final class SegmentPublisher {
             if (now.isPresent()) {
                 final CommitManifest current = parse(now.get());
                 if (current.term() == term && writerId != null && writerId.equals(current.writer())) {
-                    return current;
+                    return new Published(current, true);
                 }
             }
             throw new StaleWriterException(term, -1L);
         }
-        return manifest;
+        return new Published(manifest, true);
     }
 
     /**
