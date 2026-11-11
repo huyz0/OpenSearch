@@ -42,6 +42,9 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-replay-collision")
+            // Records are planted in the shard's own log, which a node writing its node's log does not read once the
+            // shard's head says that log is quiet: what is tested is how that log's replay treats them.
+            .put("serverless.wal.node_log.enabled", false)
             .put("path.home", createTempDir())
             .put("network.host", "127.0.0.1")
             .put("http.port", "0")
