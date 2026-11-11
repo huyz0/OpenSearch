@@ -15,10 +15,13 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.serverless.store.NodeLogEpoch;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Objects;
 import java.util.Set;
 
@@ -46,6 +49,7 @@ public final class NodeLease {
     private final int cap;
     private final int inUse;
     private final int refused;
+    private final List<NodeLogEpoch> nodeLog;
 
     /**
      * Creates a lease.
@@ -102,6 +106,7 @@ public final class NodeLease {
         this.cap = -1;
         this.inUse = -1;
         this.refused = -1;
+        this.nodeLog = List.of();
     }
 
     private NodeLease(NodeLease lease, boolean revoked, long expiresAtMillis, int held, int cap) {
@@ -109,6 +114,19 @@ public final class NodeLease {
     }
 
     private NodeLease(NodeLease lease, boolean revoked, long expiresAtMillis, int held, int cap, int inUse, int refused) {
+        this(lease, revoked, expiresAtMillis, held, cap, inUse, refused, lease.nodeLog);
+    }
+
+    private NodeLease(
+        NodeLease lease,
+        boolean revoked,
+        long expiresAtMillis,
+        int held,
+        int cap,
+        int inUse,
+        int refused,
+        List<NodeLogEpoch> nodeLog
+    ) {
         this.nodeId = lease.nodeId;
         this.ephemeralId = lease.ephemeralId;
         this.address = lease.address;
@@ -121,6 +139,7 @@ public final class NodeLease {
         this.cap = cap;
         this.inUse = inUse;
         this.refused = refused;
+        this.nodeLog = List.copyOf(nodeLog);
     }
 
     /**
@@ -209,6 +228,29 @@ public final class NodeLease {
      */
     public boolean revoked() {
         return revoked;
+    }
+
+    /**
+     * Returns this lease carrying the epochs of its node's write log that a successor would have to fence and replay.
+     *
+     * <p>The lease is where a successor learns them, so an epoch is recorded here before its first blob is written, and
+     * the trim point and landed hint of each are refreshed on every renewal. A successor reads no listing to find them.
+     *
+     * @param epochs the open epochs, oldest first
+     * @return the copy
+     */
+    public NodeLease withNodeLog(List<NodeLogEpoch> epochs) {
+        return new NodeLease(this, revoked, expiresAtMillis, held, cap, inUse, refused, epochs);
+    }
+
+    /**
+     * Returns the epochs of this node's write log that still hold records not yet published; empty for a node that
+     * writes no such log, or a lease written before the field.
+     *
+     * @return the epochs, oldest first
+     */
+    public List<NodeLogEpoch> nodeLog() {
+        return nodeLog;
     }
 
     /**
@@ -332,6 +374,17 @@ public final class NodeLease {
             if (refused >= 0) {
                 builder.field("refused", refused);
             }
+            if (nodeLog.isEmpty() == false) {
+                builder.startArray("node_log");
+                for (NodeLogEpoch epoch : nodeLog) {
+                    builder.startObject();
+                    builder.field("epoch", epoch.epoch());
+                    builder.field("trim", epoch.trimPoint());
+                    builder.field("landed", epoch.landed());
+                    builder.endObject();
+                }
+                builder.endArray();
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -364,6 +417,7 @@ public final class NodeLease {
             int inUse = -1;
             int refused = -1;
             final Set<String> roles = new LinkedHashSet<>();
+            final List<NodeLogEpoch> nodeLog = new ArrayList<>();
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
@@ -375,6 +429,10 @@ public final class NodeLease {
                 } else if (token == XContentParser.Token.START_ARRAY && "roles".equals(field)) {
                     while (parser.nextToken() != XContentParser.Token.END_ARRAY) {
                         roles.add(parser.text());
+                    }
+                } else if (token == XContentParser.Token.START_ARRAY && "node_log".equals(field)) {
+                    while (parser.nextToken() == XContentParser.Token.START_OBJECT) {
+                        nodeLog.add(parseNodeLogEpoch(parser));
                     }
                 } else if (token.isValue()) {
                     switch (field == null ? "" : field) {
@@ -405,9 +463,40 @@ public final class NodeLease {
                 cap,
                 inUse,
                 refused
-            );
+            ).withNodeLog(nodeLog);
             return revoked ? lease.revokedCopy() : lease;
         }
+    }
+
+    private static NodeLogEpoch parseNodeLogEpoch(XContentParser parser) throws IOException {
+        long epoch = -1L;
+        long trim = 0L;
+        long landed = 0L;
+        String field = null;
+        XContentParser.Token token;
+        while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
+            if (token == null) {
+                throw new IOException("malformed node lease: unterminated node_log entry");
+            }
+            if (token == XContentParser.Token.FIELD_NAME) {
+                field = parser.currentName();
+            } else if (token.isValue()) {
+                switch (field == null ? "" : field) {
+                    case "epoch" -> epoch = parser.longValue();
+                    case "trim" -> trim = parser.longValue();
+                    case "landed" -> landed = parser.longValue();
+                    default -> {
+                        // forward compatibility: ignore fields written by a newer node
+                    }
+                }
+            } else {
+                parser.skipChildren();
+            }
+        }
+        if (epoch < 0) {
+            throw new IOException("malformed node lease: a node_log entry has no epoch");
+        }
+        return new NodeLogEpoch(epoch, trim, landed);
     }
 
     @Override
