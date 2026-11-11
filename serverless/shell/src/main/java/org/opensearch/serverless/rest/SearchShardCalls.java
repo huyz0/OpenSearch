@@ -87,16 +87,25 @@ final class SearchShardCalls {
         // A hot shard is spread over several of its top-ranked readers, picked by load; a cold one keeps its first.
         // Two are tried either way before the owner, as before.
         final org.opensearch.serverless.cluster.HotShardSpread spread = spreadOf(serving);
-        final List<String> ordered = spread.order(
+        // A hot shard's search goes first to a reader in this node's zone, so its answer stays inside the zone.
+        final List<String> ordered = zonePreferenceOf(serving).order(
             index,
             shard,
-            org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+            spread.order(
                 index,
                 shard,
-                members,
-                ServerlessNode.ROLE_SEARCH,
-                Math.max(2, spread.maxReaders())
-            )
+                org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+                    index,
+                    shard,
+                    members,
+                    ServerlessNode.ROLE_SEARCH,
+                    Math.max(2, spread.maxReaders())
+                )
+            ),
+            members,
+            ServerlessNode.ROLE_SEARCH,
+            serving.router().localZone(),
+            spread
         );
         final List<String> targets = ordered.subList(0, Math.min(2, ordered.size()));
         final java.util.Set<String> tried = new java.util.HashSet<>();
@@ -187,6 +196,11 @@ final class SearchShardCalls {
         if (result.total() > 0) {
             serving.shards().markUsed(shardId);
         }
+    }
+
+    /** The node's zone preference for hot shards; see {@link org.opensearch.serverless.cluster.ZonePreference}. */
+    static org.opensearch.serverless.cluster.ZonePreference zonePreferenceOf(ServerlessNode serving) {
+        return org.opensearch.serverless.cluster.ZonePreference.of(serving, serving.settings());
     }
 
     /** The node's spread of hot shards over readers; see {@link org.opensearch.serverless.cluster.HotShardSpread#of}. */
