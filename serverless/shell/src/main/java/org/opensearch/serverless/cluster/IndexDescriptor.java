@@ -331,14 +331,17 @@ public final class IndexDescriptor {
      * @return the new descriptor
      */
     public IndexDescriptor withLayout(org.opensearch.serverless.routing.UnitLayout newLayout) {
+        final int slots = newLayout == null ? numberOfShards : newLayout.nextUnitId();
         return new IndexDescriptor(
             name,
             uuid,
-            newLayout == null ? numberOfShards : newLayout.nextUnitId(),
+            slots,
             mapping,
             extraSettings,
             mappingVersion,
-            settingsVersion,
+            // The slot count is the projected index's number_of_shards, so a node with the index open must take it as a
+            // settings change, not keep the settings it already has at an unchanged version.
+            slots == numberOfShards ? settingsVersion : settingsVersion + 1,
             createdAtMillis,
             createdVersionId,
             aliasedBy,

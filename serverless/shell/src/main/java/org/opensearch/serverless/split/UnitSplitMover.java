@@ -254,7 +254,7 @@ public final class UnitSplitMover {
     }
 
     /** Gives the halves up and drops the pending split, after the hold ran out and the old unit took writes they lack. */
-    private void abandon(String indexName, UnitLayout.Split split, ShardId left, ShardId right) throws IOException {
+    private void abandon(String indexName, UnitLayout.Split split, ShardId left, ShardId right) throws Exception {
         for (ShardId half : List.of(left, right)) {
             final IndexShard shard = node.reconciler().shard(half);
             if (shard != null) {
