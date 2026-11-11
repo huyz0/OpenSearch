@@ -77,6 +77,7 @@ public final class UnitLayout {
     private final List<Unit> units;
     private final long[] firsts;
     private final int nextUnitId;
+    private final Split pending;
 
     /**
      * Creates a layout, checking that it covers the whole hash space and keeps the shape rule.
@@ -87,6 +88,19 @@ public final class UnitLayout {
      * @param nextUnitId the id the next new unit gets; greater than every id in {@code units}
      */
     public UnitLayout(ShardMode mode, int declaredShards, List<Unit> units, int nextUnitId) {
+        this(mode, declaredShards, units, nextUnitId, null);
+    }
+
+    /**
+     * Creates a layout with a split planned but not yet applied.
+     *
+     * @param mode the index's shard mode
+     * @param declaredShards the user's {@code number_of_shards}
+     * @param units the live units, in any order
+     * @param nextUnitId the id the next new unit gets; greater than every id in {@code units} and in {@code pending}
+     * @param pending the planned split whose halves have ids reserved but serve nothing yet, or null
+     */
+    public UnitLayout(ShardMode mode, int declaredShards, List<Unit> units, int nextUnitId, Split pending) {
         this.mode = Objects.requireNonNull(mode);
         if (declaredShards < 1) {
             throw new IllegalArgumentException("declared shards must be positive, got " + declaredShards);
@@ -125,6 +139,23 @@ public final class UnitLayout {
             firsts[i] = sorted.get(i).first();
         }
         this.nextUnitId = nextUnitId;
+        if (pending != null) {
+            final Split p = pending;
+            if (this.units.contains(p.retired()) == false
+                || p.left().first() != p.retired().first()
+                || p.right().last() != p.retired().last()
+                || p.left().last() == LAST_HASH
+                || p.left().last() + 1L != p.right().first()
+                || ids.contains(p.left().id())
+                || ids.contains(p.right().id())
+                || p.left().id() == p.right().id()
+                || Math.max(p.left().id(), p.right().id()) >= nextUnitId) {
+                throw new IllegalArgumentException("pending split " + p + " does not split a unit of this layout into two new halves");
+            }
+            checkShape(p.left());
+            checkShape(p.right());
+        }
+        this.pending = pending;
     }
 
     /**
@@ -279,6 +310,9 @@ public final class UnitLayout {
      * @throws IllegalArgumentException when there is no such unit, or it covers a single hash
      */
     public Split planSplit(int unitId) {
+        if (pending != null) {
+            throw new IllegalStateException("a split is already pending: " + pending);
+        }
         final Unit unit = unit(unitId);
         final int firstShard = RoutingHash.declaredShard(unit.first(), declaredShards);
         final int lastShard = RoutingHash.declaredShard(unit.last(), declaredShards);
@@ -295,7 +329,45 @@ public final class UnitLayout {
     }
 
     /**
-     * Returns this layout with a planned split applied.
+     * Returns the split planned but not yet applied, or null.
+     *
+     * <p>Its halves' ids are reserved, so they are shard slots of the index and can be built, opened and caught
+     * up, but they are not live units: nothing routes to them and no search covers them until the split is
+     * applied.
+     *
+     * @return the pending split, or null
+     */
+    public Split pending() {
+        return pending;
+    }
+
+    /**
+     * Returns this layout with a split recorded as pending, its halves' ids reserved.
+     *
+     * @param split a plan made from this layout
+     * @return the new layout
+     */
+    public UnitLayout withPending(Split split) {
+        return new UnitLayout(
+            mode,
+            declaredShards,
+            units,
+            Math.max(nextUnitId, Math.max(split.left().id(), split.right().id()) + 1),
+            split
+        );
+    }
+
+    /**
+     * Returns this layout without its pending split; the reserved ids stay used, so they are never handed out again.
+     *
+     * @return the new layout
+     */
+    public UnitLayout withoutPending() {
+        return new UnitLayout(mode, declaredShards, units, nextUnitId, null);
+    }
+
+    /**
+     * Returns this layout with a planned split applied. A pending split, if it is this one, is cleared.
      *
      * @param split a plan made from this layout
      * @return the new layout
@@ -308,7 +380,14 @@ public final class UnitLayout {
         next.remove(split.retired());
         next.add(split.left());
         next.add(split.right());
-        return new UnitLayout(mode, declaredShards, next, Math.max(nextUnitId, Math.max(split.left().id(), split.right().id()) + 1));
+        final Split stillPending = split.equals(pending) ? null : pending;
+        return new UnitLayout(
+            mode,
+            declaredShards,
+            next,
+            Math.max(nextUnitId, Math.max(split.left().id(), split.right().id()) + 1),
+            stillPending
+        );
     }
 
     /**
@@ -332,7 +411,10 @@ public final class UnitLayout {
         next.remove(lower);
         next.remove(upper);
         next.add(new Unit(nextUnitId, lower.first(), upper.last()));
-        return new UnitLayout(mode, declaredShards, next, nextUnitId + 1);
+        if (pending != null && (pending.retired().equals(lower) || pending.retired().equals(upper))) {
+            throw new IllegalStateException("unit " + pending.retired().id() + " has a split pending");
+        }
+        return new UnitLayout(mode, declaredShards, next, nextUnitId + 1, pending);
     }
 
     /**
@@ -357,16 +439,24 @@ public final class UnitLayout {
             && mode == other.mode
             && declaredShards == other.declaredShards
             && nextUnitId == other.nextUnitId
-            && units.equals(other.units);
+            && units.equals(other.units)
+            && Objects.equals(pending, other.pending);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(mode, declaredShards, nextUnitId, units);
+        return Objects.hash(mode, declaredShards, nextUnitId, units, pending);
     }
 
     @Override
     public String toString() {
-        return "UnitLayout[" + mode.settingValue() + ", declared=" + declaredShards + ", units=" + units + "]";
+        return "UnitLayout["
+            + mode.settingValue()
+            + ", declared="
+            + declaredShards
+            + ", units="
+            + units
+            + (pending == null ? "" : ", pending=" + pending)
+            + "]";
     }
 }
