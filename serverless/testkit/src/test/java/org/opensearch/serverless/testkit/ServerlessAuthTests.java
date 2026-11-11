@@ -123,7 +123,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
                     org.opensearch.rest.RestChannel channel,
                     org.opensearch.transport.client.node.NodeClient client
                 ) {
-                    final String name = PROBE_NODE.get().identityService().getCurrentSubject().getPrincipal().getName();
+                    final String name = PROBE_NODE.get().services().identityService().getCurrentSubject().getPrincipal().getName();
                     channel.sendResponse(new BytesRestResponse(RestStatus.OK, BytesRestResponse.TEXT_CONTENT_TYPE, name));
                 }
             });
@@ -408,7 +408,8 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
 
             // Deleted straight out of the index, which is what another node's removal looks like from
             // here: the document is gone and nothing told this node about it.
-            node.client()
+            node.services()
+                .client()
                 .delete(
                     new org.opensearch.action.delete.DeleteRequest(AUTH_INDEX, "phasma").setRefreshPolicy(
                         org.opensearch.action.support.WriteRequest.RefreshPolicy.IMMEDIATE
@@ -459,7 +460,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
                 send(node, "GET", "/", basic("snoke", "supreme"), null).status()
             );
 
-            final CredentialStore elsewhere = new CredentialStore(settings, node::client, authClock::get);
+            final CredentialStore elsewhere = new CredentialStore(settings, node.services()::client, authClock::get);
             final long before = elsewhere.version();
             assertNotEquals("creating the account moved the marker", 0L, before);
             assertTrue(elsewhere.remove("snoke"));
@@ -663,7 +664,10 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
             assertEquals("and see a different caller differently: " + asMaz.body(), "maz", asMaz.body());
 
             // Off a request there is no caller, and core's answer for that is the one to give.
-            assertEquals(NamedPrincipal.UNAUTHENTICATED.getName(), node.identityService().getCurrentSubject().getPrincipal().getName());
+            assertEquals(
+                NamedPrincipal.UNAUTHENTICATED.getName(),
+                node.services().identityService().getCurrentSubject().getPrincipal().getName()
+            );
         }
     }
 
@@ -682,7 +686,8 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
                 send(node, "PUT", "/_serverless/security/users/hux", basic(ADMIN, ADMIN_PASSWORD), "{\"password\":\"starkiller\"}").status()
             );
 
-            final String stored = node.client()
+            final String stored = node.services()
+                .client()
                 .get(new org.opensearch.action.get.GetRequest(AUTH_INDEX, "hux"))
                 .actionGet()
                 .getSourceAsString();
@@ -880,7 +885,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
             // With a plane but no account index, an unknown credential is "no such account" rather than
             // "the accounts are unreachable", which is the case worth checking here.
             node.setMetadataPlane(plane(clock));
-            final var subject = (org.opensearch.identity.UserSubject) node.identityService().getCurrentSubject();
+            final var subject = (org.opensearch.identity.UserSubject) node.services().identityService().getCurrentSubject();
             subject.authenticate(urlSafeBasicToken(ADMIN, ADMIN_PASSWORD));
             final var refused = expectThrows(
                 org.opensearch.OpenSearchSecurityException.class,

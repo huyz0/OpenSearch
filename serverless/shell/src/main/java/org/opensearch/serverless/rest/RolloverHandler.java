@@ -116,7 +116,7 @@ public final class RolloverHandler extends BaseRestHandler {
                     try (
                         var parser = mediaType.xContent()
                             .createParser(
-                                serving.searchXContentRegistry(),
+                                serving.services().searchXContentRegistry(),
                                 org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
                                 content.streamInput()
                             )
@@ -124,7 +124,8 @@ public final class RolloverHandler extends BaseRestHandler {
                         nativeRequest.fromXContent(parser);
                     }
                 }
-                final var response = serving.actionGate()
+                final var response = serving.services()
+                    .actionGate()
                     .run(
                         RolloverAction.NAME,
                         nativeRequest,

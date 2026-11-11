@@ -265,7 +265,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 respondFailure(channel, e);
             }
         }, failure -> respondFailure(channel, failure));
-        if (serving.actionGate().isEmpty()) {
+        if (serving.services().actionGate().isEmpty()) {
             planWrite(metadata, serving, index, id, source, pipeline, deletion, requireAbsent, refresh, ifSeqNo, ifPrimaryTerm, completed);
             return;
         }
@@ -300,7 +300,8 @@ public final class DocumentHandler extends BaseRestHandler {
             }
             request = write;
         }
-        serving.actionGate()
+        serving.services()
+            .actionGate()
             .runAsync(
                 serving.threadPool(),
                 deletion ? org.opensearch.action.delete.DeleteAction.NAME : org.opensearch.action.index.IndexAction.NAME,
@@ -492,8 +493,9 @@ public final class DocumentHandler extends BaseRestHandler {
                 if (stored.isEmpty()) {
                     throw new WriteRefusal(RestStatus.BAD_REQUEST, "pipeline_missing", "no such pipeline: " + ran);
                 }
-                final var outcome = serving.ingestPipelines()
-                    .run(serving.ingestPipelines().compile(ran, stored.get()), writtenIndex, id, shaped);
+                final var outcome = serving.services()
+                    .ingestPipelines()
+                    .run(serving.services().ingestPipelines().compile(ran, stored.get()), writtenIndex, id, shaped);
                 if (outcome.dropped()) {
                     answer.onResponse(
                         WriteResult.dropped(
@@ -519,7 +521,8 @@ public final class DocumentHandler extends BaseRestHandler {
             listener,
             into) -> {
             try (
-                org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
+                org.opensearch.common.lease.Releasable inFlight = serving.services()
+                    .indexingPressure()
                     .markCoordinatingOperationStarted(inFlightBytes, false)
             ) {
                 final WriteOutcome outcome = deletion
@@ -584,7 +587,8 @@ public final class DocumentHandler extends BaseRestHandler {
                     // Accounted on this node for as long as the forward is in flight, exactly as a local
                     // write is: the bytes are held here until the owner answers, whichever node applies them.
                     try (
-                        org.opensearch.common.lease.Releasable forwarded = serving.indexingPressure()
+                        org.opensearch.common.lease.Releasable forwarded = serving.services()
+                            .indexingPressure()
                             .markCoordinatingOperationStarted(inFlightBytes, false)
                     ) {
                         String forwardTarget = owner;
@@ -639,10 +643,11 @@ public final class DocumentHandler extends BaseRestHandler {
                                 // member that takes its shards over, once, marked to be taken there -- not to a doubt
                                 // here that queued the shard on every survivor a write reached. Anything short of an
                                 // answer from there falls back to taking it here.
-                                if (serving.routesTakeovers()
+                                if (serving.nodeCapacity().routesTakeovers()
                                     && head.isPresent()
                                     && metadata.heads().isHeld(head.get(), metadata.clock().getAsLong()) == false) {
-                                    final Optional<String> winner = serving.takeoverWinner(metadata, writtenIndex, shard, fresh);
+                                    final Optional<String> winner = serving.nodeCapacity()
+                                        .takeoverWinner(metadata, writtenIndex, shard, fresh);
                                     if (winner.isPresent() && winner.get().equals(serving.localNode().getId()) == false) {
                                         try {
                                             ack = DocumentForwarding.forwardTo(
@@ -660,7 +665,7 @@ public final class DocumentHandler extends BaseRestHandler {
                                                 requireAbsent,
                                                 true
                                             );
-                                            serving.noteTakeoverWriteRouted();
+                                            serving.nodeCapacity().noteTakeoverWriteRouted();
                                             answer.onResponse(
                                                 WriteResult.written(
                                                     new ShardId(writtenIndex, descriptor.get().uuid(), shard),
@@ -744,11 +749,12 @@ public final class DocumentHandler extends BaseRestHandler {
             // below the mean: the write goes there, marked to be taken, so a node that has just joined takes new shards
             // rather than the full ones evicting to make room for them, and load evens out below the cap as well.
             // Anything that went wrong before the member could have applied it falls back to taking it here.
-            final Optional<String> roomy = serving.handOffTarget(metadata);
+            final Optional<String> roomy = serving.nodeCapacity().handOffTarget(metadata);
             if (roomy.isPresent()) {
                 serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
                     try (
-                        org.opensearch.common.lease.Releasable forwarded = serving.indexingPressure()
+                        org.opensearch.common.lease.Releasable forwarded = serving.services()
+                            .indexingPressure()
                             .markCoordinatingOperationStarted(inFlightBytes, false)
                     ) {
                         final var ack = DocumentForwarding.forwardTo(
@@ -766,7 +772,7 @@ public final class DocumentHandler extends BaseRestHandler {
                             requireAbsent,
                             true
                         );
-                        serving.noteWriteSteered();
+                        serving.nodeCapacity().noteWriteSteered();
                         answer.onResponse(
                             WriteResult.written(
                                 new ShardId(writtenIndex, descriptor.get().uuid(), shard),

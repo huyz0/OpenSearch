@@ -201,7 +201,8 @@ public class ServerlessThrottleTests extends OpenSearchTestCase {
                 + encoder.encodeToString(new byte[16])
                 + "$"
                 + encoder.encodeToString(new byte[64]);
-            node.client()
+            node.services()
+                .client()
                 .index(
                     new IndexRequest(AUTH_INDEX).id("planted")
                         .source("{\"user\":\"planted\",\"hash\":\"" + planted + "\"}", XContentType.JSON)

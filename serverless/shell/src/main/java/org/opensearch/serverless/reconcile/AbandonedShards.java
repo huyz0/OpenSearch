@@ -96,12 +96,8 @@ final class AbandonedShards {
             int taking = 0;
             for (Map.Entry<String, Integer> claim : claims) {
                 // The same choice a request for the shard is routed by, so the shard is queued on one survivor only.
-                final Optional<String> winner = reconciler.node.takeoverWinner(
-                    reconciler.plane,
-                    claim.getKey(),
-                    claim.getValue(),
-                    deadNodeId
-                );
+                final Optional<String> winner = reconciler.node.nodeCapacity()
+                    .takeoverWinner(reconciler.plane, claim.getKey(), claim.getValue(), deadNodeId);
                 if (rank < 0 || winner.isEmpty() || winner.get().equals(reconciler.node.localNode().getId())) {
                     if (takeIfStillHeldBy(deadNodeId, claim)) {
                         taking++;
@@ -178,7 +174,8 @@ final class AbandonedShards {
             int taking = 0;
             final List<Map.Entry<String, Integer>> deferred = new java.util.ArrayList<>();
             for (Map.Entry<String, Integer> claim : claims) {
-                if (last == false && reconciler.node.takeoverBelongsElsewhere(reconciler.plane, claim.getKey(), claim.getValue())) {
+                if (last == false
+                    && reconciler.node.nodeCapacity().takeoverBelongsElsewhere(reconciler.plane, claim.getKey(), claim.getValue())) {
                     deferred.add(claim);
                     continue;
                 }

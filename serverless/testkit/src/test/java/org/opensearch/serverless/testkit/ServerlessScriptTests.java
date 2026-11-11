@@ -334,7 +334,8 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
                 store.onNextRegisterRead(
                     "scripts",
                     "_version",
-                    () -> node.client()
+                    () -> node.services()
+                        .client()
                         .index(
                             new org.opensearch.action.index.IndexRequest("alpha").id("1")
                                 .source("{\"msg\":\"raced\",\"n\":99}", org.opensearch.common.xcontent.XContentType.JSON)

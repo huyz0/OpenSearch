@@ -178,7 +178,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         try (
             XContentParser parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
                 .createParser(
-                    serving.searchXContentRegistry(),
+                    serving.services().searchXContentRegistry(),
                     org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
                     request.content().streamInput()
                 )

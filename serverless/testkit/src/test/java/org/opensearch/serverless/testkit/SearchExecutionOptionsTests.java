@@ -38,7 +38,7 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
 
     public void testDefaultNativeSearchStillReturnsBothShards() throws Exception {
         withNode(new org.opensearch.plugins.Plugin() {
-        }, node -> { assertEquals(2L, node.client().search(ask()).actionGet().getHits().getTotalHits().value()); });
+        }, node -> { assertEquals(2L, node.services().client().search(ask()).actionGet().getHits().getTotalHits().value()); });
     }
 
     public void testRestDfsCannotSilentlyUseLocalStatistics() throws Exception {
@@ -89,7 +89,7 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
     private void assertNativeRefused(SearchRequest request) throws Exception {
         withNode(new org.opensearch.plugins.Plugin() {
         }, node -> {
-            final Exception failure = expectThrows(Exception.class, () -> node.client().search(request).actionGet());
+            final Exception failure = expectThrows(Exception.class, () -> node.services().client().search(request).actionGet());
             assertEquals(failure.toString(), RestStatus.NOT_IMPLEMENTED, org.opensearch.ExceptionsHelper.status(failure));
         });
     }
@@ -135,7 +135,7 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
                 .pipeline("required-policy")
                 .scroll("1m")
                 .preference("_shards:0");
-            assertEquals(2L, node.client().search(request).actionGet().getHits().getTotalHits().value());
+            assertEquals(2L, node.services().client().search(request).actionGet().getHits().getTotalHits().value());
             final var observed = plugin.observed.get();
             assertNotNull(observed);
             assertEquals(SearchType.DFS_QUERY_THEN_FETCH, observed.searchType());
@@ -149,7 +149,8 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
     public void testNativePartialResultsPolicyWithRealShardFailure() throws Exception {
         withNodeAndMetadata(new org.opensearch.plugins.Plugin() {
         }, (node, metadata) -> {
-            node.client()
+            node.services()
+                .client()
                 .admin()
                 .indices()
                 .create(
@@ -160,7 +161,8 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
                 )
                 .actionGet();
             final var numbers = node.activation().activateWriter(metadata, "numbers", 0).orElseThrow();
-            node.client()
+            node.services()
+                .client()
                 .index(
                     new org.opensearch.action.index.IndexRequest("numbers").id("number")
                         .source("{\"msg\":42}", org.opensearch.common.xcontent.XContentType.JSON)
@@ -169,12 +171,12 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
             node.reconciler().shard(numbers).refresh("partial-results-test");
             final var source = new SearchSourceBuilder().query(QueryBuilders.rangeQuery("msg").gte("aaa"));
             final var request = new SearchRequest("docs", "numbers").source(source).allowPartialSearchResults(true);
-            final var partial = node.client().search(request).actionGet();
+            final var partial = node.services().client().search(request).actionGet();
             assertEquals(2, partial.getSuccessfulShards());
             assertEquals(1, partial.getFailedShards());
             assertEquals(2L, partial.getHits().getTotalHits().value());
             request.allowPartialSearchResults(false);
-            final var failure = expectThrows(Exception.class, () -> node.client().search(request).actionGet());
+            final var failure = expectThrows(Exception.class, () -> node.services().client().search(request).actionGet());
             assertNotNull(
                 failure.toString(),
                 org.opensearch.ExceptionsHelper.unwrap(failure, org.opensearch.index.query.QueryShardException.class)

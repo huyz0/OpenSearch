@@ -177,7 +177,7 @@ public class ServerlessPluginCollaboratorTests extends OpenSearchTestCase {
     public void testResolvingAnIndexNameRefusesWithAReason() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("collaborators-resolve"))) {
             node.startup().start();
-            final IndexNameExpressionResolver resolver = node.indexNameExpressionResolver();
+            final IndexNameExpressionResolver resolver = node.services().indexNameExpressionResolver();
             final var failure = expectThrows(
                 UnsupportedOperationException.class,
                 () -> resolver.concreteIndexNames(

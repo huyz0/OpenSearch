@@ -273,8 +273,8 @@ final class SearchMerge {
         return org.opensearch.search.aggregations.InternalAggregations.topLevelReduce(
             perShard,
             org.opensearch.search.aggregations.InternalAggregation.ReduceContext.forFinalReduction(
-                serving.bigArrays(),
-                serving.scriptService(),
+                serving.services().bigArrays(),
+                serving.services().scriptService(),
                 // Core's bucket bound and core's breaker: a reduce that would build more buckets than
                 // search.max_buckets allows is refused, where a no-op consumer let it build them all.
                 new org.opensearch.search.aggregations.MultiBucketConsumerService.MultiBucketConsumer(
