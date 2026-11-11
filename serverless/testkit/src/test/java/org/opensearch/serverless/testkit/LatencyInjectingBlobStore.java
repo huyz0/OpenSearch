@@ -60,6 +60,21 @@ final class LatencyInjectingBlobStore implements BlobStore {
         this.delayNanos = TimeUnit.MILLISECONDS.toNanos(delayMillis);
     }
 
+    private volatile int tailEvery;
+    private volatile long tailNanos;
+    private final java.util.concurrent.atomic.AtomicLong requests = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Makes every {@code every}-th request take {@code tailMillis} instead, the slow tail an object store has.
+     *
+     * @param every how often; zero or less for never
+     * @param tailMillis how long those take
+     */
+    void setTail(int every, long tailMillis) {
+        this.tailNanos = TimeUnit.MILLISECONDS.toNanos(tailMillis);
+        this.tailEvery = every;
+    }
+
     /** Takes and clears what has been recorded since the last call. */
     List<Request> drain() {
         final List<Request> drained = new ArrayList<>();
@@ -91,8 +106,10 @@ final class LatencyInjectingBlobStore implements BlobStore {
 
     private void pay(String op, BlobPath path, String name) {
         log.add(new Request(op, path.buildAsString() + (name == null ? "" : name), Thread.currentThread().getName()));
-        final long until = System.nanoTime() + delayNanos;
-        for (long left = delayNanos; left > 0; left = until - System.nanoTime()) {
+        final int every = tailEvery;
+        final long delay = every > 0 && requests.incrementAndGet() % every == 0 ? Math.max(tailNanos, delayNanos) : delayNanos;
+        final long until = System.nanoTime() + delay;
+        for (long left = delay; left > 0; left = until - System.nanoTime()) {
             LockSupport.parkNanos(left);
         }
     }

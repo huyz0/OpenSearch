@@ -537,6 +537,8 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             } catch (Exception e) {
                 logger.warn("shard-head verification failed; the backstop will retry", e);
             }
+            // Before its deadline, whether or not the shard publishes again.
+            loop.checkpointDue();
             if (renewals.get() % READER_REFRESH_EVERY_RENEWALS == 0) {
                 try {
                     loop.refreshReaders();
