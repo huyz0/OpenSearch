@@ -33,7 +33,7 @@ public final class UpdateOutcome {
             servedBy
         );
         if ("noop".equals(result) == false) {
-            ShardOperations.completeNativeWriteResponse(response, refresh);
+            DocumentWrites.completeNativeWriteResponse(response, refresh);
         }
     }
 
