@@ -248,7 +248,7 @@ public final class ShardRouter {
             );
         }
         requireLiveOwnership(shardId);
-        final org.opensearch.serverless.shell.ServerlessNode.WriteOutcome outcome;
+        final org.opensearch.serverless.shell.WriteOutcome outcome;
         if (request.deletion()) {
             outcome = node.delete(shardId, request.id(), request.ifSeqNo(), request.ifPrimaryTerm());
         } else {
