@@ -13,6 +13,7 @@ import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.metadata.ConditionalDeleteProbe;
+import org.opensearch.serverless.store.MeteredBlobStore;
 import org.opensearch.serverless.store.ObjectStores;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -37,7 +38,7 @@ public class MeteredStoreDelegationTests extends OpenSearchTestCase {
         final var stream = new ByteArrayInputStream(new byte[12]);
         org.mockito.Mockito.when(raw.readBlobWithMetadata("doc"))
             .thenReturn(new org.opensearch.common.blobstore.InputStreamWithMetadata(stream, java.util.Map.of("policy", "retained")));
-        try (var metered = new ObjectStores.Metered(backend)) {
+        try (var metered = new MeteredBlobStore(backend)) {
             try (var read = metered.blobContainer(path).readBlobWithMetadata("doc")) {
                 assertEquals(java.util.Map.of("policy", "retained"), read.getMetadata());
                 assertEquals(0L, metered.bytesRead());
@@ -55,7 +56,7 @@ public class MeteredStoreDelegationTests extends OpenSearchTestCase {
         org.mockito.Mockito.when(backend.blobContainer(path)).thenReturn(raw);
         org.mockito.Mockito.when(raw.readBlobWithVersion("doc"))
             .thenReturn(new org.opensearch.common.blobstore.VersionedBlob(new byte[12], "token"));
-        try (var metered = new ObjectStores.Metered(backend)) {
+        try (var metered = new MeteredBlobStore(backend)) {
             final var read = metered.blobContainer(path).readBlobWithVersion("doc");
             assertEquals("token", read.versionToken());
             assertEquals(12L, metered.bytesRead());
@@ -71,7 +72,7 @@ public class MeteredStoreDelegationTests extends OpenSearchTestCase {
         final var stream = org.mockito.Mockito.mock(java.io.InputStream.class);
         org.mockito.Mockito.when(stream.read()).thenThrow(new java.io.IOException("interrupted transfer"));
         org.mockito.Mockito.when(raw.readBlob("doc")).thenReturn(stream);
-        try (var metered = new ObjectStores.Metered(backend); var read = metered.blobContainer(path).readBlob("doc")) {
+        try (var metered = new MeteredBlobStore(backend); var read = metered.blobContainer(path).readBlob("doc")) {
             assertEquals("interrupted transfer", expectThrows(java.io.IOException.class, read::read).getMessage());
             assertEquals(1L, metered.errors());
             assertEquals(0L, metered.bytesRead());
@@ -96,7 +97,7 @@ public class MeteredStoreDelegationTests extends OpenSearchTestCase {
                 org.mockito.ArgumentMatchers.eq(BlobContainer.BlobNameSortOrder.LEXICOGRAPHIC),
                 org.mockito.ArgumentMatchers.any()
             );
-        try (var metered = new ObjectStores.Metered(backend)) {
+        try (var metered = new MeteredBlobStore(backend)) {
             final var attributed = new java.util.concurrent.atomic.AtomicLong();
             final var seen = new java.util.concurrent.atomic.AtomicReference<Exception>();
             ObjectStores.attributedTo(attributed, () -> {
@@ -117,7 +118,7 @@ public class MeteredStoreDelegationTests extends OpenSearchTestCase {
     }
 
     public void testTheConditionalDeleteProbePassesThroughTheWrapper() throws Exception {
-        final ObjectStores.Metered metered = new ObjectStores.Metered(new FsBlobStore(1024, createTempDir(), false));
+        final MeteredBlobStore metered = new MeteredBlobStore(new FsBlobStore(1024, createTempDir(), false));
         assertTrue(
             "a store that honours conditional deletes must be seen to through the production wrapper",
             ConditionalDeleteProbe.honoured(metered, BlobPath.cleanPath().add("probe"))
@@ -125,7 +126,7 @@ public class MeteredStoreDelegationTests extends OpenSearchTestCase {
     }
 
     public void testPagedListingsAreTheBackendsOwnAndCounted() throws Exception {
-        final ObjectStores.Metered metered = new ObjectStores.Metered(new FsBlobStore(1024, createTempDir(), false));
+        final MeteredBlobStore metered = new MeteredBlobStore(new FsBlobStore(1024, createTempDir(), false));
         final BlobContainer container = metered.blobContainer(BlobPath.cleanPath().add("names"));
         for (String name : List.of("a", "b", "c", "d")) {
             container.writeBlob(name, new ByteArrayInputStream(new byte[1]), 1, false);

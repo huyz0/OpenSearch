@@ -24,7 +24,7 @@ public class ObjectStoreLifecycleTests extends OpenSearchTestCase {
         doThrow(new IOException("store close failed")).when(store).close();
         final ThreadPool pool = new TestThreadPool("store-close-failure");
         try {
-            final var handle = new ObjectStores.Handle(store, pool);
+            final var handle = new ObjectStoreHandle(store, pool);
             assertEquals("store close failed", expectThrows(IOException.class, handle::close).getMessage());
             assertTrue("closing the store must terminate its pool even after a failure", pool.awaitTermination(1, TimeUnit.MILLISECONDS));
         } finally {
@@ -43,7 +43,7 @@ public class ObjectStoreLifecycleTests extends OpenSearchTestCase {
             closed.add("plugin");
             throw new IOException("plugin close failed");
         };
-        final var handle = new ObjectStores.Handle(store, null, repository, plugin);
+        final var handle = new ObjectStoreHandle(store, null, repository, plugin);
         final var failure = expectThrows(IOException.class, handle::close);
         assertEquals("repository close failed", failure.getMessage());
         assertEquals("plugin close failed", failure.getSuppressed()[0].getMessage());
@@ -72,7 +72,7 @@ public class ObjectStoreLifecycleTests extends OpenSearchTestCase {
         try (var node = new org.opensearch.serverless.shell.ServerlessNode(settings)) {
             node.startup().start();
             try (var handle = ObjectStores.create(settings, node.clusterService(), home.resolve("config"))) {
-                assertTrue(handle.blobStore() instanceof ObjectStores.Metered);
+                assertTrue(handle.blobStore() instanceof MeteredBlobStore);
             }
         }
     }

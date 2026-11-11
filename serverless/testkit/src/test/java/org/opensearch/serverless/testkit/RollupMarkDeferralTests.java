@@ -17,6 +17,7 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.DigestRollups;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.RollupEntry;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.PruningDigest;
@@ -58,7 +59,7 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
         return new IndexDescriptor(index, "uuid-" + index + "-000000000000".substring(index.length()), 1, MAPPING, null);
     }
 
-    private static DigestRollups.Entry entryOf(MetadataPlane plane, String index) throws Exception {
+    private static RollupEntry entryOf(MetadataPlane plane, String index) throws Exception {
         return plane.rollups().readGroup(DigestRollups.group(index), new DescriptorStore.Reads() {
             @Override
             public <T> List<T> runAll(List<Callable<T>> tasks) {
@@ -86,7 +87,7 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
         return total;
     }
 
-    private static void assertCoversThePublishedRange(DigestRollups.Entry entry, long nowMillis) {
+    private static void assertCoversThePublishedRange(RollupEntry entry, long nowMillis) {
         assertNotNull("the index keeps its entry", entry);
         assertEquals("the mark is cleared", 0L, entry.states().get(0).ownerTerm());
         assertNotNull("and the entry carries a digest", entry.states().get(0).digest());
@@ -126,7 +127,7 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
 
             // And a clear by the successor keeps what the stale writer published.
             rollups.clearOwned("logs-a", "uuid-a", 0, 4L, n(300, 400));
-            final DigestRollups.Entry entry = rollups.readGroup(DigestRollups.group("logs-a"), new DescriptorStore.Reads() {
+            final RollupEntry entry = rollups.readGroup(DigestRollups.group("logs-a"), new DescriptorStore.Reads() {
                 @Override
                 public <T> List<T> runAll(List<Callable<T>> tasks) throws InterruptedException {
                     final List<T> out = new ArrayList<>();
@@ -199,7 +200,7 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
                 assertEquals(1, dyingLoop.publishDirty().size());
             }
             final String dead = dying.localNode().getId();
-            final DigestRollups.Entry marked = entryOf(setup, "orphaned");
+            final RollupEntry marked = entryOf(setup, "orphaned");
             assertTrue("still marked by the writer that died", marked.states().get(0).ownerTerm() > 0L);
             assertNull("and its publishes never widened the entry", marked.states().get(0).digest());
 

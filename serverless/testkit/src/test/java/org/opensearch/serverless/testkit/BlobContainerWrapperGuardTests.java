@@ -24,6 +24,8 @@ import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.serverless.metadata.ConditionalDeleteProbe;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.store.MeteredBlobStore;
+import org.opensearch.serverless.store.ObjectStoreHandle;
 import org.opensearch.serverless.store.ObjectStores;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -53,7 +55,7 @@ import java.util.stream.Stream;
 /**
  * Nothing between the node and the store may quietly stand an interface default in for the backend's own method.
  *
- * <p>{@code ObjectStores.Metered} -- the wrapper every production store is built behind -- overrode neither the
+ * <p>{@code MeteredBlobStore} -- the wrapper every production store is built behind -- overrode neither the
  * conditional register delete nor the bounded listings, so those calls reached {@code BlobContainer}'s defaults:
  * the delete threw {@code UnsupportedOperationException}, the probe read that as a store that does not honour the
  * condition, and every node stayed on tombstones; the capped listing listed the whole prefix. Every test passed,
@@ -132,7 +134,7 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
         final List<Class<?>> containers = shellBlobContainers();
         assertTrue(
             "the production wrapper must be among them, or the scan is not finding anything: " + containers,
-            containers.stream().anyMatch(c -> c.getName().startsWith(ObjectStores.Metered.class.getName()))
+            containers.stream().anyMatch(c -> c.getName().startsWith(MeteredBlobStore.class.getName()))
         );
         final Map<String, List<String>> dropped = new TreeMap<>();
         for (Class<?> container : containers) {
@@ -166,7 +168,7 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
     public void testTheProductionChainOnAFilesystem() throws Exception {
         final Path dir = createTempDir();
         try (
-            ObjectStores.Handle handle = ObjectStores.create(
+            ObjectStoreHandle handle = ObjectStores.create(
                 Settings.builder().put(ObjectStores.TYPE, "fs").put("serverless.store.path", dir.toString()).build(),
                 null,
                 createTempDir()
@@ -204,7 +206,7 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
         final boolean honours = Boolean.parseBoolean(System.getProperty("tests.serverless.guard.conditional_delete", "true"));
         try (ServerlessNode node = new ServerlessNode(settings)) {
             node.startup().start();
-            try (ObjectStores.Handle handle = ObjectStores.create(settings, node.clusterService(), createTempDir())) {
+            try (ObjectStoreHandle handle = ObjectStores.create(settings, node.clusterService(), createTempDir())) {
                 exercise(handle.blobStore(), honours);
             }
         } finally {
@@ -214,8 +216,8 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
 
     /** Each non-default path, through whatever chain {@code store} is, observed at the store. */
     private void exercise(BlobStore store, boolean honoursConditionalDelete) throws Exception {
-        assertTrue("the production factory builds behind the wrapper", store instanceof ObjectStores.Metered);
-        final ObjectStores.Metered metered = (ObjectStores.Metered) store;
+        assertTrue("the production factory builds behind the wrapper", store instanceof MeteredBlobStore);
+        final MeteredBlobStore metered = (MeteredBlobStore) store;
         final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath().add("guard")));
 
         // Registers: create, read, swap.
@@ -293,7 +295,7 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
     }
 
     /**
-     * {@code ObjectStores.Metered.Counting} as it stood at {@code 7bfec04d070}: the abstract methods, the three
+     * {@code MeteredBlobStore.Counting} as it stood at {@code 7bfec04d070}: the abstract methods, the three
      * register methods and the plain listings delegated; nothing else.
      */
     private static final class LikeMeteredBeforeTheFix implements ConditionalBlobContainer {

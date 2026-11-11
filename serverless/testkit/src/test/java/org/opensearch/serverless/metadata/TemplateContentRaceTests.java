@@ -39,7 +39,7 @@ public class TemplateContentRaceTests extends OpenSearchTestCase {
                     .createRegisterIfAbsent("_version", org.opensearch.core.common.bytes.BytesReference.bytes(body));
             }
             final TemplateStore templates = new TemplateStore(container);
-            expectThrows(TemplateStore.TooManyTemplatesException.class, () -> templates.put("overflow", "{}"));
+            expectThrows(TooManyTemplatesException.class, () -> templates.put("overflow", "{}"));
             assertTrue("a refused write must not leave a new unindexed content object", container.listBlobsByPrefix("blob-").isEmpty());
         }
     }
