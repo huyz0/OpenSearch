@@ -16,6 +16,7 @@ import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.FleetSize;
+import org.opensearch.serverless.shell.NodeCapacity;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -347,8 +348,8 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
                     + " against a mean of "
                     + mean,
                 heavy.nodeCapacity().capacity().held() <= Math.max(
-                    Math.ceil(mean * ServerlessNode.HAND_OFF_ABOVE_MEAN),
-                    cap * ServerlessNode.MEAN_MATTERS_FROM
+                    Math.ceil(mean * NodeCapacity.HAND_OFF_ABOVE_MEAN),
+                    cap * NodeCapacity.MEAN_MATTERS_FROM
                 )
             );
             assertFalse("and so no longer handing off", heavy.nodeCapacity().aboveFleetShare(plane));
@@ -398,7 +399,7 @@ public class ServerlessScaleOutTests extends OpenSearchTestCase {
             assertEquals(2, loop.activateOnDemand(List.of(Map.entry("dead0", 0), Map.entry("dead1", 0))).size());
             assertEquals("past the cap, within the ceiling", cap + 2, survivor.nodeCapacity().capacity().held());
             assertEquals("nothing evicted on the take path", 0, survivor.nodeCapacity().capacity().evicted());
-            assertEquals(2, survivor.takeoversOvercommitted());
+            assertEquals(2, survivor.nodeCapacity().takeoversOvercommitted());
 
             // The passes after bring it back to the cap, a tenth of the cap a pass, and never the shards just taken.
             int passes = 0;

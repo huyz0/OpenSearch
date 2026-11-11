@@ -46,7 +46,7 @@ final class LeaseUpkeep {
                 //
                 // IfDue, not unconditionally: the scan is one register read per held shard, and running it on
                 // every renewal and every backstop alike made it the largest standing cost of an idle node.
-                // See ServerlessNode#DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS for why a bounded wait is safe here
+                // See NodeLeases#DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS for why a bounded wait is safe here
                 // and where the unconditional scan still happens.
                 return reconciler.node.leases().verifyHeadsIfDue(reconciler.plane);
             }

@@ -19,6 +19,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.ShardHead;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.TickResult;
+import org.opensearch.serverless.shell.NodeLeases;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -117,7 +118,7 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
 
     /** More shards than lanes: the scan runs in parallel, and still reads each head exactly once. */
     public void testVerifyingManyHeadsReadsEachExactlyOnce() throws Exception {
-        final int shards = ServerlessNode.HEAD_READ_LANES + 4;
+        final int shards = NodeLeases.HEAD_READ_LANES + 4;
         final AtomicLong clock = new AtomicLong(1_000L);
         final CountingBlobStore counter = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false));
         final MetadataPlane plane = deploymentWith(counter, clock, shards);

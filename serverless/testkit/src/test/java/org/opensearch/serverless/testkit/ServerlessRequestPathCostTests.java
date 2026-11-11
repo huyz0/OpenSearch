@@ -102,7 +102,7 @@ public class ServerlessRequestPathCostTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("request-cost-reads"))) {
             node.startup().start();
             node.setMetadataPlane(plane);
-            node.setIncarnationFenceMillis(60_000L);
+            node.fences().setIncarnationFenceMillis(60_000L);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
             loop.tick(clock.get());

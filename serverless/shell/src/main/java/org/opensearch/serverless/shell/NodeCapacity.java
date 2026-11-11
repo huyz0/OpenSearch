@@ -17,7 +17,95 @@ public final class NodeCapacity {
 
     NodeCapacity(ServerlessNode node) {
         this.node = node;
+        this.placement = new FleetPlacement(
+            () -> node.localNode.getId(),
+            () -> admission.maxShardsHeld(),
+            () -> node.reconciler == null ? 0 : node.reconciler.heldShards().size()
+        );
     }
+
+    volatile ShardAdmission admission = new ShardAdmission() {
+        @Override
+        public int maxShardsHeld() {
+            return org.opensearch.serverless.reconcile.BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD;
+        }
+
+        @Override
+        public boolean makeRoom() {
+            return false;
+        }
+    };
+
+    /**
+     * Installs the cap and eviction policy readers and views are admitted under.
+     *
+     * @param admission the policy, normally the node's reconciler
+     */
+    public void setShardAdmission(ShardAdmission admission) {
+        this.admission = admission;
+    }
+
+    /** Reader opens this node refused at its shard cap. */
+    final java.util.concurrent.atomic.AtomicLong readerOpensRefusedAtCap = new java.util.concurrent.atomic.AtomicLong();
+    /** Writer activations this node refused at its shard cap. */
+    final java.util.concurrent.atomic.AtomicLong activationsRefusedAtCap = new java.util.concurrent.atomic.AtomicLong();
+    /** Shards given up to make room for another. */
+    final java.util.concurrent.atomic.AtomicLong evictedForRoom = new java.util.concurrent.atomic.AtomicLong();
+    /** Shards given up because a member with room could take them. */
+    final java.util.concurrent.atomic.AtomicLong handedOff = new java.util.concurrent.atomic.AtomicLong();
+    /** Writes for a shard nobody held that this node sent to a member with room rather than take. */
+    final java.util.concurrent.atomic.AtomicLong writesSteered = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * When each shard turned away at the cap was last turned away: distinct shards, not refusals. A burst of searches asked
+     * for the same shards over and over, and counted as events one minute's refusals said the fleet wanted forty-three nodes.
+     */
+    final java.util.Map<String, Long> refusedShards = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** How long a shard counts as in use after it was last used. */
+    public static final long IN_USE_WINDOW_MILLIS = 60_000L;
+
+    /** The share of a node's cap a fleet sized by {@link NodeCapacity#fleetSize} aims to use. */
+    public static final double TARGET_UTILISATION = FleetPlacement.TARGET_UTILISATION;
+
+    final java.util.concurrent.atomic.AtomicLong takeoversOvercommitted = new java.util.concurrent.atomic.AtomicLong();
+
+    /**
+     * Dead members' shards taken past the cap, since the node started.
+     *
+     * @return the count
+     */
+    public long takeoversOvercommitted() {
+        return takeoversOvercommitted.get();
+    }
+
+    /** Above this share of its cap a node looks for a member to hand work to. */
+    public static final double HAND_OFF_ABOVE = FleetPlacement.HAND_OFF_ABOVE;
+    /** At or below this share of its cap a member can take work handed to it. */
+    public static final double ROOM_AT_OR_BELOW = FleetPlacement.ROOM_AT_OR_BELOW;
+    /** Above this multiple of the fleet's mean held shards a node hands work off, however far it is from its cap. */
+    public static final double HAND_OFF_ABOVE_MEAN = FleetPlacement.HAND_OFF_ABOVE_MEAN;
+    /** A node handing off for being above the mean hands off down to this multiple of it. */
+    public static final double HAND_OFF_DOWN_TO_MEAN = FleetPlacement.HAND_OFF_DOWN_TO_MEAN;
+    /** Below this share of its cap a node is never too busy for the mean to matter: a small fleet's few shards stay. */
+    public static final double MEAN_MATTERS_FROM = FleetPlacement.MEAN_MATTERS_FROM;
+
+    /** Decides where this node's work belongs across the fleet; the methods below forward to it. */
+    final FleetPlacement placement;
+
+    /**
+     * Where writer activations spend their time, summed: reading the descriptor, acquiring the head, marking the rollup
+     * entry owned, and opening the shard -- restoring its commit and replaying its log -- of which projecting and applying
+     * the local view that names it is a part of its own. With {@link #activationsOpened}
+     * an operator reads the average of each, and which one a burst of cold shards is waiting on.
+     */
+    final java.util.concurrent.atomic.AtomicLong[] activationPhases = {
+        new java.util.concurrent.atomic.AtomicLong(),
+        new java.util.concurrent.atomic.AtomicLong(),
+        new java.util.concurrent.atomic.AtomicLong(),
+        new java.util.concurrent.atomic.AtomicLong(),
+        new java.util.concurrent.atomic.AtomicLong() };
+    final java.util.concurrent.atomic.AtomicLong activationsOpened = new java.util.concurrent.atomic.AtomicLong();
 
     /**
      * Returns how full this node is and what fullness has cost.
@@ -26,13 +114,13 @@ public final class NodeCapacity {
      */
     public Capacity capacity() {
         return new Capacity(
-            node.admission.maxShardsHeld(),
+            admission.maxShardsHeld(),
             node.reconciler == null ? 0 : node.reconciler.heldShards().size(),
-            node.readerOpensRefusedAtCap.get(),
-            node.activationsRefusedAtCap.get(),
-            node.evictedForRoom.get(),
-            node.handedOff.get(),
-            node.writesSteered.get()
+            readerOpensRefusedAtCap.get(),
+            activationsRefusedAtCap.get(),
+            evictedForRoom.get(),
+            handedOff.get(),
+            writesSteered.get()
         );
     }
 
@@ -43,12 +131,12 @@ public final class NodeCapacity {
      * @param shard the shard
      */
     public void noteActivationRefusedAtCap(String indexName, int shard) {
-        node.activationsRefusedAtCap.incrementAndGet();
+        activationsRefusedAtCap.incrementAndGet();
         noteRefusedRecently(indexName, shard);
     }
 
     void noteRefusedRecently(String indexName, int shard) {
-        node.refusedShards.put(ServerlessNode.shardKey(indexName, shard), System.nanoTime());
+        refusedShards.put(ServerlessNode.shardKey(indexName, shard), System.nanoTime());
     }
 
     /**
@@ -58,8 +146,8 @@ public final class NodeCapacity {
      */
     public int refusedLastMinute() {
         final long cutoff = System.nanoTime() - java.util.concurrent.TimeUnit.MINUTES.toNanos(1);
-        node.refusedShards.values().removeIf(at -> at < cutoff);
-        return node.refusedShards.size();
+        refusedShards.values().removeIf(at -> at < cutoff);
+        return refusedShards.size();
     }
 
     /**
@@ -77,7 +165,7 @@ public final class NodeCapacity {
         int used = 0;
         for (org.opensearch.core.index.shard.ShardId shardId : node.reconciler.openShards()) {
             final java.util.OptionalLong last = node.reconciler.lastUsed(shardId);
-            if (last.isPresent() && now - last.getAsLong() < ServerlessNode.IN_USE_WINDOW_MILLIS) {
+            if (last.isPresent() && now - last.getAsLong() < NodeCapacity.IN_USE_WINDOW_MILLIS) {
                 used++;
             }
         }
@@ -91,7 +179,7 @@ public final class NodeCapacity {
      * @return the members counted and the nodes wanted
      */
     public FleetSize fleetSize(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return node.placement.fleetSize(plane);
+        return placement.fleetSize(plane);
     }
 
     /**
@@ -100,21 +188,21 @@ public final class NodeCapacity {
      * @param forHandOff true if given up for a member with room
      */
     public void noteEvicted(boolean forHandOff) {
-        (forHandOff ? node.handedOff : node.evictedForRoom).incrementAndGet();
+        (forHandOff ? handedOff : evictedForRoom).incrementAndGet();
     }
 
     /** Counts a dead member's shard taken past the cap, without evicting for it. */
     public void noteTakeoverOvercommitted() {
-        node.takeoversOvercommitted.incrementAndGet();
+        takeoversOvercommitted.incrementAndGet();
     }
 
     /**
-     * Whether this node holds more than {@link ServerlessNode#HAND_OFF_ABOVE} of its cap.
+     * Whether this node holds more than {@link #HAND_OFF_ABOVE} of its cap.
      *
      * @return true when nearly full
      */
     public boolean nearlyFull() {
-        return node.placement.nearlyFull();
+        return placement.nearlyFull();
     }
 
     /**
@@ -124,7 +212,7 @@ public final class NodeCapacity {
      * @return the member's id
      */
     public java.util.Optional<String> memberWithRoom(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return node.placement.memberWithRoom(plane);
+        return placement.memberWithRoom(plane);
     }
 
     /**
@@ -133,7 +221,7 @@ public final class NodeCapacity {
      * @param route whether to
      */
     public void setRouteTakeovers(boolean route) {
-        node.placement.setRouteTakeovers(route);
+        placement.setRouteTakeovers(route);
     }
 
     /**
@@ -142,7 +230,7 @@ public final class NodeCapacity {
      * @return true if they do
      */
     public boolean routesTakeovers() {
-        return node.placement.routesTakeovers();
+        return placement.routesTakeovers();
     }
 
     /**
@@ -151,17 +239,17 @@ public final class NodeCapacity {
      * @param fraction of the cap
      */
     public void setTakeoverOvercommit(double fraction) {
-        node.placement.setTakeoverOvercommit(fraction);
+        placement.setTakeoverOvercommit(fraction);
     }
 
     /** Counts a write for a dead member's shard sent to the member that takes it over. */
     public void noteTakeoverWriteRouted() {
-        node.placement.noteTakeoverWriteRouted();
+        placement.noteTakeoverWriteRouted();
     }
 
     /** Counts a doubt about a dead member's shard this node left to the member that takes it over. */
     public void noteTakeoverDoubtLeft() {
-        node.placement.noteTakeoverDoubtLeft();
+        placement.noteTakeoverDoubtLeft();
     }
 
     /**
@@ -170,7 +258,7 @@ public final class NodeCapacity {
      * @return routed, then left
      */
     public long[] takeoverRouting() {
-        return node.placement.takeoverRouting();
+        return placement.takeoverRouting();
     }
 
     /**
@@ -188,7 +276,7 @@ public final class NodeCapacity {
         int shard,
         String deadOwner
     ) {
-        return node.placement.takeoverWinner(plane, indexName, shard, deadOwner);
+        return placement.takeoverWinner(plane, indexName, shard, deadOwner);
     }
 
     /**
@@ -201,7 +289,7 @@ public final class NodeCapacity {
      * @return true to leave it to the member named
      */
     public boolean takeoverBelongsElsewhere(org.opensearch.serverless.metadata.MetadataPlane plane, String indexName, int shard) {
-        return node.placement.takeoverBelongsElsewhere(plane, indexName, shard);
+        return placement.takeoverBelongsElsewhere(plane, indexName, shard);
     }
 
     /**
@@ -211,7 +299,7 @@ public final class NodeCapacity {
      * @return the mean, or -1 if no member says
      */
     public double fleetMeanHeld(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return node.placement.fleetMeanHeld(plane);
+        return placement.fleetMeanHeld(plane);
     }
 
     /**
@@ -221,7 +309,7 @@ public final class NodeCapacity {
      * @return true when above its share
      */
     public boolean aboveFleetShare(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return node.placement.aboveFleetShare(plane);
+        return placement.aboveFleetShare(plane);
     }
 
     /**
@@ -231,7 +319,7 @@ public final class NodeCapacity {
      * @return the member's id
      */
     public java.util.Optional<String> memberBelowMean(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return node.placement.memberBelowMean(plane);
+        return placement.memberBelowMean(plane);
     }
 
     /**
@@ -241,7 +329,7 @@ public final class NodeCapacity {
      * @return the member's id
      */
     public java.util.Optional<String> handOffTarget(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return node.placement.handOffTarget(plane);
+        return placement.handOffTarget(plane);
     }
 
     /**
@@ -252,16 +340,16 @@ public final class NodeCapacity {
      */
     public long[] activationPhaseMillis() {
         return new long[] {
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(node.activationPhases[0].get()),
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(node.activationPhases[1].get()),
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(node.activationPhases[2].get()),
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(node.activationPhases[3].get()),
-            node.activationsOpened.get(),
-            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(node.activationPhases[4].get()) };
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[0].get()),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[1].get()),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[2].get()),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[3].get()),
+            activationsOpened.get(),
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(activationPhases[4].get()) };
     }
 
     /** Counts a write for an unheld shard sent to a member with room. */
     public void noteWriteSteered() {
-        node.writesSteered.incrementAndGet();
+        writesSteered.incrementAndGet();
     }
 }

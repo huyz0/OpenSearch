@@ -16,6 +16,7 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.shell.WriteFences;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.concurrent.atomic.AtomicLong;
@@ -138,7 +139,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
             // Without it, the confirmation the activation above took -- a second ago, and true then -- still
             // licenses an answer, which is the fence working as designed: a write inside that second is
             // concurrent with a delete that has not yet returned.
-            node.setIncarnationFenceMillis(0L);
+            node.fences().setIncarnationFenceMillis(0L);
 
             // But the shard it would route to no longer answers for that name, so the write is refused.
             // place() matches an open shard on uuid, and the recreated index's shard is a different one.
@@ -179,7 +180,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
             theirs.deleteIndex("alpha");
             theirs.createIndex(new IndexDescriptor("alpha", "uuid-alpha-11111111", 1, MAPPING, null));
             // The other node's delete answered after the settle window; that wait is what this stands for.
-            node.setIncarnationFenceMillis(0L);
+            node.fences().setIncarnationFenceMillis(0L);
 
             final Response response = send(node, "PUT", "/alpha/_doc/doc", "{\"msg\":\"stale\"}");
             logger.info("freshness: a REST write routed by a stale resolution answered {} {}", response.status(), response.body());
@@ -218,7 +219,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
 
             theirs.deleteIndex("alpha");
             theirs.createIndex(new IndexDescriptor("alpha", "uuid-alpha-11111111", 1, MAPPING, null));
-            node.setIncarnationFenceMillis(0L);
+            node.fences().setIncarnationFenceMillis(0L);
 
             final Response get = send(node, "GET", "/alpha/_doc/old", null);
             assertFalse("a get must not return a document from a deleted incarnation: " + get.body(), get.body().contains("previous"));
@@ -247,8 +248,8 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
             final long tookMillis = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
             assertEquals(deleted.body(), 200, deleted.status());
             assertTrue(
-                "a delete answered in " + tookMillis + " ms, inside the fence window of " + ServerlessNode.INCARNATION_FENCE_MILLIS + " ms",
-                tookMillis >= ServerlessNode.DELETE_SETTLE_MILLIS
+                "a delete answered in " + tookMillis + " ms, inside the fence window of " + WriteFences.INCARNATION_FENCE_MILLIS + " ms",
+                tookMillis >= WriteFences.DELETE_SETTLE_MILLIS
             );
             assertTrue(plane.describe("alpha").isEmpty());
         }

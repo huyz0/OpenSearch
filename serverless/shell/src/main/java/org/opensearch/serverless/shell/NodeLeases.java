@@ -25,6 +25,84 @@ public final class NodeLeases {
     }
 
     /**
+     * Heads this node lost to its own lapsed lease and has not yet given back in the register, with the
+     * term it lost them at. Drained on every renewal, so a store that was unreachable when the loss was
+     * discovered does not leave a head naming a node that is not serving the shard.
+     */
+    final java.util.Map<org.opensearch.core.index.shard.ShardId, Long> headsToGiveBack = new java.util.concurrent.ConcurrentHashMap<>();
+    final Object leaseRenewalLock = new Object();
+    /** Serialises head verification: two passes interleaving their releases was the hazard, and waiting is cheaper than skipping. */
+    final Object headVerificationLock = new Object();
+    /** Whether a head verification is running, so an activation can tell it would only wait behind one. */
+    final java.util.concurrent.atomic.AtomicBoolean verifyingHeads = new java.util.concurrent.atomic.AtomicBoolean();
+    /**
+     * True from the moment this node's lease is found lapsed until a head verification that began after
+     * the renewal has read every head. While set, no write is acknowledged and no forwarded write is
+     * accepted. See {@link NodeLeases#renewLease}.
+     */
+    volatile boolean ownershipUnverified;
+    /** Bumped on every lapse, so a verification that began before the renewal cannot lift the suspension. */
+    final java.util.concurrent.atomic.AtomicLong lapseEpoch = new java.util.concurrent.atomic.AtomicLong();
+    /** How many shard-head reads a verification pass has in flight at once. */
+    public static final int HEAD_READ_LANES = 8;
+
+    /**
+     * How long a node may go without re-reading the head of every writer shard it holds.
+     *
+     * <p>One lease TTL, where this used to run on every renewal <em>and</em> every backstop -- four scans
+     * per TTL at the defaults, each of them one register read per held shard. At the thousand-shard cap
+     * that was 480 reads per shard per hour paid to be told nothing had changed, and it is the largest
+     * standing cost a node has when it is doing nothing at all.
+     *
+     * <p><b>Why cutting it is safe, and why it is not cut further.</b> The scan is not what fences a
+     * writer. A node refuses to acknowledge past its own lease deadline less the skew margin
+     * ({@code ensureOwnLeaseIsStillValid}), which needs no I/O and so happens on every single write; and a
+     * successor seals the log at takeover, so anything appended behind that seal is never replayed. A head
+     * cannot be taken from a node whose lease is live, because {@code ShardHeadStore#acquire} refuses an
+     * owner the liveness oracle says is alive. So in steady state this scan is looking for something that
+     * cannot have happened.
+     *
+     * <p>What it does still catch is worth a bounded wait rather than nothing: a shard of an index deleted
+     * and recreated under a new uuid, a head given back and won elsewhere, and the clock-skew edge where
+     * two nodes disagree about whether a lease had expired. A lapse takes the unconditional path and is
+     * unaffected -- {@code renewLease} scans every head before acknowledgement resumes, which is where the
+     * correctness argument actually lives.
+     *
+     * <p><b>Zero by default, which means the scan still runs on every pass.</b> The saving is real and
+     * measured -- between scans a tick reads one register whatever the node holds, against one per shard --
+     * but switching it on trades something a deployment may not want to trade, and three existing tests
+     * encode the current bargain as a guarantee: a tick reacquires a shard whose lease was lost, a
+     * forwarded write finds the owner has moved, a node stops holding what it no longer owns. All of them
+     * describe how quickly a node <em>notices</em>, and all of them get slower by up to this interval.
+     *
+     * <p>What does not get worse is worth saying precisely, because it is what makes the option safe to
+     * offer at all. A node cannot acknowledge a write past its own lease deadline less the skew margin
+     * ({@code ensureOwnLeaseIsStillValid}), which needs no I/O and so happens on every write; a successor
+     * seals the log at takeover, so anything appended behind that seal never replays; and a head cannot be
+     * taken from a node whose lease is live, because {@code ShardHeadStore#acquire} refuses an owner the
+     * liveness oracle says is alive. A lapse takes the unconditional path regardless. So the exposure a
+     * longer interval buys is a node serving reads from a shard it has lost, for up to the interval --
+     * bounded, and never an acknowledged write that nobody replays.
+     *
+     * <p><b>What made a long interval safe to deploy is a signal carried on the node's own lease.</b> A
+     * revocation marker written somewhere else fails because it is not atomic with the swap that moves
+     * ownership, so its absence proves nothing -- {@code RegisterMap#assignments} says the same of the
+     * listing it maintains. A revocation written <em>onto the owner's lease register</em>, before the head
+     * is swapped, does not: the taker's swap of the lease and the owner's renewal of it contend on one
+     * register, so either the owner renewed first and the taker backs off, or the revocation landed first
+     * and the owner's next renewal fails, which it treats as a lapse -- suspend, re-read every head (see
+     * {@code BlobLeaseMembership#revoke} and {@link NodeLeases#renewLease}). A node whose renewals keep succeeding has
+     * therefore lost no head to a takeover, at one write per renewal however many shards it holds, and
+     * {@code ServerlessBootstrap#HEAD_VERIFY_INTERVAL} runs this scan every five minutes as a backstop for a
+     * head released by someone other than its owner. The library default below stays per pass, because the
+     * tests that encode the old bargain construct nodes directly.
+     */
+    public static final long DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS = 0L;
+
+    volatile long headVerifyIntervalMillis = DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS;
+    volatile long headsVerifiedAtNanos = Long.MIN_VALUE;
+
+    /**
      * Renews this node's lease and lets go of anything it has lost: {@link #renewLease} then
      * {@link #verifyHeads}, as one pass.
      *
@@ -68,7 +146,7 @@ public final class NodeLeases {
      * stale hint forwarded a write, the lease was valid again, the record landed behind a successor's
      * seal, and the client was told 201. Nobody replays a record behind a seal.
      *
-     * <p>So a lapse <em>suspends acknowledgement</em> ({@link ServerlessNode#ownershipUnverified}) before the renewal,
+     * <p>So a lapse <em>suspends acknowledgement</em> ({@link #ownershipUnverified}) before the renewal,
      * and the suspension is lifted only by a head verification that started after the renewal and read
      * every head. Between the two, every write is refused before it is applied. A shard whose head still
      * names this node is kept -- nobody took it, and closing it would move it for no reason; one whose
@@ -110,8 +188,8 @@ public final class NodeLeases {
             // Before the renewal, never after: from here until a verification that started after the
             // renewal completes, nothing is acknowledged. The epoch is what tells a verification that
             // began before this moment from one that began after it.
-            node.lapseEpoch.incrementAndGet();
-            node.ownershipUnverified = true;
+            lapseEpoch.incrementAndGet();
+            ownershipUnverified = true;
             ServerlessNode.logger.info(
                 "this node's lease lapsed at {} by its own clock (now {}); acknowledgement is suspended until every held head is re-read",
                 plane.membership().ownExpiresAtMillis() - plane.membership().skewMarginMillis(),
@@ -119,7 +197,7 @@ public final class NodeLeases {
             );
         }
         for (java.util.Map.Entry<org.opensearch.core.index.shard.ShardId, Long> lost : new java.util.ArrayList<>(
-            node.headsToGiveBack.entrySet()
+            headsToGiveBack.entrySet()
         )) {
             try {
                 plane.heads()
@@ -131,13 +209,13 @@ public final class NodeLeases {
                         lost.getKey().getIndex().getUUID(),
                         node.localNode.getEphemeralId()
                     );
-                node.headsToGiveBack.remove(lost.getKey(), lost.getValue());
+                headsToGiveBack.remove(lost.getKey(), lost.getValue());
             } catch (java.io.IOException e) {
                 ServerlessNode.logger.warn("could not give back the head of " + lost.getKey() + "; will retry on the next renewal", e);
             }
         }
         boolean revoked = false;
-        synchronized (node.leaseRenewalLock) {
+        synchronized (leaseRenewalLock) {
             try {
                 node.renewOwnLease(plane);
             } catch (org.opensearch.serverless.membership.LeaseRevokedException e) {
@@ -145,14 +223,14 @@ public final class NodeLeases {
                 // taker does only once it judges the lease expired -- so a clock beyond the skew budget
                 // has had this node serving shards it may have lost. The same suspension as a lapse, and
                 // the same full scan before it lifts. The renewal after this one starts the lease afresh.
-                node.lapseEpoch.incrementAndGet();
-                node.ownershipUnverified = true;
+                lapseEpoch.incrementAndGet();
+                ownershipUnverified = true;
                 revoked = true;
                 ServerlessNode.logger.warn("{}; acknowledgement is suspended until every held head is re-read", e.getMessage());
                 node.renewOwnLease(plane);
             }
         }
-        if ((lapsed || revoked) && (verifyAfterLapse || node.verifyingHeads.get() == false)) {
+        if ((lapsed || revoked) && (verifyAfterLapse || verifyingHeads.get() == false)) {
             // Now, not on the next timer: the suspension lasts exactly as long as this scan.
             released.addAll(verifyHeads(plane));
         }
@@ -186,7 +264,7 @@ public final class NodeLeases {
      * is read once per open index anyway, and a shard whose index is tombstoned or recreated under a
      * different uuid is an orphan whatever its head says.
      *
-     * <p><b>Bounded and parallel.</b> One register read per held writer shard, in {@link ServerlessNode#HEAD_READ_LANES}
+     * <p><b>Bounded and parallel.</b> One register read per held writer shard, in {@link #HEAD_READ_LANES}
      * lanes on the fan-out pool once there are more shards than lanes, so a node holding a thousand pays
      * a thousand reads in a hundred-odd round trips rather than a thousand. Single-flight: a pass that
      * finds one already running returns nothing, rather than interleaving two sets of releases.
@@ -199,18 +277,18 @@ public final class NodeLeases {
         throws Exception {
         node.ensureStarted();
         node.adopt(plane);
-        synchronized (node.headVerificationLock) {
-            node.verifyingHeads.set(true);
+        synchronized (headVerificationLock) {
+            verifyingHeads.set(true);
             try {
                 return verifyHeadsExclusively(plane, true);
             } finally {
-                node.verifyingHeads.set(false);
+                verifyingHeads.set(false);
             }
         }
     }
 
     /**
-     * Verifies every held head, but only if {@link ServerlessNode#DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS} has passed since
+     * Verifies every held head, but only if {@link #DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS} has passed since
      * the last time.
      *
      * <p>What the periodic callers use. A lapse, a doubt raised against a specific shard, and an operator
@@ -224,26 +302,26 @@ public final class NodeLeases {
         throws Exception {
         node.ensureStarted();
         node.adopt(plane);
-        final long last = node.headsVerifiedAtNanos;
+        final long last = headsVerifiedAtNanos;
         // Due on every pass while acknowledgement is suspended: only a full read of the heads lifts the suspension,
         // and the read right after a lapse fails under exactly the conditions that cause one. Waiting for the interval
         // left a node refusing every write for minutes after a minute of SlowDown had ended.
-        final boolean due = node.ownershipUnverified
-            || node.headVerifyIntervalMillis <= 0L
+        final boolean due = ownershipUnverified
+            || headVerifyIntervalMillis <= 0L
             || last == Long.MIN_VALUE
-            || System.nanoTime() - last >= java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(node.headVerifyIntervalMillis);
+            || System.nanoTime() - last >= java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(headVerifyIntervalMillis);
         if (due) {
-            node.headsVerifiedAtNanos = System.nanoTime();
+            headsVerifiedAtNanos = System.nanoTime();
         }
         // Not due still runs the pass, minus the per-shard head reads: the index half of it -- releasing a
         // shard whose index was deleted or recreated, and reopening one whose log could not be appended to
         // -- is not what costs, and deferring it would leave a deleted index served until the next scan.
-        synchronized (node.headVerificationLock) {
-            node.verifyingHeads.set(true);
+        synchronized (headVerificationLock) {
+            verifyingHeads.set(true);
             try {
                 return verifyHeadsExclusively(plane, due);
             } finally {
-                node.verifyingHeads.set(false);
+                verifyingHeads.set(false);
             }
         }
     }
@@ -255,7 +333,7 @@ public final class NodeLeases {
         final java.util.Set<org.opensearch.core.index.shard.ShardId> released = new java.util.LinkedHashSet<>();
         // Taken before any read: a lapse that happens during this pass bumps it, and this pass's reads
         // then predate the renewal and may not lift the suspension.
-        final long epoch = node.lapseEpoch.get();
+        final long epoch = lapseEpoch.get();
 
         // First, shards whose log could not be appended to. Reaching this point means the store answered
         // a lease renewal, so it is time to reopen them from their logs: close, and ask for activation,
@@ -328,11 +406,11 @@ public final class NodeLeases {
         }
         // Only a pass that actually read every head may lift the suspension: that is the whole content of
         // the claim it is making. A pass that skipped the scan has established nothing about ownership.
-        if (readHeads && node.ownershipUnverified && node.lapseEpoch.get() == epoch) {
+        if (readHeads && ownershipUnverified && lapseEpoch.get() == epoch) {
             // Every head this node holds was read after the renewal that followed the lapse, and each
             // one either still names this node or has been let go. Nothing can be taken from a node with
             // a live lease, so acknowledgement is safe again.
-            node.ownershipUnverified = false;
+            ownershipUnverified = false;
             ServerlessNode.logger.info("every held head re-read after the lapse; acknowledgement resumes");
         }
         return released;
@@ -342,7 +420,7 @@ public final class NodeLeases {
      * Reads the given heads, in lanes on the fan-out pool once there are more than fit in one.
      *
      * <p>Each lane's reads are issued together and waited for together, so the store sees at most
-     * {@link ServerlessNode#HEAD_READ_LANES} reads from this pass at once. A pool that refuses the work runs the read
+     * {@link #HEAD_READ_LANES} reads from this pass at once. A pool that refuses the work runs the read
      * inline instead, which is slower and correct.
      */
     void readHeads(
@@ -351,7 +429,7 @@ public final class NodeLeases {
         java.util.Map<org.opensearch.core.index.shard.ShardId, java.util.Optional<org.opensearch.serverless.metadata.ShardHead>> heads,
         java.util.Map<org.opensearch.core.index.shard.ShardId, java.io.IOException> failures
     ) throws InterruptedException {
-        if (shards.size() <= ServerlessNode.HEAD_READ_LANES) {
+        if (shards.size() <= NodeLeases.HEAD_READ_LANES) {
             for (org.opensearch.core.index.shard.ShardId shardId : shards) {
                 try {
                     heads.put(shardId, plane.heads().read(shardId.getIndexName(), shardId.id()));
@@ -362,10 +440,10 @@ public final class NodeLeases {
             return;
         }
         final java.util.concurrent.Executor executor = node.threadPool.executor(NodeThreadPools.FANOUT_POOL);
-        for (int start = 0; start < shards.size(); start += ServerlessNode.HEAD_READ_LANES) {
+        for (int start = 0; start < shards.size(); start += NodeLeases.HEAD_READ_LANES) {
             final java.util.List<org.opensearch.core.index.shard.ShardId> lane = shards.subList(
                 start,
-                Math.min(shards.size(), start + ServerlessNode.HEAD_READ_LANES)
+                Math.min(shards.size(), start + NodeLeases.HEAD_READ_LANES)
             );
             final CountDownLatch done = new CountDownLatch(lane.size());
             for (org.opensearch.core.index.shard.ShardId shardId : lane) {

@@ -8,11 +8,9 @@
 
 package org.opensearch.serverless.shell;
 
-import org.opensearch.Version;
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.NodeConnectionsService;
 import org.opensearch.cluster.node.DiscoveryNode;
-import org.opensearch.cluster.node.DiscoveryNodeRole;
 import org.opensearch.cluster.service.ClusterApplier;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.network.NetworkModule;
@@ -40,7 +38,6 @@ import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.Closeable;
 import java.net.InetAddress;
-import java.util.Collections;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -155,114 +152,6 @@ public final class ServerlessNode implements Closeable {
      * reopened from the log by the next heartbeat that reaches the store. See {@link NodeWritePath#appendOrRelease}.
      */
     final Set<org.opensearch.core.index.shard.ShardId> writeFenced = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    /**
-     * Heads this node lost to its own lapsed lease and has not yet given back in the register, with the
-     * term it lost them at. Drained on every renewal, so a store that was unreachable when the loss was
-     * discovered does not leave a head naming a node that is not serving the shard.
-     */
-    final Map<org.opensearch.core.index.shard.ShardId, Long> headsToGiveBack = new java.util.concurrent.ConcurrentHashMap<>();
-    final Object leaseRenewalLock = new Object();
-    /** Serialises head verification: two passes interleaving their releases was the hazard, and waiting is cheaper than skipping. */
-    final Object headVerificationLock = new Object();
-    /** Whether a head verification is running, so an activation can tell it would only wait behind one. */
-    final java.util.concurrent.atomic.AtomicBoolean verifyingHeads = new java.util.concurrent.atomic.AtomicBoolean();
-    /**
-     * True from the moment this node's lease is found lapsed until a head verification that began after
-     * the renewal has read every head. While set, no write is acknowledged and no forwarded write is
-     * accepted. See {@link NodeLeases#renewLease}.
-     */
-    volatile boolean ownershipUnverified;
-    /** Bumped on every lapse, so a verification that began before the renewal cannot lift the suspension. */
-    final java.util.concurrent.atomic.AtomicLong lapseEpoch = new java.util.concurrent.atomic.AtomicLong();
-    /** How many shard-head reads a verification pass has in flight at once. */
-    public static final int HEAD_READ_LANES = 8;
-
-    volatile ShardAdmission admission = new ShardAdmission() {
-        @Override
-        public int maxShardsHeld() {
-            return org.opensearch.serverless.reconcile.BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD;
-        }
-
-        @Override
-        public boolean makeRoom() {
-            return false;
-        }
-    };
-
-    /**
-     * Installs the cap and eviction policy readers and views are admitted under.
-     *
-     * @param admission the policy, normally the node's reconciler
-     */
-    public void setShardAdmission(ShardAdmission admission) {
-        this.admission = admission;
-    }
-
-    /** Reader opens this node refused at its shard cap. */
-    final java.util.concurrent.atomic.AtomicLong readerOpensRefusedAtCap = new java.util.concurrent.atomic.AtomicLong();
-    /** Writer activations this node refused at its shard cap. */
-    final java.util.concurrent.atomic.AtomicLong activationsRefusedAtCap = new java.util.concurrent.atomic.AtomicLong();
-    /** Shards given up to make room for another. */
-    final java.util.concurrent.atomic.AtomicLong evictedForRoom = new java.util.concurrent.atomic.AtomicLong();
-    /** Shards given up because a member with room could take them. */
-    final java.util.concurrent.atomic.AtomicLong handedOff = new java.util.concurrent.atomic.AtomicLong();
-    /** Writes for a shard nobody held that this node sent to a member with room rather than take. */
-    final java.util.concurrent.atomic.AtomicLong writesSteered = new java.util.concurrent.atomic.AtomicLong();
-
-    /**
-     * When each shard turned away at the cap was last turned away: distinct shards, not refusals. A burst of searches asked
-     * for the same shards over and over, and counted as events one minute's refusals said the fleet wanted forty-three nodes.
-     */
-    final Map<String, Long> refusedShards = new java.util.concurrent.ConcurrentHashMap<>();
-
-    /** How long a shard counts as in use after it was last used. */
-    public static final long IN_USE_WINDOW_MILLIS = 60_000L;
-
-    /** The share of a node's cap a fleet sized by {@link NodeCapacity#fleetSize} aims to use. */
-    public static final double TARGET_UTILISATION = FleetPlacement.TARGET_UTILISATION;
-
-    final java.util.concurrent.atomic.AtomicLong takeoversOvercommitted = new java.util.concurrent.atomic.AtomicLong();
-
-    /**
-     * Dead members' shards taken past the cap, since the node started.
-     *
-     * @return the count
-     */
-    public long takeoversOvercommitted() {
-        return takeoversOvercommitted.get();
-    }
-
-    /** Above this share of its cap a node looks for a member to hand work to. */
-    public static final double HAND_OFF_ABOVE = FleetPlacement.HAND_OFF_ABOVE;
-    /** At or below this share of its cap a member can take work handed to it. */
-    public static final double ROOM_AT_OR_BELOW = FleetPlacement.ROOM_AT_OR_BELOW;
-    /** Above this multiple of the fleet's mean held shards a node hands work off, however far it is from its cap. */
-    public static final double HAND_OFF_ABOVE_MEAN = FleetPlacement.HAND_OFF_ABOVE_MEAN;
-    /** A node handing off for being above the mean hands off down to this multiple of it. */
-    public static final double HAND_OFF_DOWN_TO_MEAN = FleetPlacement.HAND_OFF_DOWN_TO_MEAN;
-    /** Below this share of its cap a node is never too busy for the mean to matter: a small fleet's few shards stay. */
-    public static final double MEAN_MATTERS_FROM = FleetPlacement.MEAN_MATTERS_FROM;
-
-    /** Decides where this node's work belongs across the fleet; the methods below forward to it. */
-    final FleetPlacement placement = new FleetPlacement(
-        () -> localNode.getId(),
-        () -> admission.maxShardsHeld(),
-        () -> this.reconciler == null ? 0 : this.reconciler.heldShards().size()
-    );
-
-    /**
-     * Where writer activations spend their time, summed: reading the descriptor, acquiring the head, marking the rollup
-     * entry owned, and opening the shard -- restoring its commit and replaying its log -- of which projecting and applying
-     * the local view that names it is a part of its own. With {@link #activationsOpened}
-     * an operator reads the average of each, and which one a burst of cold shards is waiting on.
-     */
-    final java.util.concurrent.atomic.AtomicLong[] activationPhases = {
-        new java.util.concurrent.atomic.AtomicLong(),
-        new java.util.concurrent.atomic.AtomicLong(),
-        new java.util.concurrent.atomic.AtomicLong(),
-        new java.util.concurrent.atomic.AtomicLong(),
-        new java.util.concurrent.atomic.AtomicLong() };
-    final java.util.concurrent.atomic.AtomicLong activationsOpened = new java.util.concurrent.atomic.AtomicLong();
 
     volatile org.opensearch.serverless.reconcile.ReconcileSignals signals = org.opensearch.serverless.reconcile.ReconcileSignals.NONE;
     volatile LocalViewProjector projector;
@@ -442,42 +331,10 @@ public final class ServerlessNode implements Closeable {
         // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
         // environment variable, and role switching under load stays a policy question.
         this.roles = Set.copyOf(settings.getAsList("serverless.roles", java.util.List.of(ROLE_INGEST, ROLE_SEARCH)));
-        // Block size is a real tuning knob, not a constant: it trades request count against wasted
-        // bytes, and the right value depends on the object store's per-request cost and the index's
-        // access pattern. Exposed so that can be measured rather than guessed.
-        this.blockCache = new org.opensearch.serverless.store.BlockCache(
-            settings.getAsInt("serverless.block_cache.block_size", org.opensearch.serverless.store.BlockCache.DEFAULT_BLOCK_SIZE),
-            // Sized from the heap when not configured: the cache lives outside the breakers (accounting it
-            // there would trip every request check by its own size), so its bound has to come from what
-            // the process actually has rather than from a constant that was right on one machine.
-            settings.getAsInt(
-                "serverless.block_cache.max_blocks",
-                (int) Math.max(
-                    256L,
-                    Runtime.getRuntime().maxMemory() / 10 / settings.getAsInt(
-                        "serverless.block_cache.block_size",
-                        org.opensearch.serverless.store.BlockCache.DEFAULT_BLOCK_SIZE
-                    )
-                )
-            )
-        );
-        // Group commit for the log. Batching only ever happens while a PUT for the same shard is already
-        // in flight, so these bound the size of a group rather than schedule one -- there is no window to
-        // configure. Setting max_records to 1 restores one PUT per write, which is what this replaced.
+        this.blockCache = NodeComponents.blockCache(settings);
         this.writeBackpressureMax = settings.getAsInt("serverless.write.backpressure.max_in_flight", 1_024);
-        this.writeBackpressure = new org.opensearch.serverless.store.WriteBackpressure(
-            settings.getAsLong("serverless.write.backpressure.target_millis", 1_000L),
-            settings.getAsLong("serverless.write.backpressure.budget_millis", 5_000L),
-            settings.getAsInt("serverless.write.backpressure.min_in_flight", 4),
-            writeBackpressureMax
-        );
-        this.walCommitter = new org.opensearch.serverless.store.WalGroupCommitter(
-            settings.getAsInt(
-                "serverless.wal.group_commit.max_records",
-                org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_RECORDS
-            ),
-            settings.getAsLong("serverless.wal.group_commit.max_bytes", org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES)
-        );
+        this.writeBackpressure = NodeComponents.writeBackpressure(settings, writeBackpressureMax);
+        this.walCommitter = NodeComponents.walCommitter(settings);
         this.nodeLogEnabled = settings.getAsBoolean("serverless.wal.node_log.enabled", true);
         this.packSegments = settings.getAsBoolean("serverless.segments.pack.enabled", true);
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
@@ -511,20 +368,11 @@ public final class ServerlessNode implements Closeable {
             // has to close this one thing above all others: NodeEnvironment holds node.lock.
             openedEnvironment = new NodeEnvironment(settings, environment);
             this.nodeEnvironment = openedEnvironment;
-            // Roles from the lease's roles, never BUILT_IN_ROLES. The role is a lease attribute,
-            // and every DiscoveryNode this shell built used to say cluster_manager+data+ingest+warm
-            // regardless -- a cluster-manager-role node that merely was not elected, which is exactly the
-            // latent arming of cluster-manager-only paths to avoid. Data always: this node opens
-            // IndexShards whatever it serves. Ingest only when it accepts writer activation. Never
-            // cluster_manager, never core's search role -- that one means "hosts search replicas" and may
-            // not be combined with data, which is not what a serverless search node is.
-            this.localNode = new DiscoveryNode(
+            this.localNode = NodeComponents.discoveryNode(
                 nodeName,
                 nodeEnvironment.nodeId(),
                 new TransportAddress(InetAddress.getLoopbackAddress(), 0),
-                discoveryAttributesFor(roles),
-                discoveryRolesFor(roles),
-                Version.CURRENT
+                roles
             );
             this.clusterService = services.buildClusterService(clusterSettings, localNode);
             this.indicesService = services.buildIndicesService(
@@ -538,31 +386,7 @@ public final class ServerlessNode implements Closeable {
             );
             this.searchService = services.buildSearchService(clusterSettings, clusterService, indicesService);
 
-            // The client every REST handler is handed, wired to the shell's own operations.
-            //
-            // It used to be a bare NodeClient with no action registry, which the shell's own handlers
-            // could ignore because they reach the node directly. A plugin's handler cannot: getRestHandlers
-            // gives it this and nothing else, and every REST handler in the OpenSearch ecosystem is written
-            // against it. Left unwired it would have thrown on the first call a real plugin made -- found
-            // by writing the shell's authentication as a plugin, whose user-management endpoint needs to
-            // write to an index from inside a handler.
-            //
-            // Overriding doExecute rather than calling initialize(...) is the point: initialize wants a map
-            // of ActionType to TransportAction, which is the action layer S6.3 decided not to build. This
-            // delegates to the same allowlist ServerlessClient enforces, so a plugin's handler and a
-            // plugin's component get identical answers, including identical refusals.
-            this.nodeClient = new NodeClient(settings, threadPool) {
-                @Override
-                public <
-                    Request extends org.opensearch.action.ActionRequest,
-                    Response extends org.opensearch.core.action.ActionResponse> void doExecute(
-                        org.opensearch.action.ActionType<Response> action,
-                        Request request,
-                        org.opensearch.core.action.ActionListener<Response> listener
-                    ) {
-                    services.client().execute(action, request, listener);
-                }
-            };
+            this.nodeClient = NodeComponents.nodeClient(settings, threadPool, services);
             // Before the controller, because every handler it registers is wrapped in this.
             this.systemIndices = new org.opensearch.serverless.rest.SystemIndices(this.plugins.systemIndexPatterns(settings));
             this.restController = wiring.buildRestController(clusterSettings);
@@ -574,14 +398,7 @@ public final class ServerlessNode implements Closeable {
                 null,
                 threadPool,
                 wiring.authenticatedPluginHops(networkModule.getTransportInterceptor()),
-                boundAddress -> new DiscoveryNode(
-                    nodeName,
-                    nodeEnvironment.nodeId(),
-                    boundAddress.publishAddress(),
-                    discoveryAttributesFor(roles),
-                    discoveryRolesFor(roles),
-                    Version.CURRENT
-                ),
+                boundAddress -> NodeComponents.discoveryNode(nodeName, nodeEnvironment.nodeId(), boundAddress.publishAddress(), roles),
                 clusterSettings,
                 Set.of(),
                 NoopTracer.INSTANCE
@@ -821,11 +638,6 @@ public final class ServerlessNode implements Closeable {
         return views.localViewMillis();
     }
 
-    /** Records that an incarnation was read and found live at {@code startedAtNanos}, for the incarnation fence. */
-    void confirmIncarnation(String uuid, long startedAtNanos) {
-        incarnationConfirmedAtNanos.merge(uuid, startedAtNanos, Math::max);
-    }
-
     /**
      * Returns this node's shard router, which forwards work to the node that owns a shard.
      *
@@ -886,69 +698,13 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * How long a node may go without re-reading the head of every writer shard it holds.
-     *
-     * <p>One lease TTL, where this used to run on every renewal <em>and</em> every backstop -- four scans
-     * per TTL at the defaults, each of them one register read per held shard. At the thousand-shard cap
-     * that was 480 reads per shard per hour paid to be told nothing had changed, and it is the largest
-     * standing cost a node has when it is doing nothing at all.
-     *
-     * <p><b>Why cutting it is safe, and why it is not cut further.</b> The scan is not what fences a
-     * writer. A node refuses to acknowledge past its own lease deadline less the skew margin
-     * ({@code ensureOwnLeaseIsStillValid}), which needs no I/O and so happens on every single write; and a
-     * successor seals the log at takeover, so anything appended behind that seal is never replayed. A head
-     * cannot be taken from a node whose lease is live, because {@code ShardHeadStore#acquire} refuses an
-     * owner the liveness oracle says is alive. So in steady state this scan is looking for something that
-     * cannot have happened.
-     *
-     * <p>What it does still catch is worth a bounded wait rather than nothing: a shard of an index deleted
-     * and recreated under a new uuid, a head given back and won elsewhere, and the clock-skew edge where
-     * two nodes disagree about whether a lease had expired. A lapse takes the unconditional path and is
-     * unaffected -- {@code renewLease} scans every head before acknowledgement resumes, which is where the
-     * correctness argument actually lives.
-     *
-     * <p><b>Zero by default, which means the scan still runs on every pass.</b> The saving is real and
-     * measured -- between scans a tick reads one register whatever the node holds, against one per shard --
-     * but switching it on trades something a deployment may not want to trade, and three existing tests
-     * encode the current bargain as a guarantee: a tick reacquires a shard whose lease was lost, a
-     * forwarded write finds the owner has moved, a node stops holding what it no longer owns. All of them
-     * describe how quickly a node <em>notices</em>, and all of them get slower by up to this interval.
-     *
-     * <p>What does not get worse is worth saying precisely, because it is what makes the option safe to
-     * offer at all. A node cannot acknowledge a write past its own lease deadline less the skew margin
-     * ({@code ensureOwnLeaseIsStillValid}), which needs no I/O and so happens on every write; a successor
-     * seals the log at takeover, so anything appended behind that seal never replays; and a head cannot be
-     * taken from a node whose lease is live, because {@code ShardHeadStore#acquire} refuses an owner the
-     * liveness oracle says is alive. A lapse takes the unconditional path regardless. So the exposure a
-     * longer interval buys is a node serving reads from a shard it has lost, for up to the interval --
-     * bounded, and never an acknowledged write that nobody replays.
-     *
-     * <p><b>What made a long interval safe to deploy is a signal carried on the node's own lease.</b> A
-     * revocation marker written somewhere else fails because it is not atomic with the swap that moves
-     * ownership, so its absence proves nothing -- {@code RegisterMap#assignments} says the same of the
-     * listing it maintains. A revocation written <em>onto the owner's lease register</em>, before the head
-     * is swapped, does not: the taker's swap of the lease and the owner's renewal of it contend on one
-     * register, so either the owner renewed first and the taker backs off, or the revocation landed first
-     * and the owner's next renewal fails, which it treats as a lapse -- suspend, re-read every head (see
-     * {@code BlobLeaseMembership#revoke} and {@link NodeLeases#renewLease}). A node whose renewals keep succeeding has
-     * therefore lost no head to a takeover, at one write per renewal however many shards it holds, and
-     * {@code ServerlessBootstrap#HEAD_VERIFY_INTERVAL} runs this scan every five minutes as a backstop for a
-     * head released by someone other than its owner. The library default below stays per pass, because the
-     * tests that encode the old bargain construct nodes directly.
-     */
-    public static final long DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS = 0L;
-
-    volatile long headVerifyIntervalMillis = DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS;
-    volatile long headsVerifiedAtNanos = Long.MIN_VALUE;
-
-    /**
      * Sets how long between periodic head verifications; zero verifies on every pass, as this used to.
      *
      * @param millis the interval
      * @return this, for chaining
      */
     public ServerlessNode setHeadVerifyIntervalMillis(long millis) {
-        this.headVerifyIntervalMillis = Math.max(0L, millis);
+        this.leases().headVerifyIntervalMillis = Math.max(0L, millis);
         return this;
     }
 
@@ -978,58 +734,6 @@ public final class ServerlessNode implements Closeable {
      * node may stand in for, from a shard nobody can open.
      */
     public static final String AT_THE_CAP = " shards, the cap; ";
-
-    /**
-     * How long a read confirming that an index incarnation still exists licenses answering from its shards.
-     *
-     * <p><b>This is what makes routing from a cached descriptor safe.</b> A coordinator routes by a
-     * resolution up to {@code MetadataPlane#DEFAULT_ROUTING_CACHE_MILLIS} old, and a stale one carries the
-     * uuid of an incarnation another node has deleted. The uuid check where the request lands cannot catch
-     * that when the landing node still holds that incarnation's shard open -- the uuids match, because both
-     * are the old one -- and a write was acknowledged into a deleted index. So the landing node answers only
-     * if it has read the descriptor and found that very uuid within this window, by its own monotonic clock,
-     * and a delete answers only after waiting longer than the window ({@link #DELETE_SETTLE_MILLIS}). A write
-     * acknowledged here was therefore acknowledged before any delete of its index returned: concurrent with
-     * the delete, never after it.
-     *
-     * <p>The read is per index and per window, not per request: a shard written a thousand times a second
-     * pays one descriptor read a second, and an idle one pays nothing.
-     */
-    public static final long INCARNATION_FENCE_MILLIS = 1_000L;
-
-    /**
-     * How long a delete waits before answering: the fence, plus a margin for two clocks' rates.
-     *
-     * <p>Durations, not timestamps, are compared on each side, so skew between the nodes does not enter;
-     * only drift in how fast their clocks run does, and a quarter of the window is far beyond that.
-     */
-    public static final long DELETE_SETTLE_MILLIS = INCARNATION_FENCE_MILLIS + 250L;
-
-    volatile long incarnationFenceMillis = INCARNATION_FENCE_MILLIS;
-
-    /** When each incarnation was last confirmed to exist, by uuid, in {@link System#nanoTime} terms. */
-    final java.util.concurrent.ConcurrentHashMap<String, Long> incarnationConfirmedAtNanos = new java.util.concurrent.ConcurrentHashMap<>();
-
-    /** Striped, so a burst of writes to one index pays one confirming read rather than one each. */
-    final Object[] incarnationLocks = newLocks(64);
-
-    private static Object[] newLocks(int n) {
-        final Object[] locks = new Object[n];
-        for (int i = 0; i < n; i++) {
-            locks[i] = new Object();
-        }
-        return locks;
-    }
-
-    /**
-     * Sets the incarnation fence window; zero confirms on every answer. For tests that need the check to
-     * run rather than be answered from a recent confirmation.
-     *
-     * @param millis the window
-     */
-    public void setIncarnationFenceMillis(long millis) {
-        this.incarnationFenceMillis = Math.max(0L, millis);
-    }
 
     final Map<org.opensearch.core.index.Index, MappingGrowthPath.MappingGrowth> mappingGrowth =
         new java.util.concurrent.ConcurrentHashMap<>();
@@ -1171,32 +875,6 @@ public final class ServerlessNode implements Closeable {
      */
     public void applyLocalView(ClusterState state, TimeValueLike timeout) throws Exception {
         views.applyLocalView(state, timeout);
-    }
-
-    /**
-     * The data plane's roles for a node advertising the given lease roles: data always, ingest when it
-     * accepts writer activation, never cluster_manager. See the constructor for why.
-     *
-     * @param leaseRoles the roles from the lease or the {@code serverless.roles} setting
-     * @return the discovery roles
-     */
-    public static Set<DiscoveryNodeRole> discoveryRolesFor(Set<String> leaseRoles) {
-        final java.util.SortedSet<DiscoveryNodeRole> out = new java.util.TreeSet<>();
-        out.add(DiscoveryNodeRole.DATA_ROLE);
-        if (leaseRoles.contains(ROLE_INGEST)) {
-            out.add(DiscoveryNodeRole.INGEST_ROLE);
-        }
-        return Collections.unmodifiableSortedSet(out);
-    }
-
-    /**
-     * The lease roles as a node attribute, so the serverless role is readable off a {@code DiscoveryNode} too.
-     *
-     * @param leaseRoles the roles from the lease or the {@code serverless.roles} setting
-     * @return the attributes to describe a node with
-     */
-    public static Map<String, String> discoveryAttributesFor(Set<String> leaseRoles) {
-        return Map.of("serverless.roles", String.join(",", new java.util.TreeSet<>(leaseRoles)));
     }
 
     // ---------------------------------------------------------------- shard fences and the local view
