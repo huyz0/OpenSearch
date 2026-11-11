@@ -159,8 +159,8 @@ final class ShardActivations {
      * to it take the shard; if the winner fails at that, the second look on every survivor still does.
      */
     boolean leftToTakeoverWinner(Map.Entry<String, Integer> candidate) {
-        if (reconciler.node.takeoverBelongsElsewhere(reconciler.plane, candidate.getKey(), candidate.getValue())) {
-            reconciler.node.noteTakeoverDoubtLeft();
+        if (reconciler.node.nodeCapacity().takeoverBelongsElsewhere(reconciler.plane, candidate.getKey(), candidate.getValue())) {
+            reconciler.node.nodeCapacity().noteTakeoverDoubtLeft();
             return true;
         }
         return false;
@@ -506,7 +506,7 @@ final class ShardActivations {
                         }
                     }
                     if (reserved) {
-                        reconciler.node.noteTakeoverOvercommitted();
+                        reconciler.node.nodeCapacity().noteTakeoverOvercommitted();
                     }
                 }
                 if (full && reconciler.leases.heldByAnotherLiveNode(indexName, shard)) {
@@ -540,7 +540,7 @@ final class ShardActivations {
                             shard,
                             reconciler.maxShardsHeld
                         );
-                        reconciler.node.noteActivationRefusedAtCap(indexName, shard);
+                        reconciler.node.nodeCapacity().noteActivationRefusedAtCap(indexName, shard);
                         return Optional.empty();
                     }
                     if (open == null && reserved == false) {
@@ -556,7 +556,7 @@ final class ShardActivations {
                     // and no unpublished write, so closing it costs nothing.
                     reconciler.node.reconciler().releaseShard(open, "reopening as a writer");
                 }
-                final Optional<ShardId> taken = reconciler.node.activateWriter(reconciler.plane, indexName, shard);
+                final Optional<ShardId> taken = reconciler.node.activation().activateWriter(reconciler.plane, indexName, shard);
                 // Its idle clock starts here, so a shard just taken is not immediately a candidate for being
                 // given straight back -- whether it was wanted or taken on demand.
                 taken.ifPresent(shardId -> reconciler.openedAt.put(shardId, reconciler.plane.clock().getAsLong()));

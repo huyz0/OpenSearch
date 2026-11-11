@@ -100,7 +100,7 @@ final class ReconcilePass {
             }
             // One small register read: the stored scripts are re-read only when their marker has moved, which
             // is how a script put on another node reaches this one without a listing per pass.
-            reconciler.node.storedScripts().refresh(false);
+            reconciler.node.services().storedScripts().refresh(false);
             // The full re-read of this node's truth, rarely. Activation no longer goes through it -- taking
             // one shard used to re-read every held head -- so this is what reopens a shard whose head still
             // names this node but which is not open here: one closed after a failed log append, or one whose
@@ -108,7 +108,7 @@ final class ReconcilePass {
             // BackgroundReconciler.RESYNC_EVERY_PASSES backstops, which at the default interval is once in ten minutes.
             if (reconciler.passes % BackgroundReconciler.RESYNC_EVERY_PASSES == BackgroundReconciler.RESYNC_EVERY_PASSES - 1) {
                 try {
-                    activated.addAll(reconciler.node.syncFrom(reconciler.plane));
+                    activated.addAll(reconciler.node.activation().syncFrom(reconciler.plane));
                 } catch (Exception e) {
                     BackgroundReconciler.logger.warn("periodic resync against the metadata plane failed; the next one will retry", e);
                 }

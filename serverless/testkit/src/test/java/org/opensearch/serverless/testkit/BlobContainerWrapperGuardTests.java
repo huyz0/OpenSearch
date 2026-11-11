@@ -16,6 +16,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.settings.MockSecureSettings;
 import org.opensearch.common.settings.Settings;
@@ -66,7 +67,11 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
     /** Every default method of {@code BlobContainer} a class inherits rather than overrides. */
     static List<String> inheritedDefaults(Class<?> implementation) throws NoSuchMethodException {
         final List<String> inherited = new ArrayList<>();
-        for (Method method : BlobContainer.class.getMethods()) {
+        // A conditional container also inherits the register defaults, which matter as much as the plain ones.
+        final Class<?> contract = ConditionalBlobContainer.class.isAssignableFrom(implementation)
+            ? ConditionalBlobContainer.class
+            : BlobContainer.class;
+        for (Method method : contract.getMethods()) {
             if (method.isDefault() == false) {
                 continue;
             }
@@ -211,7 +216,7 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
     private void exercise(BlobStore store, boolean honoursConditionalDelete) throws Exception {
         assertTrue("the production factory builds behind the wrapper", store instanceof ObjectStores.Metered);
         final ObjectStores.Metered metered = (ObjectStores.Metered) store;
-        final BlobContainer container = store.blobContainer(BlobPath.cleanPath().add("guard"));
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath().add("guard")));
 
         // Registers: create, read, swap.
         final BlobRegisterCasResult created = container.createRegisterIfAbsent("reg", bytes("v1"));
@@ -291,7 +296,7 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
      * {@code ObjectStores.Metered.Counting} as it stood at {@code 7bfec04d070}: the abstract methods, the three
      * register methods and the plain listings delegated; nothing else.
      */
-    private static final class LikeMeteredBeforeTheFix implements BlobContainer {
+    private static final class LikeMeteredBeforeTheFix implements ConditionalBlobContainer {
         private final BlobContainer inner;
 
         LikeMeteredBeforeTheFix(BlobContainer inner) {
@@ -356,18 +361,18 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
 
         @Override
         public Optional<BlobRegister> readRegister(String blobName) throws IOException {
-            return inner.readRegister(blobName);
+            return ConditionalBlobContainer.of(inner).readRegister(blobName);
         }
 
         @Override
         public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
             throws IOException {
-            return inner.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+            return ConditionalBlobContainer.of(inner).compareAndSwapRegister(blobName, expectedGeneration, newValue);
         }
 
         @Override
         public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
-            return inner.createRegisterIfAbsent(blobName, value);
+            return ConditionalBlobContainer.of(inner).createRegisterIfAbsent(blobName, value);
         }
     }
 }

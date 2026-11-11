@@ -9,6 +9,7 @@ package org.opensearch.serverless.metadata;
 
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 
 import java.io.IOException;
@@ -25,10 +26,10 @@ import java.util.Optional;
  */
 final class DescriptorListing {
 
-    private final BlobContainer container;
+    private final ConditionalBlobContainer container;
 
     DescriptorListing(BlobContainer container) {
-        this.container = container;
+        this.container = ConditionalBlobContainer.of(container);
     }
 
     /**

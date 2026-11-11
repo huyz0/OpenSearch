@@ -56,14 +56,14 @@ public class SearchRetainedPayloadBudgetTests extends OpenSearchTestCase {
                 // Drain the translog's charged write buffer and the completed HTTP response before
                 // measuring search allocations; background cleanup can otherwise change the baseline.
                 node.reconciler().shard(new ShardId("docs", "uuid-docs", 0)).sync();
-                assertBusy(() -> assertEquals(0L, node.circuitBreakerService().getBreaker(CircuitBreaker.REQUEST).getUsed()));
+                assertBusy(() -> assertEquals(0L, node.services().circuitBreakerService().getBreaker(CircuitBreaker.REQUEST).getUsed()));
                 work.accept(node);
             }
         }
     }
 
     private void assertPayloadRefused(ServerlessNode node, String query) throws Exception {
-        final var breaker = node.circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
+        final var breaker = node.services().circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
         final long before = breaker.getUsed();
         final var response = send(node, "POST", "/docs/_search?allow_partial_search_results=false", query);
         assertEquals(response.body(), 429, response.statusCode());

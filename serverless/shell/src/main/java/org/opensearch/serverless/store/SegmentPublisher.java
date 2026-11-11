@@ -17,6 +17,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.store.Store;
 
@@ -48,7 +49,7 @@ public final class SegmentPublisher {
 
     private final BlobStore blobStore;
     private final BlobPath shardBase;
-    private final BlobContainer container;
+    private final ConditionalBlobContainer container;
 
     /** Whether a publish writes the files it adds as one pack rather than a blob each. */
     private volatile boolean packing;
@@ -73,7 +74,7 @@ public final class SegmentPublisher {
     public SegmentPublisher(BlobStore blobStore, BlobPath shardBase) {
         this.blobStore = blobStore;
         this.shardBase = shardBase;
-        this.container = blobStore.blobContainer(shardBase);
+        this.container = ConditionalBlobContainer.of(blobStore.blobContainer(shardBase));
     }
 
     /**

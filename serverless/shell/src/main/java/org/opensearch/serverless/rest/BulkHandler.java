@@ -202,10 +202,11 @@ public final class BulkHandler extends BaseRestHandler {
             // too; rejecting this one is the cheaper failure. Core's own accounting, so the rejection is
             // the 429 an operator has seen before.
             try (
-                org.opensearch.common.lease.Releasable inFlight = serving.indexingPressure()
+                org.opensearch.common.lease.Releasable inFlight = serving.services()
+                    .indexingPressure()
                     .markCoordinatingOperationStarted(inFlightBytes, false)
             ) {
-                if (serving.actionGate().isEmpty()) {
+                if (serving.services().actionGate().isEmpty()) {
                     // The usual path needs no second UTF-8 source encoding or native response objects.
                     route(serving, metadata, items);
                     shape(serving, metadata, items);
@@ -217,7 +218,7 @@ public final class BulkHandler extends BaseRestHandler {
                     if (timeout != null) {
                         batch.request().timeout(timeout);
                     }
-                    final var result = serving.actionGate().run(BulkAction.NAME, batch.request(), admitted -> {
+                    final var result = serving.services().actionGate().run(BulkAction.NAME, batch.request(), admitted -> {
                         final var selected = (BulkRequest) admitted;
                         if (selected.waitForActiveShards().equals(org.opensearch.action.support.ActiveShardCount.DEFAULT) == false
                             && selected.waitForActiveShards().equals(org.opensearch.action.support.ActiveShardCount.NONE) == false
@@ -564,10 +565,11 @@ public final class BulkHandler extends BaseRestHandler {
                             item.fail(RestStatus.BAD_REQUEST, "pipeline_missing", "no such pipeline: " + id);
                             break;
                         }
-                        pipeline = serving.ingestPipelines().compile(id, stored.get());
+                        pipeline = serving.services().ingestPipelines().compile(id, stored.get());
                         compiled.put(id, pipeline);
                     }
-                    final var outcome = serving.ingestPipelines()
+                    final var outcome = serving.services()
+                        .ingestPipelines()
                         .run(pipeline, item.writtenIndex, item.operation.id(), item.operation.source());
                     if (outcome.dropped()) {
                         // A drop ends the document, so a final pipeline does not run over one that is not

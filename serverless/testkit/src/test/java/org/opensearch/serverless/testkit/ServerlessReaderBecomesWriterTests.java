@@ -56,7 +56,7 @@ public class ServerlessReaderBecomesWriterTests extends OpenSearchTestCase {
         try (ServerlessNode writer = new ServerlessNode(nodeSettings(name, "ingest"))) {
             writer.startup().start();
             final long term = plane.activate("alpha", 0, writer.localNode().getId(), writer.localNode().getEphemeralId()).head().term();
-            final ShardId shardId = writer.syncFrom(plane).iterator().next();
+            final ShardId shardId = writer.activation().syncFrom(plane).iterator().next();
             for (int i = 1; i <= docs; i++) {
                 ShardOps.indexDoc(writer.reconciler().shard(shardId), name + "-" + i, "{\"msg\":\"searchable\",\"n\":" + i + "}");
             }
@@ -75,7 +75,7 @@ public class ServerlessReaderBecomesWriterTests extends OpenSearchTestCase {
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("both", "ingest,search"))) {
             node.startup().start();
-            final ShardId shardId = node.serveAsReader(plane, "alpha", 0);
+            final ShardId shardId = node.readers().serveAsReader(plane, "alpha", 0);
             assertTrue(node.reconciler().readerShards().contains(shardId));
 
             // The commit moves on, so the reader is stale and the next pass will let it go.
@@ -88,7 +88,7 @@ public class ServerlessReaderBecomesWriterTests extends OpenSearchTestCase {
                 store.onNextRegisterRead("alpha#", SegmentPublisher.MANIFEST, () -> {
                     try {
                         // A write arrives: the reader is closed and the node opens the shard as its writer.
-                        assertTrue("the takeover must succeed", node.activateWriter(plane, "alpha", 0).isPresent());
+                        assertTrue("the takeover must succeed", node.activation().activateWriter(plane, "alpha", 0).isPresent());
                     } catch (Exception e) {
                         takeover.set(e);
                     }

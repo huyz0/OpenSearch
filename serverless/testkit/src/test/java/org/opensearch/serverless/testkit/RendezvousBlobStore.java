@@ -14,6 +14,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.core.common.bytes.BytesReference;
 
@@ -142,7 +143,7 @@ public final class RendezvousBlobStore implements BlobStore {
         return null;
     }
 
-    private final class Rendezvous implements BlobContainer {
+    private final class Rendezvous implements ConditionalBlobContainer {
 
         private final BlobContainer inner;
 
@@ -275,18 +276,18 @@ public final class RendezvousBlobStore implements BlobStore {
 
         @Override
         public Optional<BlobRegister> readRegister(String blobName) throws IOException {
-            return inner.readRegister(blobName);
+            return ConditionalBlobContainer.of(inner).readRegister(blobName);
         }
 
         @Override
         public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
-            return inner.deleteRegisterIfUnchanged(blobName, expectedGeneration);
+            return ConditionalBlobContainer.of(inner).deleteRegisterIfUnchanged(blobName, expectedGeneration);
         }
 
         @Override
         public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
             throws IOException {
-            return inner.compareAndSwapRegister(blobName, expectedGeneration, newValue);
+            return ConditionalBlobContainer.of(inner).compareAndSwapRegister(blobName, expectedGeneration, newValue);
         }
     }
 }

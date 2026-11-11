@@ -83,7 +83,7 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
             assertEquals(refused.body(), 429, refused.status());
             final Response document = send(node, "GET", "/alpha/_doc/" + id, null);
             assertEquals(document.body(), deletion ? 200 : 404, document.status());
-            assertEquals(0L, node.indexingPressure().getCurrentCoordinatingBytes());
+            assertEquals(0L, node.services().indexingPressure().getCurrentCoordinatingBytes());
         }
     }
 
@@ -105,7 +105,7 @@ public class ServerlessWriteBackpressureTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(settings)) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
-                final var id = node.activateWriter(plane, "alpha", 0).orElseThrow();
+                final var id = node.activation().activateWriter(plane, "alpha", 0).orElseThrow();
                 node.writes().index(id, "doc", "{\"new_field\":\"first\"}");
                 assertTrue(node.reads().get(id, "doc").found());
                 node.writes().index(id, "doc", "{\"new_field\":\"second\",\"another_field\":7}");

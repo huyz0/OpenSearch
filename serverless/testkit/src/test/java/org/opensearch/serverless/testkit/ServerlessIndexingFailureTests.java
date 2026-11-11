@@ -38,7 +38,7 @@ public class ServerlessIndexingFailureTests extends OpenSearchTestCase {
             try (var node = new ServerlessNode(settings)) {
                 node.startup().start();
                 node.setMetadataPlane(metadata);
-                final var shard = node.activateWriter(metadata, descriptor.name(), 0).orElseThrow();
+                final var shard = node.activation().activateWriter(metadata, descriptor.name(), 0).orElseThrow();
                 final var address = node.boundHttpAddress().publishAddress();
                 try (var client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
                     final var request = HttpRequest.newBuilder(

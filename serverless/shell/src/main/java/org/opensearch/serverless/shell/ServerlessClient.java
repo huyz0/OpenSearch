@@ -254,7 +254,7 @@ public final class ServerlessClient extends AbstractClient {
     private CreateIndexResponse createIndex(CreateIndexRequest request, MetadataPlane metadata) throws Exception {
         // The one action here that does not reach ShardOperations, so it carries its own gate call. A
         // plugin creating an index through the client is subject to the same filters a user is.
-        return node.get().actionGate().run(CreateIndexAction.NAME, request, admitted -> {
+        return node.get().services().actionGate().run(CreateIndexAction.NAME, request, admitted -> {
             if (admitted instanceof CreateIndexRequest selected) {
                 return doCreateIndex(selected, metadata);
             }

@@ -391,7 +391,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
 
         try (ServerlessNode writer = new ServerlessNode(nodeSettings("gap-writer"))) {
             writer.startup().start();
-            final ShardId shardId = writer.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId shardId = writer.activation().activateWriter(plane, "alpha", 0).orElseThrow();
 
             // Both logged documents are there, each keeping the number it was logged with: the hole cost
             // no data and did not renumber what surrounded it.
@@ -426,7 +426,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
             .build();
         try (ServerlessNode reader = new ServerlessNode(searchOnly)) {
             reader.startup().start();
-            final ShardId asReader = reader.serveAsReader(plane, "alpha", 0);
+            final ShardId asReader = reader.readers().serveAsReader(plane, "alpha", 0);
             assertNotNull("a reader must be able to open a shard whose log had a hole in it", asReader);
             assertTrue("and serve what was published", reader.reads().get(asReader, "a").found());
         }

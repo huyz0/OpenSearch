@@ -138,7 +138,7 @@ public class ServerlessPointInTimeTests extends OpenSearchTestCase {
             // Move the shard to a new term and publish there, so the frozen commit's files are in a dead
             // term container and unreferenced by the live manifest -- the exact condition the sweep deletes.
             assertTrue(plane.heads().release("swept", 0, node.localNode().getId()));
-            node.activateWriter(plane, "swept", 0);
+            node.activation().activateWriter(plane, "swept", 0);
             for (int i = 5; i <= 12; i++) {
                 final Response written = send(node, "PUT", "/swept/_doc/s" + i + "?refresh=true", body(i));
                 assertEquals(written.body(), 201, written.status());

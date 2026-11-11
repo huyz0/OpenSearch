@@ -308,7 +308,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
             // A's lease expires and B takes the shard.
             b.startup().start();
             clock.set(1_000L + TTL);
-            b.activateWriter(planeB, "alpha", 0).orElseThrow();
+            b.activation().activateWriter(planeB, "alpha", 0).orElseThrow();
 
             // A scan that is not due changes nothing, which is the saving.
             assertTrue("a pass inside the interval must not scan", a.leases().verifyHeadsIfDue(planeA).isEmpty());

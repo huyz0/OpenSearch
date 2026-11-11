@@ -62,7 +62,7 @@ import static java.util.Collections.emptyMap;
  *
  * <p>Upstream constructor changes to these core classes break this file and no other.
  */
-final class NodeServices implements Closeable {
+public final class NodeServices implements Closeable {
 
     private final Settings settings;
     private final ServerlessPlugins plugins;

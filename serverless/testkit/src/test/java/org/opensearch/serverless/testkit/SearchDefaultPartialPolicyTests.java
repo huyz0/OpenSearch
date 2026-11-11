@@ -39,7 +39,7 @@ public class SearchDefaultPartialPolicyTests extends OpenSearchTestCase {
         }, (node, source) -> {
             final var request = new SearchRequest("docs", "numbers").source(source);
             assertNull(request.allowPartialSearchResults());
-            final var failure = expectThrows(Exception.class, () -> node.client().search(request).actionGet());
+            final var failure = expectThrows(Exception.class, () -> node.services().client().search(request).actionGet());
             assertNotNull(
                 failure.toString(),
                 org.opensearch.ExceptionsHelper.unwrap(failure, org.opensearch.index.query.QueryShardException.class)
@@ -69,7 +69,8 @@ public class SearchDefaultPartialPolicyTests extends OpenSearchTestCase {
     public void testExplicitNativePolicyOverridesStrictDefault() throws Exception {
         withFailure(new org.opensearch.plugins.Plugin() {
         }, (node, source) -> {
-            final var reply = node.client()
+            final var reply = node.services()
+                .client()
                 .search(new SearchRequest("docs", "numbers").source(source).allowPartialSearchResults(true))
                 .actionGet();
             assertEquals(2, reply.getSuccessfulShards());
@@ -90,7 +91,8 @@ public class SearchDefaultPartialPolicyTests extends OpenSearchTestCase {
         org.opensearch.common.CheckedBiConsumer<ServerlessNode, SearchSourceBuilder, Exception> work
     ) throws Exception {
         withNodeAndMetadata(plugin, (node, metadata) -> {
-            node.client()
+            node.services()
+                .client()
                 .admin()
                 .indices()
                 .create(
@@ -100,8 +102,9 @@ public class SearchDefaultPartialPolicyTests extends OpenSearchTestCase {
                     )
                 )
                 .actionGet();
-            final var numbers = node.activateWriter(metadata, "numbers", 0).orElseThrow();
-            node.client()
+            final var numbers = node.activation().activateWriter(metadata, "numbers", 0).orElseThrow();
+            node.services()
+                .client()
                 .index(
                     new org.opensearch.action.index.IndexRequest("numbers").id("number")
                         .source("{\"msg\":42}", org.opensearch.common.xcontent.XContentType.JSON)
@@ -134,7 +137,7 @@ public class SearchDefaultPartialPolicyTests extends OpenSearchTestCase {
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("docs", "uuid-docs", 2, "{\"properties\":{\"msg\":{\"type\":\"text\"}}}", null));
                 for (int i = 0; i < 2; i++) {
-                    final var shard = node.activateWriter(metadata, "docs", i).orElseThrow();
+                    final var shard = node.activation().activateWriter(metadata, "docs", i).orElseThrow();
                     node.writes().index(shard, "doc-" + i, "{\"msg\":\"visible\"}");
                     node.reconciler().shard(shard).refresh("search-options-test");
                 }

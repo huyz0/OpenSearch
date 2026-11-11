@@ -160,7 +160,7 @@ public class ManyShardTakeoverTests extends OpenSearchTestCase {
         try (ServerlessNode second = new ServerlessNode(nodeSettings("many-refresh-second"))) {
             second.startup().start();
             second.setMetadataPlane(plane);
-            final ShardId shardId = second.activateWriter(plane, "alpha", 0).orElseThrow();
+            final ShardId shardId = second.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             final long term = second.reconciler().shard(shardId).getOperationPrimaryTerm();
             assertTrue("the fixture needs a term above the first writer's", term > 1L);
 

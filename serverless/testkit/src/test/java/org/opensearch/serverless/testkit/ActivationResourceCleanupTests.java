@@ -47,11 +47,11 @@ public class ActivationResourceCleanupTests extends OpenSearchTestCase {
                     reachedManifest.set(true);
                     throw new IllegalStateException("injected manifest read failure");
                 });
-                final var failure = expectThrows(Exception.class, () -> node.activateWriter(metadata, "docs", 0));
+                final var failure = expectThrows(Exception.class, () -> node.activation().activateWriter(metadata, "docs", 0));
                 assertTrue(failure.toString(), reachedManifest.get());
                 assertTrue(node.reconciler().openShards().isEmpty());
                 assertNull("an unsuccessful activation must not retain its empty index service", node.indicesService().indexService(index));
-                final var opened = node.activateWriter(metadata, "docs", 0).orElseThrow();
+                final var opened = node.activation().activateWriter(metadata, "docs", 0).orElseThrow();
                 assertNotNull(node.reconciler().shard(opened));
             }
         }
@@ -64,16 +64,16 @@ public class ActivationResourceCleanupTests extends OpenSearchTestCase {
             metadata.createIndex(descriptor);
             try (var node = new ServerlessNode(settings("sibling-open-failure"))) {
                 node.startup().start();
-                final var first = node.activateWriter(metadata, "docs", 0).orElseThrow();
+                final var first = node.activation().activateWriter(metadata, "docs", 0).orElseThrow();
                 final var service = node.indicesService().indexService(first.getIndex());
                 store.onNextRegisterRead("#1", SegmentPublisher.MANIFEST, () -> {
                     assertTrue(service.hasShard(0));
                     throw new IllegalStateException("injected sibling manifest failure");
                 });
-                expectThrows(Exception.class, () -> node.activateWriter(metadata, "docs", 1));
+                expectThrows(Exception.class, () -> node.activation().activateWriter(metadata, "docs", 1));
                 assertSame(service, node.indicesService().indexService(first.getIndex()));
                 assertSame(service.getShard(0), node.reconciler().shard(first));
-                assertNotNull(node.activateWriter(metadata, "docs", 1).orElseThrow());
+                assertNotNull(node.activation().activateWriter(metadata, "docs", 1).orElseThrow());
             }
         }
     }
@@ -92,7 +92,7 @@ public class ActivationResourceCleanupTests extends OpenSearchTestCase {
             metadata.createIndex(descriptor);
             try (var node = new ServerlessNode(settings("mapping-open-failure"))) {
                 node.startup().start();
-                expectThrows(Exception.class, () -> node.activateWriter(metadata, "docs", 0));
+                expectThrows(Exception.class, () -> node.activation().activateWriter(metadata, "docs", 0));
                 assertTrue(node.reconciler().openShards().isEmpty());
                 assertNull(node.indicesService().indexService(new Index(descriptor.name(), descriptor.uuid())));
             }

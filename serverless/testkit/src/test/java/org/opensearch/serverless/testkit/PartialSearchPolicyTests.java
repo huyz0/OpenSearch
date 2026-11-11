@@ -141,7 +141,8 @@ public class PartialSearchPolicyTests extends OpenSearchTestCase {
         org.opensearch.common.CheckedBiConsumer<ServerlessNode, SearchSourceBuilder, Exception> work
     ) throws Exception {
         withNodeAndMetadata(plugin, (node, metadata) -> {
-            node.client()
+            node.services()
+                .client()
                 .admin()
                 .indices()
                 .create(
@@ -151,8 +152,9 @@ public class PartialSearchPolicyTests extends OpenSearchTestCase {
                     )
                 )
                 .actionGet();
-            final var numbers = node.activateWriter(metadata, "numbers", 0).orElseThrow();
-            node.client()
+            final var numbers = node.activation().activateWriter(metadata, "numbers", 0).orElseThrow();
+            node.services()
+                .client()
                 .index(
                     new org.opensearch.action.index.IndexRequest("numbers").id("number")
                         .source("{\"msg\":42}", org.opensearch.common.xcontent.XContentType.JSON)
@@ -183,7 +185,7 @@ public class PartialSearchPolicyTests extends OpenSearchTestCase {
                 node.setMetadataPlane(metadata);
                 metadata.createIndex(new IndexDescriptor("docs", "uuid-docs", 2, "{\"properties\":{\"msg\":{\"type\":\"text\"}}}", null));
                 for (int i = 0; i < 2; i++) {
-                    final var shard = node.activateWriter(metadata, "docs", i).orElseThrow();
+                    final var shard = node.activation().activateWriter(metadata, "docs", i).orElseThrow();
                     node.writes().index(shard, "doc-" + i, "{\"msg\":\"visible\"}");
                     node.reconciler().shard(shard).refresh("search-options-test");
                 }

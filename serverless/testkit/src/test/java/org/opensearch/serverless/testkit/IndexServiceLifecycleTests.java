@@ -40,7 +40,7 @@ public class IndexServiceLifecycleTests extends OpenSearchTestCase {
             metadata.createIndex(new IndexDescriptor("docs", "uuid-docs", 2, MAPPING, null));
             try (var node = new ServerlessNode(settings("opening-sibling"))) {
                 node.startup().start();
-                final var first = node.activateWriter(metadata, "docs", 0).orElseThrow();
+                final var first = node.activation().activateWriter(metadata, "docs", 0).orElseThrow();
                 final var service = node.indicesService().indexService(first.getIndex());
                 final var opening = new CountDownLatch(1);
                 final var resume = new CountDownLatch(1);
@@ -54,7 +54,7 @@ public class IndexServiceLifecycleTests extends OpenSearchTestCase {
                     }
                 });
                 try (var executor = Executors.newSingleThreadExecutor()) {
-                    final var next = executor.submit(() -> node.activateWriter(metadata, "docs", 1).orElseThrow());
+                    final var next = executor.submit(() -> node.activation().activateWriter(metadata, "docs", 1).orElseThrow());
                     try {
                         assertTrue(opening.await(30, TimeUnit.SECONDS));
                         node.reconciler().releaseShard(first, "last serving shard closes while sibling is opening");
@@ -79,13 +79,13 @@ public class IndexServiceLifecycleTests extends OpenSearchTestCase {
             metadata.createIndex(new IndexDescriptor("docs", "uuid-docs", 2, MAPPING, null));
             try (var node = new ServerlessNode(settings("failed-sibling-marker"))) {
                 node.startup().start();
-                final var first = node.activateWriter(metadata, "docs", 0).orElseThrow();
+                final var first = node.activation().activateWriter(metadata, "docs", 0).orElseThrow();
                 store.onNextRegisterRead(
                     "#1",
                     SegmentPublisher.MANIFEST,
                     () -> { throw new IllegalStateException("injected sibling failure"); }
                 );
-                expectThrows(Exception.class, () -> node.activateWriter(metadata, "docs", 1));
+                expectThrows(Exception.class, () -> node.activation().activateWriter(metadata, "docs", 1));
                 node.reconciler().releaseShard(first, "last serving shard after failed sibling");
                 assertNull(node.indicesService().indexService(first.getIndex()));
             }

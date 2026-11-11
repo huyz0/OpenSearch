@@ -104,7 +104,7 @@ public class ServerlessExplainTests extends OpenSearchTestCase {
             successor.startup().start();
             successor.setMetadataPlane(metadata);
             assertTrue(metadata.heads().release("books", 0, former.localNode().getId()));
-            assertTrue(successor.activateWriter(metadata, "books", 0).isPresent());
+            assertTrue(successor.activation().activateWriter(metadata, "books", 0).isPresent());
             port = successor.boundHttpAddress().publishAddress().getPort();
             final Answer updated = call("PUT", "/books/_doc/1?refresh=true", "{\"title\":\"newest\"}");
             assertEquals(updated.body(), 200, updated.status());

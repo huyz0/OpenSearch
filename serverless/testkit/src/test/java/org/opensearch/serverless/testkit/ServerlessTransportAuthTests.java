@@ -265,8 +265,8 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            other.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            other.activation().syncFrom(plane);
             assertTrue(
                 "the other node must not own the shard, so the write has to be forwarded",
                 other.reconciler().openShards().isEmpty()
@@ -297,14 +297,15 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             assertTrue("refused for the signature, not for something else: " + describe(refused), mentions(refused, "transport token"));
             assertFalse(
                 "a refused forward must not have written anything",
-                owner.client().get(new GetRequest("alpha", "k")).actionGet().isExists()
+                owner.services().client().get(new GetRequest("alpha", "k")).actionGet().isExists()
             );
 
             // The control: with nothing planted the router signs the request itself.
-            other.client()
+            other.services()
+                .client()
                 .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"right mac\",\"n\":1}", XContentType.JSON))
                 .actionGet();
-            assertTrue(owner.client().get(new GetRequest("alpha", "k")).actionGet().isExists());
+            assertTrue(owner.services().client().get(new GetRequest("alpha", "k")).actionGet().isExists());
         }
     }
 
@@ -332,7 +333,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             owner.startup().start();
             stranger.startup().start();
             owner.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
+            owner.activation().activateWriter(plane, "alpha", 0);
 
             final TransportService transport = TRANSPORT.get();
             assertNotNull("the stranger's transport service must have been captured", transport);
@@ -361,7 +362,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
 
             assertFalse(
                 "a refused forward must not have written anything",
-                owner.client().get(new GetRequest("alpha", "k")).actionGet().isExists()
+                owner.services().client().get(new GetRequest("alpha", "k")).actionGet().isExists()
             );
         }
     }
@@ -391,11 +392,14 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            other.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            other.activation().syncFrom(plane);
 
-            other.client().index(new IndexRequest("alpha").id("k").source("{\"msg\":\"first\",\"n\":1}", XContentType.JSON)).actionGet();
-            assertTrue(owner.client().get(new GetRequest("alpha", "k")).actionGet().isExists());
+            other.services()
+                .client()
+                .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"first\",\"n\":1}", XContentType.JSON))
+                .actionGet();
+            assertTrue(owner.services().client().get(new GetRequest("alpha", "k")).actionGet().isExists());
             final TransportRequest captured = LAST_REQUEST.get();
             final String mac = LAST_MAC.get();
             assertNotNull("the interceptor must have seen the forwarded write", captured);
@@ -420,8 +424,11 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
 
             // A fresh forward of the same document from the same node is still fine: it is the frame that
             // is dead, not the sender.
-            other.client().index(new IndexRequest("alpha").id("k").source("{\"msg\":\"second\",\"n\":2}", XContentType.JSON)).actionGet();
-            assertTrue(owner.client().get(new GetRequest("alpha", "k")).actionGet().getSourceAsString().contains("second"));
+            other.services()
+                .client()
+                .index(new IndexRequest("alpha").id("k").source("{\"msg\":\"second\",\"n\":2}", XContentType.JSON))
+                .actionGet();
+            assertTrue(owner.services().client().get(new GetRequest("alpha", "k")).actionGet().getSourceAsString().contains("second"));
         }
     }
 
@@ -448,12 +455,12 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             other.startup().start();
             owner.setMetadataPlane(plane);
             other.setMetadataPlane(plane);
-            owner.activateWriter(plane, "alpha", 0);
-            other.syncFrom(plane);
+            owner.activation().activateWriter(plane, "alpha", 0);
+            other.activation().syncFrom(plane);
 
             // Both nodes read generation 1 by forwarding once.
             write(other, "g1");
-            assertTrue(owner.client().get(new GetRequest("alpha", "g1")).actionGet().isExists());
+            assertTrue(owner.services().client().get(new GetRequest("alpha", "g1")).actionGet().isExists());
             final long first = plane.transportSecrets().generation();
 
             // Rotate; the sender re-reads and signs under generation 2. The receiver still holds
@@ -465,7 +472,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             write(other, "g2-ahead");
             assertTrue(
                 "a sender ahead of the receiver is served",
-                owner.client().get(new GetRequest("alpha", "g2-ahead")).actionGet().isExists()
+                owner.services().client().get(new GetRequest("alpha", "g2-ahead")).actionGet().isExists()
             );
             assertEquals("and the receiver has caught up", second.generation(), owner.transportSecrets(false).generation());
 
@@ -478,7 +485,7 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             write(other, "g2-behind");
             assertTrue(
                 "a sender one generation behind is served under the previous secret",
-                owner.client().get(new GetRequest("alpha", "g2-behind")).actionGet().isExists()
+                owner.services().client().get(new GetRequest("alpha", "g2-behind")).actionGet().isExists()
             );
 
             // Rotate once more, receiver re-reads: the sender's generation 2 is now neither current nor
@@ -487,17 +494,23 @@ public class ServerlessTransportAuthTests extends OpenSearchTestCase {
             owner.transportSecrets(true);
             final Exception stale = expectThrows(Exception.class, () -> write(other, "g2-stale"));
             assertTrue("two generations behind is refused: " + describe(stale), mentions(stale, "secret generation"));
-            assertFalse(owner.client().get(new GetRequest("alpha", "g2-stale")).actionGet().isExists());
+            assertFalse(owner.services().client().get(new GetRequest("alpha", "g2-stale")).actionGet().isExists());
 
             // And the fix is the re-read, not a restart.
             other.transportSecrets(true);
             write(other, "g4");
-            assertTrue("a sender that re-read is served again", owner.client().get(new GetRequest("alpha", "g4")).actionGet().isExists());
+            assertTrue(
+                "a sender that re-read is served again",
+                owner.services().client().get(new GetRequest("alpha", "g4")).actionGet().isExists()
+            );
         }
     }
 
     private static void write(ServerlessNode from, String id) {
-        from.client().index(new IndexRequest("alpha").id(id).source("{\"msg\":\"" + id + "\",\"n\":1}", XContentType.JSON)).actionGet();
+        from.services()
+            .client()
+            .index(new IndexRequest("alpha").id(id).source("{\"msg\":\"" + id + "\",\"n\":1}", XContentType.JSON))
+            .actionGet();
     }
 
     private static PlainActionFuture<ForwardedIndexResponse> sendRaw(

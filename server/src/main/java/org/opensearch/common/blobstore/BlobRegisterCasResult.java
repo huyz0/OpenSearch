@@ -11,7 +11,7 @@ package org.opensearch.common.blobstore;
 import org.opensearch.common.annotation.ExperimentalApi;
 
 /**
- * The outcome of a {@link BlobContainer#compareAndSwapRegister} attempt: either the write applied
+ * The outcome of a {@link ConditionalBlobContainer#compareAndSwapRegister} attempt: either the write applied
  * ({@link #applied()} is {@code true} and {@link #currentGeneration()} is the new generation), or
  * it lost the race and {@link #currentGeneration()} reports an observed conflicting generation or
  * {@link #UNKNOWN_GENERATION} when the backend cannot report that generation atomically. A later read

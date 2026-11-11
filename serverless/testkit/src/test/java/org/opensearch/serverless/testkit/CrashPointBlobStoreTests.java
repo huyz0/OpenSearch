@@ -10,6 +10,7 @@ package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.serverless.testkit.CrashPointBlobStore.CrashedException;
@@ -41,7 +42,7 @@ public class CrashPointBlobStoreTests extends OpenSearchTestCase {
     public void testEachCallIsRecordedWithItsKind() throws Exception {
         final FsBlobStore honest = store();
         final CrashPointBlobStore store = new CrashPointBlobStore(honest);
-        final BlobContainer container = store.blobContainer(BlobPath.cleanPath().add("c"));
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath().add("c")));
         put(container, "a", "1", true);
         put(container, "b", "2", false);
         container.readBlob("a").close();
@@ -78,7 +79,7 @@ public class CrashPointBlobStoreTests extends OpenSearchTestCase {
     public void testAnAmbiguousCallLandsAndTheWriterCarriesOn() throws Exception {
         final FsBlobStore honest = store();
         final CrashPointBlobStore store = new CrashPointBlobStore(honest).on(s -> s.kind() == Kind.CREATE, Fault.AMBIGUOUS, 1);
-        final BlobContainer container = store.blobContainer(BlobPath.cleanPath().add("c"));
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath().add("c")));
         expectThrows(InjectedFailureException.class, () -> put(container, "a", "1", true));
         assertTrue(honest.blobContainer(BlobPath.cleanPath().add("c")).blobExists("a"));
         put(container, "b", "2", true);
@@ -89,9 +90,9 @@ public class CrashPointBlobStoreTests extends OpenSearchTestCase {
     public void testAFailedCallDoesNotLandAndTheWriterCarriesOn() throws Exception {
         final FsBlobStore honest = store();
         final CrashPointBlobStore store = new CrashPointBlobStore(honest).at(0, Fault.FAIL_BEFORE);
-        final BlobContainer container = store.blobContainer(BlobPath.cleanPath().add("c"));
+        final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath().add("c")));
         expectThrows(InjectedFailureException.class, () -> container.createRegisterIfAbsent("r", new BytesArray("x")));
-        assertTrue(honest.blobContainer(BlobPath.cleanPath().add("c")).readRegister("r").isEmpty());
+        assertTrue(ConditionalBlobContainer.of(honest.blobContainer(BlobPath.cleanPath().add("c"))).readRegister("r").isEmpty());
         assertTrue(container.createRegisterIfAbsent("r", new BytesArray("x")).applied());
     }
 

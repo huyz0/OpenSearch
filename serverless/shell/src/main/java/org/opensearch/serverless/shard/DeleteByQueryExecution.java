@@ -90,7 +90,7 @@ final class DeleteByQueryExecution {
             long conflicts = 0;
             int batches = 0;
             for (Integer shard : shards.keySet()) {
-                final var frozenShardId = node.openFrozenView(plane, pit, shard);
+                final var frozenShardId = node.activation().openFrozenView(plane, pit, shard);
                 Object[] cursor = null;
                 while (visited < maxDocs) {
                     final var page = new org.opensearch.search.builder.SearchSourceBuilder().query(query)
@@ -117,7 +117,8 @@ final class DeleteByQueryExecution {
                     // A page of deletes is a page of writes, and accounted as one: this operation used to
                     // be the only writer on the node that indexing pressure could not see.
                     try (
-                        org.opensearch.common.lease.Releasable inFlight = node.indexingPressure()
+                        org.opensearch.common.lease.Releasable inFlight = node.services()
+                            .indexingPressure()
                             .markCoordinatingOperationStarted(pageBytes, false)
                     ) {
                         for (int i = 0; i < hits.size(); i++) {

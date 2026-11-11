@@ -41,7 +41,12 @@ public class IndexCreationValidationTests extends OpenSearchTestCase {
         withNode((node, metadata) -> {
             final Exception failure = expectThrows(
                 Exception.class,
-                () -> node.client().admin().indices().create(new CreateIndexRequest("invalid").mapping(INVALID_MAPPING)).actionGet()
+                () -> node.services()
+                    .client()
+                    .admin()
+                    .indices()
+                    .create(new CreateIndexRequest("invalid").mapping(INVALID_MAPPING))
+                    .actionGet()
             );
             assertEquals(failure.toString(), RestStatus.BAD_REQUEST, org.opensearch.ExceptionsHelper.status(failure));
             assertTrue(metadata.describe("invalid").isEmpty());
@@ -117,7 +122,7 @@ public class IndexCreationValidationTests extends OpenSearchTestCase {
             );
             assertEquals(response.body(), 200, response.statusCode());
             assertFalse("validation must not register an IndexService", node.indicesService().iterator().hasNext());
-            final var shard = node.activateWriter(metadata, "valid", 0).orElseThrow();
+            final var shard = node.activation().activateWriter(metadata, "valid", 0).orElseThrow();
             node.writes().index(shard, "doc", "{\"msg\":\"HELLO\"}");
             assertTrue(node.reads().get(shard, "doc").found());
         });
@@ -163,7 +168,7 @@ public class IndexCreationValidationTests extends OpenSearchTestCase {
                 );
             final var response = send(node, "PUT", "/events-1", "{\"mappings\":{\"_doc\":{\"properties\":{\"n\":{\"type\":\"long\"}}}}}");
             assertEquals(response.body(), 200, response.statusCode());
-            final var shard = node.activateWriter(metadata, "events-1", 0).orElseThrow();
+            final var shard = node.activation().activateWriter(metadata, "events-1", 0).orElseThrow();
             node.writes().index(shard, "doc", "{\"n\":9,\"tag\":\"valid\"}");
             assertTrue(node.reads().get(shard, "doc").found());
         });
@@ -198,7 +203,7 @@ public class IndexCreationValidationTests extends OpenSearchTestCase {
                 assertTrue(metadata.describe("sorted").isEmpty());
             } else {
                 assertFalse(node.indicesService().iterator().hasNext());
-                final var shard = node.activateWriter(metadata, "sorted", 0).orElseThrow();
+                final var shard = node.activation().activateWriter(metadata, "sorted", 0).orElseThrow();
                 node.writes().index(shard, "doc", "{\"n\":9}");
                 assertTrue(node.reads().get(shard, "doc").found());
             }

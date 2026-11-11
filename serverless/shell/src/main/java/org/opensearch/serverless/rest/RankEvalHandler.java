@@ -105,7 +105,7 @@ public final class RankEvalHandler extends BaseRestHandler {
         try (
             XContentParser parser = XContentType.JSON.xContent()
                 .createParser(
-                    serving.rankEvalXContentRegistry(),
+                    serving.services().rankEvalXContentRegistry(),
                     LoggingDeprecationHandler.INSTANCE,
                     request.requiredContent().streamInput()
                 )
@@ -158,7 +158,7 @@ public final class RankEvalHandler extends BaseRestHandler {
         final Map<String, Exception> errors = new LinkedHashMap<>();
         final Map<String, TemplateScript.Factory> templates = new HashMap<>();
         for (Map.Entry<String, Script> entry : spec.getTemplates().entrySet()) {
-            templates.put(entry.getKey(), serving.scriptService().compile(entry.getValue(), TemplateScript.CONTEXT));
+            templates.put(entry.getKey(), serving.services().scriptService().compile(entry.getValue(), TemplateScript.CONTEXT));
         }
         final Map<String, EvalQueryQuality> details = new LinkedHashMap<>();
         for (RatedRequest rated : spec.getRatedRequests()) {
@@ -172,7 +172,7 @@ public final class RankEvalHandler extends BaseRestHandler {
                     final String resolved = template.newInstance(rated.getParams()).execute();
                     try (
                         XContentParser sub = XContentType.JSON.xContent()
-                            .createParser(serving.searchXContentRegistry(), LoggingDeprecationHandler.INSTANCE, resolved)
+                            .createParser(serving.services().searchXContentRegistry(), LoggingDeprecationHandler.INSTANCE, resolved)
                     ) {
                         evaluation = SearchSourceBuilder.fromXContent(sub, false);
                     }

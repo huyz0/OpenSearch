@@ -474,7 +474,7 @@ public final class SearchFanout {
 
     /** The breaker a coordinator's working set is charged to, which is core's request breaker. */
     static org.opensearch.core.common.breaker.CircuitBreaker breaker(ServerlessNode serving) {
-        return serving.circuitBreakerService().getBreaker(org.opensearch.core.common.breaker.CircuitBreaker.REQUEST);
+        return serving.services().circuitBreakerService().getBreaker(org.opensearch.core.common.breaker.CircuitBreaker.REQUEST);
     }
 
     /** One shard's reason for not answering, addressed the way a real response addresses one. */

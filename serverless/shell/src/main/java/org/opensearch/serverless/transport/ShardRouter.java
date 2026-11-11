@@ -140,7 +140,8 @@ public final class ShardRouter {
 
     private void handleStats(ForwardedStatsRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         requireMac(ForwardedStatsRequest.ACTION, request);
-        final ForwardedStatsResponse response = node.actionGate()
+        final ForwardedStatsResponse response = node.services()
+            .actionGate()
             .run(
                 org.opensearch.action.admin.cluster.node.stats.NodesStatsAction.NAME,
                 new org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest(node.localNode().getId()).all(),
@@ -206,7 +207,8 @@ public final class ShardRouter {
         // Accounted on the owner as a primary operation, the way core accounts a write that arrived from
         // a coordinating node: a flood of forwarded writes used to be invisible to this node's pressure.
         try (
-            org.opensearch.common.lease.Releasable primary = node.indexingPressure()
+            org.opensearch.common.lease.Releasable primary = node.services()
+                .indexingPressure()
                 .markPrimaryOperationStarted(org.opensearch.serverless.store.WalRecord.contentBytes(request.id(), request.source()), false)
         ) {
             handleIndexAccounted(request, channel, shardId);
@@ -277,7 +279,11 @@ public final class ShardRouter {
         requirePluginOriginForSystemIndex(request.index());
         final ShardId shardId = writerShard(request.index(), request.shard(), request.indexUuid());
         // Counted by the request as it was built, not by re-encoding every record here to measure it.
-        try (org.opensearch.common.lease.Releasable primary = node.indexingPressure().markPrimaryOperationStarted(request.bytes(), false)) {
+        try (
+            org.opensearch.common.lease.Releasable primary = node.services()
+                .indexingPressure()
+                .markPrimaryOperationStarted(request.bytes(), false)
+        ) {
             handleBulkAccounted(request, channel, shardId);
         }
     }
@@ -345,10 +351,10 @@ public final class ShardRouter {
             // Open it. This is the property that makes placement a hint rather than a requirement: a
             // node asked for a shard it does not have fetches the manifest and serves, so a stale or
             // unlucky routing decision costs a cold read and never a wrong answer.
-            shardId = node.serveAsReader(plane.get(), request.index(), request.shard(), request.indexUuid());
+            shardId = node.readers().serveAsReader(plane.get(), request.index(), request.shard(), request.indexUuid());
         } else {
             // Open already, perhaps as a reader whose writer has since died: checked like a fresh one.
-            node.ensureReaderCurrent(plane.get(), request.index(), request.shard(), shardId);
+            node.readers().ensureReaderCurrent(plane.get(), request.index(), request.shard(), shardId);
         }
         if (openedForThis) {
             // Opened now, so used now; one already held is used only if it matches, below -- see SearchFanout.
@@ -380,7 +386,7 @@ public final class ShardRouter {
         // and openFrozenView is idempotent -- opening it here for the first time is exactly what placement
         // being a hint means. plane.get() rather than the request: the view travelled the wire, but which
         // object store to open its files from is this node's own configuration, never the sender's.
-        final ShardId shardId = node.openFrozenView(plane.get(), request.pit(), request.shard());
+        final ShardId shardId = node.activation().openFrozenView(plane.get(), request.pit(), request.shard());
         node.reconciler().enter(shardId);
         final ShardQuery.Result result;
         try {

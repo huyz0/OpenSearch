@@ -17,7 +17,7 @@ import java.util.Map;
  * Serves shards as readers for {@link ServerlessNode}: opens or shares a reader, checks it is still current, and
  * forgets it.
  */
-final class ReaderServing {
+public final class ReaderServing {
 
     private final ServerlessNode node;
 
@@ -193,7 +193,7 @@ final class ReaderServing {
             // node. The same ceiling demand-driven writers have applies -- the configured one, counting
             // views -- and the same eviction makes room before this refuses.
             node.readerOpensRefusedAtCap.incrementAndGet();
-            node.noteRefusedRecently(indexName, shardNumber);
+            node.nodeCapacity().noteRefusedRecently(indexName, shardNumber);
             throw new IllegalStateException(
                 "this node holds "
                     + node.reconciler.openShards().size()
