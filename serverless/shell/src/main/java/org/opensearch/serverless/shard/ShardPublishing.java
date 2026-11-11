@@ -101,6 +101,15 @@ final class ShardPublishing {
         }
         if (nodeLogHooks != null) {
             nodeLogHooks.published(shardId, nodeLogAt);
+            // What the open replayed from the shard's own log is in this commit: the head can say that log is quiet.
+            if (reconciler.shardLogQuietOnPublish.remove(shardId, term)) {
+                try {
+                    nodeLogHooks.shardLogQuiet(shardId, term);
+                } catch (IOException | RuntimeException e) {
+                    // The next owner closes the shard's log again, which costs listings, never records.
+                    ShardReconciler.logger.debug("could not record that " + shardId + "'s own log is quiet", e);
+                }
+            }
         }
         return manifest;
     }

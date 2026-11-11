@@ -389,7 +389,13 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
             )
         );
 
-        try (ServerlessNode writer = new ServerlessNode(nodeSettings("gap-writer"))) {
+        // Planted in the shard's own log before any head exists, which no writer does: a node writing its node's log
+        // would take the shard's first head as saying that log is quiet. One writing the shard's own log reads it.
+        final Settings perShardLog = Settings.builder()
+            .put(nodeSettings("gap-writer"))
+            .put("serverless.wal.node_log.enabled", false)
+            .build();
+        try (ServerlessNode writer = new ServerlessNode(perShardLog)) {
             writer.startup().start();
             final ShardId shardId = writer.activation().activateWriter(plane, "alpha", 0).orElseThrow();
 

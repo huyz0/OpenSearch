@@ -65,7 +65,25 @@ final class ShardActivation {
      * @throws IOException if the register cannot be read or created
      */
     public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid) throws IOException {
-        final Acquisition acquisition = heads.acquire(indexName, shardId, nodeId, ephemeralId, indexUuid);
+        return activate(indexName, shardId, nodeId, ephemeralId, indexUuid, false);
+    }
+
+    /**
+     * Attempts to take ownership of a shard of one incarnation of an index, saying which write log the taker writes.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param nodeId the acquiring node
+     * @param ephemeralId the acquiring node's ephemeral id
+     * @param indexUuid the uuid of the index being activated
+     * @param writesNodeLog whether the acquiring node writes its node's log rather than the shard's own; see
+     *     {@link ShardHead#withShardLogQuietSince}
+     * @return the outcome, carrying the winner's head either way
+     * @throws IOException if the register cannot be read or created
+     */
+    public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid, boolean writesNodeLog)
+        throws IOException {
+        final Acquisition acquisition = heads.acquire(indexName, shardId, nodeId, ephemeralId, indexUuid, writesNodeLog);
         if (acquisition.acquired()) {
             // Seal the log here, at the swap, rather than leaving it to whoever opens the shard.
             //
@@ -86,7 +104,9 @@ final class ShardActivation {
             // Only when the uuid is known, because that is what locates the shard's bytes. A caller
             // that acquires without one -- the overload that skips the incarnation check -- gets the
             // old behaviour, with the open path's seal as the bound.
-            if (acquisition.head().indexUuid() != null) {
+            // Not for a head whose shard log is quiet: every term of it is closed already, and fencing them again is a
+            // listing per term to find so.
+            if (acquisition.head().indexUuid() != null && acquisition.head().shardLogQuiet() == false) {
                 try {
                     plane.walStore(indexName, acquisition.head().indexUuid(), shardId).fenceOlderTerms(acquisition.head().term());
                 } catch (IOException e) {

@@ -172,7 +172,11 @@ public class PackedFileLocationTests extends OpenSearchTestCase {
         final BlobContainer older = store.blobContainer(shardBase.add("t=1"));
         older.writeBlob("pack-orphan", new ByteArrayInputStream(new byte[] { 1, 2, 3 }), 3, false);
 
-        final List<String> deleted = new GarbageCollector(store, BlobPath.cleanPath()).collectShard(plane, "logs", 0);
+        final List<String> deleted = new java.util.ArrayList<>(
+            new GarbageCollector(store, BlobPath.cleanPath()).collectShard(plane, "logs", 0)
+        );
+        // The test filesystem drops stray extraN files into directories; they are not ours.
+        deleted.removeIf(blob -> blob.substring(blob.indexOf('/') + 1).startsWith("extra"));
         assertEquals(List.of("t=1/pack-orphan"), deleted);
         assertTrue(store.blobContainer(shardBase.add(TERM_DIR)).blobExists(PACK));
     }

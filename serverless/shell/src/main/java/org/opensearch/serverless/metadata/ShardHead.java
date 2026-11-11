@@ -50,6 +50,7 @@ public final class ShardHead {
     private final String ownerEphemeralId;
     private final long leaseExpiresAtMillis;
     private final List<String> writers;
+    private final long shardLogQuietSince;
 
     /**
      * Creates a head.
@@ -101,9 +102,14 @@ public final class ShardHead {
         this.ownerEphemeralId = ownerEphemeralId;
         this.leaseExpiresAtMillis = leaseExpiresAtMillis;
         this.writers = List.of();
+        this.shardLogQuietSince = -1L;
     }
 
     private ShardHead(ShardHead head, List<String> writers) {
+        this(head, writers, head.shardLogQuietSince);
+    }
+
+    private ShardHead(ShardHead head, List<String> writers, long shardLogQuietSince) {
         this.indexName = head.indexName;
         this.indexUuid = head.indexUuid;
         this.shardId = head.shardId;
@@ -112,6 +118,41 @@ public final class ShardHead {
         this.ownerEphemeralId = head.ownerEphemeralId;
         this.leaseExpiresAtMillis = head.leaseExpiresAtMillis;
         this.writers = List.copyOf(writers);
+        this.shardLogQuietSince = shardLogQuietSince;
+    }
+
+    /**
+     * Returns this head saying the shard's own write log has gone quiet since a term, or no longer saying so.
+     *
+     * <p>Quiet since T: every term of the shard's own log up to T is closed and holds nothing a published commit lacks,
+     * and every owner since has written to its node's log instead. An open by a node that writes its node's log then has
+     * nothing to fence or replay in the shard's own log, and skips the listings that would find so -- the bulk of what an
+     * open cost in listings once the node log was on. An owner that writes the shard's own log takes the head without
+     * it, so the next owner closes that log as before.
+     *
+     * @param since the term the shard's own log has been quiet since, or -1 for not known to be quiet
+     * @return the copy
+     */
+    public ShardHead withShardLogQuietSince(long since) {
+        return new ShardHead(this, writers, since < 0 ? -1L : since);
+    }
+
+    /**
+     * Returns the term since which the shard's own write log has been quiet; see {@link #withShardLogQuietSince}.
+     *
+     * @return the term, or -1 if the log is not known to be quiet
+     */
+    public long shardLogQuietSince() {
+        return shardLogQuietSince;
+    }
+
+    /**
+     * Returns whether the shard's own write log is known to be quiet; see {@link #withShardLogQuietSince}.
+     *
+     * @return true if it is
+     */
+    public boolean shardLogQuiet() {
+        return shardLogQuietSince >= 0;
     }
 
     /**
@@ -262,6 +303,9 @@ public final class ShardHead {
             if (writers.isEmpty() == false) {
                 builder.array("writers", writers.toArray(new String[0]));
             }
+            if (shardLogQuietSince >= 0) {
+                builder.field("shard_log_quiet_since", shardLogQuietSince);
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -290,6 +334,7 @@ public final class ShardHead {
             int shard = -1;
             long term = 0;
             long expiry = 0;
+            long quietSince = -1L;
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
@@ -316,6 +361,7 @@ public final class ShardHead {
                         case "owner_node_id" -> owner = parser.textOrNull();
                         case "owner_ephemeral_id" -> ephemeral = parser.textOrNull();
                         case "lease_expires_at_millis" -> expiry = parser.longValue();
+                        case "shard_log_quiet_since" -> quietSince = parser.longValue();
                         default -> {
                             // forward compatibility
                         }
@@ -325,7 +371,8 @@ public final class ShardHead {
             if (index == null || shard < 0 || term < 1) {
                 throw new IOException("malformed shard head: missing a required field");
             }
-            return new ShardHead(index, shard, term, owner, ephemeral, expiry, uuid).withWriters(writers);
+            return new ShardHead(index, shard, term, owner, ephemeral, expiry, uuid).withWriters(writers)
+                .withShardLogQuietSince(quietSince);
         }
     }
 
@@ -341,6 +388,7 @@ public final class ShardHead {
             + ownerNodeId
             + " expires="
             + leaseExpiresAtMillis
-            + (writers.isEmpty() ? "" : " writers=" + writers);
+            + (writers.isEmpty() ? "" : " writers=" + writers)
+            + (shardLogQuietSince < 0 ? "" : " shardLogQuietSince=" + shardLogQuietSince);
     }
 }

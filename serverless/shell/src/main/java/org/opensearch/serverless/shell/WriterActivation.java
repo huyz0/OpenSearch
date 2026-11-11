@@ -244,7 +244,8 @@ public final class WriterActivation {
             shardNumber,
             node.localNode.getId(),
             node.localNode.getEphemeralId(),
-            described.get().uuid()
+            described.get().uuid(),
+            node.nodeLogEnabled
         );
         node.nodeCapacity().activationPhases[1].addAndGet(System.nanoTime() - acquiringAt);
         if (acquisition.acquired() == false) {
@@ -271,6 +272,8 @@ public final class WriterActivation {
             // Whose node logs the open replays: every node the head names as holding what was not published.
             node.startup().nodeLog(plane);
             node.reconciler.noteNodeLogWriters(indexName, shardNumber, acquisition.head().writers());
+            // And whether the shard's own log has anything for the open to close or replay.
+            node.reconciler.noteShardLogQuiet(indexName, shardNumber, acquisition.head().term(), acquisition.head().shardLogQuiet());
         }
         try {
             // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed

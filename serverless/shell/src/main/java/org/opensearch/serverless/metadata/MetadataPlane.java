@@ -585,6 +585,12 @@ public final class MetadataPlane {
         return activation.activate(indexName, shardId, nodeId, ephemeralId, indexUuid);
     }
 
+    /** Attempts to take ownership of a shard of one incarnation of an index, saying which write log the taker writes. */
+    public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid, boolean writesNodeLog)
+        throws IOException {
+        return activation.activate(indexName, shardId, nodeId, ephemeralId, indexUuid, writesNodeLog);
+    }
+
     /** Forgets a node's claim on a shard. */
     public void forgetAssignment(String nodeId, String indexName, int shardId) throws IOException {
         activation.forgetAssignment(nodeId, indexName, shardId);

@@ -497,6 +497,16 @@ public final class ShardReconciler {
          * @throws IOException if the head cannot be read or written
          */
         void replayedAndPublished(ShardId shardId, long term) throws IOException;
+
+        /**
+         * Records in the shard's head that its own write log is quiet: every term of it closed, and whatever it held
+         * published. Owners that write their node's log then open it without listing it.
+         *
+         * @param shardId the shard
+         * @param term the term this node holds it at
+         * @throws IOException if the head cannot be read or written
+         */
+        void shardLogQuiet(ShardId shardId, long term) throws IOException;
     }
 
     volatile NodeLogHooks nodeLog;
@@ -509,6 +519,32 @@ public final class ShardReconciler {
      */
     public void setNodeLog(NodeLogHooks nodeLog) {
         this.nodeLog = nodeLog;
+    }
+
+    /** Per index and shard, the term at which this node took a head that said the shard's own log is quiet. */
+    final java.util.concurrent.ConcurrentHashMap<String, Long> shardLogQuietAt = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Shards whose own log this node closed and replayed records from at open, by the term it holds them at: the first
+     * publish at that term holds those records, and then the head can say the log is quiet.
+     */
+    final java.util.concurrent.ConcurrentHashMap<ShardId, Long> shardLogQuietOnPublish = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Records whether the head this node just took says the shard's own log is quiet, so the open that follows -- at
+     * that term -- neither fences nor replays it. One use: the open consumes it.
+     *
+     * @param indexName the index
+     * @param shard the shard
+     * @param term the term taken
+     * @param quiet whether the head says the shard's own log is quiet
+     */
+    public void noteShardLogQuiet(String indexName, int shard, long term, boolean quiet) {
+        if (quiet) {
+            shardLogQuietAt.put(indexName + "#" + shard, term);
+        } else {
+            shardLogQuietAt.remove(indexName + "#" + shard);
+        }
     }
 
     /** Per index and shard, the nodes the head named when it was taken: whose node logs the open replays. */
