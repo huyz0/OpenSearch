@@ -82,8 +82,8 @@ public final class RolloverHandler extends BaseRestHandler {
     }
 
     /** What the request asked for. */
-    private record Ask(String target, String newIndex, boolean dryRun, Map<String, Object> conditions,
-        IndexAdminHandler.CreateRequest create, boolean bodyShapesIndex) {
+    private record Ask(String target, String newIndex, boolean dryRun, Map<String, Object> conditions, IndexCreateRequest create,
+        boolean bodyShapesIndex) {
     }
 
     @Override
@@ -323,7 +323,7 @@ public final class RolloverHandler extends BaseRestHandler {
         // index it made. A stream's backing index inherits what the stream's own name matches, which is the
         // template that declared the stream -- see DataStreamHandler.create for why it cannot be resolved
         // against the backing name.
-        final IndexAdminHandler.CreateRequest create = ask.create();
+        final IndexCreateRequest create = ask.create();
         long newGeneration = incrementCounter(record.generation(), "rollover generation");
         String createdUuid;
         try {
@@ -333,11 +333,7 @@ public final class RolloverHandler extends BaseRestHandler {
                     metadata::componentTemplates,
                     ask.target()
                 );
-                final IndexAdminHandler.CreateRequest streamCreate = DataStreamHandler.withTimestamp(
-                    create,
-                    record.timestampField(),
-                    inherited
-                );
+                final IndexCreateRequest streamCreate = DataStreamHandler.withTimestamp(create, record.timestampField(), inherited);
                 // A taken name is skipped by bumping the generation, as core does, rather than wedging the
                 // stream on a name something else holds.
                 for (int attempt = 0;; attempt++) {

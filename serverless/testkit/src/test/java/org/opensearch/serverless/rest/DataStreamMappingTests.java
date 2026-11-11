@@ -19,7 +19,7 @@ import java.util.Map;
 public class DataStreamMappingTests extends OpenSearchTestCase {
     public void testTimestampFieldNamesAreJsonEscaped() throws Exception {
         final String field = "event\"time\\stamp";
-        final var request = DataStreamHandler.withTimestamp(new IndexAdminHandler.CreateRequest(1, null, Settings.EMPTY), field);
+        final var request = DataStreamHandler.withTimestamp(new IndexCreateRequest(1, null, Settings.EMPTY), field);
         assertEquals(
             Map.of(
                 "properties",
@@ -32,12 +32,12 @@ public class DataStreamMappingTests extends OpenSearchTestCase {
     }
 
     public void testTimestampMappingKeepsAnExplicitShardCount() throws Exception {
-        final var original = IndexAdminHandler.CreateRequest.parse(Map.of("settings", Map.of("number_of_shards", 1)), "", 1);
+        final var original = IndexCreateRequest.parse(Map.of("settings", Map.of("number_of_shards", 1)), "", 1);
         assertTrue(original.explicitShards);
         final var request = DataStreamHandler.withTimestamp(original, "@timestamp");
         assertTrue("adding a timestamp mapping must preserve explicit shard selection", request.explicitShards);
         final var inherited = new TemplateResolver.Inherited(Map.of("number_of_shards", 5), Map.of(), "template");
-        assertEquals(1, IndexAdminHandler.CreateRequest.shardsWith(request.shards, request.explicitShards, inherited));
+        assertEquals(1, IndexCreateRequest.shardsWith(request.shards, request.explicitShards, inherited));
     }
 
     public void testExistingTimestampTypeAndFormatArePreserved() throws Exception {
@@ -48,7 +48,7 @@ public class DataStreamMappingTests extends OpenSearchTestCase {
             "_data_stream_timestamp",
             Map.of("enabled", true, "timestamp_field", Map.of("name", "@timestamp"))
         );
-        final var original = new IndexAdminHandler.CreateRequest(
+        final var original = new IndexCreateRequest(
             1,
             "{\"properties\":{\"@timestamp\":{\"type\":\"date_nanos\",\"format\":\"strict_date_optional_time_nanos\"}}}",
             Settings.EMPTY
@@ -56,12 +56,12 @@ public class DataStreamMappingTests extends OpenSearchTestCase {
         assertEquals(mapping, mapping(DataStreamHandler.withTimestamp(original, "@timestamp")));
     }
 
-    private static Map<String, Object> mapping(IndexAdminHandler.CreateRequest request) {
+    private static Map<String, Object> mapping(IndexCreateRequest request) {
         return XContentHelper.convertToMap(new BytesArray(request.mapping), false, XContentType.JSON).v2();
     }
 
     public void testAProvidedMappingCannotDisableTheTimestampGuard() throws Exception {
-        final var original = new IndexAdminHandler.CreateRequest(
+        final var original = new IndexCreateRequest(
             1,
             "{\"_data_stream_timestamp\":{\"enabled\":false,\"timestamp_field\":{\"name\":\"other\"}}}",
             Settings.EMPTY
