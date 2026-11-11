@@ -1468,7 +1468,8 @@ public final class MetadataPlane {
         final org.opensearch.serverless.store.WalStore log = walStore(indexName, uuid, shard);
         log.fenceOlderTerms(abandoned.get().released().term());
         final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
-        if (unpublished(indexName, uuid, shard, commit, log) || nodeLogHolds(deadNodeId, uuid, shard, abandoned.get().released().term())) {
+        if (unpublished(indexName, uuid, shard, commit, log)
+            || nodeLogHolds(abandoned.get().released().writers(), uuid, shard, abandoned.get().released().term())) {
             return Settled.NEEDS_REPLAY;
         }
         // Widened to the published commit as the mark goes: the dead writer's publishes skipped the rollup under it.
@@ -1508,7 +1509,7 @@ public final class MetadataPlane {
         final String uuid = descriptor.get().uuid();
         final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
         if (unpublished(indexName, uuid, shard, commit, walStore(indexName, uuid, shard))
-            || nodeLogHolds(head.get().lastWriter(), uuid, shard, head.get().term())) {
+            || nodeLogHolds(head.get().writers(), uuid, shard, head.get().term())) {
             return Settled.NEEDS_REPLAY;
         }
         // A writer that takes the shard meanwhile marks it at a higher term first, which this clear leaves alone. Widened
@@ -1549,6 +1550,25 @@ public final class MetadataPlane {
         }
         final java.util.OptionalLong committed = publisher.committedMaxSeqNo(commit.get());
         return committed.isEmpty() || log.maxSeqNoFromTerm(commit.get().term()) > committed.getAsLong();
+    }
+
+    /**
+     * Whether any of the nodes a head names holds records of a shard in its write log that it has not published.
+     *
+     * @param nodeIds the nodes, as {@link ShardHead#writers} names them
+     * @param uuid the index's uuid
+     * @param shard the shard number
+     * @param term the term recorded in a fence, for diagnosis
+     * @return true if any of their logs may hold unpublished records of the shard
+     * @throws IOException if a lease or a log cannot be read, or a fence fails
+     */
+    public boolean nodeLogHolds(List<String> nodeIds, String uuid, int shard, long term) throws IOException {
+        for (String nodeId : nodeIds) {
+            if (nodeLogHolds(nodeId, uuid, shard, term)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -1622,7 +1642,7 @@ public final class MetadataPlane {
             if (walStore(indexName, uuid, shard).landedPast(0L, -1L)) {
                 return false;
             }
-            if (head.isPresent() && nodeLogHolds(head.get().lastWriter(), uuid, shard, head.get().term())) {
+            if (head.isPresent() && nodeLogHolds(head.get().writers(), uuid, shard, head.get().term())) {
                 return false;
             }
         }
@@ -1656,7 +1676,7 @@ public final class MetadataPlane {
                 return List.of();
             }
             if (unpublished(indexName, uuid, shard, walStore(indexName, uuid, shard))
-                || (head.isPresent() && nodeLogHolds(head.get().lastWriter(), uuid, shard, head.get().term()))) {
+                || (head.isPresent() && nodeLogHolds(head.get().writers(), uuid, shard, head.get().term()))) {
                 replay.add(shard);
                 continue;
             }
