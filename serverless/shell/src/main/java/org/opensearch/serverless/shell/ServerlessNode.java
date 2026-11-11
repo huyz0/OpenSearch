@@ -187,6 +187,13 @@ public final class ServerlessNode implements Closeable {
      */
     private final boolean nodeLogEnabled;
 
+    /**
+     * Whether a publish writes the files it adds as one blob per segment rather than one blob per file:
+     * {@code serverless.segments.pack.enabled}.
+     * See {@link org.opensearch.serverless.store.SegmentPublisher#packing}.
+     */
+    private final boolean packSegments;
+
     /** This node's write log when {@link #nodeLogEnabled}, started with the first metadata plane it writes through. */
     private volatile NodeLogWriter nodeLogWriter;
 
@@ -715,6 +722,7 @@ public final class ServerlessNode implements Closeable {
             settings.getAsLong("serverless.wal.group_commit.max_bytes", org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES)
         );
         this.nodeLogEnabled = settings.getAsBoolean("serverless.wal.node_log.enabled", true);
+        this.packSegments = settings.getAsBoolean("serverless.segments.pack.enabled", false);
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
         final Environment environment = new Environment(settings, null);
@@ -1954,7 +1962,9 @@ public final class ServerlessNode implements Closeable {
     ) throws Exception {
         ensureStarted();
         adopt(plane);
-        reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setSegmentPublishers(
+            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(packSegments)
+        );
         reconciler.setBeforePublish(widensRollupsOf(plane));
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
@@ -2028,7 +2038,9 @@ public final class ServerlessNode implements Closeable {
         throws Exception {
         ensureStarted();
         adopt(plane);
-        reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setSegmentPublishers(
+            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(packSegments)
+        );
         reconciler.setBeforePublish(widensRollupsOf(plane));
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
@@ -2094,7 +2106,9 @@ public final class ServerlessNode implements Closeable {
             throw new IllegalStateException("node " + nodeName + " does not accept writer activation; its roles are " + roles);
         }
         adopt(plane);
-        reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setSegmentPublishers(
+            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(packSegments)
+        );
         reconciler.setBeforePublish(widensRollupsOf(plane));
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
@@ -2780,7 +2794,9 @@ public final class ServerlessNode implements Closeable {
     ) throws Exception {
         ensureStarted();
         adopt(plane);
-        reconciler.setSegmentPublishers(id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()));
+        reconciler.setSegmentPublishers(
+            id -> plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(packSegments)
+        );
         reconciler.setBeforePublish(widensRollupsOf(plane));
         reconciler.setWalStores(
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(threadPool().generic())
