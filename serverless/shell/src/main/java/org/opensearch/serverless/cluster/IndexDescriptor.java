@@ -286,6 +286,25 @@ public final class IndexDescriptor {
     }
 
     /**
+     * Returns whether a node may take a shard slot as its writer: any slot of an index without a shard mode; a live
+     * unit, or a half of the split in progress, of one with a mode. A unit retired by a split is refused, so a write
+     * routed with a stale layout cannot bring it back to life beside the halves that replaced it.
+     *
+     * @param slot the shard slot
+     * @return true if the slot may be written
+     */
+    public boolean writableSlot(int slot) {
+        if (slot < 0 || slot >= numberOfShards) {
+            return false;
+        }
+        if (layout == null || java.util.Arrays.binarySearch(unitIds, slot) >= 0) {
+            return true;
+        }
+        final org.opensearch.serverless.routing.UnitLayout.Split pending = layout.pending();
+        return pending != null && (pending.left().id() == slot || pending.right().id() == slot);
+    }
+
+    /**
      * Returns the range map from routing hashes to units, or null for an index created without a shard mode.
      *
      * @return the layout, or null
