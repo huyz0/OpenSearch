@@ -13,6 +13,11 @@ import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.cluster.ShardAssignment;
 import org.opensearch.serverless.membership.BlobLeaseMembership;
+import org.opensearch.serverless.membership.NodeLease;
+import org.opensearch.serverless.store.NodeLogBlob;
+import org.opensearch.serverless.store.NodeLogEpoch;
+import org.opensearch.serverless.store.NodeLogStore;
+import org.opensearch.serverless.store.NodeLogTakeover;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -1463,7 +1468,7 @@ public final class MetadataPlane {
         final org.opensearch.serverless.store.WalStore log = walStore(indexName, uuid, shard);
         log.fenceOlderTerms(abandoned.get().released().term());
         final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
-        if (unpublished(indexName, uuid, shard, commit, log)) {
+        if (unpublished(indexName, uuid, shard, commit, log) || nodeLogHolds(deadNodeId, uuid, shard, abandoned.get().released().term())) {
             return Settled.NEEDS_REPLAY;
         }
         // Widened to the published commit as the mark goes: the dead writer's publishes skipped the rollup under it.
@@ -1502,7 +1507,8 @@ public final class MetadataPlane {
         }
         final String uuid = descriptor.get().uuid();
         final Optional<org.opensearch.serverless.store.CommitManifest> commit = segmentPublisher(indexName, uuid, shard).readManifest();
-        if (unpublished(indexName, uuid, shard, commit, walStore(indexName, uuid, shard))) {
+        if (unpublished(indexName, uuid, shard, commit, walStore(indexName, uuid, shard))
+            || nodeLogHolds(head.get().lastWriter(), uuid, shard, head.get().term())) {
             return Settled.NEEDS_REPLAY;
         }
         // A writer that takes the shard meanwhile marks it at a higher term first, which this clear leaves alone. Widened
@@ -1546,6 +1552,50 @@ public final class MetadataPlane {
     }
 
     /**
+     * Whether a node's write log may hold records of a shard that it has not published.
+     *
+     * <p>A node that is live let go of the shard itself and writes no more of it, so its log is read up to each epoch's
+     * first free slot and nothing is fenced: fencing would fail the writes of every shard it still holds. A node that is
+     * not live may not be as dead as it looks, and may still land records of the shard in an epoch it opened while it
+     * held it, so its epochs are fenced first, as a takeover fences them.
+     *
+     * <p>The answer errs towards a replay: a shard published after the last header was written is still named.
+     *
+     * @param nodeId the node that last wrote the shard; null if none is known
+     * @param uuid the index's uuid
+     * @param shard the shard number
+     * @param term the term recorded in a fence, for diagnosis
+     * @return true if the node's log may hold unpublished records of the shard
+     * @throws IOException if the lease or the log cannot be read, or a fence fails
+     */
+    public boolean nodeLogHolds(String nodeId, String uuid, int shard, long term) throws IOException {
+        if (nodeId == null) {
+            return false;
+        }
+        final Optional<NodeLease> lease = membership().read(nodeId);
+        final List<NodeLogEpoch> epochs = lease.map(NodeLease::nodeLog).orElse(List.of());
+        if (epochs.isEmpty()) {
+            return false;
+        }
+        final NodeLogStore log = new NodeLogStore(blobStore, base, nodeId);
+        final NodeLogTakeover.LeaseReader reread = () -> membership().read(nodeId).map(NodeLease::nodeLog).orElse(List.of());
+        final NodeLogTakeover reader = isLive(lease.get())
+            ? NodeLogTakeover.unfenced(log, epochs, reread)
+            : new NodeLogTakeover(log, epochs, "settled-by-survivor", term, reread);
+        return reader.holds(new NodeLogBlob.ShardKey(uuid, shard));
+    }
+
+    /**
+     * Whether a lease names a node that is live now: neither revoked nor expired on this plane's clock.
+     *
+     * @param lease the lease
+     * @return true if the node it names is live
+     */
+    public boolean isLive(NodeLease lease) {
+        return lease.revoked() == false && lease.isExpiredAt(clock.getAsLong()) == false;
+    }
+
+    /**
      * Takes an index out of its group's rollups if it holds nothing: no shard owned, published or logged to.
      *
      * <p>See {@link DigestRollups#removeIfNothing}. Every shard is checked here -- head, manifest, log -- and the
@@ -1570,6 +1620,9 @@ public final class MetadataPlane {
                 return false;
             }
             if (walStore(indexName, uuid, shard).landedPast(0L, -1L)) {
+                return false;
+            }
+            if (head.isPresent() && nodeLogHolds(head.get().lastWriter(), uuid, shard, head.get().term())) {
                 return false;
             }
         }
@@ -1602,7 +1655,8 @@ public final class MetadataPlane {
                 // Marked by its writer, so never ruled out; the writer's clear widens the entry when it lets go.
                 return List.of();
             }
-            if (unpublished(indexName, uuid, shard, walStore(indexName, uuid, shard))) {
+            if (unpublished(indexName, uuid, shard, walStore(indexName, uuid, shard))
+                || (head.isPresent() && nodeLogHolds(head.get().lastWriter(), uuid, shard, head.get().term()))) {
                 replay.add(shard);
                 continue;
             }

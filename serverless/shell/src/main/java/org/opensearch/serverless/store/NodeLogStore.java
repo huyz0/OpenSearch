@@ -192,6 +192,18 @@ public final class NodeLogStore {
         return barrier;
     }
 
+    /**
+     * Returns an epoch's first free slot, searching from a slot every slot below which is taken.
+     *
+     * @param epoch the epoch
+     * @param fromOrdinal a slot at or before the first free one
+     * @return the first free slot
+     * @throws IOException if an existence check fails
+     */
+    public long firstFree(long epoch, long fromOrdinal) throws IOException {
+        return firstFree(container(epoch), fromOrdinal);
+    }
+
     private static long firstFree(BlobContainer container, long fromOrdinal) throws IOException {
         if (container.blobExists(name(fromOrdinal)) == false) {
             return fromOrdinal;

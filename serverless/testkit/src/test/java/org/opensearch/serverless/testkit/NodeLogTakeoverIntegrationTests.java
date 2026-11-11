@@ -13,7 +13,9 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.metadata.Acquisition;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.metadata.ShardHead;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
@@ -170,5 +172,84 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
             takeAll(second, plane, clock);
             assertFound(second, written);
         }
+    }
+
+    public void testASurvivorSettlingADeadWritersShardsLeavesThoseItsLogHoldsForAReplay() throws Exception {
+        final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
+        final ServerlessNode first = new ServerlessNode(nodeSettings("node-log-settle-first"));
+        try {
+            first.start();
+            first.setMetadataPlane(plane);
+            final Map<Integer, String> unpublished = writeAndLeaveUnpublished(first, plane, clock, "settle");
+            final String dead = first.localNode().getId();
+
+            clock.addAndGet(2 * TTL);
+            for (int shard = 0; shard < SHARDS; shard++) {
+                assertEquals(
+                    "the shard's own log is published, but the dead writer's holds what it never published",
+                    MetadataPlane.Settled.NEEDS_REPLAY,
+                    plane.settleAbandoned("alpha", shard, dead)
+                );
+                final ShardHead head = plane.heads().read("alpha", shard).orElseThrow();
+                assertNull("given back", head.ownerNodeId());
+                assertEquals("naming whose log to read", dead, head.lastWriter());
+            }
+
+            // Whoever takes them next reads the dead writer's log, fenced, since it is not live.
+            try (ServerlessNode second = new ServerlessNode(nodeSettings("node-log-settle-second"))) {
+                second.start();
+                second.setMetadataPlane(plane);
+                takeAll(second, plane, clock);
+                assertFound(second, unpublished);
+            }
+        } finally {
+            closeQuietly(first);
+        }
+    }
+
+    public void testASettledShardWhoseWritesWerePublishedAndTrimmedIsReleasedClean() throws Exception {
+        final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
+        final ServerlessNode first = new ServerlessNode(nodeSettings("node-log-settle-clean"));
+        try {
+            first.start();
+            first.setMetadataPlane(plane);
+            writeAndLeaveUnpublished(first, plane, clock, "trimmed");
+            for (ShardId shardId : new ArrayList<>(first.reconciler().openShards())) {
+                first.reconciler().publish(shardId, first.reconciler().shard(shardId).getOperationPrimaryTerm());
+            }
+            // The renewal records the trim point the publishes moved; nothing below it is needed.
+            first.renewLease(plane);
+            final String dead = first.localNode().getId();
+            clock.addAndGet(2 * TTL);
+            for (int shard = 0; shard < SHARDS; shard++) {
+                assertEquals(MetadataPlane.Settled.RELEASED_CLEAN, plane.settleAbandoned("alpha", shard, dead));
+            }
+        } finally {
+            closeQuietly(first);
+        }
+    }
+
+    public void testAHeadGivenBackNamesItsLastWriterToTheNextTaker() throws Exception {
+        final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+        final Acquisition taken = plane.heads().acquire("alpha", 0, "taker", "eph-taker", "uuid-alpha-00000000");
+        assertTrue(taken.acquired());
+        assertTrue(
+            "an open that failed gives the head back naming the node it was taking the shard from",
+            plane.heads().release("alpha", 0, "taker", taken.head().term(), "uuid-alpha-00000000", "eph-taker", "crashed-writer")
+        );
+        assertEquals("crashed-writer", plane.heads().read("alpha", 0).orElseThrow().lastWriter());
+        final Acquisition next = plane.heads().acquire("alpha", 0, "next", "eph-next", "uuid-alpha-00000000");
+        assertTrue(next.acquired());
+        assertEquals("crashed-writer", next.previousOwner());
+        assertTrue(next.previousLetGo());
+        assertNull("an owned head names no last writer", plane.heads().read("alpha", 0).orElseThrow().lastWriter());
+        assertTrue("an ordinary release names the releaser", plane.heads().release("alpha", 0, "next", next.head().term(), null, null));
+        assertEquals("next", plane.heads().read("alpha", 0).orElseThrow().lastWriter());
     }
 }

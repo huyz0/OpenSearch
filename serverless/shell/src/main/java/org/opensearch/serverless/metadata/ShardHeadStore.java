@@ -182,7 +182,14 @@ public final class ShardHeadStore {
         final ShardHead next = new ShardHead(indexName, shardId, current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis, indexUuid);
         final BlobRegisterCasResult result = container.compareAndSwapRegister(name, existing.get().generation(), next.toBytes());
         if (result.applied()) {
-            return Acquisition.won(next, otherIncarnation ? null : current.ownerNodeId());
+            if (otherIncarnation) {
+                return Acquisition.won(next, null, false);
+            }
+            // A head with an owner names whose log to read; one given back names its last writer, which let go of the
+            // shard, or was given back for when it died. A reader fences that log only if the writer is not live.
+            return current.ownerNodeId() != null
+                ? Acquisition.won(next, current.ownerNodeId(), false)
+                : Acquisition.won(next, current.lastWriter(), true);
         }
         // Someone swapped it between our read and our write. They won; route to them.
         return read(indexName, shardId).map(Acquisition::heldByAnother)
@@ -284,6 +291,37 @@ public final class ShardHeadStore {
         String expectedIndexUuid,
         String expectedEphemeralId
     ) throws IOException {
+        return release(indexName, shardId, nodeId, expectedTerm, expectedIndexUuid, expectedEphemeralId, nodeId);
+    }
+
+    /**
+     * Releases exactly the writer incarnation observed by the caller, recording whose write log may still hold the
+     * shard's unpublished records.
+     *
+     * <p>A head given back with no owner otherwise says nothing of who wrote last, and with one write log per node the
+     * records a release did not publish are in that writer's log, not the shard's: the next owner reads the log of the
+     * node recorded here.
+     *
+     * @param indexName the index name
+     * @param shardId the shard
+     * @param nodeId the stable owner ID
+     * @param expectedTerm the owned term
+     * @param expectedIndexUuid the index incarnation, or null for legacy callers
+     * @param expectedEphemeralId the process incarnation, or null for legacy callers
+     * @param lastWriter the node whose log may hold unpublished records: the releasing node, or for an open that failed
+     *     before it published, the node it was taking the shard from; null for none
+     * @return whether this writer released its own head
+     * @throws IOException if the backing store fails
+     */
+    public boolean release(
+        String indexName,
+        int shardId,
+        String nodeId,
+        long expectedTerm,
+        String expectedIndexUuid,
+        String expectedEphemeralId,
+        String lastWriter
+    ) throws IOException {
         final String name = RegisterMap.shardHeadBlob(indexName, shardId);
         final Optional<BlobRegister> existing = container.readRegister(name);
         if (existing.isEmpty()) {
@@ -307,7 +345,9 @@ public final class ShardHeadStore {
         }
         // Unowned, but still this incarnation's: the uuid is kept so the next acquirer of a recreated
         // index sees a head from the previous one and overwrites it, exactly as it would an owned one.
-        final ShardHead released = new ShardHead(indexName, shardId, current.term(), null, null, 0L, current.indexUuid());
+        final ShardHead released = new ShardHead(indexName, shardId, current.term(), null, null, 0L, current.indexUuid()).withLastWriter(
+            lastWriter
+        );
         return container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied();
     }
 
@@ -346,7 +386,9 @@ public final class ShardHeadStore {
             || oracle.revokeUnlessLive(current.ownerNodeId(), current.ownerEphemeralId()) == false) {
             return Optional.empty();
         }
-        final ShardHead released = new ShardHead(indexName, shardId, current.term() + 1, null, null, 0L, current.indexUuid());
+        // The dead owner's log may hold what it never published: whoever takes the shard next reads it.
+        final ShardHead released = new ShardHead(indexName, shardId, current.term() + 1, null, null, 0L, current.indexUuid())
+            .withLastWriter(deadNodeId);
         if (container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied() == false) {
             return Optional.empty();
         }
