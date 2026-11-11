@@ -18,10 +18,6 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.time.Instant;
-import java.time.LocalDateTime;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -48,12 +44,6 @@ import java.util.function.Predicate;
  * <p>See this package's documentation for which object stores this has been verified against.
  */
 public final class DescriptorStore {
-
-    /**
-     * How a tombstone begins. Every tombstone this store ever wrote starts this way, with or without the
-     * {@code deleted_at} that later ones carry, and no descriptor or alias record does.
-     */
-    private static final String TOMBSTONE_PREFIX = "{\"tombstone\":true";
 
     /**
      * How long a tombstone is kept before {@link #sweepTombstones} may remove it.
@@ -84,11 +74,8 @@ public final class DescriptorStore {
      */
     public static final long TOMBSTONE_REAP_HANDOFF_MILLIS = 60_000L;
 
-    /** Buckets are named for the UTC hour they start at, so an operator reading a bucket can tell when. */
-    private static final DateTimeFormatter BUCKET_FORMAT = DateTimeFormatter.ofPattern("uuuuMMddHH", java.util.Locale.ROOT)
-        .withZone(ZoneOffset.UTC);
-
     private final BlobContainer container;
+    private final DescriptorListing listing;
     private final BlobStore blobStore;
     private final BlobPath tombstonesPath;
     private final LongSupplier clock;
@@ -103,78 +90,6 @@ public final class DescriptorStore {
      */
     private volatile java.util.function.Consumer<String> onChanged = name -> {};
 
-    private static boolean isTombstone(org.opensearch.core.common.bytes.BytesReference value) {
-        if (value.length() < TOMBSTONE_PREFIX.length()) {
-            return false;
-        }
-        final byte[] head = org.opensearch.core.common.bytes.BytesReference.toBytes(value.slice(0, TOMBSTONE_PREFIX.length()));
-        return new String(head, java.nio.charset.StandardCharsets.UTF_8).equals(TOMBSTONE_PREFIX);
-    }
-
-    /** Renders a tombstone recording when the delete happened. */
-    private static org.opensearch.core.common.bytes.BytesArray tombstone(long deletedAtMillis) {
-        return tombstone(deletedAtMillis, 0L);
-    }
-
-    /**
-     * Renders a tombstone recording when the delete happened and, if non-zero, when a sweep claimed it for
-     * removal. Still begins with {@link #TOMBSTONE_PREFIX}, so every reader that treats a tombstone as
-     * absent treats a claimed one the same way.
-     */
-    private static org.opensearch.core.common.bytes.BytesArray tombstone(long deletedAtMillis, long reapingAtMillis) {
-        final String claim = reapingAtMillis == 0L ? "" : ",\"reaping_at\":" + reapingAtMillis;
-        return new org.opensearch.core.common.bytes.BytesArray(
-            (TOMBSTONE_PREFIX + ",\"deleted_at\":" + deletedAtMillis + claim + "}").getBytes(java.nio.charset.StandardCharsets.UTF_8)
-        );
-    }
-
-    /** When a tombstone's delete happened, or 0 for one written before that was recorded. */
-    private static long tombstoneDeletedAt(org.opensearch.core.common.bytes.BytesReference value) throws IOException {
-        return tombstoneField(value, "deleted_at");
-    }
-
-    /** When a sweep claimed a tombstone for removal, or 0 if none has. */
-    private static long tombstoneReapingAt(org.opensearch.core.common.bytes.BytesReference value) throws IOException {
-        return tombstoneField(value, "reaping_at");
-    }
-
-    private static long tombstoneField(org.opensearch.core.common.bytes.BytesReference value, String field) throws IOException {
-        try (
-            org.opensearch.core.xcontent.XContentParser parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
-                .createParser(
-                    org.opensearch.core.xcontent.NamedXContentRegistry.EMPTY,
-                    org.opensearch.core.xcontent.DeprecationHandler.THROW_UNSUPPORTED_OPERATION,
-                    value.streamInput()
-                )
-        ) {
-            final Object stamp = parser.map().get(field);
-            return stamp instanceof Number number ? number.longValue() : 0L;
-        }
-    }
-
-    /** The bucket a delete at this moment drops its marker into. */
-    static String tombstoneBucket(long millis) {
-        return BUCKET_FORMAT.format(Instant.ofEpochMilli(millis));
-    }
-
-    /** When a bucket starts, or -1 for a name that is not a bucket this store wrote. */
-    static long tombstoneBucketStart(String bucket) {
-        if (bucket.length() != 10 || bucket.chars().allMatch(Character::isDigit) == false) {
-            return -1L;
-        }
-        try {
-            return LocalDateTime.of(
-                Integer.parseInt(bucket.substring(0, 4)),
-                Integer.parseInt(bucket.substring(4, 6)),
-                Integer.parseInt(bucket.substring(6, 8)),
-                Integer.parseInt(bucket.substring(8, 10)),
-                0
-            ).toInstant(ZoneOffset.UTC).toEpochMilli();
-        } catch (java.time.DateTimeException e) {
-            return -1L;
-        }
-    }
-
     /**
      * Creates a store.
      *
@@ -185,6 +100,7 @@ public final class DescriptorStore {
      */
     public DescriptorStore(BlobContainer container, BlobStore blobStore, BlobPath tombstonesPath, LongSupplier clock) {
         this.container = container;
+        this.listing = new DescriptorListing(container);
         this.blobStore = blobStore;
         this.tombstonesPath = tombstonesPath;
         this.clock = clock;
@@ -246,8 +162,8 @@ public final class DescriptorStore {
             return created.currentGeneration();
         }
         final Optional<BlobRegister> current = container.readRegister(blobName);
-        if (current.isPresent() && isTombstone(current.get().value())) {
-            final long reapingAt = tombstoneReapingAt(current.get().value());
+        if (current.isPresent() && Tombstones.isTombstone(current.get().value())) {
+            final long reapingAt = Tombstones.tombstoneReapingAt(current.get().value());
             if (reapingAt != 0L && clock.getAsLong() < reapingAt + TOMBSTONE_REAP_HANDOFF_MILLIS) {
                 throw new NameBeingReclaimedException(name);
             }
@@ -274,7 +190,7 @@ public final class DescriptorStore {
         if (register.isEmpty()) {
             return Optional.empty();
         }
-        if (isTombstone(register.get().value())) {
+        if (Tombstones.isTombstone(register.get().value())) {
             // Deleted, and the blob has not been removed yet. Absent is the truthful answer.
             return Optional.empty();
         }
@@ -360,7 +276,7 @@ public final class DescriptorStore {
         Names.validateIndexOrAlias(name);
         final Optional<BlobRegister> register = container.readRegister(RegisterMap.descriptorBlob(name));
         final long generation = register.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
-        if (register.isEmpty() || isTombstone(register.get().value())) {
+        if (register.isEmpty() || Tombstones.isTombstone(register.get().value())) {
             return new Resolution(null, null, generation);
         }
         if (isAlias(register.get().value())) {
@@ -381,7 +297,7 @@ public final class DescriptorStore {
      * own contents can forge is not a discriminator. The record is small and this is one read's worth of
      * parsing on a path already doing a round trip to an object store.
      */
-    private static boolean isAlias(org.opensearch.core.common.bytes.BytesReference value) throws IOException {
+    static boolean isAlias(org.opensearch.core.common.bytes.BytesReference value) throws IOException {
         try (
             org.opensearch.core.xcontent.XContentParser parser = org.opensearch.common.xcontent.XContentType.JSON.xContent()
                 .createParser(
@@ -558,9 +474,13 @@ public final class DescriptorStore {
             }
             return deleted;
         }
-        blobStore.blobContainer(tombstonesPath.add(tombstoneBucket(nowMillis)))
+        blobStore.blobContainer(tombstonesPath.add(Tombstones.tombstoneBucket(nowMillis)))
             .writeBlob(blobName, new ByteArrayInputStream(new byte[0]), 0, false);
-        final BlobRegisterCasResult swapped = container.compareAndSwapRegister(blobName, expectedGeneration, tombstone(nowMillis));
+        final BlobRegisterCasResult swapped = container.compareAndSwapRegister(
+            blobName,
+            expectedGeneration,
+            Tombstones.tombstone(nowMillis)
+        );
         if (swapped.applied() == false) {
             return false;
         }
@@ -686,7 +606,7 @@ public final class DescriptorStore {
         }
         final List<String> removed = new ArrayList<>();
         for (String bucket : new ArrayList<>(blobStore.blobContainer(tombstonesPath).children().keySet())) {
-            final long start = tombstoneBucketStart(bucket);
+            final long start = Tombstones.tombstoneBucketStart(bucket);
             // Only a bucket whose oldest possible name has passed the quarantine; younger ones are not
             // listed at all. Not waiting for the whole bucket keeps the quarantine exact rather than up to
             // a bucket late, and costs at most one more listing of it, since each name is still checked.
@@ -812,12 +732,12 @@ public final class DescriptorStore {
     private Reaped reap(String blobName, long bucketStart, long nowMillis, long quarantineMillis, long claimAt, Map<String, Long> claimed)
         throws IOException {
         final Optional<BlobRegister> register = container.readRegister(blobName);
-        if (register.isEmpty() || isTombstone(register.get().value()) == false) {
+        if (register.isEmpty() || Tombstones.isTombstone(register.get().value()) == false) {
             // Already removed, recreated since, or a delete whose swap lost after its marker was written.
             return Reaped.STALE;
         }
         final org.opensearch.core.common.bytes.BytesReference value = register.get().value();
-        final long deletedAt = tombstoneDeletedAt(value);
+        final long deletedAt = Tombstones.tombstoneDeletedAt(value);
         if (deletedAt >= bucketStart + TOMBSTONE_BUCKET_MILLIS) {
             // Recreated and deleted again later. That delete dropped its own marker in its own bucket.
             return Reaped.STALE;
@@ -826,7 +746,7 @@ public final class DescriptorStore {
             // Stamped by a clock running ahead of this one. Its quarantine is not this sweep's to shorten.
             return Reaped.KEEP;
         }
-        final long reapingAt = tombstoneReapingAt(value);
+        final long reapingAt = Tombstones.tombstoneReapingAt(value);
         if (reapingAt != 0L && claimAt < reapingAt + TOMBSTONE_REAP_HANDOFF_MILLIS) {
             // Another sweep's claim, not yet abandoned.
             return Reaped.KEEP;
@@ -834,7 +754,7 @@ public final class DescriptorStore {
         final BlobRegisterCasResult swapped = container.compareAndSwapRegister(
             blobName,
             register.get().generation(),
-            tombstone(deletedAt, claimAt)
+            Tombstones.tombstone(deletedAt, claimAt)
         );
         if (swapped.applied()) {
             claimed.put(blobName, swapped.currentGeneration());
@@ -867,7 +787,7 @@ public final class DescriptorStore {
      * @throws IOException if listing or reading fails
      */
     public Page listPage(String after, int limit) throws IOException {
-        return listPage("", after, limit);
+        return listing.listPage(after, limit);
     }
 
     /**
@@ -881,7 +801,7 @@ public final class DescriptorStore {
      * @see #listPage(String, int)
      */
     public Page listPage(String prefix, String after, int limit) throws IOException {
-        return listPage(prefix, after, limit, DescriptorStore::readInSequence);
+        return listing.listPage(prefix, after, limit);
     }
 
     /**
@@ -902,7 +822,7 @@ public final class DescriptorStore {
         <T> List<T> runAll(List<java.util.concurrent.Callable<T>> tasks) throws InterruptedException;
     }
 
-    private static <T> List<T> readInSequence(List<java.util.concurrent.Callable<T>> tasks) {
+    static <T> List<T> readInSequence(List<java.util.concurrent.Callable<T>> tasks) {
         final List<T> results = new ArrayList<>(tasks.size());
         for (java.util.concurrent.Callable<T> task : tasks) {
             try {
@@ -926,63 +846,8 @@ public final class DescriptorStore {
      * @throws IOException if listing or any read fails
      */
     public Page listPage(String prefix, String after, int limit, Reads reads) throws IOException {
-        Names.validatePrefix(prefix);
-        if (limit < 1) {
-            throw new IllegalArgumentException("limit must be positive, got " + limit);
-        }
-        final Map<String, IndexDescriptor> page = new LinkedHashMap<>();
-        String cursor = after;
-        while (true) {
-            // One more than the page can take, so a full page knows whether anything follows it.
-            final int want = (int) Math.min((long) limit - page.size() + 1, LIST_PAGE);
-            final List<org.opensearch.common.blobstore.BlobMetadata> batch = container.listBlobsByPrefix(prefix, cursor, want);
-            // Every name the page can still take is read at once; the one beyond it only proves there is more.
-            final List<java.util.concurrent.Callable<Optional<IndexDescriptor>>> tasks = new ArrayList<>();
-            for (int i = 0; i < Math.min(batch.size(), limit - page.size()); i++) {
-                final String name = batch.get(i).name();
-                tasks.add(() -> readLive(name));
-            }
-            final List<Optional<IndexDescriptor>> read;
-            try {
-                read = reads.runAll(tasks);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new IOException("interrupted reading a page of descriptors", e);
-            }
-            for (int i = 0; i < read.size(); i++) {
-                cursor = batch.get(i).name();
-                final Optional<IndexDescriptor> descriptor = read.get(i);
-                if (descriptor == null) {
-                    throw new IOException("could not read the descriptor of [" + cursor + "]");
-                }
-                descriptor.ifPresent(d -> page.put(d.name(), d));
-            }
-            if (page.size() >= limit && batch.size() > read.size()) {
-                // There is more. Report a cursor rather than a total: knowing how many there are in
-                // total is itself a full scan, and is the question this API refuses to answer.
-                return new Page(page, cursor);
-            }
-            if (batch.size() < want) {
-                return new Page(page, null);
-            }
-            // Otherwise tombstones left the page short, or it filled exactly at the end of a listing: list
-            // on from the last name read, which re-lists any name this batch held but did not read.
-        }
+        return listing.listPage(prefix, after, limit, reads);
     }
-
-    /** A descriptor if the name holds a live one; empty for a tombstone or a name deleted since it was listed. */
-    private Optional<IndexDescriptor> readLive(String name) throws IOException {
-        final Optional<BlobRegister> register = container.readRegister(name);
-        if (register.isEmpty() || isTombstone(register.get().value()) || isAlias(register.get().value())) {
-            return Optional.empty();
-        }
-        try (InputStream in = register.get().value().streamInput()) {
-            return Optional.of(IndexDescriptor.fromStream(in));
-        }
-    }
-
-    /** The most names one listing request asks for: S3's own page size. */
-    static final int LIST_PAGE = 1000;
 
     /** A bounded page of descriptors, and where to resume. */
     public static final class Page {
@@ -1103,57 +968,7 @@ public final class DescriptorStore {
      * @throws IOException if the listing fails
      */
     public List<String> namesWithPrefix(String prefix, int cap) throws IOException {
-        Names.validatePrefix(prefix);
-        if (cap < 1) {
-            throw new IllegalArgumentException("cap must be positive, got " + cap);
-        }
-        final List<String> names = listUpToCap(prefix, cap);
-        return names != null ? names : liveNamesOrRefuse(prefix, cap);
-    }
-
-    /** Up to cap names in one serial walk; null when there are more, for the caller to settle. */
-    private List<String> listUpToCap(String prefix, int cap) throws IOException {
-        // Up to cap + 1 names, a thousand per listing, each resuming where the last stopped.
-        final List<String> names = new ArrayList<>();
-        String cursor = null;
-        while (names.size() <= cap) {
-            final int want = (int) Math.min((long) cap + 1 - names.size(), LIST_PAGE);
-            final List<org.opensearch.common.blobstore.BlobMetadata> batch = container.listBlobsByPrefix(prefix, cursor, want);
-            for (org.opensearch.common.blobstore.BlobMetadata blob : batch) {
-                names.add(blob.name());
-            }
-            if (batch.size() < want) {
-                return names;
-            }
-            cursor = batch.get(batch.size() - 1).name();
-        }
-        return null;
-    }
-
-    private List<String> liveNamesOrRefuse(String prefix, int cap) throws IOException {
-        String cursor;
-        // More names than the cap, deleted ones included. Walk the prefix again, a page at a time, reading
-        // each name to tell live from deleted and refusing once the live ones pass the cap: the reads are
-        // bounded by the cap plus the tombstones among them, and the memory by the cap.
-        final List<String> live = new ArrayList<>();
-        cursor = null;
-        while (true) {
-            final List<org.opensearch.common.blobstore.BlobMetadata> batch = container.listBlobsByPrefix(prefix, cursor, LIST_PAGE);
-            for (org.opensearch.common.blobstore.BlobMetadata blob : batch) {
-                final Optional<BlobRegister> register = container.readRegister(blob.name());
-                if (register.isEmpty() || isTombstone(register.get().value())) {
-                    continue;
-                }
-                live.add(blob.name());
-                if (live.size() > cap) {
-                    throw new TooManyMatchesException(prefix, cap);
-                }
-            }
-            if (batch.size() < LIST_PAGE) {
-                return live;
-            }
-            cursor = batch.get(batch.size() - 1).name();
-        }
+        return listing.namesWithPrefix(prefix, cap);
     }
 
     /**
@@ -1168,21 +983,6 @@ public final class DescriptorStore {
      * @throws IOException if listing or reading fails
      */
     public Map<String, IndexDescriptor> listAll() throws IOException {
-        final Map<String, IndexDescriptor> descriptors = new LinkedHashMap<>();
-        final List<String> names = new ArrayList<>(container.listBlobs().keySet());
-        for (String blobName : names) {
-            final Optional<BlobRegister> register = container.readRegister(blobName);
-            if (register.isEmpty()) {
-                continue;
-            }
-            if (isTombstone(register.get().value()) || isAlias(register.get().value())) {
-                continue;
-            }
-            try (InputStream in = register.get().value().streamInput()) {
-                final IndexDescriptor descriptor = IndexDescriptor.fromStream(in);
-                descriptors.put(descriptor.name(), descriptor);
-            }
-        }
-        return descriptors;
+        return listing.listAll();
     }
 }
