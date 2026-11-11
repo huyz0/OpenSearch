@@ -18,6 +18,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
+import org.opensearch.serverless.shell.NodeLeases;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -126,7 +127,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
 
     /** What one node holding {@code shards} shards spends on a tick that has nothing to do. */
     private long[] steadyStateTick(CountingBlobStore store, String label, int shards, int ticks) throws Exception {
-        return steadyStateTick(store, label, shards, ticks, ServerlessNode.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS);
+        return steadyStateTick(store, label, shards, ticks, NodeLeases.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS);
     }
 
     /**
@@ -234,7 +235,7 @@ public class ServerlessCostTests extends OpenSearchTestCase {
         );
 
         // What it would cost not to. The head scan can be put on an interval rather than run on every
-        // pass -- see ServerlessNode#DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS, which is zero by default because
+        // pass -- see NodeLeases#DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS, which is zero by default because
         // the saving is bought with ownership-detection latency, and three tests above encode the bargain
         // it would change. Measured here rather than argued, so the trade is a number rather than a
         // claim: between scans the tick costs the same at eight shards as at one, which is the O(shards)

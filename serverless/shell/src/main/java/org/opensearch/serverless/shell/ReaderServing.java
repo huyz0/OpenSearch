@@ -159,7 +159,7 @@ public final class ReaderServing {
                 .orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
             final org.opensearch.core.index.shard.ShardId opened = openReader(plane, indexName, shardNumber, descriptor, openingKey);
             // The read above confirmed the incarnation, so the query this open serves need not read it again.
-            node.confirmIncarnation(descriptor.uuid(), describedAt);
+            node.fences().confirmIncarnation(descriptor.uuid(), describedAt);
             mine.complete(opened);
             return opened;
         } catch (Exception e) {
@@ -187,12 +187,12 @@ public final class ReaderServing {
         node.readerShards.add(new java.util.AbstractMap.SimpleEntry<>(indexName, shardNumber));
 
         if (node.shards().localShardOf(indexName, shardNumber) == null
-            && node.reconciler.heldShards().size() >= node.admission.maxShardsHeld()
-            && node.admission.makeRoom() == false) {
+            && node.reconciler.heldShards().size() >= node.nodeCapacity().admission.maxShardsHeld()
+            && node.nodeCapacity().admission.makeRoom() == false) {
             // Readers used to be uncapped: a wide search burst could open thousands of shards on one
             // node. The same ceiling demand-driven writers have applies -- the configured one, counting
             // views -- and the same eviction makes room before this refuses.
-            node.readerOpensRefusedAtCap.incrementAndGet();
+            node.nodeCapacity().readerOpensRefusedAtCap.incrementAndGet();
             node.nodeCapacity().noteRefusedRecently(indexName, shardNumber);
             throw new IllegalStateException(
                 "this node holds "

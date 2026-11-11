@@ -349,7 +349,7 @@ final class SearchShardCalls {
         } finally {
             serving.reconciler().exit(shardId);
         }
-        // An answer from a deleted incarnation is refused rather than merged; see ServerlessNode#INCARNATION_FENCE_MILLIS.
+        // An answer from a deleted incarnation is refused rather than merged; see WriteFences#INCARNATION_FENCE_MILLIS.
         // Not for a frozen view: it is keyed by its view's id rather than the index's uuid, and outliving
         // its index is what a point in time is for.
         if (frozen == false) {
