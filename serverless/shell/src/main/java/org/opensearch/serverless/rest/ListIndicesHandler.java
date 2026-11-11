@@ -164,7 +164,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
                         return null;
                     }
                 );
-            } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
+            } catch (org.opensearch.serverless.metadata.TooManyMatchesException e) {
                 // The refusal that makes this endpoint honest. An answer cut off at a limit looks exactly
                 // like a complete one, so the caller is told to narrow the prefix instead.
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());

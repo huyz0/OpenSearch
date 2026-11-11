@@ -31,7 +31,7 @@ final class RoutingCache {
          * @return what it names
          * @throws IOException if the register cannot be read or parsed
          */
-        DescriptorStore.Resolution read(String name) throws IOException;
+        DescriptorResolution read(String name) throws IOException;
     }
 
     private final Resolver resolve;
@@ -59,7 +59,7 @@ final class RoutingCache {
     static final long DEFAULT_ROUTING_CACHE_MILLIS = 1_000L;
 
     /** A resolution and when it was read. */
-    private record CachedResolution(DescriptorStore.Resolution resolution, long atMillis, long readStartedNanos, long weight) {
+    private record CachedResolution(DescriptorResolution resolution, long atMillis, long readStartedNanos, long weight) {
     }
 
     /** Approximate retained memory budget, including the lazily rendered routing metadata. */
@@ -106,7 +106,7 @@ final class RoutingCache {
      * @return what it names
      * @throws IOException if the register cannot be read or parsed
      */
-    DescriptorStore.Resolution resolveForRouting(String name) throws IOException {
+    DescriptorResolution resolveForRouting(String name) throws IOException {
         if (routingCacheMillis <= 0L) {
             return resolve.read(name);
         }
@@ -120,7 +120,7 @@ final class RoutingCache {
             epoch = routingCacheEpoch;
         }
         final long readStartedNanos = System.nanoTime();
-        final DescriptorStore.Resolution fresh = resolve.read(name);
+        final DescriptorResolution fresh = resolve.read(name);
         synchronized (routingCacheMutation) {
             // A read started before a local mutation must not republish the invalidated value.
             if (epoch == routingCacheEpoch) {
@@ -236,7 +236,7 @@ final class RoutingCache {
         }
     }
 
-    private static long routingCacheWeight(String name, DescriptorStore.Resolution resolution) {
+    private static long routingCacheWeight(String name, DescriptorResolution resolution) {
         // Include a fixed object/entry allowance and headroom for parsed routing metadata. Counting
         // only names would leave a handful of large mappings or aliases able to exhaust the heap.
         long weight = 4096L + 2L * name.length();

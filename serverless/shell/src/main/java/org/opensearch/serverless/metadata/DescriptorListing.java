@@ -55,7 +55,7 @@ final class DescriptorListing {
      * @return the page
      * @throws IOException if listing or reading fails
      */
-    public DescriptorStore.Page listPage(String after, int limit) throws IOException {
+    public DescriptorPage listPage(String after, int limit) throws IOException {
         return listPage("", after, limit);
     }
 
@@ -69,7 +69,7 @@ final class DescriptorListing {
      * @throws IOException if listing or reading fails
      * @see #listPage(String, int)
      */
-    public DescriptorStore.Page listPage(String prefix, String after, int limit) throws IOException {
+    public DescriptorPage listPage(String prefix, String after, int limit) throws IOException {
         return listPage(prefix, after, limit, DescriptorStore::readInSequence);
     }
 
@@ -84,7 +84,7 @@ final class DescriptorListing {
      * @return the page
      * @throws IOException if listing or any read fails
      */
-    public DescriptorStore.Page listPage(String prefix, String after, int limit, DescriptorStore.Reads reads) throws IOException {
+    public DescriptorPage listPage(String prefix, String after, int limit, DescriptorStore.Reads reads) throws IOException {
         Names.validatePrefix(prefix);
         if (limit < 1) {
             throw new IllegalArgumentException("limit must be positive, got " + limit);
@@ -119,10 +119,10 @@ final class DescriptorListing {
             if (page.size() >= limit && batch.size() > read.size()) {
                 // There is more. Report a cursor rather than a total: knowing how many there are in
                 // total is itself a full scan, and is the question this API refuses to answer.
-                return new DescriptorStore.Page(page, cursor);
+                return new DescriptorPage(page, cursor);
             }
             if (batch.size() < want) {
-                return new DescriptorStore.Page(page, null);
+                return new DescriptorPage(page, null);
             }
             // Otherwise tombstones left the page short, or it filled exactly at the end of a listing: list
             // on from the last name read, which re-lists any name this batch held but did not read.
@@ -173,7 +173,7 @@ final class DescriptorListing {
      * @param prefix the prefix, which may be empty to mean every name
      * @param cap the most names to return
      * @return the matching names, in lexicographic order
-     * @throws DescriptorStore.TooManyMatchesException if more than {@code cap} live names match
+     * @throws TooManyMatchesException if more than {@code cap} live names match
      * @throws IOException if the listing fails
      */
     public List<String> namesWithPrefix(String prefix, int cap) throws IOException {
@@ -220,7 +220,7 @@ final class DescriptorListing {
                 }
                 live.add(blob.name());
                 if (live.size() > cap) {
-                    throw new DescriptorStore.TooManyMatchesException(prefix, cap);
+                    throw new TooManyMatchesException(prefix, cap);
                 }
             }
             if (batch.size() < LIST_PAGE) {

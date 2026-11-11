@@ -312,7 +312,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
                             null
                         )
                     );
-                } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
+                } catch (org.opensearch.serverless.metadata.TooManyMatchesException e) {
                     keep(items, budget, new Item(null, false, List.of(), RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage()));
                 } catch (Exception e) {
                     // This search's problem, not the batch's. The slot carries the failure so a caller

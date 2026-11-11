@@ -177,7 +177,7 @@ final class SearchIndexResolver {
             } else {
                 try {
                     matched = metadata.namesWithPrefix(prefix, serving.searchSettings().patternCap());
-                } catch (org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException e) {
+                } catch (org.opensearch.serverless.metadata.TooManyMatchesException e) {
                     return SearchHandler.Resolution.refuse(RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
                 }
             }
@@ -244,7 +244,7 @@ final class SearchIndexResolver {
         // Every name's resolution at once, through the fan-out, before the loop below reads them in order: one
         // register read per name was a serial chain as long as the pattern was wide -- five thousand round trips
         // before the first shard was asked. Each read lands in the routing cache the loop then reads from.
-        final java.util.Map<String, org.opensearch.serverless.metadata.DescriptorStore.Resolution> prefetched = prefetch(
+        final java.util.Map<String, org.opensearch.serverless.metadata.DescriptorResolution> prefetched = prefetch(
             serving,
             metadata,
             names
@@ -261,7 +261,7 @@ final class SearchIndexResolver {
             // Through the routing cache: this was a register read per named index on every search. A stale
             // resolution routes to a shard that refuses to answer for a deleted incarnation; see
             // MetadataPlane#resolveForRouting.
-            final org.opensearch.serverless.metadata.DescriptorStore.Resolution early = prefetched.get(name);
+            final org.opensearch.serverless.metadata.DescriptorResolution early = prefetched.get(name);
             final var resolved = early != null ? early : metadata.resolveForRouting(name);
             if (resolved.absent()) {
                 if (fromPattern.contains(name)) {
@@ -445,12 +445,12 @@ final class SearchIndexResolver {
     }
 
     /** Resolves many names concurrently; a name whose read failed is left for the caller to read and fail on. */
-    static java.util.Map<String, org.opensearch.serverless.metadata.DescriptorStore.Resolution> prefetch(
+    static java.util.Map<String, org.opensearch.serverless.metadata.DescriptorResolution> prefetch(
         ServerlessNode serving,
         MetadataPlane metadata,
         java.util.Collection<String> names
     ) {
-        final java.util.Map<String, org.opensearch.serverless.metadata.DescriptorStore.Resolution> resolved =
+        final java.util.Map<String, org.opensearch.serverless.metadata.DescriptorResolution> resolved =
             new java.util.concurrent.ConcurrentHashMap<>();
         if (names.size() < 2) {
             return resolved;

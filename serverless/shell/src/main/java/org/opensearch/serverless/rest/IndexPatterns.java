@@ -45,7 +45,7 @@ final class IndexPatterns {
      * @param requested what the caller typed, comma-separated
      * @param cap the most matches a single pattern may produce
      * @return the resolved names, in the order they were first seen, without duplicates
-     * @throws org.opensearch.serverless.metadata.DescriptorStore.TooManyMatchesException if a pattern matches
+     * @throws org.opensearch.serverless.metadata.TooManyMatchesException if a pattern matches
      *     more than the cap
      * @throws IOException if listing fails
      */
