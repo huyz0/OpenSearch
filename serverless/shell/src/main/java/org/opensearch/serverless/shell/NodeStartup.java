@@ -149,6 +149,7 @@ public final class NodeStartup {
         node.localNode = node.transportService.getLocalNode();
         node.router = new org.opensearch.serverless.transport.ShardRouter(node, node.transportService, () -> node.metadataPlane);
         node.router.registerHandlers();
+        org.opensearch.serverless.transport.CacheWarmCopy.of(node).registerHandlers();
 
         // Built here rather than in the constructor: both need the node identity, and the identity is
         // not final until the transport has bound and told us the address it got.

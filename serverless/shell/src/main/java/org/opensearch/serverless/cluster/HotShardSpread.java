@@ -59,6 +59,22 @@ public final class HotShardSpread {
     private final Map<String, Rate> rates = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> inFlight = new ConcurrentHashMap<>();
 
+    private static final Map<Object, HotShardSpread> BY_NODE = new java.util.WeakHashMap<>();
+
+    /**
+     * Returns a node's spread, one per node, built from its settings on first use. Its searches pick readers by it, and
+     * a peer asked what a joining node will serve reads how wide each hot shard has gone from it.
+     *
+     * @param node the node, held weakly
+     * @param settings the node's settings
+     * @return its spread
+     */
+    public static HotShardSpread of(Object node, Settings settings) {
+        synchronized (BY_NODE) {
+            return BY_NODE.computeIfAbsent(node, n -> new HotShardSpread(settings, System::nanoTime));
+        }
+    }
+
     /**
      * Builds a spread from a node's settings.
      *
