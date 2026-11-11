@@ -409,7 +409,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
             assertEquals("and the global checkpoint with it", 2L, stats.getGlobalCheckpoint());
 
             writer.reconciler().shard(shardId).refresh("test");
-            writer.publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
+            writer.shards().publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
         }
 
         // A commit whose max sequence number sits above its global checkpoint is the shape ReadOnlyEngine

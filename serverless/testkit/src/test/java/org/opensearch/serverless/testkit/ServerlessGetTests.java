@@ -223,7 +223,7 @@ public class ServerlessGetTests extends OpenSearchTestCase {
         final ShardId held = writer.reconciler().openShards().iterator().next();
         // A clean handover: the head is released, so nothing names an owner.
         assertTrue("the writer should be able to release the head it holds", plane.heads().release("alpha", 0, writer.localNode().getId()));
-        writer.releaseShard(held, "test: scaling to zero");
+        writer.shards().releaseShard(held, "test: scaling to zero");
         writer.close();
 
         assertTrue("nobody should own the shard now", plane.heads().read("alpha", 0).map(h -> h.ownerNodeId()).isEmpty());

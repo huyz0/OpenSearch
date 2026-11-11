@@ -174,17 +174,18 @@ final class LeaseUpkeep {
 
     /** A head the heartbeat read within one renewal, or a fresh read that is then noted for the others. */
     Optional<org.opensearch.serverless.metadata.ShardHead> recentOrReadHead(ShardId shardId) throws IOException {
-        final Optional<org.opensearch.serverless.metadata.ShardHead> recent = reconciler.node.recentHead(
-            shardId.getIndexName(),
-            shardId.id(),
-            Math.max(1_000L, reconciler.plane.leaseTtlMillis() / ReconcileScheduler.RENEWALS_PER_TTL)
-        );
+        final Optional<org.opensearch.serverless.metadata.ShardHead> recent = reconciler.node.sightings()
+            .recentHead(
+                shardId.getIndexName(),
+                shardId.id(),
+                Math.max(1_000L, reconciler.plane.leaseTtlMillis() / ReconcileScheduler.RENEWALS_PER_TTL)
+            );
         if (recent.isPresent()) {
             return recent;
         }
         final Optional<org.opensearch.serverless.metadata.ShardHead> read = reconciler.plane.heads()
             .read(shardId.getIndexName(), shardId.id());
-        reconciler.node.noteHead(shardId.getIndexName(), shardId.id(), read.orElse(null));
+        reconciler.node.sightings().noteHead(shardId.getIndexName(), shardId.id(), read.orElse(null));
         return read;
     }
 }

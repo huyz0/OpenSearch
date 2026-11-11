@@ -64,7 +64,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
                 ShardOps.indexDoc(writer.reconciler().shard(shardId), String.valueOf(i), "{\"msg\":\"searchable\",\"n\":" + i + "}");
             }
             writer.reconciler().shard(shardId).refresh("p5");
-            writer.publishShard(shardId, term);
+            writer.shards().publishShard(shardId, term);
         }
     }
 
@@ -112,7 +112,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
             );
 
             // And publishing is refused early, with a reason rather than a Lucene-level complaint.
-            final Exception refused = expectThrows(Exception.class, () -> reader.publishShard(shardId, 1L));
+            final Exception refused = expectThrows(Exception.class, () -> reader.shards().publishShard(shardId, 1L));
             assertTrue("the refusal must explain itself: " + refused.getMessage(), refused.getMessage().contains("owns no head"));
         }
     }
@@ -213,7 +213,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
                 final ShardId onWriter = writer2.activation().syncFrom(plane).iterator().next();
                 ShardOps.indexDoc(writer2.reconciler().shard(onWriter), "3", "{\"msg\":\"searchable\",\"n\":3}");
                 writer2.reconciler().shard(onWriter).refresh("p5");
-                writer2.publishShard(onWriter, term);
+                writer2.shards().publishShard(onWriter, term);
             }
 
             // The already-open reader still serves the commit it opened -- it is a cache, not a follower.
@@ -224,7 +224,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
             );
 
             // Re-opening picks up the newer commit. The background reconciler makes this automatic.
-            reader.releaseShard(shardId, "reopening onto a newer commit");
+            reader.shards().releaseShard(shardId, "reopening onto a newer commit");
             final ShardId reopened = reader.readers().serveAsReader(plane, "alpha", 0);
             assertEquals(
                 "a reopened reader did not see the newer commit",
@@ -280,7 +280,7 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
                     final ShardId onWriter = writer2.activation().syncFrom(plane).iterator().next();
                     ShardOps.indexDoc(writer2.reconciler().shard(onWriter), "3", "{\"msg\":\"searchable\",\"n\":3}");
                     writer2.reconciler().shard(onWriter).refresh("p5");
-                    writer2.publishShard(onWriter, term);
+                    writer2.shards().publishShard(onWriter, term);
                 }
 
                 assertEquals("the pass must let go of the stale reader", java.util.Set.of(shardId), loop.refreshReaders());

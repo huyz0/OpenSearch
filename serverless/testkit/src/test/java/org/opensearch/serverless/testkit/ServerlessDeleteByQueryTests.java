@@ -97,7 +97,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
                 .findFirst()
                 .orElseThrow();
             final long term = plane.heads().read(index, shard).orElseThrow().term();
-            node.publishShard(shardId, term);
+            node.shards().publishShard(shardId, term);
         }
     }
 

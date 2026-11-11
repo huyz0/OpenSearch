@@ -113,7 +113,7 @@ public class ServerlessShardTests extends OpenSearchTestCase {
                 .next();
             assertEquals(1, node.reconciler().openShards().size());
 
-            node.releaseShard(shardId, "shard-head says another node owns it now");
+            node.shards().releaseShard(shardId, "shard-head says another node owns it now");
 
             assertTrue("release did not close the shard", node.reconciler().openShards().isEmpty());
             assertNull(node.reconciler().shard(shardId));
