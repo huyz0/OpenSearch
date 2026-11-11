@@ -251,6 +251,9 @@ public final class BackgroundReconciler implements Closeable {
     /** Per shard, the files of the manifest the last sweep ran against. */
     final Map<ShardId, Set<String>> sweptAgainst = new ConcurrentHashMap<>();
 
+    /** Per shard, what the last sweep named in older terms, so the next one need not list them. */
+    final Map<ShardId, SweepScope> sweepScopes = new ConcurrentHashMap<>();
+
     /** Shards whose next sweep must run whatever their manifest says. */
     final Set<ShardId> forceSweep = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
