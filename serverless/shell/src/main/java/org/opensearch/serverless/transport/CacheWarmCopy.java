@@ -74,6 +74,13 @@ public final class CacheWarmCopy {
     /** The default: enough to keep a joiner's network busy without one peer's slowness setting the pace of all. */
     static final int DEFAULT_PARALLEL_PEERS = 8;
 
+    /**
+     * Whether a joiner copies blocks from peers in other zones; false by default. A block from a peer in another zone
+     * is billed by the byte both ways, about four hundred times what reading the same block from the object store in
+     * 8 MB ranges costs, so by default such a peer is asked only what it holds and the blocks are read from the store.
+     */
+    public static final String CROSS_ZONE = "serverless.search.warm_copy.cross_zone";
+
     /** The most blocks a peer hands over in one answer, whatever it is asked for. */
     static final int MAX_BATCH_BLOCKS = 1024;
 
@@ -121,6 +128,7 @@ public final class CacheWarmCopy {
     private final int parallelPeers;
     private final long maxBytes;
     private final long recentMillis;
+    private final boolean crossZone;
     private volatile LongSupplier nanoClock = System::nanoTime;
     private volatile Pause pause = nanos -> Thread.sleep(nanos / 1_000_000L, (int) (nanos % 1_000_000L));
 
@@ -132,6 +140,7 @@ public final class CacheWarmCopy {
         final BlockCache cache = router.node.blockCache();
         this.maxBytes = Math.max(0L, router.node.settings().getAsLong(MAX_BYTES, (long) cache.maxBlocks() * cache.blockSize() / 4));
         this.recentMillis = router.node.settings().getAsTime(RECENT_WINDOW, DEFAULT_RECENT_WINDOW).millis();
+        this.crossZone = router.node.settings().getAsBoolean(CROSS_ZONE, false);
     }
 
     /**
@@ -316,7 +325,8 @@ public final class CacheWarmCopy {
      * @param peers the peers to copy from
      * @param fraction the share of named blocks, from 0 to 1, at which to call {@code atFraction}
      * @param atFraction called once, on a copying thread, with the shards this node will serve, when that share is held,
-     *                   or at the end if it never is
+     *                   or at the end if it never is; not at the end when blocks were left for the store, which the
+     *                   caller reads from {@link Outcome#unheld} before it counts as warm
      * @return what was copied, and the shards this node will serve
      */
     public Outcome copyFrom(List<String> peers, double fraction, java.util.function.Consumer<Set<Shard>> atFraction) {
@@ -384,6 +394,18 @@ public final class CacheWarmCopy {
                 }
                 offered.put(got.get().getKey(), hottestFirst(perShard));
             }
+            // Peers in this node's zone first, so a block two peers offer comes from the one whose copy is not billed.
+            final Map<DiscoveryNode, List<String>> byZone = new LinkedHashMap<>();
+            for (boolean sameZone : new boolean[] { true, false }) {
+                offered.forEach((peer, keys) -> {
+                    if ((router.pathTo(peer) != ZoneTraffic.Path.CROSS_ZONE) == sameZone) {
+                        byZone.put(peer, keys);
+                    }
+                });
+            }
+            offered.clear();
+            offered.putAll(byZone);
+            long fromStore = 0;
             // One budget across every peer, after dedupe: the peers' lists are taken in turn, hottest first, and a block
             // two peers both offer is taken once, from the first to offer it. A block already held costs nothing.
             final Map<DiscoveryNode, List<String>> wantedFrom = new LinkedHashMap<>();
@@ -406,7 +428,12 @@ public final class CacheWarmCopy {
                         missed.incrementAndGet();
                     } else if (budget >= cache.blockSize()) {
                         budget -= cache.blockSize();
-                        wantedFrom.computeIfAbsent(peer.getKey(), k -> new ArrayList<>()).add(key);
+                        if (crossZone || router.pathTo(peer.getKey()) != ZoneTraffic.Path.CROSS_ZONE) {
+                            wantedFrom.computeIfAbsent(peer.getKey(), k -> new ArrayList<>()).add(key);
+                        } else {
+                            // Named, and left for the caller to read from the store, which no zone bills.
+                            fromStore++;
+                        }
                     } else {
                         continue;
                     }
@@ -414,11 +441,14 @@ public final class CacheWarmCopy {
                 }
             }
             final Set<Shard> share = Set.copyOf(shards.keySet());
+            // Blocks left for the store still count towards the share, and only a copy reaches it. When any were left, the
+            // end of the copy is not a ready point either: the caller has them still to read.
             final Threshold threshold = new Threshold(
                 fraction,
                 shards.values().stream().mapToLong(Set::size).sum(),
                 held,
-                () -> atFraction.accept(share)
+                () -> atFraction.accept(share),
+                fromStore == 0
             );
             // Then every peer's blocks at once.
             final List<java.util.concurrent.Callable<Object>> work = new ArrayList<>();
@@ -548,9 +578,12 @@ public final class CacheWarmCopy {
         private final java.util.concurrent.atomic.AtomicLong held;
         private final java.util.concurrent.atomic.AtomicBoolean called = new java.util.concurrent.atomic.AtomicBoolean();
 
-        Threshold(double fraction, long named, long alreadyHeld, Runnable callback) {
+        private final boolean fireAtEnd;
+
+        Threshold(double fraction, long named, long alreadyHeld, Runnable callback, boolean fireAtEnd) {
             this.needed = (long) Math.ceil(Math.max(0.0, Math.min(1.0, fraction)) * named);
             this.callback = callback;
+            this.fireAtEnd = fireAtEnd;
             this.held = new java.util.concurrent.atomic.AtomicLong(alreadyHeld);
             if (alreadyHeld >= needed) {
                 fire();
@@ -564,7 +597,9 @@ public final class CacheWarmCopy {
         }
 
         void end() {
-            fire();
+            if (fireAtEnd) {
+                fire();
+            }
         }
 
         private void fire() {
