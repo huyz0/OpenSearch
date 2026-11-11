@@ -102,4 +102,54 @@ public class NodeLogRecordsSinceTests extends OpenSearchTestCase {
             assertTrue(idsSince(log, shardId, term, checkpoint).contains("still-writable"));
         }
     }
+
+    public void testAPinKeepsRecordsReadablePastPublishesUntilItIsClosedOrLapses() throws Exception {
+        final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("node-log-pin"))) {
+            node.startup().start();
+            node.setMetadataPlane(plane);
+            node.leases().renewLease(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("alpha", 0);
+            loop.tick(clock.get());
+            final ShardId shardId = node.reconciler().openShards().iterator().next();
+            final NodeLogWriter log = node.nodeLogWriter();
+
+            final WriteOutcome base = node.writes().index(shardId, "base", "{\"msg\":\"m\",\"n\":0}");
+            final long term = base.primaryTerm();
+            loop.publishAll();
+            final var pin = log.retain(shardId, 60_000L);
+            expectThrows(IllegalStateException.class, () -> log.retain(shardId, 60_000L));
+            // The commit the caller starts from is read after the pin: here, the one holding "base".
+            final long checkpoint = base.seqNo();
+            final List<String> written = new ArrayList<>();
+            for (int round = 0; round < 3; round++) {
+                for (int i = 0; i < 2; i++) {
+                    final String id = "r" + round + "-" + i;
+                    node.writes().index(shardId, id, "{\"msg\":\"m\",\"n\":" + i + "}");
+                    written.add(id);
+                }
+                loop.publishAll();
+                log.renew();
+                assertEquals("published, and still readable while pinned", written, idsSince(log, shardId, term, checkpoint));
+            }
+            pin.close();
+            assertEquals("closed: the published records are let go of", List.of(), idsSince(log, shardId, term, checkpoint));
+            log.renew();
+
+            final var short_ = log.retain(shardId, 1L);
+            node.writes().index(shardId, "late", "{\"msg\":\"m\",\"n\":9}");
+            loop.publishAll();
+            final long until = System.nanoTime() + 50_000_000L;
+            while (System.nanoTime() < until) {
+                Thread.onSpinWait();
+            }
+            log.renew();
+            expectThrows(java.io.IOException.class, () -> idsSince(log, shardId, term, checkpoint));
+            short_.close();
+            assertEquals("closed after a lapse, it reads again", List.of(), idsSince(log, shardId, term, checkpoint));
+        }
+    }
 }

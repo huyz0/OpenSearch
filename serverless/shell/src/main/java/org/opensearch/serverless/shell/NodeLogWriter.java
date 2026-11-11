@@ -187,6 +187,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
      */
     public void renew() throws IOException {
         synchronized (leaseLock) {
+            committer.expirePins();
             completed.addAll(committer.takeComplete());
             final List<NodeLogEpoch> mine = committer.positions();
             leaseWriter.write(withInherited(mine), false);
@@ -340,9 +341,9 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
      * moves part of a shard elsewhere and filters what it is handed, such as a shard split. It reads only; it fences
      * nothing a live writer uses, and changes nothing.
      *
-     * <p>The node log keeps a shard's records only until a commit holding them is published, so {@code afterSeqNo} must
-     * be at or past the local checkpoint of the shard's latest published commit; records the log has let go of are not
-     * streamed. Records of a write not yet acknowledged are not streamed either: a caller that needs every write holds
+     * <p>The node log keeps a shard's records only until a commit holding them is published, unless the shard is pinned
+     * with {@link #retain}, so {@code afterSeqNo} must be at or past the local checkpoint of the latest commit published
+     * before the pin, or before the read when there is none; records the log has let go of are not streamed. Records of a write not yet acknowledged are not streamed either: a caller that needs every write holds
      * the shard's writes first.
      *
      * @param shardId the shard
@@ -350,18 +351,45 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
      * @param afterSeqNo the highest sequence number the caller already has; negative for every record the log keeps
      * @param consumer what takes each record
      * @return how many records were streamed
-     * @throws IOException if a read fails
+     * @throws IOException if a read fails, or the shard's pin lapsed
      */
     public long forEachRecordSince(ShardId shardId, long term, long afterSeqNo, CheckedConsumer<WalRecord, IOException> consumer)
         throws IOException {
+        final ShardKey key = keyOf(shardId);
         final long[] count = { 0 };
-        replay(shardId, null, term, record -> {
+        final CheckedConsumer<WalRecord, IOException> filtering = record -> {
             if (record.seqNo() > afterSeqNo) {
                 count[0]++;
                 consumer.accept(record);
             }
-        });
+        };
+        if (inherited.isEmpty() == false) {
+            takeoverOf(nodeId, own, inherited, term, null).forEachRecord(key, filtering);
+        }
+        final NodeLogTakeover reader = new NodeLogTakeover(own, List.of(), nodeId, term);
+        for (Map.Entry<Long, List<Range>> runs : committer.heldRuns(key).entrySet()) {
+            reader.forEachRecordIn(runs.getKey(), runs.getValue(), key, filtering);
+        }
         return count[0];
+    }
+
+    /**
+     * Pins what the node log holds of a shard, so {@link #forEachRecordSince} goes on streaming it after the shard
+     * publishes: for a caller that builds from a commit while the shard keeps publishing, such as a shard split. Take the
+     * pin first, then read the commit to start from, whose checkpoint covers what the log let go of before the pin.
+     *
+     * <p>While the pin is open the log keeps every blob holding the shard's records since the pin, so it grows with the
+     * shard's writes. A pin past {@code maxMillis} lapses: the log lets go of what it kept, and {@link #forEachRecordSince}
+     * throws for the shard until the pin is closed or another is taken, so the caller starts over rather than miss
+     * records.
+     *
+     * @param shardId the shard
+     * @param maxMillis how long the pin may last; at least 1
+     * @return the pin, which the caller closes
+     * @throws IllegalStateException if the shard is already pinned
+     */
+    public NodeLogCommitter.Pin retain(ShardId shardId, long maxMillis) {
+        return committer.pin(keyOf(shardId), maxMillis);
     }
 
     /**
