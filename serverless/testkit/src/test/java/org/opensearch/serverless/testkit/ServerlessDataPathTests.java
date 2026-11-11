@@ -275,7 +275,7 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
         send(writerHttp, "PUT", "/cold?shards=1", MAPPING);
         final var shardId = writer.activation().activateWriter(plane, "cold", 0).orElseThrow();
         assertEquals(201, send(writerHttp, "PUT", "/cold/_doc/1?refresh=true", "{\"msg\":\"cached\",\"n\":1}").status());
-        writer.publishShard(shardId, plane.heads().read("cold", 0).orElseThrow().term());
+        writer.shards().publishShard(shardId, plane.heads().read("cold", 0).orElseThrow().term());
         writer.close();
 
         // A search-only node that has never seen this index, and no writer is left alive.

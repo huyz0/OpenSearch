@@ -61,7 +61,7 @@ public class ServerlessReaderBecomesWriterTests extends OpenSearchTestCase {
                 ShardOps.indexDoc(writer.reconciler().shard(shardId), name + "-" + i, "{\"msg\":\"searchable\",\"n\":" + i + "}");
             }
             writer.reconciler().shard(shardId).refresh("reader-writer");
-            writer.publishShard(shardId, term);
+            writer.shards().publishShard(shardId, term);
         }
     }
 

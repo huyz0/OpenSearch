@@ -140,7 +140,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             ShardOps.indexDoc(a.reconciler().shard(shardId), String.valueOf(i), "{\"msg\":\"durable\",\"n\":" + i + "}");
         }
         a.reconciler().shard(shardId).refresh("p6");
-        a.publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
+        a.shards().publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
 
         // The process dies. Nothing is released and nothing is told.
         a.close();
@@ -172,7 +172,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             final long zombieTerm = plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"before the pause\",\"n\":1}");
             zombie.reconciler().shard(onZombie).refresh("p6");
-            zombie.publishShard(onZombie, zombieTerm);
+            zombie.shards().publishShard(onZombie, zombieTerm);
 
             // The JVM pauses. No heartbeat, no release, no awareness of anything.
             clock.set(1_000L + TTL);
@@ -181,7 +181,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             assertTrue("the successor must hold a higher term", successorTerm > zombieTerm);
             ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"after takeover\",\"n\":2}");
             successor.reconciler().shard(onSuccessor).refresh("p6");
-            successor.publishShard(onSuccessor, successorTerm);
+            successor.shards().publishShard(onSuccessor, successorTerm);
 
             // The zombie wakes. It has no idea it lost anything, and it keeps working.
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"from the zombie\",\"n\":3}");
@@ -191,7 +191,10 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             assertEquals(1L, ShardOps.hits(zombie.searchService(), onZombie, "msg", "zombie"));
 
             // But it cannot make anyone else believe them.
-            final StaleWriterException fenced = expectThrows(StaleWriterException.class, () -> zombie.publishShard(onZombie, zombieTerm));
+            final StaleWriterException fenced = expectThrows(
+                StaleWriterException.class,
+                () -> zombie.shards().publishShard(onZombie, zombieTerm)
+            );
             assertTrue(fenced.getMessage().contains("term " + zombieTerm));
 
             // The successor's commit is untouched: still its term, and still what a reader would get.
@@ -261,7 +264,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             final java.util.concurrent.atomic.AtomicReference<Throwable> thrown = new java.util.concurrent.atomic.AtomicReference<>();
             final Thread publishing = new Thread(() -> {
                 try {
-                    loser.publishShard(onLoser, loserTerm);
+                    loser.shards().publishShard(onLoser, loserTerm);
                 } catch (Throwable t) {
                     thrown.set(t);
                 }
@@ -279,7 +282,7 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             assertTrue("the successor must hold a higher term", winnerTerm > loserTerm);
             ShardOps.indexDoc(winner.reconciler().shard(onWinner), "2", "{\"msg\":\"from the winner\",\"n\":2}");
             winner.reconciler().shard(onWinner).refresh("p6");
-            winner.publishShard(onWinner, winnerTerm);
+            winner.shards().publishShard(onWinner, winnerTerm);
 
             // Now the loser wakes up and finishes a publish it began when it was still the owner.
             store.release();

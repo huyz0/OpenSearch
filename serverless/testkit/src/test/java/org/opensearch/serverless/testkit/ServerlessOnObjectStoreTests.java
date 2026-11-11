@@ -221,7 +221,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
 
             // Not a clean handover: drop the shard and the lease the way a crash would, without letting
             // the node publish on its way out.
-            first.node().releaseShard(shardId, "simulating a writer that stopped without unwinding");
+            first.node().shards().releaseShard(shardId, "simulating a writer that stopped without unwinding");
             first.plane().membership().release(first.node().localNode().getId());
         } finally {
             // A clean stop, and this test says so rather than pretending otherwise: it releases the lease
@@ -370,7 +370,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             final java.util.concurrent.atomic.AtomicReference<Throwable> thrown = new java.util.concurrent.atomic.AtomicReference<>();
             final Thread publishing = new Thread(() -> {
                 try {
-                    loser.publishShard(onLoser, loserTerm);
+                    loser.shards().publishShard(onLoser, loserTerm);
                 } catch (Throwable t) {
                     thrown.set(t);
                 }
@@ -384,7 +384,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             assertTrue("the successor must hold a higher term", winnerTerm > loserTerm);
             ShardOps.indexDoc(winner.reconciler().shard(onWinner), "2", "{\"msg\":\"from the winner\",\"n\":2}");
             winner.reconciler().shard(onWinner).refresh("fence");
-            winner.publishShard(onWinner, winnerTerm);
+            winner.shards().publishShard(onWinner, winnerTerm);
 
             store.release();
             publishing.join(TimeUnit.MINUTES.toMillis(3));

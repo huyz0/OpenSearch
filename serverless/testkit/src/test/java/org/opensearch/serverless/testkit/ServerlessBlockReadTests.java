@@ -97,7 +97,7 @@ public class ServerlessBlockReadTests extends OpenSearchTestCase {
                 .shard(shardId)
                 .forceMerge(new org.opensearch.action.admin.indices.forcemerge.ForceMergeRequest().maxNumSegments(1).flush(true));
             writer.reconciler().shard(shardId).refresh("blocks");
-            writer.publishShard(shardId, plane.heads().read("bulky", 0).orElseThrow().term());
+            writer.shards().publishShard(shardId, plane.heads().read("bulky", 0).orElseThrow().term());
         }
 
         final long published = publishedBytes(plane, objectStore, "bulky", 0);
@@ -165,7 +165,7 @@ public class ServerlessBlockReadTests extends OpenSearchTestCase {
                 writer.writes().index(shardId, "d" + i, "{\"msg\":\"repeated\",\"n\":" + i + "}");
             }
             writer.reconciler().shard(shardId).refresh("blocks");
-            writer.publishShard(shardId, plane.heads().read("warm", 0).orElseThrow().term());
+            writer.shards().publishShard(shardId, plane.heads().read("warm", 0).orElseThrow().term());
         }
 
         try (ServerlessNode reader = new ServerlessNode(nodeSettings("blocks-r2", "search"))) {

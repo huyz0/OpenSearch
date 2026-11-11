@@ -431,7 +431,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             renewalTask = threadPool.schedule(
                 this::runRenewal,
                 nextRenewalDelay(),
-                org.opensearch.serverless.shell.ServerlessNode.LEASE_POOL
+                org.opensearch.serverless.shell.NodeThreadPools.LEASE_POOL
             );
         }
     }

@@ -113,20 +113,23 @@ public class ServerlessCacheBoundTests extends OpenSearchTestCase {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         try (ServerlessNode node = new ServerlessNode(nodeSettings())) {
             node.setMetadataPlane(plane);
-            node.setRecentHeadsPruneAbove(5);
+            node.sightings().setRecentHeadsPruneAbove(5);
             final int shards = 20;
             for (int i = 0; i < shards; i++) {
-                node.noteHead("idx", i, new ShardHead("idx", i, 1L, "owner", "ephemeral", clock.get() + TTL));
+                node.sightings().noteHead("idx", i, new ShardHead("idx", i, 1L, "owner", "ephemeral", clock.get() + TTL));
             }
-            assertTrue("every sighting inside one lease is held: " + node.recentHeadCount(), node.recentHeadCount() >= shards - 1);
+            assertTrue(
+                "every sighting inside one lease is held: " + node.sightings().recentHeadCount(),
+                node.sightings().recentHeadCount() >= shards - 1
+            );
 
             clock.addAndGet(TTL + 1);
-            node.noteHead("idx", 0, new ShardHead("idx", 0, 1L, "owner", "ephemeral", clock.get() + TTL));
+            node.sightings().noteHead("idx", 0, new ShardHead("idx", 0, 1L, "owner", "ephemeral", clock.get() + TTL));
             assertTrue(
-                "past a lease, sightings nothing would believe must be dropped: " + node.recentHeadCount(),
-                node.recentHeadCount() <= 1
+                "past a lease, sightings nothing would believe must be dropped: " + node.sightings().recentHeadCount(),
+                node.sightings().recentHeadCount() <= 1
             );
-            assertEquals("and the fresh one is still a hint", "owner", node.ownerHint("idx", 0).orElseThrow());
+            assertEquals("and the fresh one is still a hint", "owner", node.sightings().ownerHint("idx", 0).orElseThrow());
         }
     }
 

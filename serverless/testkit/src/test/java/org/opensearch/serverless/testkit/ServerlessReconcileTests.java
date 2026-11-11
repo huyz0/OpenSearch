@@ -161,7 +161,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
             zombie.reconciler().shard(onZombie).refresh("p8");
-            final CommitManifest firstCommit = zombie.publishShard(onZombie, term1);
+            final CommitManifest firstCommit = zombie.shards().publishShard(onZombie, term1);
             assertFalse(firstCommit.files().isEmpty());
 
             // Successor takes over and publishes, INHERITING term 1's files rather than re-uploading.
@@ -170,7 +170,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
             successor.reconciler().shard(onSuccessor).refresh("p8");
-            final CommitManifest liveCommit = successor.publishShard(onSuccessor, term2);
+            final CommitManifest liveCommit = successor.shards().publishShard(onSuccessor, term2);
 
             final long inheritedFromTerm1 = liveCommit.files()
                 .keySet()
@@ -232,14 +232,14 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
             zombie.reconciler().shard(onZombie).refresh("p8");
-            zombie.publishShard(onZombie, term1);
+            zombie.shards().publishShard(onZombie, term1);
 
             clock.set(1_000L + TTL);
             final ShardId onSuccessor = successor.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
             successor.reconciler().shard(onSuccessor).refresh("p8");
-            final CommitManifest liveCommit = successor.publishShard(onSuccessor, term2);
+            final CommitManifest liveCommit = successor.shards().publishShard(onSuccessor, term2);
 
             // The zombie wakes and writes. It cannot publish, so these are orphans in a dead term.
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
@@ -298,14 +298,14 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
             zombie.reconciler().shard(onZombie).refresh("p8");
-            zombie.publishShard(onZombie, term1);
+            zombie.shards().publishShard(onZombie, term1);
 
             clock.set(1_000L + TTL);
             final ShardId onSuccessor = successor.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
             successor.reconciler().shard(onSuccessor).refresh("p8");
-            final CommitManifest liveCommit = successor.publishShard(onSuccessor, term2);
+            final CommitManifest liveCommit = successor.shards().publishShard(onSuccessor, term2);
 
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
             zombie.reconciler().shard(onZombie).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
@@ -350,14 +350,14 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             final long term1 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "1", "{\"msg\":\"kept\",\"n\":1}");
             zombie.reconciler().shard(onZombie).refresh("p8");
-            zombie.publishShard(onZombie, term1);
+            zombie.shards().publishShard(onZombie, term1);
 
             clock.set(1_000L + TTL);
             final ShardId onSuccessor = successor.activation().activateWriter(d.plane, "alpha", 0).orElseThrow();
             final long term2 = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(successor.reconciler().shard(onSuccessor), "2", "{\"msg\":\"kept\",\"n\":2}");
             successor.reconciler().shard(onSuccessor).refresh("p8");
-            successor.publishShard(onSuccessor, term2);
+            successor.shards().publishShard(onSuccessor, term2);
             ShardOps.indexDoc(zombie.reconciler().shard(onZombie), "3", "{\"msg\":\"orphan\",\"n\":3}");
             zombie.reconciler().shard(onZombie).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
             leaveAnUnfinishedPublish(d, term1);
@@ -393,7 +393,7 @@ public class ServerlessReconcileTests extends OpenSearchTestCase {
             final long term = d.plane.heads().read("alpha", 0).orElseThrow().term();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"live\",\"n\":1}");
             a.reconciler().shard(shardId).refresh("p8");
-            final CommitManifest manifest = a.publishShard(shardId, term);
+            final CommitManifest manifest = a.shards().publishShard(shardId, term);
 
             // The reason the live term is excluded entirely, rather than trusted to the reference check:
             // publishing uploads files and THEN swaps the manifest, so there is a window in which a live

@@ -339,8 +339,8 @@ final class ShardActivations {
                 continue;
             }
             try {
-                // Never GENERIC: what waits for an activation waits there. See ServerlessNode#ACTIVATION_POOL.
-                reconciler.node.threadPool().executor(org.opensearch.serverless.shell.ServerlessNode.ACTIVATION_POOL).execute(() -> {
+                // Never GENERIC: what waits for an activation waits there. See NodeThreadPools#ACTIVATION_POOL.
+                reconciler.node.threadPool().executor(org.opensearch.serverless.shell.NodeThreadPools.ACTIVATION_POOL).execute(() -> {
                     try {
                         task.run();
                     } finally {

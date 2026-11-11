@@ -329,7 +329,7 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
             // One write through the coordinator, so it remembers the first node as the owner, and one
             // publish, so a reader has a commit to open later.
             assertEquals(201, send(coordinator, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"first\",\"n\":1}").status());
-            assertEquals(first.localNode().getId(), coordinator.ownerHint("alpha", 0).orElseThrow());
+            assertEquals(first.localNode().getId(), coordinator.sightings().ownerHint("alpha", 0).orElseThrow());
             final var headNamingFirst = plane.heads().read("alpha", 0).orElseThrow();
             assertEquals(1, loopFirst.tick(clock.get() + 1_000).published().size());
 
@@ -341,7 +341,7 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
             // The case is a hint refreshed just before the takeover -- the coordinator's own hint rebuild
             // reading the head a moment before the first node lost it -- so it is re-noted here, fresh,
             // still naming the first node.
-            coordinator.noteHead("alpha", 0, headNamingFirst);
+            coordinator.sightings().noteHead("alpha", 0, headNamingFirst);
             assertEquals(1, first.leases().heartbeat(plane).size());
             assertTrue("the first node must have released the writer", first.reconciler().openShards().isEmpty());
             // ...and then opens the same shard as a search reader, which is the state the bug needs.
@@ -352,11 +352,15 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
             );
 
             // The coordinator still believes the first node owns the shard.
-            assertEquals(first.localNode().getId(), coordinator.ownerHint("alpha", 0).orElseThrow());
+            assertEquals(first.localNode().getId(), coordinator.sightings().ownerHint("alpha", 0).orElseThrow());
             final Response written = send(coordinator, "PUT", "/alpha/_doc/2?refresh=true", "{\"msg\":\"second\",\"n\":2}");
             assertEquals("the write must be re-routed to the owner, not fail on the reader: " + written.body(), 201, written.status());
             assertTrue("and applied by the second node: " + written.body(), written.body().contains(second.localNode().getId()));
-            assertEquals("the hint now names the owner", second.localNode().getId(), coordinator.ownerHint("alpha", 0).orElseThrow());
+            assertEquals(
+                "the hint now names the owner",
+                second.localNode().getId(),
+                coordinator.sightings().ownerHint("alpha", 0).orElseThrow()
+            );
             assertEquals(
                 "the document is where the owner can see it",
                 1L,

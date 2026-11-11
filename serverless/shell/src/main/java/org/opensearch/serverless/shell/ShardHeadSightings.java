@@ -23,7 +23,7 @@ import java.util.function.Supplier;
  * <p>Every answer here is a hint: whoever uses one survives its being wrong, because the owner refuses what it
  * does not hold and the caller then reads the register.
  */
-final class ShardHeadSightings {
+public final class ShardHeadSightings {
 
     private final Supplier<MetadataPlane> metadataPlane;
 

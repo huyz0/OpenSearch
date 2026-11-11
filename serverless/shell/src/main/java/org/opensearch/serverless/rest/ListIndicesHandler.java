@@ -186,7 +186,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
         String index,
         boolean asPage
     ) throws Exception {
-        final List<String> names = new java.util.ArrayList<>(IndexPatterns.expand(metadata, index, serving.patternCap()));
+        final List<String> names = new java.util.ArrayList<>(IndexPatterns.expand(metadata, index, serving.searchSettings().patternCap()));
         names.removeIf(serving::isSystemIndex);
         final CatTable table = new CatTable("index", "uuid", "pri", "rep", "status", "mapping_version");
         for (String name : names) {
@@ -230,7 +230,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
             .listPage(paging.prefix(), paging.after(), paging.size(), new org.opensearch.serverless.metadata.DescriptorStore.Reads() {
                 @Override
                 public <T> List<T> runAll(List<java.util.concurrent.Callable<T>> tasks) throws InterruptedException {
-                    return Fanout.run(pool, serving.searchFanoutConcurrency(), tasks);
+                    return Fanout.run(pool, serving.searchSettings().searchFanoutConcurrency(), tasks);
                 }
             });
         final CatTable table = new CatTable("index", "uuid", "pri", "rep", "status", "mapping_version");

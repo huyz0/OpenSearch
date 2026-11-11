@@ -78,7 +78,7 @@ public final class ServerlessBootstrap implements Closeable {
      * waiting on the object store, so a node taking a dead node's shards, or a new node taking its share, is bounded by
      * this times the store's latency rather than by its own work.
      */
-    public static final String ACTIVATION_CONCURRENCY = ServerlessNode.ACTIVATION_CONCURRENCY_SETTING;
+    public static final String ACTIVATION_CONCURRENCY = NodeThreadPools.ACTIVATION_CONCURRENCY_SETTING;
 
     /** Whether the activations at once follow the store, up to {@link #ACTIVATION_CONCURRENCY}; off by default. */
     public static final String ACTIVATION_ADAPTIVE = "serverless.activation.adaptive";

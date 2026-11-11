@@ -74,7 +74,7 @@ final class RequestRouting {
         // The owner as this node last saw it, before the register: a wrong hint is refused by the node it
         // names and corrected by one read then, see freshOwner.
         return once(owners, index + "#" + shard, () -> {
-            final Optional<String> hinted = node.ownerHint(index, shard);
+            final Optional<String> hinted = node.sightings().ownerHint(index, shard);
             if (hinted.isPresent()) {
                 return hinted;
             }
@@ -85,7 +85,7 @@ final class RequestRouting {
     /** Reads the head and notes it for the node. Called from inside the cache's compute, so it does not touch the cache. */
     Optional<String> freshOwner(String index, int shard) throws IOException {
         final var head = plane.heads().read(index, shard);
-        node.noteHead(index, shard, head.orElse(null));
+        node.sightings().noteHead(index, shard, head.orElse(null));
         return head.map(h -> h.ownerNodeId());
     }
 
@@ -108,7 +108,7 @@ final class RequestRouting {
      * @throws IOException when there is nothing to retry, worded for the caller
      */
     Placement afterForwardFailure(String index, Placement stale, Exception failure, boolean mayRetry) throws IOException {
-        node.forgetOwner(index, stale.shard());
+        node.sightings().forgetOwner(index, stale.shard());
         owners.remove(index + "#" + stale.shard());
         final org.opensearch.serverless.transport.ForwardFailure kind = org.opensearch.serverless.transport.ForwardFailure.classify(
             failure

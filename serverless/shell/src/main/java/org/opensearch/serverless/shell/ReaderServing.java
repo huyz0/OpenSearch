@@ -186,7 +186,7 @@ public final class ReaderServing {
         node.served.put(indexName, descriptor);
         node.readerShards.add(new java.util.AbstractMap.SimpleEntry<>(indexName, shardNumber));
 
-        if (node.localShardOf(indexName, shardNumber) == null
+        if (node.shards().localShardOf(indexName, shardNumber) == null
             && node.reconciler.heldShards().size() >= node.admission.maxShardsHeld()
             && node.admission.makeRoom() == false) {
             // Readers used to be uncapped: a wide search burst could open thousands of shards on one

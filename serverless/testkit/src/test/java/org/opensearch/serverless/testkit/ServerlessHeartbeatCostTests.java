@@ -243,13 +243,17 @@ public class ServerlessHeartbeatCostTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("hb-hint"))) {
             node.startup().start();
             node.setMetadataPlane(plane);
-            node.noteHead("alpha", 0, new ShardHead("alpha", 0, 1L, "somebody-else", "eph", 0L, "uuid-alpha-00000000"));
-            assertEquals("somebody-else", node.ownerHint("alpha", 0).orElseThrow());
+            node.sightings().noteHead("alpha", 0, new ShardHead("alpha", 0, 1L, "somebody-else", "eph", 0L, "uuid-alpha-00000000"));
+            assertEquals("somebody-else", node.sightings().ownerHint("alpha", 0).orElseThrow());
 
             clock.addAndGet(TTL);
-            assertEquals("inside a lease the sighting is still a hint", "somebody-else", node.ownerHint("alpha", 0).orElseThrow());
+            assertEquals(
+                "inside a lease the sighting is still a hint",
+                "somebody-else",
+                node.sightings().ownerHint("alpha", 0).orElseThrow()
+            );
             clock.incrementAndGet();
-            assertTrue("a sighting older than a lease must be re-read, not routed on", node.ownerHint("alpha", 0).isEmpty());
+            assertTrue("a sighting older than a lease must be re-read, not routed on", node.sightings().ownerHint("alpha", 0).isEmpty());
         }
     }
 }

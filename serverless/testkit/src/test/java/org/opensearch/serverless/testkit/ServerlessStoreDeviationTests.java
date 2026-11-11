@@ -213,9 +213,9 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             ShardOps.indexDoc(b.reconciler().shard(onB.get()), "b1", "{\"msg\":\"bbb\"}");
             b.reconciler().shard(onB.get()).refresh("deviation");
 
-            a.publishShard(onA.get(), 1L);
+            a.shards().publishShard(onA.get(), 1L);
 
-            final var refused = expectThrows(ForeignWriterException.class, () -> b.publishShard(onB.get(), 1L));
+            final var refused = expectThrows(ForeignWriterException.class, () -> b.shards().publishShard(onB.get(), 1L));
             assertTrue(
                 "the refusal must name the other node and say what it implies: " + refused.getMessage(),
                 refused.getMessage().contains(a.localNode().getId()) && refused.getMessage().contains("two winners")
@@ -286,8 +286,8 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             ShardOps.indexDoc(b.reconciler().shard(onB), "b2", "{\"msg\":\"ccc\"}");
             b.reconciler().shard(onB).flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true));
 
-            final var fromA = a.publishShard(onA, 1L);
-            expectThrows(ForeignWriterException.class, () -> b.publishShard(onB, 1L));
+            final var fromA = a.shards().publishShard(onA, 1L);
+            expectThrows(ForeignWriterException.class, () -> b.shards().publishShard(onB, 1L));
 
             final var surviving = planeA.segmentPublisher("alpha", 0).readManifest().orElseThrow();
             assertEquals("the first writer's commit must be the one that stands", fromA.files(), surviving.files());
@@ -314,7 +314,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             final var onA = a.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             ShardOps.indexDoc(a.reconciler().shard(onA), "a1", "{\"msg\":\"aaa\"}");
             a.reconciler().shard(onA).refresh("deviation");
-            a.publishShard(onA, 1L);
+            a.shards().publishShard(onA, 1L);
 
             // Rewrite the manifest as an older build would have left it: a term and files, no writer.
             final var published = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
@@ -327,7 +327,7 @@ public class ServerlessStoreDeviationTests extends OpenSearchTestCase {
             // And publishing onto it still works.
             ShardOps.indexDoc(a.reconciler().shard(onA), "a2", "{\"msg\":\"ddd\"}");
             a.reconciler().shard(onA).refresh("deviation");
-            final var again = a.publishShard(onA, 1L);
+            final var again = a.shards().publishShard(onA, 1L);
             assertEquals("the publish must have been allowed and recorded its writer", a.localNode().getId(), again.writer());
         }
     }

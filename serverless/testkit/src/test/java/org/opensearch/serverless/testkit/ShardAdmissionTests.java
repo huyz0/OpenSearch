@@ -40,7 +40,7 @@ public class ShardAdmissionTests extends OpenSearchTestCase {
                 node.startup().start();
                 node.setMetadataPlane(plane);
                 final var id = node.activation().activateWriter(plane, "index", 0).orElseThrow();
-                node.releaseShard(id, "closed before query admission");
+                node.shards().releaseShard(id, "closed before query admission");
                 expectThrows(org.opensearch.index.shard.IndexShardClosedException.class, () -> node.reconciler().enter(id));
                 assertEquals(0, node.reconciler().inFlight(id));
             }

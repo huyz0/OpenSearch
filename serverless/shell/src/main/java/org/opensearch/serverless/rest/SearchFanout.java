@@ -136,7 +136,11 @@ public final class SearchFanout {
         }
         final List<ShardAnswer> answers;
         try {
-            answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), serving.searchFanoutConcurrency(), tasks);
+            answers = Fanout.run(
+                serving.threadPool().executor(ThreadPool.Names.GENERIC),
+                serving.searchSettings().searchFanoutConcurrency(),
+                tasks
+            );
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             charged.abandon();
@@ -289,7 +293,7 @@ public final class SearchFanout {
         final List<org.opensearch.action.search.ShardSearchFailure> failures = java.util.Collections.synchronizedList(new ArrayList<>());
 
         // The activation budget: shards not open here are the ones that may cost a cold open.
-        final int budget = serving.searchActivationBudget();
+        final int budget = serving.searchSettings().searchActivationBudget();
         int cold = 0;
         for (Target target : searched) {
             if (SearchShardCalls.localShard(serving, target.descriptor(), target.shard()) == null) {
@@ -375,7 +379,11 @@ public final class SearchFanout {
             // on each other had nothing left to serve each other with -- a deadlock resolved only by the
             // forward timeout. Outgoing waits now live on GENERIC, incoming work on the fan-out pool, and
             // Fanout's caller-runs rule keeps a full GENERIC from parking the coordinator behind itself.
-            answers = Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), serving.searchFanoutConcurrency(), tasks);
+            answers = Fanout.run(
+                serving.threadPool().executor(ThreadPool.Names.GENERIC),
+                serving.searchSettings().searchFanoutConcurrency(),
+                tasks
+            );
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             charged.abandon();
@@ -417,7 +425,7 @@ public final class SearchFanout {
         java.util.Set<String> judged
     ) throws IOException {
         final java.util.Set<Target> pruned = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        if (serving.searchPruning() == false
+        if (serving.searchSettings().searchPruning() == false
             || candidates.size() < 2
             || org.opensearch.serverless.store.PruningDigest.mayPrune(source.query()) == false
             || source.suggest() != null
@@ -451,7 +459,7 @@ public final class SearchFanout {
             });
         }
         try {
-            Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), serving.searchFanoutConcurrency(), checks);
+            Fanout.run(serving.threadPool().executor(ThreadPool.Names.GENERIC), serving.searchSettings().searchFanoutConcurrency(), checks);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted while pruning", e);

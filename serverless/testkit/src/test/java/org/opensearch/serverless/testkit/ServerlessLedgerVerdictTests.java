@@ -129,7 +129,7 @@ public class ServerlessLedgerVerdictTests extends OpenSearchTestCase {
         final List<String> ids = ids("published", 20);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("verdict-published"))) {
             final ShardId shardId = writeAcknowledged(node, plane, ids);
-            node.publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
+            node.shards().publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
             // What truncation leaves once a publish covers the records: none of them in the log.
             try (Stream<Path> files = Files.walk(dir)) {
                 for (Path file : files.filter(Files::isRegularFile).filter(p -> p.toString().contains("wal")).toList()) {

@@ -180,7 +180,7 @@ public class ServerlessBatchedLeaseTests extends OpenSearchTestCase {
             final ShardId shardId = a.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             ShardOps.indexDoc(a.reconciler().shard(shardId), "1", "{\"msg\":\"kept\"}");
             a.reconciler().shard(shardId).refresh("p8b");
-            final var manifest = a.publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
+            final var manifest = a.shards().publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
 
             final Map<String, List<String>> swept = gc.collectAll(plane);
             logger.info("sweep: {} shards had orphans across 2 indices", swept.size());

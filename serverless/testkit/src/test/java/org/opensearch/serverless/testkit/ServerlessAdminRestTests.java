@@ -139,7 +139,7 @@ public class ServerlessAdminRestTests extends OpenSearchTestCase {
             final ShardId shardId = node.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             ShardOps.indexDoc(node.reconciler().shard(shardId), "1", "{\"msg\":\"hello\"}");
             node.reconciler().shard(shardId).refresh("p7");
-            node.publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
+            node.shards().publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
 
             final Response warm = send(http, "GET", "/_serverless/shards/alpha", null);
             assertTrue("an owned shard must report its owner: " + warm.body(), warm.body().contains(node.localNode().getId()));

@@ -18,6 +18,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.ReconcileScheduler;
 import org.opensearch.serverless.reconcile.TickResult;
+import org.opensearch.serverless.shell.NodeThreadPools;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -177,7 +178,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
             node.setMetadataPlane(plane);
             try (var loop = new BackgroundReconciler(node, plane)) {
                 loop.setDemandDrivenActivation(true);
-                node.threadPool().executor(ServerlessNode.ACTIVATION_POOL).shutdown();
+                node.threadPool().executor(NodeThreadPools.ACTIVATION_POOL).shutdown();
                 final var result = loop.activateForRequest("alpha", 0);
                 final var failure = expectThrows(
                     java.util.concurrent.ExecutionException.class,

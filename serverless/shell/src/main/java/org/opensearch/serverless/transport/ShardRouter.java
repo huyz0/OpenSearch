@@ -79,8 +79,8 @@ public final class ShardRouter {
         // Suppliers throughout: the router is built before the node's plane is attached and before its
         // local node exists, and the window is the lease TTL, which is the plane's to say.
         this.authenticator = new TransportAuthenticator(
-            () -> node.transportSecrets(false),
-            () -> node.transportSecrets(true),
+            () -> node.secrets().transportSecrets(false),
+            () -> node.secrets().transportSecrets(true),
             () -> TransportAuthenticator.identity(node.localNode()),
             () -> plane.get() == null ? System.currentTimeMillis() : plane.get().clock().getAsLong(),
             () -> forwardTimeout().millis(),
@@ -93,37 +93,37 @@ public final class ShardRouter {
         transportService.registerRequestHandler(
             ForwardedIndexRequest.ACTION,
             // Not WRITE: see FORWARDED_WRITE_POOL for the deadlock that was.
-            org.opensearch.serverless.shell.ServerlessNode.FORWARDED_WRITE_POOL,
+            org.opensearch.serverless.shell.NodeThreadPools.FORWARDED_WRITE_POOL,
             ForwardedIndexRequest::new,
             this::handleIndex
         );
         transportService.registerRequestHandler(
             ForwardedBulkRequest.ACTION,
-            org.opensearch.serverless.shell.ServerlessNode.FORWARDED_WRITE_POOL,
+            org.opensearch.serverless.shell.NodeThreadPools.FORWARDED_WRITE_POOL,
             ForwardedBulkRequest::new,
             this::handleBulk
         );
         transportService.registerRequestHandler(
             ForwardedGetRequest.ACTION,
-            org.opensearch.serverless.shell.ServerlessNode.FORWARDED_READ_POOL,
+            org.opensearch.serverless.shell.NodeThreadPools.FORWARDED_READ_POOL,
             ForwardedGetRequest::new,
             this::handleGet
         );
         transportService.registerRequestHandler(
             ForwardedSearchRequest.ACTION,
-            org.opensearch.serverless.shell.ServerlessNode.FANOUT_POOL,
+            org.opensearch.serverless.shell.NodeThreadPools.FANOUT_POOL,
             ForwardedSearchRequest::new,
             this::handleSearch
         );
         transportService.registerRequestHandler(
             ForwardedExplainRequest.ACTION,
-            org.opensearch.serverless.shell.ServerlessNode.FANOUT_POOL,
+            org.opensearch.serverless.shell.NodeThreadPools.FANOUT_POOL,
             ForwardedExplainRequest::new,
             this::handleExplain
         );
         transportService.registerRequestHandler(
             ForwardedFrozenSearchRequest.ACTION,
-            org.opensearch.serverless.shell.ServerlessNode.FANOUT_POOL,
+            org.opensearch.serverless.shell.NodeThreadPools.FANOUT_POOL,
             ForwardedFrozenSearchRequest::new,
             this::handleFrozenSearch
         );
@@ -358,7 +358,7 @@ public final class ShardRouter {
         }
         if (openedForThis) {
             // Opened now, so used now; one already held is used only if it matches, below -- see SearchFanout.
-            node.markUsed(shardId);
+            node.shards().markUsed(shardId);
         }
         // Before the query too, so it runs on the mapping in force now; see WriteFences#ensureIncarnationLive.
         node.fences().ensureIncarnationLive(shardId);
@@ -374,7 +374,7 @@ public final class ShardRouter {
         }
         node.fences().ensureIncarnationLive(shardId);
         if (result.total() > 0) {
-            node.markUsed(shardId);
+            node.shards().markUsed(shardId);
         }
         channel.sendResponse(new ForwardedSearchResponse(result));
     }
@@ -465,7 +465,7 @@ public final class ShardRouter {
             if (mac != null) {
                 context.putHeader(TransportAuthenticator.MAC_HEADER, mac);
             } else {
-                final String token = node.transportToken();
+                final String token = node.secrets().transportToken();
                 if (token != null) {
                     context.putHeader(TOKEN_HEADER, token);
                 }
@@ -519,7 +519,7 @@ public final class ShardRouter {
 
     /** The static-token check, kept for senders that do not yet sign. */
     private void requireToken() {
-        final String expected = node.transportToken();
+        final String expected = node.secrets().transportToken();
         final String presented = transportService.getThreadPool().getThreadContext().getHeader(TOKEN_HEADER);
         if (expected == null
             || presented == null

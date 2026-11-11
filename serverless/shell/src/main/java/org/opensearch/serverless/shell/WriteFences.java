@@ -279,11 +279,8 @@ public final class WriteFences {
         if (plane.membership().selfLeaseValidAt(plane.clock().getAsLong()) == false) {
             return false;
         }
-        java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = node.recentHead(
-            shardId.getIndexName(),
-            shardId.id(),
-            maxHeadAgeMillis
-        );
+        java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = node.sightings()
+            .recentHead(shardId.getIndexName(), shardId.id(), maxHeadAgeMillis);
         if (head.isEmpty()) {
             try {
                 head = plane.heads().read(shardId.getIndexName(), shardId.id());
@@ -291,7 +288,7 @@ public final class WriteFences {
                 ServerlessNode.logger.debug("could not read the head of {} to answer a forwarded write; refusing it", shardId);
                 return false;
             }
-            node.noteHead(shardId.getIndexName(), shardId.id(), head.orElse(null));
+            node.sightings().noteHead(shardId.getIndexName(), shardId.id(), head.orElse(null));
         }
         if (node.leases.namesThisNode(head, shardId)) {
             return true;

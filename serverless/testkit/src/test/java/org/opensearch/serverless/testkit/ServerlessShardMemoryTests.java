@@ -260,7 +260,7 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
             for (int shard = 0; shard < COMPARISON_BATCH; shard++) {
                 final var shardId = writer.activation().activateWriter(plane, "alpha", shard).orElseThrow();
                 final long term = plane.heads().read("alpha", shard).orElseThrow().term();
-                writer.publishShard(shardId, term);
+                writer.shards().publishShard(shardId, term);
             }
         }
         // close() tears down local infrastructure and does not release shard-head ownership -- only the

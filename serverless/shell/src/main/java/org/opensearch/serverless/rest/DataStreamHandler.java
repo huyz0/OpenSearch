@@ -372,7 +372,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                 if (pattern == false) {
                     validateName(wanted);
                 }
-                for (String each : IndexPatterns.expand(metadata, wanted, serving.patternCap())) {
+                for (String each : IndexPatterns.expand(metadata, wanted, serving.searchSettings().patternCap())) {
                     final var resolved = metadata.resolve(each);
                     if (resolved.alias() != null && resolved.alias().dataStream()) {
                         streams.putIfAbsent(each, resolved.alias());

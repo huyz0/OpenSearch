@@ -551,13 +551,13 @@ public final class DocumentHandler extends BaseRestHandler {
             // The owner as last seen, if this node has seen it: a head read per write was the largest
             // fixed cost of a write this node does not serve itself. A hint that is wrong is refused by
             // the node it names, and the register is read then -- once -- and the write forwarded again.
-            final Optional<String> hinted = serving.ownerHint(writtenIndex, shard);
+            final Optional<String> hinted = serving.sightings().ownerHint(writtenIndex, shard);
             final String owner;
             if (hinted.isPresent()) {
                 owner = hinted.get();
             } else {
                 final var head = metadata.heads().read(writtenIndex, shard);
-                serving.noteHead(writtenIndex, shard, head.orElse(null));
+                serving.sightings().noteHead(writtenIndex, shard, head.orElse(null));
                 owner = head.map(h -> h.ownerNodeId()).orElse(null);
             }
             if (owner != null && owner.equals(serving.localNode().getId())) {
@@ -572,7 +572,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 //
                 // Better than either: wait for the activation in flight, which is the one this node's own
                 // single flight is running, and write once it is open.
-                serving.forgetOwner(writtenIndex, shard);
+                serving.sightings().forgetOwner(writtenIndex, shard);
                 final String routedUuid = descriptor.get().uuid();
                 serving.threadPool()
                     .executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
@@ -615,7 +615,7 @@ public final class DocumentHandler extends BaseRestHandler {
                             // was tried on every request and every request through this node failed the
                             // same way until it restarted -- while the same write through _bulk, which
                             // reads the register each time, succeeded.
-                            serving.forgetOwner(writtenIndex, shard);
+                            serving.sightings().forgetOwner(writtenIndex, shard);
                             if (org.opensearch.serverless.transport.ForwardFailure.classify(first.getCause())
                                 .mayRetryElsewhere() == false) {
                                 // Applied, possibly applied, or answered: not sent anywhere else.
@@ -623,7 +623,7 @@ public final class DocumentHandler extends BaseRestHandler {
                             }
                             // The owner never applied it. Read the register once and forward to whoever it names.
                             final var head = metadata.heads().read(writtenIndex, shard);
-                            serving.noteHead(writtenIndex, shard, head.orElse(null));
+                            serving.sightings().noteHead(writtenIndex, shard, head.orElse(null));
                             final String fresh = head.map(h -> h.ownerNodeId()).orElse(null);
                             if (fresh == null) {
                                 // Whoever the hint named is gone and nobody has taken over: the same state,

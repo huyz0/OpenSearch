@@ -36,7 +36,7 @@ public final class NodeDocumentReads {
         if (node.reconciler.shard(shardId) == null) {
             throw new java.io.IOException("cannot explain from " + shardId + ": not open on " + node.nodeName);
         }
-        node.markUsed(shardId);
+        node.shards().markUsed(shardId);
         node.fences().ensureIncarnationLive(shardId);
         final var outcome = org.opensearch.serverless.shard.ShardExplain.execute(node.searchService(), shardId, id, query);
         node.fences().ensureIncarnationLive(shardId);
@@ -68,7 +68,7 @@ public final class NodeDocumentReads {
         if (shard == null) {
             throw new java.io.IOException("cannot read from " + shardId + ": not open on " + node.nodeName);
         }
-        node.markUsed(shardId);
+        node.shards().markUsed(shardId);
         node.fences().ensureIncarnationLive(shardId);
         final var result = shard.getService()
             .get(
