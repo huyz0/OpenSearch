@@ -248,10 +248,20 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                 second.startup().start();
                 second.setMetadataPlane(plane);
                 store.reset();
+                slow.drain();
                 final long takeStarted = System.nanoTime();
                 final BackgroundReconciler loop = takeAll(second, plane, clock, shards);
                 final double takeoverSeconds = (System.nanoTime() - takeStarted) / 1e9;
                 final double takeoverRequestsPerShard = (store.total()) / (double) shards;
+                final Map<String, Integer> takeoverRequests = new java.util.TreeMap<>();
+                for (LatencyInjectingBlobStore.Request request : slow.drain()) {
+                    takeoverRequests.merge(
+                        request.op() + " " + request.key().replaceAll("[0-9a-f]{8,}|_[0-9]+|[0-9]{3,}|soak-[0-9]+", "*"),
+                        1,
+                        Integer::sum
+                    );
+                }
+                logger.info("SOAKTAKE|{}|requests by kind {}", mode, takeoverRequests);
                 logger.info(
                     "SOAKTAKE|{}|takeover {} s: {}|open phases ms {}|log records read {}|opened from logged commits {}",
                     mode,
