@@ -75,6 +75,7 @@ public final class ShardRouter {
     private final CommitPush commitPush;
     private final TailPush tailPush;
     private final TailOverlays tailOverlays;
+    private final RefreshVisibility refreshVisibility;
     private final boolean meterZones;
     private final boolean compressCrossZone;
     private final String localZone;
@@ -106,6 +107,16 @@ public final class ShardRouter {
         this.commitPush = new CommitPush(this);
         this.tailPush = new TailPush(this);
         this.tailOverlays = new TailOverlays(this);
+        this.refreshVisibility = new RefreshVisibility(node.settings());
+    }
+
+    /**
+     * Returns how far a refreshing write is made visible before it is answered.
+     *
+     * @return the refresh visibility
+     */
+    public RefreshVisibility refreshVisibility() {
+        return refreshVisibility;
     }
 
     /**
@@ -291,6 +302,21 @@ public final class ShardRouter {
         org.opensearch.core.common.io.stream.Writeable.Reader<T> reader,
         TimeValue timeout
     ) throws IOException {
+        final SendFault fault = sendFault;
+        if (fault != null) {
+            final long delay = fault.delayMillis(action, peer.getId());
+            if (delay < 0) {
+                throw new IOException("[" + action + "] to [" + peer.getId() + "] was lost on purpose");
+            }
+            if (delay > 0) {
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted while delaying [" + action + "]", e);
+                }
+            }
+        }
         final PlainActionFuture<T> future = PlainActionFuture.newFuture();
         try (var ignored = withMac(action, request, peer)) {
             transportService.sendRequest(
@@ -302,6 +328,30 @@ public final class ShardRouter {
             );
         }
         return await(future, timeout, peer, action);
+    }
+
+    /** Delays or loses messages this node sends, for tests of what happens when the network does. */
+    @FunctionalInterface
+    public interface SendFault {
+        /**
+         * Decides what happens to a message about to be sent.
+         *
+         * @param action the transport action
+         * @param target the node it is sent to
+         * @return how long to hold it before sending, 0 to send it now, or negative to lose it
+         */
+        long delayMillis(String action, String target);
+    }
+
+    private volatile SendFault sendFault;
+
+    /**
+     * Delays or loses messages this node sends; null sends every message as it comes. For tests.
+     *
+     * @param fault what to do to each message, or null
+     */
+    public void injectSendFault(SendFault fault) {
+        this.sendFault = fault;
     }
 
     /** How long a steered write waits for this node to take its shard. */

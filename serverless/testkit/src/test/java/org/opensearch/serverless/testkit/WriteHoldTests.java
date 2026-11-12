@@ -91,8 +91,9 @@ public class WriteHoldTests extends OpenSearchTestCase {
         }
 
         @Override
-        public void refresh(String source) {
+        public boolean refresh(String source) {
             ids.add("refresh");
+            return true;
         }
     }
 
@@ -131,9 +132,9 @@ public class WriteHoldTests extends OpenSearchTestCase {
         }
 
         @Override
-        public void refresh(String source) {
+        public boolean refresh(String source) {
             refreshes.add(source);
-            node.writes().refresh(to, source);
+            return node.writes().refresh(to, source);
         }
     }
 

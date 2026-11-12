@@ -208,8 +208,8 @@ public final class BulkHandler extends BaseRestHandler {
                     // The usual path needs no second UTF-8 source encoding or native response objects.
                     dispatcher.route(serving, metadata, items);
                     dispatcher.shape(serving, metadata, items);
-                    dispatcher.dispatch(serving, items, refresh);
-                    respond(channel, items, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt), refresh);
+                    final boolean refreshed = dispatcher.dispatch(serving, items, refresh);
+                    respond(channel, items, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt), refreshed);
                 } else {
                     final NativeBatch batch = bulkRequestFor(items, refreshPolicy, defaultPipeline);
                     batch.request().waitForActiveShards(activeShards);
@@ -231,11 +231,11 @@ public final class BulkHandler extends BaseRestHandler {
                         dispatcher.route(serving, metadata, admittedItems);
                         dispatcher.shape(serving, metadata, admittedItems);
                         final boolean selectedRefresh = selected.getRefreshPolicy() != WriteRequest.RefreshPolicy.NONE;
-                        dispatcher.dispatch(serving, admittedItems, selectedRefresh);
+                        final boolean refreshed = dispatcher.dispatch(serving, admittedItems, selectedRefresh);
                         return nativeResult(
                             admittedItems,
                             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt),
-                            selectedRefresh
+                            refreshed
                         );
                     }, bulkResponseView());
                     respondNative(channel, result);

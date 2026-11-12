@@ -115,9 +115,8 @@ final class ForwardedWorkHandlers {
             outcome = router.node.writes()
                 .index(shardId, request.id(), request.source(), request.ifSeqNo(), request.ifPrimaryTerm(), request.requireAbsent());
         }
-        if (request.refresh()) {
-            router.node.writes().refreshWritten(shardId, outcome, "serverless-forwarded-refresh");
-        }
+        final boolean refreshed = request.refresh()
+            && router.node.writes().refreshWritten(shardId, outcome, "serverless-forwarded-refresh");
         channel.sendResponse(
             new ForwardedIndexResponse(
                 router.node.localNode().getId(),
@@ -125,7 +124,8 @@ final class ForwardedWorkHandlers {
                 outcome.primaryTerm(),
                 outcome.version(),
                 outcome.created(),
-                outcome.found()
+                outcome.found(),
+                refreshed
             )
         );
     }
@@ -157,10 +157,9 @@ final class ForwardedWorkHandlers {
         }
         router.requireLiveOwnership(shardId);
         final var outcomes = router.node.writes().bulkOperations(shardId, request.batch());
-        if (request.refresh()) {
-            router.node.writes().refreshWritten(shardId, outcomes, "serverless-forwarded-refresh");
-        }
-        channel.sendResponse(new ForwardedBulkResponse(router.node.localNode().getId(), outcomes));
+        final boolean refreshed = request.refresh()
+            && router.node.writes().refreshWritten(shardId, outcomes, "serverless-forwarded-refresh");
+        channel.sendResponse(new ForwardedBulkResponse(router.node.localNode().getId(), outcomes, refreshed));
     }
 
     void handleGet(ForwardedGetRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {

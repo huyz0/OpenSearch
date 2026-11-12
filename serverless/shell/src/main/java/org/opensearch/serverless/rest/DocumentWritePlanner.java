@@ -347,7 +347,7 @@ final class DocumentWritePlanner {
                                                         ack.created(),
                                                         ack.found()
                                                     ),
-                                                    refresh
+                                                    refresh && ack.refreshed()
                                                 )
                                             );
                                             return;
@@ -391,7 +391,7 @@ final class DocumentWritePlanner {
                                 ack.ownerNodeId(),
                                 deletion,
                                 new WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
-                                refresh
+                                refresh && ack.refreshed()
                             )
                         );
                     } catch (ForwardFailed failed) {
@@ -448,7 +448,7 @@ final class DocumentWritePlanner {
                                 ack.ownerNodeId(),
                                 deletion,
                                 new WriteOutcome(ack.seqNo(), ack.primaryTerm(), ack.version(), ack.created(), ack.found()),
-                                refresh
+                                refresh && ack.refreshed()
                             )
                         );
                     } catch (ForwardFailed failed) {

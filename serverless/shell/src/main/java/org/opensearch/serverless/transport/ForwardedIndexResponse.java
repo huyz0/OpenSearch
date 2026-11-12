@@ -23,6 +23,7 @@ public final class ForwardedIndexResponse extends TransportResponse {
     private final long version;
     private final boolean created;
     private final boolean found;
+    private final boolean refreshed;
 
     /**
      * Creates a response.
@@ -41,6 +42,30 @@ public final class ForwardedIndexResponse extends TransportResponse {
      * @param found whether a deletion found anything
      */
     public ForwardedIndexResponse(String ownerNodeId, long seqNo, long primaryTerm, long version, boolean created, boolean found) {
+        this(ownerNodeId, seqNo, primaryTerm, version, created, found, false);
+    }
+
+    /**
+     * Creates a response that says whether the write was made visible as far as its refresh promises.
+     *
+     * @param ownerNodeId the node that actually performed the write
+     * @param seqNo the sequence number the owner's engine assigned
+     * @param primaryTerm the primary term it ran at
+     * @param version the version assigned
+     * @param created whether a write created the document rather than overwriting one
+     * @param found whether a deletion found anything
+     * @param refreshed whether the write is visible as far as its refresh promises
+     */
+    public ForwardedIndexResponse(
+        String ownerNodeId,
+        long seqNo,
+        long primaryTerm,
+        long version,
+        boolean created,
+        boolean found,
+        boolean refreshed
+    ) {
+        this.refreshed = refreshed;
         this.ownerNodeId = ownerNodeId;
         this.seqNo = seqNo;
         this.primaryTerm = primaryTerm;
@@ -62,6 +87,7 @@ public final class ForwardedIndexResponse extends TransportResponse {
         this.version = in.readZLong();
         this.created = in.readBoolean();
         this.found = in.readBoolean();
+        this.refreshed = in.readBoolean();
     }
 
     @Override
@@ -72,6 +98,16 @@ public final class ForwardedIndexResponse extends TransportResponse {
         out.writeZLong(version);
         out.writeBoolean(created);
         out.writeBoolean(found);
+        out.writeBoolean(refreshed);
+    }
+
+    /**
+     * Returns whether the write is visible as far as the refresh it asked for promises.
+     *
+     * @return true if refreshed
+     */
+    public boolean refreshed() {
+        return refreshed;
     }
 
     /**
