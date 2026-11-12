@@ -61,6 +61,24 @@ final class ShardOpening {
     }
 
     /**
+     * The newest commit the shard's earlier writers staged and logged after the register's, or null to open from the
+     * register: also when the head names no earlier writer, or a log cannot be read, which costs only a longer replay.
+     */
+    private LoggedCommitHooks.Logged loggedCommit(ShardId shardId, long term, Optional<CommitManifest> register) {
+        final ShardReconciler.NodeLogHooks hooks = reconciler.nodeLog;
+        if (hooks == null || register.isEmpty() || register.get().stageSequence() < 0L) {
+            return null;
+        }
+        final java.util.List<String> writers = reconciler.nodeLogWriters.get(shardId.getIndexName() + "#" + shardId.id());
+        try {
+            return hooks.loggedAfter(shardId, writers, term, register.get());
+        } catch (IOException | RuntimeException e) {
+            ShardReconciler.logger.debug("could not read the commits logged for " + shardId + "; opening from the register", e);
+            return null;
+        }
+    }
+
+    /**
      * @param knownCommit the commit to recover from, when the caller already knows it; null to ask the
      *     publisher for the current one. A frozen view has to pass it, for two reasons: the commit it
      *     wants is by definition not the current one, and its synthetic index uuid has no manifest
@@ -94,9 +112,15 @@ final class ShardOpening {
             // Whether anything was published decides the recovery source, and the decision must be made
             // before the shard is created because the source is baked into its routing entry.
             final SegmentPublisher publisher = reconciler.publishers == null ? null : reconciler.publishers.apply(shardId);
-            final Optional<CommitManifest> published = knownCommit != null
+            final Optional<CommitManifest> fromRegister = knownCommit != null
                 ? Optional.of(knownCommit)
                 : (publisher == null ? Optional.empty() : publisher.readManifest());
+            // A writer opens from the newest commit its predecessor staged and logged, when there is one: it replays only
+            // what came after it, rather than everything since the register's older commit.
+            final LoggedCommitHooks.Logged logged = replayWal && knownCommit == null
+                ? loggedCommit(shardId, shardHeadTerm, fromRegister)
+                : null;
+            final Optional<CommitManifest> published = logged == null ? fromRegister : Optional.of(logged.commit());
             final boolean restoring = published.isPresent() && published.get().files().isEmpty() == false;
             lap.run();
             if (replayWal) {
@@ -208,6 +232,9 @@ final class ShardOpening {
                     }
                 }
                 lap.run();
+                if (logged != null) {
+                    reconciler.nodeLog.replayAfter(shardId, logged);
+                }
                 try {
                     shard.markAsRecovering("serverless-store", new RecoveryState(initializing, reconciler.localNode, null));
                     final PlainActionFuture<Boolean> recovered = PlainActionFuture.newFuture();
@@ -218,6 +245,16 @@ final class ShardOpening {
                 } finally {
                     reconciler.pendingReplay.remove(shardId);
                     reconciler.pendingNodeLogReplay.remove(shardId);
+                    if (logged != null) {
+                        reconciler.nodeLog.replayAfter(shardId, null);
+                    }
+                }
+                if (logged != null && publisher.adopt(logged.commit(), fromRegister.get()) == false) {
+                    // Before anything lets go of the predecessor's log, which holds what the register's commit lacks.
+                    throw new IOException("the register of " + shardId + " moved while it opened from a logged commit");
+                }
+                if (logged != null) {
+                    reconciler.loggedCommitOpens.incrementAndGet();
                 }
                 lap.run();
 

@@ -130,6 +130,16 @@ public final class SegmentPublisher {
     }
 
     /**
+     * How long ago the oldest node pack the staged commits name landed, or the first was staged; zero with none.
+     *
+     * @return the age
+     */
+    public long stagedAgeMillis() {
+        final CommitStaging stage = staging;
+        return stage == null ? 0L : stage.ageMillis();
+    }
+
+    /**
      * Whether a staged commit has waited long enough that the register should be written now.
      *
      * @return true if {@link #checkpoint} would write it
@@ -535,7 +545,40 @@ public final class SegmentPublisher {
         if (register.isEmpty()) {
             return Optional.empty();
         }
-        return Optional.of(parse(register.get()));
+        final CommitManifest manifest = parse(register.get());
+        lastRead = new ReadRegister(manifest, register.get().generation());
+        return Optional.of(manifest);
+    }
+
+    private record ReadRegister(CommitManifest manifest, long generation) {
+    }
+
+    /** The register as this publisher last read it, for {@link #adopt}. */
+    private volatile ReadRegister lastRead;
+
+    /**
+     * Writes a commit a predecessor staged, read back from its node log, over the register as this publisher last read
+     * it: what a successor that opened from that commit makes the register say before it lets go of the predecessor's
+     * log. One compare-and-swap, with no upload: the commit's files were uploaded before it was staged. Written as no
+     * longer staging, since its writer stages nothing more: a reader then serves it rather than ask that writer.
+     *
+     * @param logged the commit
+     * @param over the register's commit, as {@link #readManifest} returned it
+     * @return true if the register now holds it; false if the register moved since it was read
+     * @throws IOException if the register cannot be written
+     */
+    public boolean adopt(CommitManifest logged, CommitManifest over) throws IOException {
+        final ReadRegister read = lastRead;
+        if (read == null || read.manifest() != over) {
+            return false;
+        }
+        final CommitManifest written = logged.withStageSequence(-1L);
+        final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, read.generation(), written.toBytes());
+        if (result.applied()) {
+            lastPublishedGeneration = result.currentGeneration();
+            lastPublished = written;
+        }
+        return result.applied();
     }
 
     /**
@@ -942,82 +985,6 @@ public final class SegmentPublisher {
     private CommitManifest parse(BlobRegister register) throws IOException {
         try (InputStream in = register.value().streamInput()) {
             return CommitManifest.fromStream(in);
-        }
-    }
-
-    /**
-     * Adapts a Lucene {@link IndexInput} to an {@link InputStream} for blob upload.
-     *
-     * <p><b>Mark and reset are supported, and have to be.</b> The S3 client refuses a stream it cannot
-     * rewind — "No mark support on inputStream breaks the S3 SDK's ability to retry requests" — because a
-     * request it cannot replay is a request it cannot retry, and an upload that fails once would then
-     * fail permanently. A filesystem never asks, which is why this was invisible until the shell was
-     * pointed at an object store: publishing a segment was impossible on S3 and worked perfectly on disk.
-     *
-     * <p>Implemented against the underlying seek rather than by wrapping in a {@code BufferedInputStream},
-     * whose mark is bounded by a read-ahead limit. Segment files are routinely larger than any limit worth
-     * buffering, and a mark that silently expires part-way through a large upload would turn a retryable
-     * failure into a corrupt one.
-     */
-    private static final class IndexInputStream extends InputStream {
-
-        private final IndexInput input;
-        private final long length;
-        private final long origin;
-        private long position;
-        private long mark = -1L;
-
-        IndexInputStream(IndexInput input, long length) {
-            this.input = input;
-            this.length = length;
-            // Where this stream started, which is not necessarily where the IndexInput did.
-            this.origin = input.getFilePointer();
-        }
-
-        @Override
-        public boolean markSupported() {
-            return true;
-        }
-
-        @Override
-        public synchronized void mark(int readLimit) {
-            // readLimit ignored on purpose: the source is seekable, so there is no read-ahead buffer to
-            // outgrow and no honest reason to invalidate a mark.
-            mark = position;
-        }
-
-        @Override
-        public synchronized void reset() throws IOException {
-            if (mark < 0) {
-                throw new IOException("reset without a mark");
-            }
-            input.seek(origin + mark);
-            position = mark;
-        }
-
-        @Override
-        public int available() {
-            return (int) Math.min(Integer.MAX_VALUE, length - position);
-        }
-
-        @Override
-        public int read() throws IOException {
-            if (position >= length) {
-                return -1;
-            }
-            position++;
-            return input.readByte() & 0xFF;
-        }
-
-        @Override
-        public int read(byte[] b, int off, int len) throws IOException {
-            if (position >= length) {
-                return -1;
-            }
-            final int toRead = (int) Math.min(len, length - position);
-            input.readBytes(b, off, toRead);
-            position += toRead;
-            return toRead;
         }
     }
 }

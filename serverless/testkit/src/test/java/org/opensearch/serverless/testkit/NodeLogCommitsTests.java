@@ -178,6 +178,62 @@ public class NodeLogCommitsTests extends OpenSearchTestCase {
         }
     }
 
+    public void testATakeoverOpensFromTheNewestLoggedCommit() throws Exception {
+        final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
+        final ServerlessNode first = new ServerlessNode(nodeSettings("logged-first", "ingest", true));
+        try {
+            first.startup().start();
+            first.setMetadataPlane(plane);
+            final BackgroundReconciler loop = takeAll(first, plane, clock);
+            writeRound(first, "checkpointed", 3);
+            loop.publishAll();
+            writeRound(first, "staged", 3);
+            loop.publishAll();
+            // Writes after the staged commit carry it to the log, in the blob that holds them.
+            writeRound(first, "after", 2);
+            final java.util.Map<Integer, CommitManifest> staged = new java.util.HashMap<>();
+            for (ShardId shardId : first.reconciler().openShards()) {
+                final CommitManifest newest = first.reconciler().newestCommit(shardId);
+                assertTrue(newest.stagedAfter(register(plane, shardId)));
+                staged.put(shardId.id(), newest);
+            }
+
+            clock.addAndGet(2 * TTL);
+            try (ServerlessNode second = new ServerlessNode(nodeSettings("logged-second", "ingest", true))) {
+                second.startup().start();
+                second.setMetadataPlane(plane);
+                takeAll(second, plane, clock);
+                assertEquals("every shard opened from its logged commit", SHARDS, second.reconciler().loggedCommitOpens());
+                for (ShardId shardId : second.reconciler().openShards()) {
+                    for (String tag : new String[] { "checkpointed", "staged" }) {
+                        for (int i = 0; i < 3; i++) {
+                            assertTrue(second.reads().get(shardId, tag + "-" + shardId.id() + "-" + i).found());
+                        }
+                    }
+                    for (int i = 0; i < 2; i++) {
+                        assertTrue(
+                            "replayed past the logged commit",
+                            second.reads().get(shardId, "after-" + shardId.id() + "-" + i).found()
+                        );
+                    }
+                    final CommitManifest now = register(plane, shardId);
+                    assertTrue(
+                        "the register moved past the checkpoint before the predecessor's log was let go",
+                        now.term() > staged.get(shardId.id()).term() || now.files().equals(staged.get(shardId.id()).files())
+                    );
+                }
+            }
+        } finally {
+            try {
+                first.close();
+            } catch (Exception e) {
+                // It lost every shard it held.
+            }
+        }
+    }
+
     public void testAReleaseWritesTheStagedCommit() throws Exception {
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);

@@ -278,6 +278,37 @@ public final class NodeLogTakeover {
     }
 
     /**
+     * Streams a shard's unpublished records that landed after a position, as {@link #forEachRecord} does: for a reader
+     * that holds a commit covering every record of the shard at or before it.
+     *
+     * @param shard the shard
+     * @param after the position; records in its blob and before are not read
+     * @param consumer what takes each record
+     * @throws IOException if a fence or a read fails
+     */
+    public void forEachRecordAfter(ShardKey shard, NodeLogCommitter.Position after, CheckedConsumer<WalRecord, IOException> consumer)
+        throws IOException {
+        fenceAll();
+        for (NodeLogEpoch epoch : epochs) {
+            if (epoch.epoch() < after.epoch()) {
+                continue;
+            }
+            final Optional<Header> last = lastHeaders.get(epoch.epoch());
+            if (last.isEmpty()) {
+                continue;
+            }
+            final List<Range> runs = last.get().ordinalsOf(shard);
+            readRuns(
+                epoch.epoch(),
+                epoch.epoch() == after.epoch() ? NodeLogBlob.trimBelow(runs, after.ordinal() + 1) : runs,
+                last.get(),
+                shard,
+                consumer
+            );
+        }
+    }
+
+    /**
      * Streams a shard's records from known runs of one epoch, with no fence: for a node reading its own log, which knows
      * what it landed and where.
      *

@@ -134,6 +134,11 @@ public final class CommitStaging {
         return staged != null && nanoClock.getAsLong() - oldestNanos > TimeUnit.MILLISECONDS.toNanos(NodePackWriter.SWAP_DEADLINE_MILLIS);
     }
 
+    /** How long ago the oldest node pack a staged commit names landed, or the first was staged; zero with none. */
+    long ageMillis() {
+        return staged == null ? 0L : TimeUnit.NANOSECONDS.toMillis(Math.max(0L, nanoClock.getAsLong() - oldestNanos));
+    }
+
     /** Whether the oldest staged commit is old enough that the register should be written now. */
     public boolean due() {
         return staged != null && nanoClock.getAsLong() - oldestNanos >= maxStagedNanos();

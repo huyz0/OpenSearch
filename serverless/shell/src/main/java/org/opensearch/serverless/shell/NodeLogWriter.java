@@ -12,6 +12,7 @@ import org.opensearch.common.CheckedConsumer;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.shard.LoggedCommitHooks.Logged;
 import org.opensearch.serverless.shard.ShardReconciler;
 import org.opensearch.serverless.store.NodeLogBlob.Range;
 import org.opensearch.serverless.store.NodeLogBlob.ShardKey;
@@ -152,6 +153,65 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
                 throw new IOException("this node does not own " + shard + " at term " + term + " by its head");
             }
         }, windowMillis, maxBytes, maxRecords);
+        this.loggedCommits = new LoggedCommits(plane, committer, shards);
+    }
+
+    private final LoggedCommits loggedCommits;
+
+    @Override
+    public void staged(
+        ShardId shardId,
+        long term,
+        org.opensearch.serverless.store.CommitManifest commit,
+        long oldestPackAgeMillis,
+        NodeLogCommitter.Position coveredThrough
+    ) {
+        loggedCommits.staged(shardId, term, commit, oldestPackAgeMillis, coveredThrough);
+    }
+
+    private record OpenRead(ShardId shardId, String writer) {
+    }
+
+    /** Per shard being opened and earlier writer, the reader of its log the open's look for logged commits made. */
+    private final Map<OpenRead, NodeLogTakeover> openReaders = new ConcurrentHashMap<>();
+
+    /** Per shard being opened from a logged commit, the commit: its writer's log is replayed from after it. */
+    private final Map<ShardId, Logged> replayAfter = new ConcurrentHashMap<>();
+
+    @Override
+    public void replayAfter(ShardId shardId, Logged logged) {
+        if (logged == null) {
+            replayAfter.remove(shardId);
+            openReaders.keySet().removeIf(read -> read.shardId().equals(shardId));
+        } else {
+            replayAfter.put(shardId, logged);
+        }
+    }
+
+    @Override
+    public void checkpointed(ShardId shardId, long stageSequence) {
+        loggedCommits.checkpointed(shardId, stageSequence);
+    }
+
+    @Override
+    public Logged loggedAfter(ShardId shardId, List<String> writers, long term, org.opensearch.serverless.store.CommitManifest register)
+        throws IOException {
+        try {
+            return loggedCommits.loggedAfter(shardId, writers, writer -> {
+                try {
+                    final NodeLogTakeover reader = readerOf(writer, term);
+                    if (reader != null && writer.equals(nodeId) == false) {
+                        // The replay that follows reads the same log: kept for it, so the lease is read once.
+                        openReaders.put(new OpenRead(shardId, writer), reader);
+                    }
+                    return reader;
+                } catch (IOException e) {
+                    throw new java.io.UncheckedIOException(e);
+                }
+            }, register);
+        } catch (java.io.UncheckedIOException e) {
+            throw e.getCause();
+        }
     }
 
     private List<NodeLogEpoch> withInherited(List<NodeLogEpoch> epochs) {
@@ -192,6 +252,13 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
             final List<NodeLogEpoch> mine = committer.positions();
             leaseWriter.write(withInherited(mine), false);
             deleteBehind(mine);
+        }
+        // Outside the lease's lock, which a new epoch's recording takes on the thread that writes the window.
+        try {
+            committer.flushQueued();
+        } catch (RuntimeException e) {
+            // What it carried is a staged commit a successor can do without, at the cost of a longer replay.
+            logger.debug("could not write the node log's queued records", e);
         }
     }
 
@@ -283,6 +350,8 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
     public void forget(ShardId shardId) {
         committer.forget(keyOf(shardId));
         shards.remove(keyOf(shardId));
+        loggedCommits.forget(shardId);
+        openReaders.keySet().removeIf(read -> read.shardId().equals(shardId));
     }
 
     /**
@@ -316,11 +385,33 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
             }
             return count[0];
         }
+        final NodeLogTakeover kept = openReaders.remove(new OpenRead(shardId, predecessor));
+        final NodeLogTakeover reader = kept != null ? kept : readerOf(predecessor, term);
+        if (reader != null) {
+            final Logged from = replayAfter.get(shardId);
+            if (from != null && from.coveredThrough() != null && predecessor.equals(from.writer())) {
+                // The commit this open started from holds every record of the shard's up to there in this log.
+                reader.forEachRecordAfter(key, from.coveredThrough(), counting);
+            } else {
+                reader.forEachRecord(key, counting);
+            }
+        }
+        return count[0];
+    }
+
+    /**
+     * Returns the reader of another node's log, or of the earlier process's epochs for this node's own id, as a replay
+     * of it reads: fenced unless it is live. Null when it names no epochs.
+     */
+    private NodeLogTakeover readerOf(String predecessor, long term) throws IOException {
+        if (predecessor == null || predecessor.equals(nodeId)) {
+            return inherited.isEmpty() ? null : takeoverOf(nodeId, own, inherited, term, null);
+        }
         // Read after the head moved, so an epoch the predecessor opens later is one whose ownership check refuses this shard.
         final Optional<NodeLease> lease = plane.membership().read(predecessor);
         final List<NodeLogEpoch> epochs = lease.map(NodeLease::nodeLog).orElse(List.of());
         if (epochs.isEmpty()) {
-            return 0L;
+            return null;
         }
         final NodeLogStore theirs = new NodeLogStore(plane.blobStore(), plane.basePath(), predecessor);
         final NodeLogTakeover.LeaseReader reread = () -> plane.membership().read(predecessor).map(NodeLease::nodeLog).orElse(List.of());
@@ -328,11 +419,9 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
             // Live, so it gave the shard back itself and writes no more of it: a node taken from has its lease revoked
             // first. Fencing would fail the writes of every shard it still holds. One that is not live may still be
             // writing an epoch it opened while it held the shard, so it is fenced below.
-            NodeLogTakeover.unfenced(theirs, epochs, reread).forEachRecord(key, counting);
-            return count[0];
+            return NodeLogTakeover.unfenced(theirs, epochs, reread);
         }
-        takeoverOf(predecessor, theirs, epochs, term, reread).forEachRecord(key, counting);
-        return count[0];
+        return takeoverOf(predecessor, theirs, epochs, term, reread);
     }
 
     /**
