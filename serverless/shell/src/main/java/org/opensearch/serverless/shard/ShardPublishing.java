@@ -120,7 +120,9 @@ final class ShardPublishing {
             // Decided per publish: a placement changed at runtime applies from the next one, and moves nothing written.
             final java.util.function.Predicate<IndexShard> placement = reconciler.nodePackPlacement;
             if (placement != null) {
-                publisher.useNodePacks(placement.test(shard));
+                // An open's publish goes in segment blobs: it is one per shard taken, and it waits, while the shard is
+                // not yet served, for nothing a node pack would batch it with.
+                publisher.useNodePacks(placement.test(shard) && openPublishes.contains(shardId) == false);
             }
             final org.opensearch.serverless.store.SegmentPublisher.Published done = publisher.publishCommit(
                 shard.store(),
@@ -178,6 +180,25 @@ final class ShardPublishing {
             trim(shardId, pending.term(), pending.nodeLogAt());
         }
         return written;
+    }
+
+    private final java.util.Set<ShardId> openPublishes = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * Publishes what an open replayed, before the shard is served.
+     *
+     * @param shardId the shard
+     * @param term the term it was opened at
+     * @return the manifest published
+     * @throws IOException if publication fails
+     */
+    CommitManifest publishAtOpen(ShardId shardId, long term) throws IOException {
+        openPublishes.add(shardId);
+        try {
+            return publish(shardId, term, false);
+        } finally {
+            openPublishes.remove(shardId);
+        }
     }
 
     /** Forgets a shard's staged trim once it is no longer held here. */

@@ -30,8 +30,9 @@ import java.util.function.Function;
  * The commits a node's publishes stage, logged in its write log so that a successor opens from the newest instead of the
  * register's older commit.
  *
- * <p><b>No write of its own.</b> A staged commit joins the log's open window and rides the blob of whatever the node logs
- * next, which on a node that is publishing is soon: its writes are why it publishes. It is logged under a key of its own
+ * <p><b>No write of its own, mostly.</b> A staged commit joins the log's open window and rides the blob of whatever the
+ * node logs next, which on a node that is publishing is soon: its writes are why it publishes. What nothing carries
+ * within a couple of windows is written on its own, one write for every shard waiting. It is logged under a key of its own
  * beside the shard's, so nothing that replays the shard's records ever sees it, and only the newest is kept: once one
  * lands, the one before is let go, so a successor reads one slice per shard.
  *
@@ -54,6 +55,8 @@ final class LoggedCommits {
     private final NodeLogCommitter committer;
     private final Map<ShardKey, ShardId> shards;
     private final Map<ShardKey, State> states = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicBoolean flushPlanned = new java.util.concurrent.atomic.AtomicBoolean();
+    private volatile java.util.function.Consumer<Runnable> later;
 
     /** Per shard, the newest logged commit's slot, and the stage sequence the register holds. */
     private static final class State {
@@ -66,6 +69,10 @@ final class LoggedCommits {
         this.plane = plane;
         this.committer = committer;
         this.shards = shards;
+    }
+
+    void flushWith(java.util.function.Consumer<Runnable> later) {
+        this.later = later;
     }
 
     static ShardKey keyOf(ShardId shardId) {
@@ -93,6 +100,23 @@ final class LoggedCommits {
             List.of(new WalRecord(RECORD_ID, source, sequence, term, 1L)),
             landed -> landed(key, sequence, landed)
         );
+        final java.util.function.Consumer<Runnable> runner = later;
+        if (runner != null && flushPlanned.compareAndSet(false, true)) {
+            // One write at most per wait, and none when the node's own records carry these first.
+            try {
+                runner.accept(() -> {
+                    flushPlanned.set(false);
+                    try {
+                        committer.flushQueued();
+                    } catch (RuntimeException e) {
+                        // Written with the next records or renewal instead.
+                    }
+                });
+            } catch (RuntimeException e) {
+                // A node shutting down runs nothing later; the next records or renewal write them, if any come.
+                flushPlanned.set(false);
+            }
+        }
     }
 
     /** Keeps only the newest commit that landed, and none the register already holds. Holds the committer's lock. */

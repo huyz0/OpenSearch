@@ -326,13 +326,48 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                 reader.leases().renewLease(plane);
                 second.leases().renewLease(plane);
                 store.reset();
+                slow.drain();
                 long firstNanos = 0;
+                long openNanos = 0;
                 for (ShardId shardId : held.subList(0, COLD_SHARDS)) {
                     final long openStarted = System.nanoTime();
                     final ShardId onReader = reader.readers().serveAsReader(plane, shardId.getIndexName(), 0);
+                    final long opened = System.nanoTime();
                     assertTrue(ShardOps.hits(reader.searchService(), onReader, "msg", "soak") > 0);
+                    openNanos += opened - openStarted;
                     firstNanos += System.nanoTime() - openStarted;
                 }
+                // Which requests a cold open waits on, by the thread that made them and the kind of blob.
+                final Map<String, Integer> coldRequests = new java.util.TreeMap<>();
+                final Map<String, Integer> serialKeys = new java.util.TreeMap<>();
+                for (LatencyInjectingBlobStore.Request request : slow.drain()) {
+                    if (request.thread().contains("TEST-")) {
+                        serialKeys.merge(
+                            request.op() + " " + request.key().replaceAll("[0-9a-f]{8,}|_[0-9]+|[0-9]{3,}", "*"),
+                            1,
+                            Integer::sum
+                        );
+                    }
+                    final String key = request.key();
+                    final String kind = key.contains("manifest") ? "manifest"
+                        : key.contains("/packs/") ? "packs"
+                        : key.contains("/segments/") ? "segments"
+                        : key.contains("node_log") || key.contains("nodelog") ? "node_log"
+                        : key.contains("lease") ? "lease"
+                        : "other";
+                    final String thread = request.thread().contains("TEST-")
+                        ? "test"
+                        : request.thread().replaceAll("\\[|\\]|#\\d+|-\\d+", "");
+                    coldRequests.merge(thread + ":" + request.op() + ":" + kind, 1, Integer::sum);
+                }
+                logger.info(
+                    "SOAKCOLD|{}|open {} ms, search {} ms per shard|requests {}|waited on {}",
+                    mode,
+                    String.format(Locale.ROOT, "%.1f", openNanos / 1e6 / COLD_SHARDS),
+                    String.format(Locale.ROOT, "%.1f", (firstNanos - openNanos) / 1e6 / COLD_SHARDS),
+                    coldRequests,
+                    serialKeys
+                );
                 final double coldGets = (store.blobReads() + store.registerReads()) / (double) COLD_SHARDS;
                 slow.setDelayMillis(0);
                 slow.setTail(0, 0);
