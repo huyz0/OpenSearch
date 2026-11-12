@@ -104,8 +104,59 @@ If something here looks like a hang, measure before concluding.
 ## Testing
 
 `:serverless:testkit:test` is 549 tests. `processTest` forks real JVMs, `pluginTest` installs a
-real assembled plugin, `tlsTest` does a real handshake. `s3Test` needs a live MinIO or SeaweedFS
-endpoint and assume-skips without one.
+real assembled plugin, `tlsTest` does a real handshake. `s3Test` needs a live S3-compatible endpoint
+(RustFS, MinIO or SeaweedFS) and assume-skips without one.
+
+### Running against RustFS
+
+RustFS is the S3-compatible store this project tests on; there is no AWS account behind any of it, so
+nothing here is evidence about real S3. Start one (single drive, and optionally four drives with erasure
+coding):
+
+```
+docker run -d --name serverless-rustfs-single -p 9200:9000 \
+  -e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin rustfs/rustfs:1.0.5 /data
+docker run -d --name serverless-rustfs-erasure -p 9300:9000 \
+  --tmpfs /data/d1 --tmpfs /data/d2 --tmpfs /data/d3 --tmpfs /data/d4 \
+  -e RUSTFS_ACCESS_KEY=rustfsadmin -e RUSTFS_SECRET_KEY=rustfsadmin rustfs/rustfs:1.0.5 '/data/d{1...4}'
+```
+
+Point the S3 tests at it. Every `s3Test` class reads the endpoint and keys from these properties
+(the keys default to MinIO's `minioadmin`):
+
+```
+S3="-Dtests.serverless.s3.endpoint=http://127.0.0.1:9200 -Dtests.serverless.s3.access_key=rustfsadmin \
+    -Dtests.serverless.s3.secret_key=rustfsadmin -Dtests.serverless.s3.conditional_delete=true"
+./gradlew :serverless:testkit:s3Test $S3 -Dtests.serverless.rustfs.endpoint=http://127.0.0.1:9200 \
+    -Dtests.serverless.rustfs_erasure.endpoint=http://127.0.0.1:9300
+./gradlew :serverless:testkit:processTest --tests '*ServerlessBucketContentionTests' $S3
+```
+
+That runs the register conformance suite (create-if-absent, compare-and-swap, conditional delete,
+linearizability), log fencing, the cost and delete-cost suites and the object-store end-to-end tests.
+
+The meters and request-count tests below run on the in-process filesystem store by default.
+`-Dtests.serverless.meter.store=s3` puts them on the endpoint above instead (a fresh bucket each),
+and `-Dtests.serverless.meter.latency` sets the delay added while they measure: `flat` (default:
+20 ms per request, one in fifty at 200 ms), `s3` (GET/HEAD 20-30 ms, PUT 40-60, conditional PUT
+50-70, DELETE 25-40, LIST 40-70, one request in fifty four times slower, one in a thousand 0.5-1 s,
+from a seeded random) or `none`. On RustFS, `none` leaves RustFS's own latency.
+
+| Test | Switch | What it measures |
+|---|---|---|
+| `NodeLogSoakMeterTests` | `-Dtests.soak.seconds=150 -Dtests.soak.shards=1000 -Dtests.soak.modes=pack+log,blob` | write ack p50/p99, PUT+LIST per publish, takeover of every shard, cold open and first search, pack collection |
+| `RefreshVisibilityMeterTests` | `-Dtests.meter.refresh=true` | `refresh=true` ack time, misses on search nodes, first open |
+| `FreshnessMeterTests` | `-Dtests.meter.freshness=all` | write-to-searchable delay by path |
+| `BucketCommitsTests`, `BucketCheckpointTests` | none | the bucket manifest swap: one conditional write per checkpoint, one lost swap per race |
+| `NodePackCollectorTests` | none | pack deletes, and that the collector never lists packs or shards |
+
+```
+./gradlew :serverless:testkit:s3Test --tests '*NodeLogSoakMeterTests' $S3 -Dtests.serverless.meter.store=s3 \
+    -Dtests.serverless.meter.latency=none -Dtests.soak.seconds=150 -Dtests.soak.shards=1000 -Dtests.soak.modes=pack+log
+```
+
+A thousand shards need `ulimit -n 20000` before the Gradle daemon starts (`./gradlew --stop` first).
+Buckets the meters create are not removed; delete the container to reclaim them.
 
 Two dependency-direction rules are enforced as build tasks rather than conventions:
 `server/` may never name `org.opensearch.serverless`, and the auth plugin may reach only for

@@ -55,8 +55,8 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
 
     private Settings s3Settings(String name, String bucket) {
         final MockSecureSettings secure = new MockSecureSettings();
-        secure.setString("s3.client.default.access_key", "minioadmin");
-        secure.setString("s3.client.default.secret_key", "minioadmin");
+        secure.setString("s3.client.default.access_key", org.opensearch.repositories.s3.MinioBlobStores.accessKey());
+        secure.setString("s3.client.default.secret_key", org.opensearch.repositories.s3.MinioBlobStores.secretKey());
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-on-s3")
@@ -77,11 +77,29 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             .build();
     }
 
+    /**
+     * Segment blobs under the shard and a manifest per publish, as the filesystem twin of the fencing test pins. The window
+     * this suite holds open is a segment upload under {@code t=<term>}, which node packs and log commits do not make.
+     */
+    private static Settings perTermLayout(Settings settings) {
+        return Settings.builder()
+            .put(settings)
+            .put("serverless.segments.node_pack.enabled", false)
+            .put("serverless.wal.node_log.commits", false)
+            .build();
+    }
+
     private String freshBucket() throws Exception {
         final String bucket = "shell-" + randomAlphaOfLength(12).toLowerCase(Locale.ROOT);
         // Created through the same helper the conformance suite uses, because creating a bucket is not something the shell
         // does or should do -- a serverless node is handed one.
-        org.opensearch.repositories.s3.MinioBlobStores.create(endpoint(), "minioadmin", "minioadmin", bucket, createTempDir());
+        org.opensearch.repositories.s3.MinioBlobStores.create(
+            endpoint(),
+            org.opensearch.repositories.s3.MinioBlobStores.accessKey(),
+            org.opensearch.repositories.s3.MinioBlobStores.secretKey(),
+            bucket,
+            createTempDir()
+        );
         return bucket;
     }
 
@@ -338,7 +356,13 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
         final long ttl = 3_000L;
         final java.util.concurrent.atomic.AtomicLong clock = new java.util.concurrent.atomic.AtomicLong(1_000L);
         final PausingBlobStore store = new PausingBlobStore(
-            org.opensearch.repositories.s3.MinioBlobStores.create(endpoint(), "minioadmin", "minioadmin", bucket, createTempDir())
+            org.opensearch.repositories.s3.MinioBlobStores.create(
+                endpoint(),
+                org.opensearch.repositories.s3.MinioBlobStores.accessKey(),
+                org.opensearch.repositories.s3.MinioBlobStores.secretKey(),
+                bucket,
+                createTempDir()
+            )
         );
         final var plane = new org.opensearch.serverless.metadata.MetadataPlane(
             store,
@@ -350,10 +374,10 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
 
         try (
             org.opensearch.serverless.shell.ServerlessNode loser = new org.opensearch.serverless.shell.ServerlessNode(
-                s3Settings("fence-loser", bucket)
+                perTermLayout(s3Settings("fence-loser", bucket))
             );
             org.opensearch.serverless.shell.ServerlessNode winner = new org.opensearch.serverless.shell.ServerlessNode(
-                s3Settings("fence-winner", bucket)
+                perTermLayout(s3Settings("fence-winner", bucket))
             )
         ) {
             loser.startup().start();
@@ -410,7 +434,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
         // like an error here, it would look like the winner's document having never been written.
         try (
             org.opensearch.serverless.shell.ServerlessNode reader = new org.opensearch.serverless.shell.ServerlessNode(
-                s3Settings("fence-verify", bucket)
+                perTermLayout(s3Settings("fence-verify", bucket))
             )
         ) {
             reader.startup().start();

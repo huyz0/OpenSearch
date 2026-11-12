@@ -11,7 +11,6 @@ package org.opensearch.serverless.testkit;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.ConditionalBlobContainer;
-import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.RegisterMap;
 import org.opensearch.serverless.reconcile.NodePackCollector;
@@ -35,6 +34,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * A node's packs are deleted once no shard's manifest names them, found through the node's ledger and each pack's
  * header rather than any listing, and never sooner than the grace allows.
  */
+// On a live endpoint (MeterStores) the S3 client keeps its threads past the test; they are the client's, not leaks.
+@com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters(filters = {
+    org.opensearch.test.BouncyCastleThreadFilter.class,
+    S3ClientThreads.class })
 public class NodePackCollectorTests extends OpenSearchTestCase {
 
     private static final long TTL = 30_000L;
@@ -50,7 +53,7 @@ public class NodePackCollectorTests extends OpenSearchTestCase {
     public void setUp() throws Exception {
         super.setUp();
         clock = new AtomicLong(1_000_000_000L);
-        store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false));
+        store = new CountingBlobStore(MeterStores.create(createTempDir(), createTempDir()));
         plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         packs = new NodePackStore(store, BlobPath.cleanPath(), "node-1");
         ledger = new NodePackLedger(store, BlobPath.cleanPath(), "node-1");

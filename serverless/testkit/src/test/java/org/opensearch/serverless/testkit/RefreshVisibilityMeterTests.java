@@ -9,7 +9,6 @@
 package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
-import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
@@ -36,11 +35,15 @@ import java.util.concurrent.atomic.AtomicInteger;
  * {@code refresh}, how often a search node that serves the shard misses a write right after its refreshing answer, how
  * long a first open of a shard takes, and the store requests and transport messages of each, in {@code owner} and
  * {@code serving} mode, with pushes leaving at once and with each push held {@value #PUSH_DELAY_MILLIS} ms. Every store request takes {@value #REQUEST_MILLIS} ms, one in {@value #TAIL_EVERY} takes
- * {@value #TAIL_MILLIS} ms, and nodes run their schedulers as a bootstrapped node does.
+ * {@value #TAIL_MILLIS} ms, and nodes run their schedulers as a bootstrapped node does. That is the default; {@link MeterStores} can put the meter on a live S3 endpoint or change the latency.
  *
  * <p>A measurement, not a pin: it logs one {@code REFRESHMETER} line per mode. Run with
  * {@code -Dtests.meter.refresh=true}.
  */
+// On a live endpoint (MeterStores) the S3 client keeps its threads past the test; they are the client's, not leaks.
+@com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters(filters = {
+    org.opensearch.test.BouncyCastleThreadFilter.class,
+    S3ClientThreads.class })
 public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
 
     private static final long TTL = ServerlessBootstrap.DEFAULT_LEASE_TTL_MILLIS;
@@ -165,7 +168,7 @@ public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
             "a refresh meter runs only when -Dtests.meter.refresh is set",
             System.getProperty("tests.meter.refresh", "").isEmpty() == false
         );
-        final LatencyInjectingBlobStore slow = new LatencyInjectingBlobStore(new FsBlobStore(8192, createTempDir(), false), 0);
+        final LatencyInjectingBlobStore slow = new LatencyInjectingBlobStore(MeterStores.create(createTempDir(), createTempDir()), 0);
         try (CountingBlobStore store = new CountingBlobStore(slow)) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
             plane.createIndex(new IndexDescriptor("hot", "uuid-hot-00000000000", 1, MAPPING, null));
@@ -210,8 +213,7 @@ public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
                 final java.util.Map<String, Tally> tallies = new java.util.TreeMap<>();
                 int opened = 0;
                 try {
-                    slow.setDelayMillis(REQUEST_MILLIS);
-                    slow.setTail(TAIL_EVERY, TAIL_MILLIS);
+                    MeterStores.slowDown(slow);
                     for (int round = 0; round < ROUNDS; round++) {
                         for (String variant : List.of("owner", "serving", "owner+push delay", "serving+push delay")) {
                             final RefreshVisibility.Mode mode = variant.startsWith("serving")
@@ -301,8 +303,7 @@ public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
                         }
                     }
                 } finally {
-                    slow.setDelayMillis(0);
-                    slow.setTail(0, 0);
+                    MeterStores.speedUp(slow);
                     for (ReconcileScheduler scheduler : schedulers) {
                         scheduler.close();
                     }
@@ -311,13 +312,11 @@ public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
                 tallies.forEach((variant, tally) -> {
                     final String line = String.format(
                         Locale.ROOT,
-                        "REFRESHMETER|%s|%d ms per request, 1 in %d at %d ms|refresh=false ack %s|refresh=true ack %s"
+                        "REFRESHMETER|%s|%s|refresh=false ack %s|refresh=true ack %s"
                             + "|missed on a search node right after a refreshing answer %d of %d (%d answered refreshed)|answered not refreshed %d"
                             + "|first open %s|per write: PUT %.3f GET %.3f LIST %.3f, push messages %.3f|fetches %d",
                         variant,
-                        REQUEST_MILLIS,
-                        TAIL_EVERY,
-                        TAIL_MILLIS,
+                        MeterStores.describe(),
                         summary(tally.plainAcks),
                         summary(tally.refreshAcks),
                         tally.missed.get(),

@@ -96,8 +96,8 @@ public class ServerlessCostTests extends OpenSearchTestCase {
         final String name = "cost-" + randomAlphaOfLength(12).toLowerCase(Locale.ROOT);
         final BlobStore store = org.opensearch.repositories.s3.MinioBlobStores.create(
             endpoint(),
-            "minioadmin",
-            "minioadmin",
+            org.opensearch.repositories.s3.MinioBlobStores.accessKey(),
+            org.opensearch.repositories.s3.MinioBlobStores.secretKey(),
             name,
             createTempDir()
         );
@@ -120,7 +120,13 @@ public class ServerlessCostTests extends OpenSearchTestCase {
     @org.junit.After
     public void removeBucketsThisTestMade() throws Exception {
         for (String bucket : created) {
-            org.opensearch.repositories.s3.MinioBlobStores.deleteBucket(endpoint(), "minioadmin", "minioadmin", bucket, createTempDir());
+            org.opensearch.repositories.s3.MinioBlobStores.deleteBucket(
+                endpoint(),
+                org.opensearch.repositories.s3.MinioBlobStores.accessKey(),
+                org.opensearch.repositories.s3.MinioBlobStores.secretKey(),
+                bucket,
+                createTempDir()
+            );
         }
         created.clear();
     }

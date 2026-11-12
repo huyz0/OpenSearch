@@ -36,11 +36,15 @@ import java.util.concurrent.TimeUnit;
  * How long an acknowledged write takes to become searchable, by the path a search takes: the writer's own engine, a
  * search node that already has the shard open, and a search node opening the shard for the first time. Nodes run their
  * schedulers the way {@link ServerlessBootstrap} wires them, on the wall clock, and every store request takes
- * {@value #REQUEST_MILLIS} ms with one in {@value #TAIL_EVERY} taking {@value #TAIL_MILLIS} ms.
+ * {@value #REQUEST_MILLIS} ms with one in {@value #TAIL_EVERY} taking {@value #TAIL_MILLIS} ms by default; {@link MeterStores} can put the meter on a live S3 endpoint or change the latency.
  *
  * <p>A measurement, not a pin: it logs one {@code FRESHMETER} line per configuration and asserts only that every write
  * became visible on every path. Run with {@code -Dtests.meter.freshness=all}.
  */
+// On a live endpoint (MeterStores) the S3 client keeps its threads past the test; they are the client's, not leaks.
+@com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters(filters = {
+    org.opensearch.test.BouncyCastleThreadFilter.class,
+    S3ClientThreads.class })
 public class FreshnessMeterTests extends OpenSearchTestCase {
 
     private static final long TTL = ServerlessBootstrap.DEFAULT_LEASE_TTL_MILLIS;
@@ -177,7 +181,7 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
     }
 
     private void measure(String label, Settings extra) throws Exception {
-        final LatencyInjectingBlobStore slow = new LatencyInjectingBlobStore(new FsBlobStore(8192, createTempDir(), false), 0);
+        final LatencyInjectingBlobStore slow = new LatencyInjectingBlobStore(MeterStores.create(createTempDir(), createTempDir()), 0);
         try (CountingBlobStore store = new CountingBlobStore(slow)) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
             final List<String> warmIndices = new ArrayList<>();
@@ -221,8 +225,7 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
                 schedulers.add(scheduled(warm, plane, new BackgroundReconciler(warm, plane)));
                 schedulers.add(scheduled(cold, plane, new BackgroundReconciler(cold, plane)));
                 try {
-                    slow.setDelayMillis(REQUEST_MILLIS);
-                    slow.setTail(TAIL_EVERY, TAIL_MILLIS);
+                    MeterStores.slowDown(slow);
                     store.reset();
                     final List<Sample> samples = new java.util.concurrent.CopyOnWriteArrayList<>();
                     final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(SAMPLES * SPACING_MILLIS + GIVE_UP_MILLIS);
@@ -296,7 +299,8 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
                     final StringBuilder line = new StringBuilder();
                     line.append("FRESHMETER|")
                         .append(label)
-                        .append(String.format(Locale.ROOT, "|%d ms per request, 1 in %d at %d ms", REQUEST_MILLIS, TAIL_EVERY, TAIL_MILLIS))
+                        .append("|")
+                        .append(MeterStores.describe())
                         .append("|write ack ")
                         .append(summary(acks));
                     byPath.forEach((path, millis) -> line.append("|").append(path).append(" visible after ack ").append(summary(millis)));
@@ -314,8 +318,7 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
                     logger.info(line.toString());
                     assertEquals("every write must become visible on every path: " + line, 0, missing);
                 } finally {
-                    slow.setDelayMillis(0);
-                    slow.setTail(0, 0);
+                    MeterStores.speedUp(slow);
                     for (ReconcileScheduler scheduler : schedulers) {
                         scheduler.close();
                     }

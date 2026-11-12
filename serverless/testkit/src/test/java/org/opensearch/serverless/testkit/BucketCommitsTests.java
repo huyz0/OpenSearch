@@ -11,7 +11,6 @@ package org.opensearch.serverless.testkit;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
-import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.bucket.BucketCommits;
 import org.opensearch.serverless.bucket.BucketManifest;
 import org.opensearch.serverless.bucket.BucketStore;
@@ -28,6 +27,10 @@ import java.util.Map;
  * Bucket members' commits share one register: many land in one swap, each judged against its own entry's version, so
  * a sibling's checkpoint is never mistaken for this member's commit moving.
  */
+// On a live endpoint (MeterStores) the S3 client keeps its threads past the test; they are the client's, not leaks.
+@com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters(filters = {
+    org.opensearch.test.BouncyCastleThreadFilter.class,
+    S3ClientThreads.class })
 public class BucketCommitsTests extends OpenSearchTestCase {
 
     private static final String BUCKET = "s03-1";
@@ -64,7 +67,7 @@ public class BucketCommitsTests extends OpenSearchTestCase {
     }
 
     public void testMembersCheckpointTogetherInOneSwap() throws Exception {
-        try (CountingBlobStore blobs = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
+        try (CountingBlobStore blobs = new CountingBlobStore(MeterStores.create(createTempDir(), createTempDir()))) {
             final BucketStore store = withMembers(blobs, "a", "b", "c");
             final BucketCommits commits = new BucketCommits(store);
             assertTrue("a member with no commit reads as none", commits.member(BUCKET, "a").read().isEmpty());
@@ -101,7 +104,7 @@ public class BucketCommitsTests extends OpenSearchTestCase {
     }
 
     public void testAMovedMemberIsRefusedAndItsSiblingsStillLand() throws Exception {
-        try (CountingBlobStore blobs = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
+        try (CountingBlobStore blobs = new CountingBlobStore(MeterStores.create(createTempDir(), createTempDir()))) {
             final BucketStore store = withMembers(blobs, "a", "b", "gone");
             final BucketCommits commits = new BucketCommits(store);
             commits.swapAll(BUCKET, swaps("a", 0L, commit(1, "_0.cfs")));
@@ -128,7 +131,7 @@ public class BucketCommitsTests extends OpenSearchTestCase {
     }
 
     public void testAnotherWriterLandingFirstCostsOneLostSwap() throws Exception {
-        try (CountingBlobStore blobs = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
+        try (CountingBlobStore blobs = new CountingBlobStore(MeterStores.create(createTempDir(), createTempDir()))) {
             final BucketStore store = withMembers(blobs, "a", "b");
             final BucketCommits mine = new BucketCommits(store);
             final BucketCommits theirs = new BucketCommits(store);

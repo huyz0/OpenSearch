@@ -38,7 +38,7 @@ import java.util.concurrent.CountDownLatch;
  *
  * <p><b>What is proven about the store.</b> A node runs on a local directory ({@code fs}) or on an
  * S3-compatible store ({@code s3}), and the two are not equally proven. The blob-store conformance suite
- * has been run against the filesystem container, MinIO and SeaweedFS; the linearizability of a
+ * has been run against the filesystem container, MinIO, SeaweedFS and RustFS; the linearizability of a
  * provider's conditional writes -- the property every register here leans on -- has not been closed for
  * Amazon S3 itself, so a node runs on such a provider only behind a flag that says so. An
  * {@code s3} store boots, and boots with a warning naming the providers actually tested, unless
@@ -215,7 +215,7 @@ public final class ServerlessBootstrap implements Closeable {
     public static final String PROVIDER_ACK = "serverless.store.provider_ack";
 
     /** The providers the blob-store conformance suite has actually been run against. */
-    static final String TESTED_PROVIDERS = "the filesystem container, MinIO and SeaweedFS";
+    static final String TESTED_PROVIDERS = "the filesystem container, MinIO, SeaweedFS and RustFS";
 
     /**
      * System property prefixes {@link #main} forwards into settings. An allowlist rather than everything,
