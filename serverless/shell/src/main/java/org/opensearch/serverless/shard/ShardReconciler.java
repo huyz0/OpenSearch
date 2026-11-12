@@ -278,6 +278,17 @@ public final class ShardReconciler {
     }
 
     /**
+     * Writes many shards' staged commits with one swap, once any has waited its time. Callers hold every one's publish lock.
+     *
+     * @param shards shards whose commits share one register: a bucket's members
+     * @param swap the write
+     * @return what was written and what failed
+     */
+    public CheckpointBatch.Outcome checkpointTogether(java.util.Collection<ShardId> shards, CheckpointBatch.Swap swap) {
+        return publishing.checkpointTogether(shards, swap);
+    }
+
+    /**
      * Returns the newest commit this node holds for a shard it writes: a staged one, or what it last published.
      *
      * @param shardId the shard
@@ -455,44 +466,7 @@ public final class ShardReconciler {
         ShardId shardId,
         org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> consumer
     ) throws IOException {
-        final var log = pendingReplay.get(shardId);
-        if (log == null) {
-            return;
-        }
-        final long readingAt = System.nanoTime();
-        try {
-            log.forEachReplayableAfterFencing(record -> {
-                consumer.accept(record);
-                logRecordsRead.incrementAndGet();
-            });
-            // After the shard's own log, which holds what was written before the node log was: oldest first.
-            final NodeLogReplay fromNodeLog = pendingNodeLogReplay.get(shardId);
-            final NodeLogHooks hooks = nodeLog;
-            if (fromNodeLog != null && hooks != null) {
-                final org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> counting = record -> {
-                    consumer.accept(record);
-                    logRecordsRead.incrementAndGet();
-                };
-                // Oldest writer first, so a record a later writer replayed and wrote again comes after the original.
-                final java.util.List<String> writers = fromNodeLog.writers().isEmpty()
-                    ? java.util.Collections.singletonList(null)
-                    : fromNodeLog.writers();
-                for (String writer : writers) {
-                    nodeLogReplayed.merge(shardId, hooks.replay(shardId, writer, fromNodeLog.term(), counting), Long::sum);
-                }
-            }
-            // Last: records a caller handed in for this open, newer than anything the shard's logs hold.
-            final java.util.List<org.opensearch.serverless.store.WalRecord> preloaded = preloadedReplay.remove(shardId);
-            if (preloaded != null) {
-                for (org.opensearch.serverless.store.WalRecord record : preloaded) {
-                    consumer.accept(record);
-                }
-                // Counted as node-log replay, so the open publishes them before it serves: no log of this shard holds them.
-                nodeLogReplayed.merge(shardId, (long) preloaded.size(), Long::sum);
-            }
-        } finally {
-            writerOpenNanos[WRITER_OPEN_PHASES.indexOf("log_read")].addAndGet(System.nanoTime() - readingAt);
-        }
+        ReplayStream.forEach(this, shardId, consumer);
     }
 
     /**

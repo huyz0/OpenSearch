@@ -37,16 +37,48 @@ import java.util.TreeMap;
  */
 public final class BucketManifest {
 
-    /** One member index: its name, for operators and sweeps, and its newest checkpointed commit, or null before its first. */
-    public record Member(String indexName, CommitManifest commit) {
+    /**
+     * One member index: its name, for operators and sweeps, its newest checkpointed commit, or null before its first, and
+     * the version of that entry.
+     *
+     * <p>The version is the member's own generation: it moves when this member's commit is swapped and at no other time,
+     * so a member's compare-and-swap is judged against its own entry rather than the bucket register, which every
+     * sibling's checkpoint moves.
+     */
+    public record Member(String indexName, CommitManifest commit, long version) {
         /**
          * Creates a member entry.
          *
          * @param indexName the member index's name
          * @param commit its newest checkpointed commit, or null if it has none yet
+         * @param version the entry's version: {@link org.opensearch.common.blobstore.BlobRegister#ABSENT_GENERATION} with no
+         *                commit, positive with one
          */
         public Member {
             Objects.requireNonNull(indexName);
+            if (version < 0 || (commit == null) != (version == 0)) {
+                throw new IllegalArgumentException("member [" + indexName + "] has version " + version + " with commit " + commit);
+            }
+        }
+
+        /**
+         * Creates a member entry at its first version.
+         *
+         * @param indexName the member index's name
+         * @param commit its newest checkpointed commit, or null if it has none yet
+         */
+        public Member(String indexName, CommitManifest commit) {
+            this(indexName, commit, commit == null ? 0L : 1L);
+        }
+
+        /**
+         * Returns this entry with a new commit, at the next version.
+         *
+         * @param next the new commit
+         * @return the new entry
+         */
+        public Member advance(CommitManifest next) {
+            return new Member(indexName, Objects.requireNonNull(next), version + 1);
         }
     }
 
@@ -163,6 +195,9 @@ public final class BucketManifest {
             for (Map.Entry<String, Member> e : members.entrySet()) {
                 builder.startObject(e.getKey());
                 builder.field("index", e.getValue().indexName());
+                if (e.getValue().version() > 0) {
+                    builder.field("version", e.getValue().version());
+                }
                 if (e.getValue().commit() != null) {
                     try (InputStream commit = e.getValue().commit().toBytes().streamInput()) {
                         builder.rawField("commit", commit, XContentType.JSON);
@@ -228,6 +263,7 @@ public final class BucketManifest {
     private static Member parseMember(String uuid, XContentParser parser) throws IOException {
         String indexName = null;
         CommitManifest commit = null;
+        long version = -1L;
         while (parser.nextToken() == XContentParser.Token.FIELD_NAME) {
             final String field = parser.currentName();
             final XContentParser.Token token = parser.nextToken();
@@ -242,12 +278,14 @@ public final class BucketManifest {
                 parser.skipChildren();
             } else if ("index".equals(field)) {
                 indexName = parser.text();
+            } else if ("version".equals(field)) {
+                version = parser.longValue();
             }
         }
         if (indexName == null) {
             throw new IOException("malformed bucket manifest: member [" + uuid + "] names no index");
         }
-        return new Member(indexName, commit);
+        return version < 0 ? new Member(indexName, commit) : new Member(indexName, commit, version);
     }
 
     @Override
@@ -260,6 +298,7 @@ public final class BucketManifest {
                 .stream()
                 .allMatch(
                     e -> e.getValue().indexName().equals(other.members.get(e.getKey()).indexName())
+                        && e.getValue().version() == other.members.get(e.getKey()).version()
                         && sameCommit(e.getValue().commit(), other.members.get(e.getKey()).commit())
                 );
     }
