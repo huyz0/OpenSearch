@@ -17,8 +17,19 @@ public final class NodeWritePath {
 
     private final ServerlessNode node;
 
+    private final WriteAckTimings timings = new WriteAckTimings();
+
     NodeWritePath(ServerlessNode node) {
         this.node = node;
+    }
+
+    /**
+     * Returns where this node's writes spend their time before they are acknowledged.
+     *
+     * @return the timings, summed since their last reset
+     */
+    public WriteAckTimings ackTimings() {
+        return timings;
     }
 
     /**
@@ -165,15 +176,30 @@ public final class NodeWritePath {
         boolean mayGrowMapping
     ) throws java.io.IOException {
         node.ensureStarted();
+        final long started = System.nanoTime();
         try {
             node.fences.awaitHold(shardId);
             // Admitted before anything is applied, so a write refused for back-pressure is in neither the engine nor the log.
             try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
+                final long admittedAt = System.nanoTime();
+                timings.add(WriteAckTimings.Step.ADMIT, admittedAt - started);
                 // Under the shard's fence from before the engine applies the operation until after it is
                 // acknowledged. See appendOrRelease for the interleaving this closes.
                 final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
                 try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
-                    return indexUnderFence(shardId, id, routing, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
+                    timings.add(WriteAckTimings.Step.FENCE, System.nanoTime() - admittedAt);
+                    final WriteOutcome outcome = indexUnderFence(
+                        shardId,
+                        id,
+                        routing,
+                        source,
+                        ifSeqNo,
+                        ifPrimaryTerm,
+                        requireAbsent,
+                        mayGrowMapping
+                    );
+                    timings.add(WriteAckTimings.Step.TOTAL, System.nanoTime() - started);
+                    return outcome;
                 } finally {
                     fence.unlock();
                 }
@@ -201,12 +227,15 @@ public final class NodeWritePath {
         if (node.reconciler.isReader(shardId)) {
             throw new java.io.IOException("cannot index into " + shardId + ": it is open as a reader");
         }
+        final long checking = System.nanoTime();
         node.fences.refuseIfWriteFenced(shardId);
         // Before the operation as well as after it: the read that confirms the incarnation brings the shard's mapping
         // and settings up to the descriptor, so a change made on another node is in force for the first operation
         // after it rather than the one after that. Within the fence window this is free; see INCARNATION_FENCE_MILLIS.
         node.fences().ensureIncarnationLive(shardId);
         node.shards().markUsed(shardId);
+        final long applying = System.nanoTime();
+        timings.add(WriteAckTimings.Step.CHECK_BEFORE, applying - checking);
         // Apply first, then log. This is the reverse of what this path used to do, and the reason is the
         // whole point of carrying sequence numbers: the engine assigns one, so there is nothing worth
         // recording until it has run. The durability contract the javadoc above states is unchanged --
@@ -247,6 +276,7 @@ public final class NodeWritePath {
             // and reports no error.
             throw new java.io.IOException("indexing " + id + " returned " + result.getResultType(), result.getFailure());
         }
+        timings.add(WriteAckTimings.Step.APPLY, System.nanoTime() - applying);
         appendOrRelease(
             shardId,
             shard,
@@ -261,7 +291,9 @@ public final class NodeWritePath {
         // until it is synced, and a node with a one-kilobyte request limit found every later search
         // refused by a page a write had left behind. One local fsync per acknowledged write is the price,
         // and it is not an object-store request.
+        final long syncing = System.nanoTime();
         syncIfStillOpen(shard);
+        timings.add(WriteAckTimings.Step.SYNC, System.nanoTime() - syncing);
         // The edge. Fired after the write is durable and applied, so a listener that publishes on it
         // can never publish a commit describing an operation the caller was not told about.
         node.signals.wrote(shardId);
@@ -323,6 +355,7 @@ public final class NodeWritePath {
         if (wal == null || records.isEmpty()) {
             return;
         }
+        final long leaseChecking = System.nanoTime();
         node.fences.ensureOwnLeaseIsStillValid(shardId);
         if (wal.begun(shard.getOperationPrimaryTerm()) == false) {
             // Not this term's writer: only a writer's open begins its term, after confirming the head names it. Appending
@@ -337,6 +370,7 @@ public final class NodeWritePath {
             );
         }
         final long appendStarted = System.nanoTime();
+        timings.add(WriteAckTimings.Step.LEASE_CHECK, appendStarted - leaseChecking);
         try {
             // Through the group committer rather than straight to the log: concurrent writes to this shard
             // share one PUT, and this caller returns only once the blob carrying its own records has
@@ -348,7 +382,9 @@ public final class NodeWritePath {
             } else {
                 node.walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
             }
-            node.writeBackpressure.onAppend(System.nanoTime() - appendStarted, true);
+            final long appended = System.nanoTime();
+            timings.add(WriteAckTimings.Step.LOG, appended - appendStarted);
+            node.writeBackpressure.onAppend(appended - appendStarted, true);
             // Acknowledged now: the shard's search nodes may search it before it is published.
             if (node.router != null) {
                 try {
@@ -358,6 +394,7 @@ public final class NodeWritePath {
                     LOG.debug("could not keep acknowledged records of {} for its search nodes", shardId, e);
                 }
             }
+            timings.add(WriteAckTimings.Step.TAIL_PUSH, System.nanoTime() - appended);
         } catch (Exception | Error e) {
             node.writeBackpressure.onAppend(System.nanoTime() - appendStarted, false);
             node.writeFenced.add(shardId);
@@ -379,9 +416,11 @@ public final class NodeWritePath {
         // refusing it was what turned a durable record into one "refused" and later replayed. A lapsed
         // lease still releases the shard, so nothing further is written here. See
         // serverless/rfc-fencing-closure.md.
+        final long checkingAfter = System.nanoTime();
         node.fences.releaseIfLeaseLapsed(shardId);
         // After the PUT, so the confirmation is of the index as it stood once the record was down.
         node.fences().ensureIncarnationLive(shardId);
+        timings.add(WriteAckTimings.Step.CHECK_AFTER, System.nanoTime() - checkingAfter);
     }
 
     /**
@@ -440,12 +479,15 @@ public final class NodeWritePath {
     public WriteOutcome delete(org.opensearch.core.index.shard.ShardId shardId, String id, String routing, long ifSeqNo, long ifPrimaryTerm)
         throws java.io.IOException {
         node.ensureStarted();
+        final long started = System.nanoTime();
         try {
             node.fences.awaitHold(shardId);
             try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
                 final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
                 try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
-                    return deleteUnderFence(shardId, id, routing, ifSeqNo, ifPrimaryTerm);
+                    final WriteOutcome outcome = deleteUnderFence(shardId, id, routing, ifSeqNo, ifPrimaryTerm);
+                    timings.add(WriteAckTimings.Step.TOTAL, System.nanoTime() - started);
+                    return outcome;
                 } finally {
                     fence.unlock();
                 }
@@ -553,12 +595,15 @@ public final class NodeWritePath {
     public java.util.List<BulkOutcome> bulkOperations(org.opensearch.core.index.shard.ShardId shardId, java.util.List<BulkOperation> batch)
         throws java.io.IOException {
         node.ensureStarted();
+        final long started = System.nanoTime();
         try {
             node.fences.awaitHold(shardId);
             try (org.opensearch.common.lease.Releasable admitted = node.writeBackpressure.admit()) {
                 final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
                 try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
-                    return bulkOperationsUnderFence(shardId, batch);
+                    final java.util.List<BulkOutcome> outcomes = bulkOperationsUnderFence(shardId, batch);
+                    timings.add(WriteAckTimings.Step.TOTAL, System.nanoTime() - started);
+                    return outcomes;
                 } finally {
                     fence.unlock();
                 }

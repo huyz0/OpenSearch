@@ -180,10 +180,12 @@ public final class NodeLogCommitter {
         if (records.isEmpty()) {
             return null;
         }
+        final long joined = System.nanoTime();
         lock.lock();
         try {
             final Window mine = join(shard, term, records);
             awaitLanded(mine);
+            timings.caller(joined, mine);
             final IOException failure = mine.failures.get(shard);
             if (failure != null) {
                 throw failure;
@@ -256,6 +258,7 @@ public final class NodeLogCommitter {
             }
             windows.pollFirst();
             flushing = true;
+            head.flushStartedNanos = System.nanoTime();
             try {
                 lock.unlock();
                 try {
@@ -268,6 +271,7 @@ public final class NodeLogCommitter {
                     lock.lock();
                 }
             } finally {
+                head.doneNanos = System.nanoTime();
                 head.done = true;
                 flushing = false;
                 changed.signalAll();
@@ -308,12 +312,16 @@ public final class NodeLogCommitter {
     /** Writes one window. Called with the lock released, by the one flusher. */
     private void write(Window window) {
         final long epoch;
+        final long opening = System.nanoTime();
         try {
             epoch = openEpoch();
         } catch (IOException | RuntimeException e) {
             window.failAll(new IOException("could not record a new epoch of the node log in the lease; nothing was logged", e));
             return;
+        } finally {
+            timings.epochNanos.add(System.nanoTime() - opening);
         }
+        final long admitting = System.nanoTime();
 
         // A shard's first records in this epoch wait for a check that this node still owns it.
         final List<ShardBatch> batches = new ArrayList<>();
@@ -324,6 +332,7 @@ public final class NodeLogCommitter {
             }
             if (admitted(epoch, key.shard, key.term) == false) {
                 try {
+                    timings.admissionChecks.increment();
                     admission.admit(key.shard, key.term, epoch);
                     markAdmitted(epoch, key.shard, key.term);
                 } catch (IOException | RuntimeException e) {
@@ -334,6 +343,7 @@ public final class NodeLogCommitter {
             batches.add(new ShardBatch(key.shard, key.term, entry.getValue()));
         }
         batches.removeIf(batch -> window.failures.containsKey(batch.shard()));
+        timings.admissionNanos.add(System.nanoTime() - admitting);
         if (batches.isEmpty()) {
             return;
         }
@@ -361,12 +371,16 @@ public final class NodeLogCommitter {
         }
 
         IOException failure = null;
+        final long putting = System.nanoTime();
         try {
             store.append(epoch, ordinal, encoded.bytes());
         } catch (IOException e) {
             failure = e;
         } catch (RuntimeException e) {
             failure = new IOException("node-log append failed", e);
+        } finally {
+            timings.putNanos.add(System.nanoTime() - putting);
+            timings.puts.increment();
         }
 
         lock.lock();
@@ -777,6 +791,98 @@ public final class NodeLogCommitter {
         return recordsCommitted.get();
     }
 
+    private final Timings timings = new Timings();
+
+    /**
+     * Returns where the callers of {@link #commit} spend their time, summed since the last reset.
+     *
+     * @return the timings
+     */
+    public Timings timings() {
+        return timings;
+    }
+
+    /**
+     * Where a {@link #commit} waits: for its window to close, behind the blob before it, and for its own blob's write;
+     * and, per blob, how that write splits between recording an epoch, checking shards new to the epoch, and the PUT.
+     */
+    public static final class Timings {
+        private final java.util.concurrent.atomic.LongAdder callers = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder windowNanos = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder behindNanos = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder writeNanos = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder epochNanos = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder admissionNanos = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder admissionChecks = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder putNanos = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder puts = new java.util.concurrent.atomic.LongAdder();
+
+        private void caller(long joinedNanos, Window window) {
+            if (window.flushStartedNanos == 0L) {
+                return;
+            }
+            final long waited = Math.max(0L, window.flushStartedNanos - joinedNanos);
+            final long forWindow = Math.min(waited, Math.max(0L, window.closesAtNanos - joinedNanos));
+            callers.increment();
+            windowNanos.add(forWindow);
+            behindNanos.add(waited - forWindow);
+            writeNanos.add(Math.max(0L, window.doneNanos - window.flushStartedNanos));
+        }
+
+        private static double mean(java.util.concurrent.atomic.LongAdder nanos, java.util.concurrent.atomic.LongAdder count) {
+            final long n = count.sum();
+            return n == 0 ? 0 : nanos.sum() / 1e6 / n;
+        }
+
+        /**
+         * Returns how many PUTs of blobs were tried since the last reset.
+         *
+         * @return the count
+         */
+        public long puts() {
+            return puts.sum();
+        }
+
+        /** Starts the sums over. */
+        public void reset() {
+            for (java.util.concurrent.atomic.LongAdder each : List.of(
+                callers,
+                windowNanos,
+                behindNanos,
+                writeNanos,
+                epochNanos,
+                admissionNanos,
+                admissionChecks,
+                putNanos,
+                puts
+            )) {
+                each.reset();
+            }
+        }
+
+        /**
+         * Describes the means, for a log line: per caller, the wait for its window to close, the wait behind the blob in
+         * flight, and its own blob's write; per blob, recording an epoch, checking new shards, and the PUT.
+         *
+         * @return the means in milliseconds
+         */
+        public String describe() {
+            return String.format(
+                java.util.Locale.ROOT,
+                "callers=%d window=%.1f behind=%.1f write=%.1f | blobs=%d epoch=%.1f admission=%.1f (%d head reads) put=%.1f ms",
+                callers.sum(),
+                mean(windowNanos, callers),
+                mean(behindNanos, callers),
+                mean(writeNanos, callers),
+                puts.sum(),
+                mean(epochNanos, puts),
+                mean(admissionNanos, puts),
+                admissionChecks.sum(),
+                mean(putNanos, puts)
+            );
+        }
+    }
+
     /** What this node knows of one epoch of its log. */
     private static final class EpochState {
         /** For each shard, the runs of slots holding its records that it has not published. */
@@ -816,6 +922,8 @@ public final class NodeLogCommitter {
         private long bytes;
         private int records;
         private boolean done;
+        private long flushStartedNanos;
+        private long doneNanos;
         private Position landed;
         private final List<Runnable> onLanded = new ArrayList<>();
 
