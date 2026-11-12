@@ -63,6 +63,18 @@ public final class NodeLogCommitter {
      * short enough that a write is acknowledged within a quarter of a second.
      */
     public static final java.util.Set<Long> ALLOWED_WINDOW_MILLIS = java.util.Set.of(100L, 200L, 250L);
+    /**
+     * How long a window's PUT may go unanswered before it is sent again, in milliseconds; zero or less never sends a
+     * second. See {@link #hedgeAppends}.
+     */
+    public static final String HEDGE_AFTER_SETTING = "serverless.wal.node_log.hedge_after_millis";
+
+    /** Whether a record that finds the log quiet for a window is written at once; see {@link #flushWhenIdle}. */
+    public static final String IDLE_FLUSH_SETTING = "serverless.wal.node_log.idle_flush";
+
+    /** The default of {@link #HEDGE_AFTER_SETTING}. */
+    public static final long DEFAULT_HEDGE_AFTER_MILLIS = 60L;
+
     /** Roughly the most bytes of id and source one window takes before the next arrival opens another. */
     public static final long DEFAULT_MAX_BYTES = 8L * 1024 * 1024;
     /** The most records one window takes before the next arrival opens another. */
@@ -259,6 +271,7 @@ public final class NodeLogCommitter {
             windows.pollFirst();
             flushing = true;
             head.flushStartedNanos = System.nanoTime();
+            lastFlushStartedNanos = head.flushStartedNanos;
             try {
                 lock.unlock();
                 try {
@@ -298,7 +311,14 @@ public final class NodeLogCommitter {
     private Window join(ShardKey shard, long term, List<WalRecord> records) {
         Window last = windows.peekLast();
         if (last == null || last.full(maxBytes, maxRecords)) {
-            last = new Window(System.nanoTime() + windowNanos);
+            final long now = System.nanoTime();
+            long closesAt = now + windowNanos;
+            if (idleFlush) {
+                // Paced by the last blob rather than by this record: at most one blob starts per window, as before, and a
+                // record that finds the log quiet for a whole window goes at once instead of waiting one out alone.
+                closesAt = Math.min(closesAt, Math.max(now, lastFlushStartedNanos + windowNanos));
+            }
+            last = new Window(closesAt);
             windows.addLast(last);
         }
         last.add(shard, term, records);
@@ -373,14 +393,24 @@ public final class NodeLogCommitter {
         IOException failure = null;
         final long putting = System.nanoTime();
         try {
-            store.append(epoch, ordinal, encoded.bytes());
+            final NodeLogStore.HedgeOutcome hedged = store.appendHedged(epoch, ordinal, encoded.bytes(), hedgeDelayNanos(), hedgeExecutor);
+            if (hedged != NodeLogStore.HedgeOutcome.NONE) {
+                timings.hedges.increment();
+                if (hedged == NodeLogStore.HedgeOutcome.WON) {
+                    timings.hedgesWon.increment();
+                }
+            }
         } catch (IOException e) {
             failure = e;
         } catch (RuntimeException e) {
             failure = new IOException("node-log append failed", e);
         } finally {
-            timings.putNanos.add(System.nanoTime() - putting);
+            final long took = System.nanoTime() - putting;
+            timings.putNanos.add(took);
             timings.puts.increment();
+            if (failure == null) {
+                notePutTook(took);
+            }
         }
 
         lock.lock();
@@ -793,6 +823,81 @@ public final class NodeLogCommitter {
 
     private final Timings timings = new Timings();
 
+    private volatile boolean idleFlush;
+    /** When the last blob started to be written; guarded by the lock. */
+    private long lastFlushStartedNanos = System.nanoTime() - TimeUnit.DAYS.toNanos(1);
+
+    /**
+     * Paces windows by the last blob instead of by their first record: a window closes a window's length after the last
+     * blob started, or at once when that is past, rather than a window's length after its first record arrived.
+     *
+     * <p><b>What it changes.</b> A record that arrives after the log has been quiet for a whole window no longer waits one
+     * out on its own: it is written at once, which is the common case on a node that is not busy. A busy node is paced
+     * exactly as before, one blob per window. Between the two, it costs PUTs: records that would have shared one window
+     * opened by the first of them may now take two, the first written at once and the rest a window after it. With
+     * arrivals at random, that is at most about half as many blobs again, when about one record arrives per window, and
+     * a tenth or less when far fewer or far more do.
+     *
+     * @param on whether windows are paced by the last blob
+     */
+    public void flushWhenIdle(boolean on) {
+        this.idleFlush = on;
+    }
+
+    private volatile long hedgeAfterNanos;
+
+    /** The most recent PUT durations, for the hedge delay; guarded by itself. */
+    private final long[] recentPutNanos = new long[RECENT_PUTS];
+    private int recentPuts;
+    private static final int RECENT_PUTS = 128;
+    /** The share of PUTs, at most, that hedging may send twice: the hedge waits at least this quantile of recent ones. */
+    private static final double HEDGE_QUANTILE = 0.95;
+
+    private void notePutTook(long nanos) {
+        synchronized (recentPutNanos) {
+            recentPutNanos[recentPuts++ % RECENT_PUTS] = nanos;
+        }
+    }
+
+    /**
+     * How long this window's PUT waits before it is sent again: the configured delay, or the 95th percentile of the recent
+     * PUTs when that is longer, so that a store slower than the setting expects is hedged on its slowest twentieth at most
+     * rather than on most of its PUTs.
+     */
+    long hedgeDelayNanos() {
+        final long configured = hedgeAfterNanos;
+        if (configured <= 0) {
+            return 0L;
+        }
+        final long[] sorted;
+        synchronized (recentPutNanos) {
+            sorted = java.util.Arrays.copyOf(recentPutNanos, Math.min(recentPuts, RECENT_PUTS));
+        }
+        if (sorted.length == 0) {
+            return configured;
+        }
+        java.util.Arrays.sort(sorted);
+        return Math.max(configured, sorted[(int) Math.min(sorted.length - 1, Math.floor(HEDGE_QUANTILE * sorted.length))]);
+    }
+
+    private volatile java.util.concurrent.Executor hedgeExecutor;
+
+    /**
+     * Sends a window's PUT a second time when the first has not answered within the given time, and lets the window
+     * land on whichever answers first; see {@link NodeLogStore#appendHedged}. A store's slowest PUTs are slow for reasons
+     * of their own, so a second one sent late usually answers well before the first: the window's writers wait for the
+     * faster of two rather than for the slow one, and so does the window behind it, which waits for this one to land.
+     * Each hedge is one more PUT, for the slow PUTs only: the delay is at least the 95th percentile of the last 128 PUTs, so
+     * at most about one PUT in twenty is sent twice whatever the store's latency, and fewer when the setting is longer.
+     *
+     * @param afterMillis how long a PUT may go unanswered before it is sent again; zero or less never sends a second
+     * @param executor where the PUTs of a hedged window run; null never sends a second
+     */
+    public void hedgeAppends(long afterMillis, java.util.concurrent.Executor executor) {
+        this.hedgeExecutor = executor;
+        this.hedgeAfterNanos = afterMillis <= 0 ? 0L : TimeUnit.MILLISECONDS.toNanos(afterMillis);
+    }
+
     /**
      * Returns where the callers of {@link #commit} spend their time, summed since the last reset.
      *
@@ -816,6 +921,8 @@ public final class NodeLogCommitter {
         private final java.util.concurrent.atomic.LongAdder admissionChecks = new java.util.concurrent.atomic.LongAdder();
         private final java.util.concurrent.atomic.LongAdder putNanos = new java.util.concurrent.atomic.LongAdder();
         private final java.util.concurrent.atomic.LongAdder puts = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder hedges = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder hedgesWon = new java.util.concurrent.atomic.LongAdder();
 
         private void caller(long joinedNanos, Window window) {
             if (window.flushStartedNanos == 0L) {
@@ -843,6 +950,15 @@ public final class NodeLogCommitter {
             return puts.sum();
         }
 
+        /**
+         * Returns how many blobs were sent a second time since the last reset: the PUTs hedging added.
+         *
+         * @return the count
+         */
+        public long hedges() {
+            return hedges.sum();
+        }
+
         /** Starts the sums over. */
         public void reset() {
             for (java.util.concurrent.atomic.LongAdder each : List.of(
@@ -854,7 +970,9 @@ public final class NodeLogCommitter {
                 admissionNanos,
                 admissionChecks,
                 putNanos,
-                puts
+                puts,
+                hedges,
+                hedgesWon
             )) {
                 each.reset();
             }
@@ -869,7 +987,8 @@ public final class NodeLogCommitter {
         public String describe() {
             return String.format(
                 java.util.Locale.ROOT,
-                "callers=%d window=%.1f behind=%.1f write=%.1f | blobs=%d epoch=%.1f admission=%.1f (%d head reads) put=%.1f ms",
+                "callers=%d window=%.1f behind=%.1f write=%.1f | blobs=%d epoch=%.1f admission=%.1f (%d head reads) put=%.1f ms"
+                    + " | hedged=%d won=%d",
                 callers.sum(),
                 mean(windowNanos, callers),
                 mean(behindNanos, callers),
@@ -878,7 +997,9 @@ public final class NodeLogCommitter {
                 mean(epochNanos, puts),
                 mean(admissionNanos, puts),
                 admissionChecks.sum(),
-                mean(putNanos, puts)
+                mean(putNanos, puts),
+                hedges.sum(),
+                hedgesWon.sum()
             );
         }
     }
