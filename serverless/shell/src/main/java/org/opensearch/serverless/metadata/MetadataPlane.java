@@ -190,12 +190,24 @@ public final class MetadataPlane {
 
     /** Deletes an index and every shard-head belonging to it. */
     public boolean deleteIndex(String indexName) throws IOException {
+        forgetBucket(indexName);
         return lifecycle.deleteIndex(indexName);
     }
 
     /** Deletes only the incarnation the caller selected, preserving a replacement under the same name. */
     public boolean deleteIndex(String indexName, String expectedUuid) throws IOException {
+        forgetBucket(indexName);
         return lifecycle.deleteIndex(indexName, expectedUuid);
+    }
+
+    private void forgetBucket(String indexName) {
+        final org.opensearch.serverless.bucket.DescriptorBucketHeads known;
+        synchronized (this) {
+            known = bucketHeads;
+        }
+        if (known != null) {
+            known.forget(indexName);
+        }
     }
 
     /** Reads an alias and its generation together, briefly waiting for a pending mutation. */
@@ -777,6 +789,31 @@ public final class MetadataPlane {
      */
     public ShardHeadStore heads() {
         return heads;
+    }
+
+    private org.opensearch.serverless.bucket.DescriptorBucketHeads bucketHeads;
+
+    /**
+     * Turns on ownership through bucket heads, answered from routing descriptors, and returns the resolver for nodes to
+     * register their open shards with. Every node of a fleet turns this on before the first bucket is made.
+     *
+     * @return the resolver the shard-head store now consults
+     */
+    public synchronized org.opensearch.serverless.bucket.DescriptorBucketHeads enableBuckets() {
+        if (bucketHeads == null) {
+            bucketHeads = new org.opensearch.serverless.bucket.DescriptorBucketHeads(this::describeForRouting, clock);
+            heads.setBucketHeads(bucketHeads);
+        }
+        return bucketHeads;
+    }
+
+    /**
+     * Returns the store of bucket manifests.
+     *
+     * @return the bucket store
+     */
+    public org.opensearch.serverless.bucket.BucketStore buckets() {
+        return new org.opensearch.serverless.bucket.BucketStore(blobStore, base);
     }
 
     /**

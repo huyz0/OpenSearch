@@ -518,6 +518,10 @@ public final class ServerlessNode implements Closeable {
         this.metadataPlane = plane;
         if (plane != null) {
             setMembershipSource(plane.membership());
+            if (nodeCapacity().bucketsOwnedTogether()) {
+                // Members are owned through their bucket's head, which only a node writing its node log may hold.
+                plane.enableBuckets().register(localNode.getId(), () -> reconciler().openShards());
+            }
             try {
                 // Publish the lease immediately. It is this node's entry in the address book that peers
                 // use to forward writes here, so a node that has not renewed yet is not merely invisible
