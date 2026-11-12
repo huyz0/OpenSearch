@@ -436,6 +436,18 @@ These are decisions, not gaps. Each answers 501 with a reason.
   strictest level, and above core's own `server/`, which sits at `class`.
 - The REST surface is an allowlist. Anything not registered answers 404 or an explicit 501, never an empty
   success.
+- **Custom routing works as core's does, in the legacy layout and in both shard modes.** A `routing` value places a
+  document instead of its id (core's own function in a legacy index, the value's 64-bit hash in the unit layout of a
+  fixed or adaptive one), is stored as `_routing`, and travels in the document's node-log record, so a crash replay
+  rebuilds it and a unit split sends it, and its log tail, to the half its routing hashes to. Index, create, delete,
+  get, `_mget`, `_update`, `_explain`, `_bulk` (path default and per line), `_search`, `_count`, `_msearch` and the
+  plugin client all take it; a routed search visits only the shards its values route to; a mapping with
+  `_routing.required` refuses a document without one. A record with no routing is byte-for-byte what it was, so
+  logs written before this replay unchanged. Two differences from core, both from units being coarser than declared
+  shards: in an adaptive index a unit can hold several declared shards, so a routed search returns every document
+  of that unit rather than only its declared shard's, and one `_id` written under two routing values that land in
+  the same unit is one document, as it would be in one core shard. A fixed index has one unit per declared shard and
+  matches core exactly. Still refused: routing on `_delete_by_query`, on an alias, and on a point in time.
 - Storage layout changed to put the index uuid in the path; an existing deployment's data is not found by a node
   running this build. Pre-release.
 - The authentication plugin authenticates and ships no policy beyond one rule: only the configured account

@@ -14,7 +14,6 @@ import org.opensearch.serverless.metadata.WriteTarget;
 import org.opensearch.serverless.shell.BulkOperation;
 import org.opensearch.serverless.shell.BulkOutcome;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.store.WalRecord;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -96,7 +95,13 @@ final class BulkDispatch {
             // it. Its uuid rides along so the local lookup and the forward both name the incarnation.
             item.writtenIndex = target.get().index().name();
             item.writtenUuid = target.get().index().uuid();
-            item.shard = DocumentRouting.shardFor(target.get().index(), item.operation.id());
+            try {
+                item.shard = DocumentRouting.shardFor(target.get().index(), item.operation.id(), item.operation.routing());
+            } catch (org.opensearch.action.RoutingMissingException e) {
+                // The mapping requires routing and this item has none: its own failure, as core reports it.
+                item.fail(RestStatus.BAD_REQUEST, "routing_missing_exception", e.getMessage());
+                continue;
+            }
             // Resolved here rather than in shape(), because this is where the index actually written to is
             // known: index.default_pipeline belongs to the backing index a data stream write lands on, not
             // to the name the caller used.
@@ -149,7 +154,7 @@ final class BulkDispatch {
                         item.noop(serving.localNode().getId());
                         break;
                     }
-                    item.operation = new WalRecord(item.operation.id(), outcome.source());
+                    item.operation = item.operation.withSource(outcome.source());
                 }
             } catch (Exception e) {
                 item.fail(RestStatus.BAD_REQUEST, "pipeline_failed", e.getMessage() == null ? e.toString() : e.getMessage());

@@ -35,6 +35,7 @@ public final class ForwardedIndexRequest extends TransportRequest {
     private final boolean requireAbsent;
     private final String indexUuid;
     private boolean steered;
+    private String routing;
 
     /**
      * Creates a request.
@@ -200,6 +201,27 @@ public final class ForwardedIndexRequest extends TransportRequest {
         this.requireAbsent = in.readBoolean();
         this.indexUuid = in.readOptionalString();
         this.steered = in.readBoolean();
+        this.routing = in.readOptionalString();
+    }
+
+    /**
+     * Sets the custom routing value the document was placed by, which the owner stores with it and logs.
+     *
+     * @param value the routing value, or null when the document is placed by its id
+     * @return this
+     */
+    public ForwardedIndexRequest routing(String value) {
+        this.routing = value;
+        return this;
+    }
+
+    /**
+     * Returns the custom routing value the document was placed by.
+     *
+     * @return the routing value, or null when the document is placed by its id
+     */
+    public String routing() {
+        return routing;
     }
 
     /**
@@ -247,6 +269,7 @@ public final class ForwardedIndexRequest extends TransportRequest {
         out.writeBoolean(requireAbsent);
         out.writeOptionalString(indexUuid);
         out.writeBoolean(steered);
+        out.writeOptionalString(routing);
     }
 
     /**

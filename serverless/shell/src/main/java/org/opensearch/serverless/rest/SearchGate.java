@@ -132,7 +132,8 @@ final class SearchGate {
                         throw unsupportedFilterRewrite("changing indices after the search scope has been resolved");
                     }
                     if (rewritten.searchType() != org.opensearch.action.search.SearchType.QUERY_THEN_FETCH
-                        || rewritten.routing() != null
+                        // The routing the caller asked for has already chosen the shards; a filter may not change it.
+                        || java.util.Objects.equals(rewritten.routing(), visible.routing()) == false
                         || rewritten.scroll() != null
                         || rewritten.pipeline() != null
                         || selectsShards(rewritten.preference())) {

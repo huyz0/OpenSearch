@@ -163,7 +163,7 @@ public final class UnitSplitMover {
                 final List<WalRecord> toRight = new ArrayList<>();
                 final HalvesTarget target = new HalvesTarget(node.writes(), after, split, left, right);
                 log.forEachRecordSince(parent, term, built.checkpoint(), record -> {
-                    (target.halfOf(record.id()).equals(left) ? toLeft : toRight).add(record);
+                    (target.halfOf(record.placedBy()).equals(left) ? toLeft : toRight).add(record);
                 });
                 openHalf(left, toLeft);
                 openHalf(right, toRight);

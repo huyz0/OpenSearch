@@ -297,8 +297,10 @@ public class ServerlessVendorCompatibilityTests extends OpenSearchTestCase {
                 "/_bulk",
                 "{\"index\":{\"_index\":\"alpha\",\"_id\":\"10\",\"routing\":\"r\"}}\n{\"msg\":\"ten\"}\n"
             );
-            assertTrue("routing is refused per item, not dropped: " + routed.body(), routed.body().contains("\"status\":501"));
-            assertEquals("a document that was not written is not found", 404, send(f.node(), "GET", "/alpha/_doc/10", null).status());
+            assertTrue("a routed item is written: " + routed.body(), routed.body().contains("\"status\":201"));
+            final Response read = send(f.node(), "GET", "/alpha/_doc/10?routing=r", null);
+            assertEquals(read.body(), 200, read.status());
+            assertTrue("the routing is stored with the document: " + read.body(), read.body().contains("\"_routing\":\"r\""));
         }
     }
 

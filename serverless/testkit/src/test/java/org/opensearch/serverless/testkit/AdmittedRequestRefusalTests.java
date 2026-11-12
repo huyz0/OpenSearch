@@ -27,10 +27,6 @@ import java.time.Duration;
 import java.util.List;
 
 public class AdmittedRequestRefusalTests extends OpenSearchTestCase {
-    public void testGetRoutingIntroducedByPolicyIsExplicitlyUnsupported() throws Exception {
-        assertUnsupported(PolicyFilterPlugin.request(GetAction.NAME, request -> ((GetRequest) request).routing("elsewhere")), false);
-    }
-
     public void testGetStoredFieldsIntroducedByPolicyAreExplicitlyUnsupported() throws Exception {
         assertUnsupported(PolicyFilterPlugin.request(GetAction.NAME, request -> ((GetRequest) request).storedFields("field")), false);
     }

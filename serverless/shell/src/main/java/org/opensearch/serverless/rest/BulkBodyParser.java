@@ -40,6 +40,18 @@ final class BulkBodyParser {
      * one — become a failed item instead, and the rest of the batch proceeds.
      */
     static List<BulkHandler.Item> parse(byte[] body, String defaultIndex) throws BadRequest, IOException {
+        return parse(body, defaultIndex, null);
+    }
+
+    /**
+     * Parses a bulk body whose request named a default routing value, which an action line's own routing overrides.
+     *
+     * @param body the newline-delimited body
+     * @param defaultIndex the index from the path, or null
+     * @param defaultRouting the routing from the path, or null
+     * @return the items, in request order
+     */
+    static List<BulkHandler.Item> parse(byte[] body, String defaultIndex, String defaultRouting) throws BadRequest, IOException {
         final List<BulkHandler.Item> items = new ArrayList<>();
         final List<byte[]> lines = split(body);
         int line = 0;
@@ -49,6 +61,9 @@ final class BulkBodyParser {
                 continue;
             }
             final Action action = parseAction(lines.get(line), line + 1, defaultIndex);
+            if (action.routing == null) {
+                action.routing = defaultRouting;
+            }
             if (action.index == null || action.index.isBlank()) {
                 throw new BadRequest("line " + (line + 1) + ": an index is required in the action or request path");
             }
@@ -152,7 +167,7 @@ final class BulkBodyParser {
                         // accepts both. This used to be read and dropped, so a create was an overwrite.
                         action.opType = parser.text();
                     } else if ("routing".equals(field) || "_routing".equals(field)) {
-                        action.routing = parser.text();
+                        action.routing = DocumentRouting.normalize(parser.text());
                     } else if ("pipeline".equals(field)) {
                         action.pipeline = parser.text();
                     } else if ("require_alias".equals(field)) {
@@ -221,7 +236,8 @@ final class BulkBodyParser {
             final BulkHandler.Item item = new BulkHandler.Item(
                 name,
                 index,
-                "delete".equals(name) ? WalRecord.deletion(documentId) : new WalRecord(documentId, source == null ? "" : source)
+                ("delete".equals(name) ? WalRecord.deletion(documentId) : new WalRecord(documentId, source == null ? "" : source))
+                    .withRouting(DocumentRouting.normalize(routing))
             );
             item.requireAbsent = "create".equals(name) || "create".equals(opType);
             item.ifSeqNo = ifSeqNo;
@@ -233,13 +249,6 @@ final class BulkBodyParser {
                 item.fail(RestStatus.BAD_REQUEST, "bad_request", "op_type is an option of the index action");
             } else if (opType != null && "create".equals(opType) == false && "index".equals(opType) == false) {
                 item.fail(RestStatus.BAD_REQUEST, "bad_request", "op_type must be create or index, not [" + opType + "]");
-            } else if (routing != null) {
-                item.fail(
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_action",
-                    "routing is not supported: a document is placed by its id alone, so a routing value would be "
-                        + "accepted and change nothing"
-                );
             } else if (requireAlias) {
                 item.fail(
                     RestStatus.NOT_IMPLEMENTED,

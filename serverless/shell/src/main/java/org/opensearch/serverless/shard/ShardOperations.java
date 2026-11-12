@@ -96,6 +96,20 @@ public final class ShardOperations {
     }
 
     /**
+     * Works out where a document placed by a custom routing value belongs and who can serve it.
+     *
+     * @param index the index
+     * @param id the document id
+     * @param customRouting the routing value, or null to place by the id
+     * @return the placement
+     * @throws IOException if the metadata plane cannot be read
+     * @throws NoSuchIndexException if the index does not exist
+     */
+    public Placement place(String index, String id, String customRouting) throws IOException {
+        return routing.place(index, id, customRouting);
+    }
+
+    /**
      * Reads one document by id, from the copy that has everything acknowledged.
      *
      * <p>Answered by the shard's owner, or from a published commit when nobody owns it. See
@@ -111,9 +125,22 @@ public final class ShardOperations {
      * @throws IOException if the read fails or no copy can answer
      */
     public Read get(String index, String id) throws IOException {
+        return get(index, id, null);
+    }
+
+    /**
+     * Reads one document by id, placed by a custom routing value.
+     *
+     * @param index the index
+     * @param id the document id
+     * @param customRouting the routing value the document was written with, or null to place by the id
+     * @return what was found and who found it
+     * @throws IOException if the read fails or no copy can answer
+     */
+    public Read get(String index, String id, String customRouting) throws IOException {
         return gated(
             org.opensearch.action.get.GetAction.NAME,
-            new org.opensearch.action.get.GetRequest(index, id),
+            new org.opensearch.action.get.GetRequest(index, id).routing(customRouting),
             admitted -> reads.readAcceptedGet((org.opensearch.action.get.GetRequest) admitted),
             DocumentReads.getView(index)
         );
@@ -195,10 +222,25 @@ public final class ShardOperations {
      * @throws IOException if the explain fails or no copy can answer
      */
     public Explained explain(String index, String id, org.opensearch.index.query.QueryBuilder query) throws IOException {
+        return explain(index, id, null, query);
+    }
+
+    /**
+     * Explains how one document, placed by a custom routing value, scores against a query.
+     *
+     * @param index the index
+     * @param id the document id
+     * @param customRouting the routing value the document was written with, or null to place by the id
+     * @param query the query to score against
+     * @return the explanation and who produced it
+     * @throws IOException if the explain fails or no copy can answer
+     */
+    public Explained explain(String index, String id, String customRouting, org.opensearch.index.query.QueryBuilder query)
+        throws IOException {
         return gated(
             org.opensearch.action.explain.ExplainAction.NAME,
-            new org.opensearch.action.explain.ExplainRequest(index, id),
-            () -> reads.doExplain(index, id, query)
+            new org.opensearch.action.explain.ExplainRequest(index, id).routing(customRouting),
+            () -> reads.doExplain(index, id, customRouting, query)
         );
     }
 
@@ -300,13 +342,7 @@ public final class ShardOperations {
                 if (invalid != null) {
                     throw invalid;
                 }
-                DocumentWrites.validateNativeWrite(
-                    accepted.routing(),
-                    accepted.version(),
-                    accepted.versionType(),
-                    accepted.waitForActiveShards(),
-                    false
-                );
+                DocumentWrites.validateNativeWrite(accepted.version(), accepted.versionType(), accepted.waitForActiveShards(), false);
                 final boolean refresh = accepted.getRefreshPolicy() != org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
                 try (
                     var ignored = node.services()
@@ -319,11 +355,13 @@ public final class ShardOperations {
                     final DocumentWrites.Written written = writes.written(
                         accepted.index(),
                         accepted.id(),
+                        accepted.routing(),
                         "",
                         refresh,
                         true,
                         accepted.ifSeqNo(),
-                        accepted.ifPrimaryTerm()
+                        accepted.ifPrimaryTerm(),
+                        false
                     );
                     final var outcome = written.outcome();
                     final var response = new org.opensearch.action.delete.DeleteResponse(

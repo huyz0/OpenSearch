@@ -44,7 +44,7 @@ final class HalvesTarget implements WriteHold.Target {
         this.right = right;
     }
 
-    /** The half a document id routes to. */
+    /** The half a document routes to, by its effective routing value: the custom routing when it has one, else its id. */
     ShardId halfOf(String id) {
         final int unit = after.unitForRouting(id).id();
         if (unit == split.left().id()) {
@@ -61,18 +61,28 @@ final class HalvesTarget implements WriteHold.Target {
     public WriteOutcome index(
         ShardId shardId,
         String id,
+        String routing,
         String source,
         long ifSeqNo,
         long ifPrimaryTerm,
         boolean requireAbsent,
         boolean mayGrowMapping
     ) throws IOException {
-        return writes.index(halfOf(id), id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
+        return writes.index(
+            halfOf(routing != null ? routing : id),
+            id,
+            routing,
+            source,
+            ifSeqNo,
+            ifPrimaryTerm,
+            requireAbsent,
+            mayGrowMapping
+        );
     }
 
     @Override
-    public WriteOutcome delete(ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm) throws IOException {
-        return writes.delete(halfOf(id), id, ifSeqNo, ifPrimaryTerm);
+    public WriteOutcome delete(ShardId shardId, String id, String routing, long ifSeqNo, long ifPrimaryTerm) throws IOException {
+        return writes.delete(halfOf(routing != null ? routing : id), id, routing, ifSeqNo, ifPrimaryTerm);
     }
 
     @Override
@@ -82,7 +92,7 @@ final class HalvesTarget implements WriteHold.Target {
         final boolean[] isLeft = new boolean[batch.size()];
         for (int i = 0; i < batch.size(); i++) {
             final BulkOperation operation = batch.get(i);
-            isLeft[i] = halfOf(operation.record().id()).equals(left);
+            isLeft[i] = halfOf(operation.record().placedBy()).equals(left);
             (isLeft[i] ? toLeft : toRight).add(operation);
         }
         final List<BulkOutcome> fromLeft = toLeft.isEmpty() ? List.of() : writes.bulkOperations(left, toLeft);

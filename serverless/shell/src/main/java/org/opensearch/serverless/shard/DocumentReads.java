@@ -36,13 +36,10 @@ final class DocumentReads {
         if (validation != null) {
             throw validation;
         }
-        if (request.routing() != null) {
-            throw new UnsupportedRequestOptionException("routing is not supported: documents are placed by their id");
-        }
         if (request.storedFields() != null) {
             throw new UnsupportedRequestOptionException("stored_fields is not supported");
         }
-        final Read read = doGet(request.index(), request.id());
+        final Read read = doGet(request.index(), request.id(), request.routing());
         final var document = read.document();
         if (document.found() && request.versionType().isVersionConflictForReads(document.version(), request.version())) {
             throw new org.opensearch.index.engine.VersionConflictEngineException(
@@ -105,7 +102,15 @@ final class DocumentReads {
                             document.source().getBytes(java.nio.charset.StandardCharsets.UTF_8)
                         ),
                     java.util.Map.of(),
-                    java.util.Map.of()
+                    document.routing() == null
+                        ? java.util.Map.of()
+                        : java.util.Map.of(
+                            org.opensearch.index.mapper.RoutingFieldMapper.NAME,
+                            new org.opensearch.common.document.DocumentField(
+                                org.opensearch.index.mapper.RoutingFieldMapper.NAME,
+                                java.util.List.of(document.routing())
+                            )
+                        )
                 );
                 return new org.opensearch.action.get.GetResponse(result);
             }
@@ -125,6 +130,10 @@ final class DocumentReads {
                             answered.getSeqNo(),
                             answered.getPrimaryTerm(),
                             answered.getVersion()
+                        ).withRouting(
+                            answered.getField(org.opensearch.index.mapper.RoutingFieldMapper.NAME) == null
+                                ? null
+                                : answered.getField(org.opensearch.index.mapper.RoutingFieldMapper.NAME).getValue()
                         ),
                         original == null ? null : original.servedBy(),
                         original != null && original.realtime(),
@@ -180,7 +189,11 @@ final class DocumentReads {
     }
 
     Read doGet(String index, String id) throws IOException {
-        final Placement placement = routing.place(index, id);
+        return doGet(index, id, null);
+    }
+
+    Read doGet(String index, String id, String customRouting) throws IOException {
+        final Placement placement = routing.place(index, id, customRouting);
         // Local only while the head agrees. A writer this node still holds after the head moved to another
         // node is a writer that has not noticed it lost the shard, and its documents are behind the real
         // owner's: the forward below asks the node the head names, which is the one answer that is fresh.
@@ -256,8 +269,8 @@ final class DocumentReads {
         }
     }
 
-    Explained doExplain(String index, String id, org.opensearch.index.query.QueryBuilder query) throws IOException {
-        final Placement placement = routing.place(index, id);
+    Explained doExplain(String index, String id, String customRouting, org.opensearch.index.query.QueryBuilder query) throws IOException {
+        final Placement placement = routing.place(index, id, customRouting);
         // A retained writer may lag the successor's acknowledged writes, just as in doGet.
         if (placement.local() != null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
             final ShardExplain.Outcome outcome = node.reads().explain(placement.local(), id, query);

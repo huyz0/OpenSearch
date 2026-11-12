@@ -239,7 +239,15 @@ public final class ServerlessClient extends AbstractClient {
             request,
             resolved.indices().keySet(),
             source,
-            admitted -> org.opensearch.serverless.rest.SearchFanout.run(serving, metadata, resolved.indices(), admitted)
+            admitted -> org.opensearch.serverless.rest.SearchFanout.run(
+                serving,
+                metadata,
+                resolved.indices(),
+                admitted,
+                org.opensearch.serverless.rest.SearchFanout.Options.DEFAULT.withRouting(
+                    org.opensearch.serverless.rest.DocumentRouting.searchRoutings(request.routing())
+                )
+            )
         );
         // The same response a REST caller gets, built by the same code, so a plugin reading
         // shard failures or a timed-out flag sees what a user would see.

@@ -17,6 +17,7 @@ public final class Document {
     private final long seqNo;
     private final long primaryTerm;
     private final long version;
+    private String routing;
 
     /**
      * Creates a found document with no sequence identity.
@@ -53,6 +54,26 @@ public final class Document {
         this.seqNo = seqNo;
         this.primaryTerm = primaryTerm;
         this.version = version;
+    }
+
+    /**
+     * Returns the custom routing value the document was written with.
+     *
+     * @return the routing value, or null when it is placed by its id
+     */
+    public String routing() {
+        return routing;
+    }
+
+    /**
+     * Sets the custom routing value the document was written with, as read from its {@code _routing} field.
+     *
+     * @param value the routing value, or null
+     * @return this
+     */
+    public Document withRouting(String value) {
+        this.routing = value;
+        return this;
     }
 
     /**
