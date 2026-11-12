@@ -188,6 +188,59 @@ public class NodeLogCommitterTests extends OpenSearchTestCase {
         }
     }
 
+    public void testShardsNewToAnEpochAreCheckedSideBySideAndARefusalFailsOnlyItsShard() throws Exception {
+        final java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(8);
+        try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
+            final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
+            final java.util.concurrent.atomic.AtomicInteger running = new java.util.concurrent.atomic.AtomicInteger();
+            final java.util.concurrent.atomic.AtomicInteger most = new java.util.concurrent.atomic.AtomicInteger();
+            final ShardKey refused = new ShardKey("uuid-7", 0);
+            final NodeLogCommitter committer = new NodeLogCommitter(log, 0L, epochs -> {}, (shard, term, epoch) -> {
+                most.accumulateAndGet(running.incrementAndGet(), Math::max);
+                try {
+                    Thread.sleep(50);
+                } catch (InterruptedException e) {
+                    throw new IOException(e);
+                } finally {
+                    running.decrementAndGet();
+                }
+                if (shard.equals(refused)) {
+                    throw new IOException("head names another node");
+                }
+            }, 1_000L, 1L << 30, 1_000_000);
+            committer.admitConcurrently(4, pool);
+            final int shards = 32;
+            final CountDownLatch go = new CountDownLatch(1);
+            final List<ShardKey> failed = new CopyOnWriteArrayList<>();
+            final List<Thread> writers = new ArrayList<>();
+            for (int shard = 0; shard < shards; shard++) {
+                final ShardKey key = new ShardKey("uuid-" + shard, 0);
+                final Thread writer = new Thread(() -> {
+                    try {
+                        go.await();
+                        committer.commit(key, 1L, records("s" + key.indexUuid(), 1));
+                    } catch (IOException e) {
+                        failed.add(key);
+                    } catch (InterruptedException e) {
+                        throw new AssertionError(e);
+                    }
+                });
+                writer.start();
+                writers.add(writer);
+            }
+            go.countDown();
+            for (Thread writer : writers) {
+                writer.join();
+            }
+            assertEquals("only the refused shard fails", List.of(refused), failed);
+            assertTrue("checks ran side by side, never more than allowed: " + most.get(), most.get() > 1 && most.get() <= 4);
+            assertEquals("all of them in one blob", 1L, store.blobWrites());
+            assertEquals(shards - 1, committer.recordsCommitted());
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
     public void testTheTrimPointIsTheLowestRecordNotYetPublished() throws Exception {
         try (FsBlobStore store = new FsBlobStore(8192, createTempDir(), false)) {
             final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");

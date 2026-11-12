@@ -72,6 +72,15 @@ public final class NodeLogCommitter {
     /** Whether a record that finds the log quiet for a window is written at once; see {@link #flushWhenIdle}. */
     public static final String IDLE_FLUSH_SETTING = "serverless.wal.node_log.idle_flush";
 
+    /**
+     * How many shards new to an epoch are checked at once before the window carrying their first records is written; one
+     * checks them one after another. See {@link #admitConcurrently}.
+     */
+    public static final String ADMISSION_CONCURRENCY_SETTING = "serverless.wal.node_log.admission_concurrency";
+
+    /** The default {@link #ADMISSION_CONCURRENCY_SETTING}. */
+    public static final int DEFAULT_ADMISSION_CONCURRENCY = 32;
+
     /** The default of {@link #HEDGE_AFTER_SETTING}. */
     public static final long DEFAULT_HEDGE_AFTER_MILLIS = 60L;
 
@@ -345,23 +354,27 @@ public final class NodeLogCommitter {
 
         // A shard's first records in this epoch wait for a check that this node still owns it.
         final List<ShardBatch> batches = new ArrayList<>();
-        for (Map.Entry<Window.Key, List<WalRecord>> entry : window.batches.entrySet()) {
-            final Window.Key key = entry.getKey();
-            if (window.failures.containsKey(key.shard)) {
-                continue;
-            }
-            if (admitted(epoch, key.shard, key.term) == false) {
-                try {
-                    timings.admissionChecks.increment();
-                    admission.admit(key.shard, key.term, epoch);
-                    markAdmitted(epoch, key.shard, key.term);
-                } catch (IOException | RuntimeException e) {
-                    window.failures.put(key.shard, new IOException("refused to log to " + key.shard + " at term " + key.term, e));
+        final List<Window.Key> toAdmit = new ArrayList<>();
+        // Under one hold of the lock: a window carries thousands of shards on a busy node, and taking it once a shard made
+        // the flusher queue behind every writer joining the next window, thousands of times per blob.
+        lock.lock();
+        try {
+            final Map<ShardKey, Long> admittedHere = epochs.get(epoch).admitted;
+            for (Map.Entry<Window.Key, List<WalRecord>> entry : window.batches.entrySet()) {
+                final Window.Key key = entry.getKey();
+                if (window.failures.containsKey(key.shard)) {
                     continue;
                 }
+                final Long at = admittedHere.get(key.shard);
+                if (at == null || at != key.term) {
+                    toAdmit.add(key);
+                }
+                batches.add(new ShardBatch(key.shard, key.term, entry.getValue()));
             }
-            batches.add(new ShardBatch(key.shard, key.term, entry.getValue()));
+        } finally {
+            lock.unlock();
         }
+        admitAll(epoch, toAdmit, window);
         batches.removeIf(batch -> window.failures.containsKey(batch.shard()));
         timings.admissionNanos.add(System.nanoTime() - admitting);
         if (batches.isEmpty()) {
@@ -482,20 +495,104 @@ public final class NodeLogCommitter {
             lastEpoch = epoch;
             epochs.put(epoch, new EpochState());
             current = epoch;
+            timings.epochsOpened.increment();
             return epoch;
         } finally {
             lock.unlock();
         }
     }
 
-    private boolean admitted(long epoch, ShardKey shard, long term) {
-        lock.lock();
-        try {
-            final Long at = epochs.get(epoch).admitted.get(shard);
-            return at != null && at == term;
-        } finally {
-            lock.unlock();
+    /**
+     * Checks every shard new to the epoch, a few at a time when an executor is set. One after another, a window carrying
+     * the first records of thousands of shards -- a node's first writes after taking them, or after its epoch changed --
+     * waited one head read per shard before its PUT: at 20 ms a read, a minute for three thousand shards, with every write
+     * on the node waiting behind it and the write limiter refusing them. Each check is independent and all of them still
+     * finish before the PUT, so running them side by side changes only how long the window waits.
+     */
+    private void admitAll(long epoch, List<Window.Key> keys, Window window) {
+        final java.util.concurrent.Executor executor = admissionExecutor;
+        final int parallelism = Math.min(admissionConcurrency, keys.size());
+        if (executor == null || parallelism <= 1) {
+            for (Window.Key key : keys) {
+                admitOne(epoch, key, window);
+            }
+            return;
         }
+        final java.util.concurrent.ConcurrentLinkedQueue<Window.Key> queue = new java.util.concurrent.ConcurrentLinkedQueue<>(keys);
+        final java.util.concurrent.ConcurrentHashMap<ShardKey, IOException> failed = new java.util.concurrent.ConcurrentHashMap<>();
+        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(parallelism);
+        final Runnable drain = () -> {
+            try {
+                for (Window.Key key = queue.poll(); key != null; key = queue.poll()) {
+                    final IOException failure = check(epoch, key);
+                    if (failure != null) {
+                        failed.put(key.shard, failure);
+                    }
+                }
+            } finally {
+                done.countDown();
+            }
+        };
+        int started = 0;
+        for (int i = 0; i < parallelism - 1; i++) {
+            try {
+                executor.execute(drain);
+                started++;
+            } catch (RuntimeException rejected) {
+                break;
+            }
+        }
+        for (int i = started; i < parallelism - 1; i++) {
+            done.countDown();
+        }
+        // This thread drains too, so the checks finish even when the executor runs none of them.
+        drain.run();
+        boolean interrupted = false;
+        while (true) {
+            try {
+                done.await();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
+        window.failures.putAll(failed);
+    }
+
+    private void admitOne(long epoch, Window.Key key, Window window) {
+        final IOException failure = check(epoch, key);
+        if (failure != null) {
+            window.failures.put(key.shard, failure);
+        }
+    }
+
+    /** Checks one shard and marks it admitted; returns the refusal, or null. */
+    private IOException check(long epoch, Window.Key key) {
+        try {
+            timings.admissionChecks.increment();
+            admission.admit(key.shard, key.term, epoch);
+            markAdmitted(epoch, key.shard, key.term);
+            return null;
+        } catch (IOException | RuntimeException e) {
+            return new IOException("refused to log to " + key.shard + " at term " + key.term, e);
+        }
+    }
+
+    private volatile java.util.concurrent.Executor admissionExecutor;
+    private volatile int admissionConcurrency = 1;
+
+    /**
+     * Checks the shards new to an epoch up to this many at a time, on the given executor and the flusher itself.
+     *
+     * @param concurrency how many checks may run at once; one or less checks them one after another
+     * @param executor where the extra checks run; null checks them one after another
+     */
+    public void admitConcurrently(int concurrency, java.util.concurrent.Executor executor) {
+        this.admissionExecutor = executor;
+        this.admissionConcurrency = Math.max(1, concurrency);
     }
 
     private void markAdmitted(long epoch, ShardKey shard, long term) {
@@ -923,6 +1020,7 @@ public final class NodeLogCommitter {
         private final java.util.concurrent.atomic.LongAdder puts = new java.util.concurrent.atomic.LongAdder();
         private final java.util.concurrent.atomic.LongAdder hedges = new java.util.concurrent.atomic.LongAdder();
         private final java.util.concurrent.atomic.LongAdder hedgesWon = new java.util.concurrent.atomic.LongAdder();
+        private final java.util.concurrent.atomic.LongAdder epochsOpened = new java.util.concurrent.atomic.LongAdder();
 
         private void caller(long joinedNanos, Window window) {
             if (window.flushStartedNanos == 0L) {
@@ -972,7 +1070,8 @@ public final class NodeLogCommitter {
                 putNanos,
                 puts,
                 hedges,
-                hedgesWon
+                hedgesWon,
+                epochsOpened
             )) {
                 each.reset();
             }
@@ -988,7 +1087,7 @@ public final class NodeLogCommitter {
             return String.format(
                 java.util.Locale.ROOT,
                 "callers=%d window=%.1f behind=%.1f write=%.1f | blobs=%d epoch=%.1f admission=%.1f (%d head reads) put=%.1f ms"
-                    + " | hedged=%d won=%d",
+                    + " | hedged=%d won=%d | epochs opened=%d",
                 callers.sum(),
                 mean(windowNanos, callers),
                 mean(behindNanos, callers),
@@ -999,7 +1098,8 @@ public final class NodeLogCommitter {
                 admissionChecks.sum(),
                 mean(putNanos, puts),
                 hedges.sum(),
-                hedgesWon.sum()
+                hedgesWon.sum(),
+                epochsOpened.sum()
             );
         }
     }

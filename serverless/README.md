@@ -145,6 +145,7 @@ from a seeded random) or `none`. On RustFS, `none` leaves RustFS's own latency.
 | Test | Switch | What it measures |
 |---|---|---|
 | `NodeLogSoakMeterTests` | `-Dtests.soak.seconds=150 -Dtests.soak.shards=1000 -Dtests.soak.modes=pack+log,blob` | write ack p50/p99, PUT+LIST per publish, takeover of every shard, cold open and first search, pack collection |
+| `WriteThroughputMeterTests` (`throughputTest` task) | `-Dtests.tput.step_seconds=60 -Dtests.tput.shards=3000 -Dtests.tput.rates=1000,2000,3000` | writes/s one node sustains across thousands of shards, p50/p99 from arrival, CPU by thread, fds/heap/open time per writer; results in [`write-throughput-results.md`](write-throughput-results.md) |
 | `RefreshVisibilityMeterTests` | `-Dtests.meter.refresh=true` | `refresh=true` ack time, misses on search nodes, first open |
 | `FreshnessMeterTests` | `-Dtests.meter.freshness=all` | write-to-searchable delay by path |
 | `BucketCommitsTests`, `BucketCheckpointTests` | none | the bucket manifest swap: one conditional write per checkpoint, one lost swap per race |
