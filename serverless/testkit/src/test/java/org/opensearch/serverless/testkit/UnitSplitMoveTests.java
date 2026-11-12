@@ -98,12 +98,26 @@ public class UnitSplitMoveTests extends OpenSearchTestCase {
                 final AtomicBoolean stop = new AtomicBoolean();
                 final List<String> acknowledged = new CopyOnWriteArrayList<>();
                 final List<String> refused = new CopyOnWriteArrayList<>();
+                final List<String> unseen = new CopyOnWriteArrayList<>();
                 final Thread writer = new Thread(() -> {
                     for (int doc = 0; stop.get() == false; doc++) {
                         final String id = "during-" + doc;
+                        // Every other write asks to be visible on return, wherever the split sends it.
+                        final boolean refresh = doc % 2 == 1;
                         try {
-                            final Response put = send(node, "PUT", "/grow/_doc/" + id, "{\"msg\":\"during\",\"n\":" + doc + "}");
+                            final Response put = send(
+                                node,
+                                "PUT",
+                                "/grow/_doc/" + id + (refresh ? "?refresh=true" : ""),
+                                "{\"msg\":\"during\",\"n\":" + doc + "}"
+                            );
                             (put.status() == 201 ? acknowledged : refused).add(id + " " + put.status() + " " + put.body());
+                            if (refresh && put.status() == 201) {
+                                final Response found = send(node, "GET", "/grow/_search?q=_id:" + id, null);
+                                if (found.body().contains("\"total\":{\"value\":1,") == false) {
+                                    unseen.add(id + " " + found.body());
+                                }
+                            }
                             if (doc % 5 == 0) {
                                 loop.publishAll();
                             }
@@ -124,6 +138,7 @@ public class UnitSplitMoveTests extends OpenSearchTestCase {
                 }
                 assertTrue("the split went through", moved.isPresent());
                 assertTrue("the client wrote during the split: " + acknowledged.size(), acknowledged.size() > 0);
+                assertEquals("a write acknowledged with refresh=true is searchable on return", List.of(), unseen);
 
                 final IndexDescriptor after = plane.describe("grow").orElseThrow();
                 assertArrayEquals(new int[] { 1, 2 }, after.unitIds());
@@ -148,9 +163,22 @@ public class UnitSplitMoveTests extends OpenSearchTestCase {
                     final Response got = send(node, "GET", "/grow/_doc/" + id, null);
                     assertEquals(id + ": " + got.body(), 200, got.status());
                 }
-                assertEquals(201, send(node, "PUT", "/grow/_doc/after?refresh=true", "{\"msg\":\"after\",\"n\":1}").status());
+                // One refreshing write into each half, so the count sees every write before it: a refresh covers one
+                // unit only, and the writes since the halves' last refresh are acknowledged but not yet searchable.
+                final List<String> afterIds = new java.util.ArrayList<>();
+                for (int half : after.unitIds()) {
+                    for (int i = 0;; i++) {
+                        if (after.layout().unitForRouting("after-" + i).id() == half) {
+                            afterIds.add("after-" + i);
+                            break;
+                        }
+                    }
+                }
+                for (String id : afterIds) {
+                    assertEquals(201, send(node, "PUT", "/grow/_doc/" + id + "?refresh=true", "{\"msg\":\"after\",\"n\":1}").status());
+                }
                 final Response count = send(node, "GET", "/grow/_count", null);
-                final long expected = (BEFORE - 1) + 5 + acknowledged.size() + 1;
+                final long expected = (BEFORE - 1) + 5 + acknowledged.size() + afterIds.size();
                 assertTrue(count.body() + " expected " + expected, count.body().contains("\"count\":" + expected));
                 assertTrue("two units searched: " + count.body(), count.body().contains("\"total\":2"));
                 for (ShardId open : node.reconciler().openShards()) {

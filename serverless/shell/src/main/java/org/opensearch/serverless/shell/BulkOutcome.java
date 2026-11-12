@@ -25,6 +25,7 @@ public final class BulkOutcome {
     private final long primaryTerm;
     private final long version;
     private final boolean created;
+    private WriteHold.Target forwardedTo;
 
     private BulkOutcome(
         String id,
@@ -217,5 +218,19 @@ public final class BulkOutcome {
      */
     public String failure() {
         return failure;
+    }
+
+    /** Marks this outcome as applied by a hold's target rather than by the shard the batch was addressed to. */
+    void forwardedBy(WriteHold.Target target) {
+        this.forwardedTo = target;
+    }
+
+    /**
+     * Returns the hold target that applied the operation, when a hold on the addressed shard forwarded its batch.
+     *
+     * @return the target, or null when the addressed shard applied it itself
+     */
+    public WriteHold.Target forwardedTo() {
+        return forwardedTo;
     }
 }
