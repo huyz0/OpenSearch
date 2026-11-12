@@ -223,6 +223,7 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
     private final AtomicLong fetched = new AtomicLong();
     private final AtomicLong grantChecks = new AtomicLong();
     private final AtomicLong refusals = new AtomicLong();
+    private final AtomicLong unreachable = new AtomicLong();
 
     TailOverlays(ShardRouter router) {
         this.router = router;
@@ -245,9 +246,12 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
         return new long[] { received.get(), fetched.get() };
     }
 
-    /** @return round trips made to a writer for a grant before a search, and searches refused for want of one */
+    /**
+     * @return round trips made to a writer for a grant before a search, searches refused for want of one, and searches
+     *     answered from the commit because the writer could not be reached
+     */
     public long[] grantCounts() {
-        return new long[] { grantChecks.get(), refusals.get() };
+        return new long[] { grantChecks.get(), refusals.get(), unreachable.get() };
     }
 
     void handle(TailPushRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
@@ -537,9 +541,17 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
         if (asked == false) {
             try {
                 final TailFetchResponse answer = ask(shardId, writer, commitCheckpoint, TailFetchRequest.CHECK);
-                claimedThrough = answer == null ? Long.MAX_VALUE : answer.claimedThrough();
+                if (answer == null) {
+                    unreachable.incrementAndGet();
+                    return true;
+                }
+                claimedThrough = answer.claimedThrough();
             } catch (Exception e) {
-                claimedThrough = Long.MAX_VALUE;
+                // A writer that cannot be reached is treated as one that died: the reader serves its commit, as it does
+                // for any acknowledged write until the shard is taken over, rather than fail every search meanwhile.
+                LOG.debug("could not reach the writer [{}] of {}; serving its commit", writer, shardId, e);
+                unreachable.incrementAndGet();
+                return true;
             }
         }
         if (commitCheckpoint >= claimedThrough) {
