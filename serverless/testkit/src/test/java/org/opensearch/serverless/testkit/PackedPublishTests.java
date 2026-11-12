@@ -46,7 +46,10 @@ public class PackedPublishTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            .put("serverless.wal.node_log.commits", false)
             .put("serverless.segments.pack.enabled", true)
+            // One blob per segment under the shard, which is what these check.
+            .put("serverless.segments.node_pack.enabled", false)
             .put("serverless.wal.node_log.window_millis", 20)
             .build();
     }

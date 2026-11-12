@@ -56,6 +56,8 @@ public class NodePackPublishTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
             .put("serverless.segments.pack.enabled", true)
+            // Off unless a test turns them on, so each compares with segment blobs.
+            .put("serverless.segments.node_pack.enabled", false)
             .put("serverless.wal.node_log.window_millis", 20)
             .put(extra)
             .build();
@@ -185,7 +187,7 @@ public class NodePackPublishTests extends OpenSearchTestCase {
         }
     }
 
-    public void testNodePacksAreOffByDefaultAndSkipLargeBlobs() throws Exception {
+    public void testNodePacksSwitchedOffOrTooSmallLeaveSegmentBlobs() throws Exception {
         final boolean nodePacksSetButTooSmall = randomBoolean();
         final Settings extra = nodePacksSetButTooSmall
             ? Settings.builder().put(nodePacksOn()).put("serverless.segments.node_pack.max_blob_bytes", "1b").build()

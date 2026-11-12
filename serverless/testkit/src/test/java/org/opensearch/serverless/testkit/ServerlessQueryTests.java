@@ -58,6 +58,8 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            // Segment blobs under each shard, so each shard's open reads its own: the rendezvous counts those.
+            .put("serverless.segments.node_pack.enabled", false)
             .build();
     }
 

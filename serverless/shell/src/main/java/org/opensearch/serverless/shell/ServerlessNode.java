@@ -337,7 +337,7 @@ public final class ServerlessNode implements Closeable {
         this.writeBackpressure = NodeComponents.writeBackpressure(settings, writeBackpressureMax);
         this.walCommitter = NodeComponents.walCommitter(settings);
         this.nodeLogEnabled = settings.getAsBoolean("serverless.wal.node_log.enabled", true);
-        if (nodeLogEnabled && settings.getAsBoolean(NodePackWiring.LOG_COMMITS, false)) {
+        if (nodeLogEnabled && settings.getAsBoolean(NodePackWiring.LOG_COMMITS, NodePackWiring.LOG_COMMITS_DEFAULT)) {
             // Refused here, at construction, rather than on the first shard it takes.
             this.nodeLogCommitCheckpointMillis = LogCommitCheckpoint.nodeValue(settings);
             this.logCommitCheckpointMillis = nodeLogCommitCheckpointMillis;
@@ -1011,5 +1011,6 @@ public final class ServerlessNode implements Closeable {
         IOUtils.closeWhileHandlingException(services);
         IOUtils.closeWhileHandlingException(transportService, searchService, indicesService, clusterService, nodeEnvironment);
         ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        NodePackWiring.forget(this);
     }
 }
