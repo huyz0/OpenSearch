@@ -398,14 +398,20 @@ public final class WalStore {
     }
 
     /**
-     * Fences a term: occupies the slot after its highest blob, so nothing can be written after it.
+     * Fences a term: occupies a slot after its highest blob, so nothing can be written after it.
      *
      * <p>Put-if-absent decides between the fence and a writer's append aimed at the same slot. If the append
      * wins, it is before the fence and the next attempt sees it; a writer's names are contiguous (see
      * {@link #append}), so its next slot is the one fenced now. A fence is a blob of no bytes, which no record
      * is, so a listing tells one apart by its length.
      *
-     * @return the fenced ordinal
+     * <p><b>A writer appending back to back.</b> A listing and a PUT can take longer than the writer's next append, and
+     * then aiming at the slot after the highest blob loses every time. So after a lost race the fence aims ahead of the
+     * writer by a gap that doubles; the writer never skips a slot, so it must stop at that barrier. The fence then fills
+     * the gap from the bottom: the writer can take at most the slots below the barrier, so this ends, and once it does
+     * the writer's next slot is fenced.
+     *
+     * @return the highest fence placed, the barrier: a writer resuming the term starts after it
      */
     private long fence(long term, boolean own) throws IOException {
         return fence(term, own, null);
@@ -417,6 +423,7 @@ public final class WalStore {
      */
     private long fence(long term, boolean own, Map<String, org.opensearch.common.blobstore.BlobMetadata> listed) throws IOException {
         final BlobContainer container = containerFor(term);
+        long gap = 0L;
         for (int attempt = 0; attempt < FENCE_ATTEMPTS; attempt++) {
             long highest = 0L;
             final Map<String, org.opensearch.common.blobstore.BlobMetadata> blobs = attempt == 0 && listed != null
@@ -434,14 +441,35 @@ public final class WalStore {
                 throw new IOException("cannot fence exhausted WAL term " + term);
             }
             final long slot = highest + 1;
-            try {
-                container.writeBlob(WalLayout.name(slot), new ByteArrayInputStream(new byte[0]), 0L, true);
-                return slot;
-            } catch (java.nio.file.FileAlreadyExistsException e) {
-                // A writer took the slot first: its record is before the fence. Look again.
+            final long barrier = slot + Math.min(gap, Long.MAX_VALUE - slot);
+            if (tryFence(container, barrier, own)) {
+                // Nothing below the barrier can be left free for the writer to land in after this returns.
+                for (long below = slot; below < barrier; below++) {
+                    if (tryFence(container, below, own)) {
+                        break;
+                    }
+                }
+                return barrier;
             }
+            // A writer took the slot first: its record is before the fence. Look again, further ahead.
+            gap = gap == 0L ? 1L : Math.min(gap << 1, MAX_FENCE_GAP);
         }
         throw new IOException("could not fence term " + term + ": a writer kept taking the next slot");
+    }
+
+    /** The widest gap a fence leaves ahead of a writer it keeps losing to. */
+    static final long MAX_FENCE_GAP = 1024L;
+
+    private boolean tryFence(BlobContainer container, long slot, boolean own) throws IOException {
+        try {
+            container.writeBlob(WalLayout.name(slot), new ByteArrayInputStream(new byte[0]), 0L, true);
+        } catch (java.nio.file.FileAlreadyExistsException taken) {
+            return false;
+        }
+        if (own) {
+            ownFences.add(WalLayout.name(slot));
+        }
+        return true;
     }
 
     /**

@@ -288,6 +288,7 @@ public abstract class LogFencingTestCase extends OpenSearchTestCase {
             });
             writer.start();
             assertTrue(writing.await(60, java.util.concurrent.TimeUnit.SECONDS));
+            final long fencesStarted = System.nanoTime();
             final Thread[] takers = new Thread[2];
             final List<Exception> failures = Collections.synchronizedList(new ArrayList<>());
             for (int t = 0; t < takers.length; t++) {
@@ -302,13 +303,23 @@ public abstract class LogFencingTestCase extends OpenSearchTestCase {
             }
             for (Thread taker : takers) {
                 taker.join(60_000);
+                assertFalse("round " + round + ": a fence did not finish within a minute", taker.isAlive());
             }
+            final long fenceMillis = (System.nanoTime() - fencesStarted) / 1_000_000;
             // Past the fences the writer can land nothing more; let it find that out a few times.
             Thread.yield();
             stop.set(true);
             writer.join(60_000);
+            assertFalse("round " + round + ": the writer did not stop within a minute of the fences", writer.isAlive());
             assertEquals("fencing must not fail: " + failures, List.of(), failures);
 
+            logger.info(
+                "round {}: fences took {} ms; {} appends acknowledged, {} refused",
+                round,
+                fenceMillis,
+                acknowledged.size(),
+                refused.size()
+            );
             final Set<String> replayed = ids(new WalStore(store, shard).replayableAfterFencing());
             for (String id : acknowledged) {
                 assertTrue("round " + round + ": acknowledged " + id + " was not replayed", replayed.contains(id));
@@ -320,5 +331,66 @@ public abstract class LogFencingTestCase extends OpenSearchTestCase {
             expectThrows(IOException.class, () -> predecessor.append(1L, List.of(record("after-the-fences", 1L))));
             assertFalse(ids(new WalStore(store, shard).replayableAfterFencing()).contains("after-the-fences"));
         }
+    }
+
+    /**
+     * A fence ends even when its listing is slower than the writer's appends.
+     *
+     * <p>Found on RustFS 1.0.0, whose listing took about 50 ms against an append of 7: aiming each attempt at the slot after
+     * the highest blob, the fence lost every race to a writer appending back to back and was still chasing it minutes later.
+     * Real S3 lists in tens of milliseconds too. Here the listing is made that slow on purpose.
+     */
+    public void testAFenceEndsAgainstAWriterAppendingFasterThanAListing() throws Exception {
+        // The writer's own requests are not slowed: only the successor's listing is.
+        final BlobStore direct = newStore();
+        final LatencyInjectingBlobStore store = new LatencyInjectingBlobStore(direct, 0);
+        store.setProfile(
+            new LatencyInjectingBlobStore.Profile(
+                "slow listing",
+                new long[] { 0, 0 },
+                new long[] { 0, 0 },
+                new long[] { 0, 0 },
+                new long[] { 0, 0 },
+                new long[] { 50, 50 },
+                0,
+                1.0,
+                0,
+                0,
+                0
+            )
+        );
+        final BlobPath shard = SHARD.add("slow-listing");
+        final WalStore predecessor = new WalStore(direct, shard);
+        predecessor.establish(1L, null);
+        final List<String> acknowledged = Collections.synchronizedList(new ArrayList<>());
+        final AtomicBoolean refusedOnce = new AtomicBoolean();
+        final CountDownLatch writing = new CountDownLatch(1);
+        final Thread writer = new Thread(() -> {
+            for (int i = 0; refusedOnce.get() == false && i < 100_000; i++) {
+                final String id = "w" + i;
+                try {
+                    predecessor.append(1L, List.of(record(id, 1L)));
+                    acknowledged.add(id);
+                } catch (IOException e) {
+                    refusedOnce.set(true);
+                }
+                if (i == 3) {
+                    writing.countDown();
+                }
+            }
+        });
+        writer.start();
+        assertTrue(writing.await(60, java.util.concurrent.TimeUnit.SECONDS));
+        final long started = System.nanoTime();
+        new WalStore(store, shard).fenceOlderTerms(2L);
+        final long fenceMillis = (System.nanoTime() - started) / 1_000_000;
+        writer.join(60_000);
+        assertFalse("the writer was never refused", writer.isAlive());
+        assertTrue("the fence took " + fenceMillis + " ms", fenceMillis < 30_000);
+        final Set<String> replayed = ids(new WalStore(direct, shard).replayableAfterFencing());
+        for (String id : acknowledged) {
+            assertTrue("acknowledged " + id + " was not replayed", replayed.contains(id));
+        }
+        expectThrows(IOException.class, () -> predecessor.append(1L, List.of(record("after-the-fence", 1L))));
     }
 }

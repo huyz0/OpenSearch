@@ -68,12 +68,12 @@ public class MinioBlobContainerConformanceTests extends BlobContainerConformance
 
     /** The access key for this target. */
     protected String accessKey() {
-        return "minioadmin";
+        return org.opensearch.repositories.s3.MinioBlobStores.accessKey();
     }
 
     /** The secret key for this target. */
     protected String secretKey() {
-        return "minioadmin";
+        return org.opensearch.repositories.s3.MinioBlobStores.secretKey();
     }
 
     @Override

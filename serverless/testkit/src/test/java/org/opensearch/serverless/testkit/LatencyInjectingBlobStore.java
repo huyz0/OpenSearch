@@ -77,6 +77,143 @@ final class LatencyInjectingBlobStore implements BlobStore {
         requests.set(0);
     }
 
+    /**
+     * Per-request latency by kind of request, with jitter and a slow tail, drawn from a seeded random so two runs see the same
+     * sequence of delays. Each kind takes a uniform delay in {@code [min, max]} milliseconds; one request in {@code tailEvery}
+     * (on average) takes {@code tailFactor} times that, and one in {@code stallEvery} takes {@code [stallMin, stallMax]}.
+     *
+     * @param read GET, ranged GET, HEAD and register read
+     * @param put unconditional PUT
+     * @param conditional PUT with If-Match or If-None-Match: register create and compare-and-swap
+     * @param delete DELETE, single, batch or conditional
+     * @param list LIST
+     */
+    record Profile(String name, long[] read, long[] put, long[] conditional, long[] delete, long[] list, int tailEvery, double tailFactor,
+        int stallEvery, long stallMin, long stallMax) {
+        /**
+         * Shaped on published S3 Standard same-region figures for small objects: first-byte GET latency in the tens of
+         * milliseconds, PUT roughly twice a GET, conditional PUTs a little above a plain PUT, LIST a little above a PUT,
+         * a p99 several times the median and rare stalls of half a second or more.
+         */
+        static final Profile S3 = new Profile(
+            "s3",
+            new long[] { 20, 30 },
+            new long[] { 40, 60 },
+            new long[] { 50, 70 },
+            new long[] { 25, 40 },
+            new long[] { 40, 70 },
+            50,
+            4.0,
+            1000,
+            500,
+            1000
+        );
+
+        /** No added delay. */
+        static final Profile NONE = new Profile(
+            "none",
+            new long[] { 0, 0 },
+            new long[] { 0, 0 },
+            new long[] { 0, 0 },
+            new long[] { 0, 0 },
+            new long[] { 0, 0 },
+            0,
+            1.0,
+            0,
+            0,
+            0
+        );
+
+        /**
+         * The profile a name selects.
+         *
+         * @param name {@code none} or {@code s3}
+         * @return the profile
+         */
+        static Profile named(String name) {
+            return switch (name) {
+                case "none" -> NONE;
+                case "s3" -> S3;
+                default -> throw new IllegalArgumentException("unknown latency profile [" + name + "]: none or s3");
+            };
+        }
+
+        long[] rangeOf(String op) {
+            if (op.startsWith("GET") || op.equals("HEAD")) {
+                return read;
+            } else if (op.equals("CAS-reg") || op.equals("CREATE-reg")) {
+                return conditional;
+            } else if (op.startsWith("PUT")) {
+                return put;
+            } else if (op.startsWith("DELETE")) {
+                return delete;
+            } else {
+                return list;
+            }
+        }
+
+        @Override
+        public String toString() {
+            if (this == NONE) {
+                return "none";
+            }
+            return String.format(
+                java.util.Locale.ROOT,
+                "%s (GET %d-%d, PUT %d-%d, conditional PUT %d-%d, DELETE %d-%d, LIST %d-%d ms; 1 in %d x%.0f; 1 in %d at %d-%d ms)",
+                name,
+                read[0],
+                read[1],
+                put[0],
+                put[1],
+                conditional[0],
+                conditional[1],
+                delete[0],
+                delete[1],
+                list[0],
+                list[1],
+                tailEvery,
+                tailFactor,
+                stallEvery,
+                stallMin,
+                stallMax
+            );
+        }
+    }
+
+    private volatile Profile profile;
+    private final java.util.Random jitter = new java.util.Random(0x5EED);
+
+    /**
+     * Replaces the fixed delay and tail with a per-request profile; {@code null} goes back to the fixed delay.
+     *
+     * @param profile the profile, or null
+     */
+    void setProfile(Profile profile) {
+        synchronized (jitter) {
+            jitter.setSeed(0x5EED);
+        }
+        this.profile = profile;
+    }
+
+    private long profiledNanos(Profile p, String op) {
+        final long[] range = p.rangeOf(op);
+        final double r;
+        final double tail;
+        final double stall;
+        synchronized (jitter) {
+            r = jitter.nextDouble();
+            tail = jitter.nextDouble();
+            stall = jitter.nextDouble();
+        }
+        double millis = range[0] + r * (range[1] - range[0]);
+        if (p.stallEvery() > 0 && stall < 1.0 / p.stallEvery()) {
+            millis = p.stallMin() + r * (p.stallMax() - p.stallMin());
+        } else if (p.tailEvery() > 0 && tail < 1.0 / p.tailEvery()) {
+            millis *= p.tailFactor();
+        }
+        return (long) (millis * 1_000_000L);
+    }
+
     /** Takes and clears what has been recorded since the last call. */
     List<Request> drain() {
         final List<Request> drained = new ArrayList<>();
@@ -108,8 +245,11 @@ final class LatencyInjectingBlobStore implements BlobStore {
 
     private void pay(String op, BlobPath path, String name) {
         log.add(new Request(op, path.buildAsString() + (name == null ? "" : name), Thread.currentThread().getName()));
+        final Profile p = profile;
         final int every = tailEvery;
-        final long delay = every > 0 && requests.incrementAndGet() % every == 0 ? Math.max(tailNanos, delayNanos) : delayNanos;
+        final long delay = p != null ? profiledNanos(p, op)
+            : every > 0 && requests.incrementAndGet() % every == 0 ? Math.max(tailNanos, delayNanos)
+            : delayNanos;
         final long until = System.nanoTime() + delay;
         for (long left = delay; left > 0; left = until - System.nanoTime()) {
             LockSupport.parkNanos(left);

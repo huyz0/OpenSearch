@@ -10,7 +10,6 @@ package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
-import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.bucket.BucketManifest;
@@ -32,6 +31,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * writer after a release, open each member at the commit its entry holds.
  */
 @org.apache.lucene.tests.util.LuceneTestCase.SuppressFileSystems("*")
+// On a live endpoint (MeterStores) the S3 client keeps its threads past the test; they are the client's, not leaks.
+@com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters(filters = {
+    org.opensearch.test.BouncyCastleThreadFilter.class,
+    S3ClientThreads.class })
 public class BucketCheckpointTests extends OpenSearchTestCase {
 
     private static final long TTL = 30_000L;
@@ -67,7 +70,7 @@ public class BucketCheckpointTests extends OpenSearchTestCase {
 
     public void testMembersCheckpointInOneSwapAndOpenFromTheirEntries() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000_000L);
-        try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
+        try (CountingBlobStore store = new CountingBlobStore(MeterStores.create(createTempDir(), createTempDir()))) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             BucketManifest bucket = BucketManifest.empty(BUCKET);
             for (int i = 0; i < MEMBERS; i++) {

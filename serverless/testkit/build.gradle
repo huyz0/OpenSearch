@@ -115,6 +115,16 @@ tasks.register('s3Test', Test) {
   include '**/Serverless*MeasurementTests.class'
   include '**/BlobContainerWrapperGuardTests.class'
   include '**/ServerlessLogRepairTests.class'
+  // Meters that run on the filesystem by default and on a live endpoint with -Dtests.serverless.meter.store=s3 (MeterStores).
+  // Each assume-skips unless its own switch is set, so including them here costs nothing.
+  include '**/NodeLogSoakMeterTests.class'
+  include '**/RefreshVisibilityMeterTests.class'
+  include '**/FreshnessMeterTests.class'
+  // Request-count tests of the bucket manifest swap and the pack collector, which run on the filesystem under `test` and here
+  // on a live endpoint when -Dtests.serverless.meter.store=s3, so the same counts are asserted over HTTP.
+  include '**/BucketCommitsTests.class'
+  include '**/BucketCheckpointTests.class'
+  include '**/NodePackCollectorTests.class'
   systemProperty 'opensearch.path.conf', 'config'
   systemProperty 'tests.security.manager', 'false'
   // Netty refuses a second attempt to set its global processor count, and both the node's transport and

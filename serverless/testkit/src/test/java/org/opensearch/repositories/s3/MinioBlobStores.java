@@ -46,6 +46,32 @@ public final class MinioBlobStores {
 
     private MinioBlobStores() {}
 
+    /** What the threads of a store made here are called, so a thread-leak filter can tell them from a test's own. */
+    public static final String S3_CLIENT_THREAD_PREFIX = "s3-test-client-";
+
+    /** Overrides the access key the S3 tests use, so the same suite can run against MinIO or RustFS. */
+    public static final String ACCESS_KEY_PROPERTY = "tests.serverless.s3.access_key";
+    /** Overrides the secret key the S3 tests use. */
+    public static final String SECRET_KEY_PROPERTY = "tests.serverless.s3.secret_key";
+
+    /**
+     * The access key for the endpoint under test: {@code -Dtests.serverless.s3.access_key}, else MinIO's default.
+     *
+     * @return the access key
+     */
+    public static String accessKey() {
+        return System.getProperty(ACCESS_KEY_PROPERTY, "minioadmin");
+    }
+
+    /**
+     * The secret key for the endpoint under test: {@code -Dtests.serverless.s3.secret_key}, else MinIO's default.
+     *
+     * @return the secret key
+     */
+    public static String secretKey() {
+        return System.getProperty(SECRET_KEY_PROPERTY, "minioadmin");
+    }
+
     /**
      * Creates the bucket if it does not exist and returns a blob store over it.
      *
@@ -139,7 +165,12 @@ public final class MinioBlobStores {
 
         final S3AsyncService asyncService = new S3AsyncService(configPath);
         asyncService.refreshAndClearCache(S3ClientSettings.load(settings, configPath));
-        final ExecutorService executor = Executors.newFixedThreadPool(2);
+        final java.util.concurrent.atomic.AtomicInteger threads = new java.util.concurrent.atomic.AtomicInteger();
+        final ExecutorService executor = Executors.newFixedThreadPool(2, task -> {
+            final Thread thread = new Thread(task, S3_CLIENT_THREAD_PREFIX + threads.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        });
         final AsyncExecutorContainer executors = new AsyncExecutorContainer(executor, executor, new AsyncTransferEventLoopGroup(1));
 
         final RepositoryMetadata metadata = new RepositoryMetadata("serverless-r11", "s3", settings);
