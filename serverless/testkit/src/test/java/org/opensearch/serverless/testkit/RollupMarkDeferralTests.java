@@ -52,6 +52,8 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            // Each publish writes the manifest, which is what a survivor judges a dead writer's shards by here.
+            .put("serverless.wal.node_log.commits", false)
             .build();
     }
 

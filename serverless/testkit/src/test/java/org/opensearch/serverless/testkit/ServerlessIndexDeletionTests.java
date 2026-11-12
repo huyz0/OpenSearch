@@ -49,6 +49,9 @@ public class ServerlessIndexDeletionTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            // Segment blobs under the shard and a manifest per publish: the per-term layout these check.
+            .put("serverless.segments.node_pack.enabled", false)
+            .put("serverless.wal.node_log.commits", false)
             .build();
     }
 

@@ -47,6 +47,9 @@ public class ServerlessFailoverTests extends OpenSearchTestCase {
             .put("transport.port", "0");
         if (roles != null) {
             b.put("serverless.roles", roles);
+            // Segment blobs under the shard and a manifest per publish: the per-term layout these check.
+            b.put("serverless.segments.node_pack.enabled", false);
+            b.put("serverless.wal.node_log.commits", false);
         }
         return b.build();
     }

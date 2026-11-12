@@ -19,7 +19,7 @@ import java.util.Locale;
  *
  * <p>Changeable at runtime, the most specific setting first: the index's {@value #INDEX_SETTING}, then the cluster's
  * {@value #CLUSTER_SETTING} in the {@code cluster/config} register, then the node's
- * {@code serverless.segments.node_pack.enabled}, then {@value #SEGMENT_BLOB}. A change applies to each shard's next
+ * {@code serverless.segments.node_pack.enabled}, on by default. A change applies to each shard's next
  * publish and moves nothing already written: a manifest records every file's location, so one commit can name files in
  * both placements, and every reader and collector already handles both.
  */
