@@ -172,7 +172,8 @@ public final class NodeStartup {
         // not final until the transport has bound and told us the address it got.
         node.projector = new LocalViewProjector(ClusterName.CLUSTER_NAME_SETTING.get(node.settings), node.localNode);
         node.reconciler = new ShardReconciler(node.indicesService, node.localNode);
-        final boolean nodePacksByDefault = node.packSegments && node.settings.getAsBoolean(NodePackWiring.ENABLED, false);
+        final boolean nodePacksByDefault = node.packSegments
+            && node.settings.getAsBoolean(NodePackWiring.ENABLED, NodePackWiring.ENABLED_DEFAULT);
         node.reconciler.setNodePackPlacement(
             shard -> node.packSegments
                 && SegmentPlacement.nodePacks(shard.indexSettings().getSettings(), node.clusterSegmentPlacement, nodePacksByDefault)

@@ -40,6 +40,8 @@ public class NodeLogRecordsSinceTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            // A publish lets go of its records at once only when its manifest is written each time, not staged.
+            .put("serverless.wal.node_log.commits", false)
             .put("serverless.wal.node_log.enabled", true)
             .put("serverless.wal.node_log.window_millis", 20)
             .build();

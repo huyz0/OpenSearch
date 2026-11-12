@@ -56,6 +56,9 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
+            // Segment blobs under the shard and a manifest per publish: the per-term layout these check.
+            .put("serverless.segments.node_pack.enabled", false)
+            .put("serverless.wal.node_log.commits", false)
             // The sweep is checked against records in the shard's own log, where writes go with the node log off.
             .put("serverless.wal.node_log.enabled", false)
             .build();

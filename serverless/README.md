@@ -160,6 +160,23 @@ unpublished record of every shard is, so a successor reads it without a listing.
   It must exceed the longest any record can stay unpublished, which for a running fleet is the publish age plus a
   takeover. A whole fleet down for longer than the rule loses what its logs held unpublished, so set it beyond any
   outage the deployment means to recover from.
+- **Node packs and log commits (both on by default).** A publish's segment blobs of up to
+  `serverless.segments.node_pack.max_blob_bytes` go into the node's next pack, one PUT shared by every shard of any
+  index that publishes within `serverless.segments.node_pack.linger_millis`. A publish's commit is staged on the writer
+  and logged in its write log, riding the next log blob with no PUT of its own; the shard's manifest is written only
+  every `serverless.wal.node_log.commits.checkpoint_millis` (60 s by default), and a successor opens from the newest
+  logged commit. Switch packs per index with `index.serverless.segment_placement` (`segment_blob` or `node_pack`), for
+  the cluster with `serverless.segment_placement` in the cluster settings, or for a node with
+  `serverless.segments.node_pack.enabled`; the index wins over the cluster, the cluster over the node, and a switch
+  moves nothing already written. Turn log commits off with `serverless.wal.node_log.commits=false`. Measured locally at
+  1,000 shards on one node (20 ms per store request, 1 in 50 at 200 ms), against one blob per segment and a manifest per
+  publish: 0.68 PUT+LIST per shard publish instead of 2.09, 4.7 GETs instead of 5.7, write p99 823 ms instead of about
+  885, a cold open 21.8 GETs instead of 25.3 and its first search about 268 ms instead of 295. The price is takeover:
+  after a crash a successor took 60 to 61 s to open all 1,000 shards instead of 48 to 50 (about 18 s instead of 15 at
+  300 shards), because more shards hold unpublished records when packs linger, and each must publish its replay before
+  it serves. A deleted index's bytes inside packs come back when the node's pack collector next finds them unnamed,
+  which runs every `serverless.segments.node_pack.collect_interval_millis` (a minute by default) and waits out a grace
+  before it deletes, so not at the delete.
 
 - **Telling search nodes about a new commit.** A search node that has a shard open checks the shard's register
   for a newer commit every other lease renewal, which is 20 seconds at the default TTL. Until it checks, its searches
