@@ -38,6 +38,14 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
      */
     private static final String TTL = "8000";
 
+    /**
+     * The register's commit is what {@code docsInPublishedCommit} restores. With node packs and log commits, a publish is
+     * staged in the node log and reaches the register only at a checkpoint, so the zombie test pins both off to read the
+     * successor's publishes there, as it was written to.
+     */
+    private static final String PACKS = "serverless.segments.node_pack.enabled";
+    private static final String LOG_COMMITS = "serverless.wal.node_log.commits";
+
     private Map<String, String> settings() {
         return Map.of(ServerlessBootstrap.LEASE_TTL, TTL);
     }
@@ -257,7 +265,17 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
                 );
 
                 assertTrue("a forward to a frozen owner must give up, not hang: took " + elapsedMillis + "ms", elapsedMillis < 20_000L);
-                assertNotEquals("and it must not claim success", 201, response.status());
+                if (response.status() == 201) {
+                    // Success is a lie only while the frozen node still owns the shard. A forward that gave up after the
+                    // frozen node's lease lapsed lets b take the shard, and then b writing it is the right answer: the
+                    // cold path's handshake bound plus the take can outlast the lease.
+                    final var head = plane(store).heads().read("alpha", 0).orElseThrow();
+                    assertEquals(
+                        "a write may succeed only once b has taken the shard, after " + elapsedMillis + "ms: " + response.body(),
+                        b.nodeId(),
+                        head.ownerNodeId()
+                    );
+                }
             } finally {
                 a.resume();
             }
@@ -299,9 +317,23 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
                 "zombie-a",
                 store,
                 createTempDir(),
-                Map.of(ServerlessBootstrap.LEASE_TTL, TTL, ServerlessBootstrap.PUBLISH_DEBOUNCE, "10000")
+                Map.of(
+                    ServerlessBootstrap.LEASE_TTL,
+                    TTL,
+                    ServerlessBootstrap.PUBLISH_DEBOUNCE,
+                    "10000",
+                    PACKS,
+                    "false",
+                    LOG_COMMITS,
+                    "false"
+                )
             );
-            NodeProcess b = NodeProcess.start("zombie-b", store, createTempDir(), settings())
+            NodeProcess b = NodeProcess.start(
+                "zombie-b",
+                store,
+                createTempDir(),
+                Map.of(ServerlessBootstrap.LEASE_TTL, TTL, PACKS, "false", LOG_COMMITS, "false")
+            )
         ) {
             assertEquals(200, send(a, "PUT", "/alpha?shards=1", MAPPING).status());
             assertEquals(201, putDoc(a, "alpha", "1", "{\"msg\":\"before\",\"n\":1}").status());

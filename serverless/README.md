@@ -165,7 +165,9 @@ unpublished record of every shard is, so a successor reads it without a listing.
     record: a write that finds the log quiet for a whole window goes at once. On a quiet node it roughly halves the
     ack (p50 295 -> 141 ms at 4 writes/s), and a busy one is paced as before, but in between it costs log PUTs: +32%
     at 4 writes/s, +44% at 10, +3% at 100. A 100 ms window instead gives p50 97 ms at 100 writes/s for 2.3 times the
-    log PUTs.
+    log PUTs. Leave it off on nodes that take writes all day, where it gains little. Turn it on for low-traffic nodes
+    (a few writes a second or fewer) whose clients need a p50 near 150 ms rather than near 250-300 ms, and that can
+    pay roughly a third more log PUTs for it.
 - **Deleting.** A node deletes its own blobs behind the trim point its lease records: the oldest record any of its
   shards has not published. A survivor deletes a dead node's log once every shard it names has published past it.
   Neither lists.
