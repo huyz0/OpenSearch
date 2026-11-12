@@ -305,6 +305,53 @@ public final class NodeLogStore {
     }
 
     /**
+     * Returns the whole body of a blob of records, every slice of it, in one read: for a reader that wants the slices of
+     * many shards in the same blob.
+     *
+     * @param epoch the epoch
+     * @param header the blob's header
+     * @return the body's bytes, which {@link #parseSlice} reads a slice of
+     * @throws IOException if the read fails or comes back short
+     */
+    public byte[] readBody(long epoch, NodeLogBlob.Header header) throws IOException {
+        final long length = bodyLength(header);
+        if (length > Integer.MAX_VALUE) {
+            throw new IOException("node-log body of " + length + " bytes is too large to read");
+        }
+        final byte[] bytes = readRange(container(epoch), name(header.ordinal()), header.bodyOffset(), (int) length);
+        if (bytes.length != length) {
+            throw new IOException("node-log body of " + length + " bytes read as " + bytes.length);
+        }
+        return bytes;
+    }
+
+    /**
+     * The records of one slice, out of a body {@link #readBody} read.
+     *
+     * @param body the body
+     * @param slice the slice, one of the header's
+     * @return its records
+     * @throws IOException if they cannot be parsed
+     */
+    public static List<WalRecord> parseSlice(byte[] body, NodeLogBlob.Slice slice) throws IOException {
+        if (slice.offset() < 0 || slice.offset() + slice.length() > body.length) {
+            throw new IOException(
+                "node-log slice at " + slice.offset() + " of " + slice.length() + " bytes is past a body of " + body.length
+            );
+        }
+        return NodeLogBlob.parseSlice(java.util.Arrays.copyOfRange(body, (int) slice.offset(), (int) slice.offset() + slice.length()));
+    }
+
+    /** How long a blob's body is: up to the end of its last slice. */
+    public static long bodyLength(NodeLogBlob.Header header) {
+        long end = 0;
+        for (NodeLogBlob.Slice slice : header.slices()) {
+            end = Math.max(end, slice.offset() + slice.length());
+        }
+        return end;
+    }
+
+    /**
      * Deletes the blobs in a range of slots, including fences; slots already empty are skipped.
      *
      * @param epoch the epoch

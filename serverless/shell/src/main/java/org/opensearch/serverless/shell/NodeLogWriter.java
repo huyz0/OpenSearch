@@ -190,6 +190,26 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
     /** Per shard being opened and earlier writer, the reader of its log the open's look for logged commits made. */
     private final Map<OpenRead, NodeLogTakeover> openReaders = new ConcurrentHashMap<>();
 
+    /** Per shard this node has taken and not yet opened, when its head was seen moved here. */
+    private final Map<String, Long> headMovedNanos = new ConcurrentHashMap<>();
+
+    private record LeaseRead(long startedNanos, Optional<NodeLease> lease) {
+    }
+
+    /** Per earlier writer, the newest read of its lease and when that read started. */
+    private final Map<String, LeaseRead> leaseReads = new ConcurrentHashMap<>();
+
+    /**
+     * Notes that this node has just moved a shard's head to itself, before the open that replays its earlier writers'
+     * logs: a read of one of their leases that starts after this serves the open as well as one of its own would.
+     *
+     * @param indexName the index
+     * @param shard the shard
+     */
+    public void noteHeadMoved(String indexName, int shard) {
+        headMovedNanos.put(indexName + "#" + shard, System.nanoTime());
+    }
+
     /** Per shard being opened from a logged commit, the commit: its writer's log is replayed from after it. */
     private final Map<ShardId, Logged> replayAfter = new ConcurrentHashMap<>();
 
@@ -198,6 +218,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
         if (logged == null) {
             replayAfter.remove(shardId);
             openReaders.keySet().removeIf(read -> read.shardId().equals(shardId));
+            headMovedNanos.remove(shardId.getIndexName() + "#" + shardId.id());
         } else {
             replayAfter.put(shardId, logged);
         }
@@ -214,7 +235,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
         try {
             return loggedCommits.loggedAfter(shardId, writers, writer -> {
                 try {
-                    final NodeLogTakeover reader = readerOf(writer, term);
+                    final NodeLogTakeover reader = readerOf(shardId, writer, term);
                     if (reader != null && writer.equals(nodeId) == false) {
                         // The replay that follows reads the same log: kept for it, so the lease is read once.
                         openReaders.put(new OpenRead(shardId, writer), reader);
@@ -367,6 +388,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
         shards.remove(keyOf(shardId));
         loggedCommits.forget(shardId);
         openReaders.keySet().removeIf(read -> read.shardId().equals(shardId));
+        headMovedNanos.remove(shardId.getIndexName() + "#" + shardId.id());
     }
 
     /**
@@ -401,7 +423,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
             return count[0];
         }
         final NodeLogTakeover kept = openReaders.remove(new OpenRead(shardId, predecessor));
-        final NodeLogTakeover reader = kept != null ? kept : readerOf(predecessor, term);
+        final NodeLogTakeover reader = kept != null ? kept : readerOf(shardId, predecessor, term);
         if (reader != null) {
             final Logged from = replayAfter.get(shardId);
             if (from != null && from.coveredThrough() != null && predecessor.equals(from.writer())) {
@@ -418,12 +440,12 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
      * Returns the reader of another node's log, or of the earlier process's epochs for this node's own id, as a replay
      * of it reads: fenced unless it is live. Null when it names no epochs.
      */
-    private NodeLogTakeover readerOf(String predecessor, long term) throws IOException {
+    private NodeLogTakeover readerOf(ShardId shardId, String predecessor, long term) throws IOException {
         if (predecessor == null || predecessor.equals(nodeId)) {
             return inherited.isEmpty() ? null : takeoverOf(nodeId, own, inherited, term, null);
         }
         // Read after the head moved, so an epoch the predecessor opens later is one whose ownership check refuses this shard.
-        final Optional<NodeLease> lease = plane.membership().read(predecessor);
+        final Optional<NodeLease> lease = leaseAfterHeadMoved(shardId, predecessor);
         final List<NodeLogEpoch> epochs = lease.map(NodeLease::nodeLog).orElse(List.of());
         if (epochs.isEmpty()) {
             return null;
@@ -437,6 +459,23 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
             return NodeLogTakeover.unfenced(theirs, epochs, reread);
         }
         return takeoverOf(predecessor, theirs, epochs, term, reread);
+    }
+
+    /**
+     * An earlier writer's lease, read after the shard's head moved here. A takeover of many shards from one node moves
+     * their heads first and opens them after, so one read that started after the last of those moves serves every open:
+     * read once per shard, it was one of the slowest steps of each.
+     */
+    private Optional<NodeLease> leaseAfterHeadMoved(ShardId shardId, String predecessor) throws IOException {
+        final Long moved = headMovedNanos.get(shardId.getIndexName() + "#" + shardId.id());
+        final LeaseRead known = leaseReads.get(predecessor);
+        if (moved != null && known != null && known.startedNanos() - moved > 0) {
+            return known.lease();
+        }
+        final long started = System.nanoTime();
+        final Optional<NodeLease> lease = plane.membership().read(predecessor);
+        leaseReads.merge(predecessor, new LeaseRead(started, lease), (a, b) -> b.startedNanos() - a.startedNanos() > 0 ? b : a);
+        return lease;
     }
 
     /**
@@ -505,7 +544,35 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
      */
     @Override
     public void replayedAndPublished(ShardId shardId, long term) throws IOException {
-        plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
+        final java.util.concurrent.Executor background = this.background;
+        if (background == null) {
+            plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
+            return;
+        }
+        // Off the open: the shard serves as soon as its replay is published, and a head that names the logs a little
+        // longer only has a later successor or a reader read them for nothing.
+        try {
+            background.execute(() -> {
+                try {
+                    plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
+                } catch (IOException | RuntimeException e) {
+                    logger.debug("could not stop the head of [{}] naming the logs it replayed", shardId, e);
+                }
+            });
+        } catch (RuntimeException e) {
+            // Shutting down: the head keeps naming them, which costs reads, never records.
+        }
+    }
+
+    private volatile java.util.concurrent.Executor background;
+
+    /**
+     * Has the step that ends a takeover's open, a head swap that stops it naming the logs replayed, run off the open.
+     *
+     * @param background where it runs
+     */
+    public void runAfterOpensOn(java.util.concurrent.Executor background) {
+        this.background = background;
     }
 
     /**

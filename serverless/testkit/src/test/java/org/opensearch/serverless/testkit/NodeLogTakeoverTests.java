@@ -100,6 +100,30 @@ public class NodeLogTakeoverTests extends OpenSearchTestCase {
         }
     }
 
+    public void testShardsInOneBlobAreReadWithOneReadOfIt() throws Exception {
+        try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
+            final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
+            final NodeLogCommitter writer = committer(log);
+            final List<ShardKey> shards = List.of(A, B, C);
+            for (ShardKey shard : shards) {
+                writer.enqueue(shard, 1L, one(shard.indexUuid() + "-0", 0), landed -> {});
+            }
+            // All three in one blob, as a window of a busy node holds many shards' records.
+            writer.flushQueued();
+            final List<NodeLogEpoch> lease = writer.positions();
+
+            final NodeLogTakeover takeover = new NodeLogTakeover(log, lease, "node-2", 2L);
+            takeover.fenceAll();
+            store.reset();
+            assertEquals(1, takeover.records(A).size());
+            final long first = store.blobReads();
+            assertTrue("the first shard reads the blob", first > 0);
+            assertEquals(1, takeover.records(B).size());
+            assertEquals(1, takeover.records(C).size());
+            assertEquals("the others read nothing more", first, store.blobReads());
+        }
+    }
+
     public void testAFenceFromAStaleLeaseIsSearchedForAgainAboveWhatTheWriterDeleted() throws Exception {
         try (FsBlobStore store = new FsBlobStore(8192, createTempDir(), false)) {
             final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
