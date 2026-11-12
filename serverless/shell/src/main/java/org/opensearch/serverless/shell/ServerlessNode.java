@@ -580,6 +580,26 @@ public final class ServerlessNode implements Closeable {
 
     /** The cluster's segment placement as last read from its register, or null; see {@link SegmentPlacement}. */
     volatile String clusterSegmentPlacement;
+
+    /** The cluster's bucket policy as last read with the segment placement, or null when unset. */
+    volatile String clusterBucketPolicy;
+
+    /**
+     * Returns whether a new index with these settings is grouped into a bucket while small: the index's setting, else
+     * the cluster's, else this node's default. Only when this node writes its node log, which a bucket's owner must.
+     *
+     * @param indexSettings the new index's settings
+     * @return true to group it
+     */
+    public boolean bucketsNewIndex(Settings indexSettings) {
+        return nodeLogEnabled
+            && org.opensearch.serverless.bucket.BucketPolicy.wanted(
+                indexSettings,
+                clusterBucketPolicy,
+                org.opensearch.serverless.bucket.BucketSettings.enabled(settings)
+            );
+    }
+
     volatile long clusterSegmentPlacementReadAtNanos;
     volatile boolean clusterSegmentPlacementRead;
 

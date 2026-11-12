@@ -232,7 +232,32 @@ final class IndexCreation {
                     );
             }
         }
-        metadata.createIndex(descriptor);
+        // A small index joins its group's open bucket first: the bucket's manifest is the truth, so the descriptor names
+        // the bucket only once the manifest lists the index, and a create that then fails takes it back out.
+        final org.opensearch.serverless.bucket.BucketAssigner assigner;
+        if (mode == null && declaredShards == 1 && serving.bucketsNewIndex(settings)) {
+            assigner = new org.opensearch.serverless.bucket.BucketAssigner(
+                metadata.buckets(),
+                org.opensearch.serverless.bucket.BucketSettings.maxMembers(serving.settings())
+            );
+            descriptor = descriptor.withBucket(
+                assigner.join(org.opensearch.serverless.bucket.BucketPolicy.group(index, settings), index, descriptor.uuid())
+            );
+        } else {
+            assigner = null;
+        }
+        try {
+            metadata.createIndex(descriptor);
+        } catch (IOException | RuntimeException e) {
+            if (assigner != null) {
+                try {
+                    assigner.leave(descriptor.bucket(), descriptor.uuid());
+                } catch (IOException leave) {
+                    e.addSuppressed(leave);
+                }
+            }
+            throw e;
+        }
         return descriptor;
     }
 
@@ -305,6 +330,15 @@ final class IndexCreation {
         } catch (IllegalArgumentException e) {
             throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
         }
+        // So is the bucket policy.
+        final String bucketPolicy = given.get(org.opensearch.serverless.bucket.BucketPolicy.INDEX_SETTING);
+        if (bucketPolicy != null) {
+            try {
+                org.opensearch.serverless.bucket.BucketPolicy.check(bucketPolicy);
+            } catch (IllegalArgumentException e) {
+                throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+            }
+        }
         // So is the segment placement.
         final String placement = given.get(org.opensearch.serverless.shell.SegmentPlacement.INDEX_SETTING);
         if (placement != null) {
@@ -315,7 +349,9 @@ final class IndexCreation {
             }
         }
         final Settings settings = org.opensearch.serverless.routing.ShardMode.without(given)
-            .filter(key -> org.opensearch.serverless.shell.SegmentPlacement.INDEX_SETTING.equals(key) == false);
+            .filter(key -> org.opensearch.serverless.shell.SegmentPlacement.INDEX_SETTING.equals(key) == false)
+            .filter(key -> org.opensearch.serverless.bucket.BucketPolicy.INDEX_SETTING.equals(key) == false)
+            .filter(key -> org.opensearch.serverless.bucket.BucketPolicy.GROUP_SETTING.equals(key) == false);
         final String unsupported = unsupportedIndexSetting(settings);
         if (unsupported != null) {
             throw new IndexAdminHandler.RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_setting", unsupported);

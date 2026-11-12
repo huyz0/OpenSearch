@@ -302,6 +302,17 @@ public final class ShardHeadStore {
      * them all. A bucket head records no incarnation, since its members' incarnations are their descriptors' business.
      */
     private Acquisition acquireMember(HeadRef ref, String nodeId, String ephemeralId, boolean writesNodeLog) throws IOException {
+        // One take of a bucket at a time on this node. Its members open in parallel, and each racing to create or swap
+        // the one head is a billed request that loses; one at a time, the first takes it and the rest join it free.
+        final Object turn = bucketTurns.computeIfAbsent(ref.name(), name -> new Object());
+        synchronized (turn) {
+            return acquireMemberInTurn(ref, nodeId, ephemeralId, writesNodeLog);
+        }
+    }
+
+    private final java.util.concurrent.ConcurrentMap<String, Object> bucketTurns = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private Acquisition acquireMemberInTurn(HeadRef ref, String nodeId, String ephemeralId, boolean writesNodeLog) throws IOException {
         final long now = clock.getAsLong();
         final Optional<BlobRegister> existing = container.readRegister(ref.name());
         if (existing.isEmpty()) {

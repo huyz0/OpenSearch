@@ -126,6 +126,31 @@ public class BucketOwnershipTests extends OpenSearchTestCase {
         }
     }
 
+    public void testMembersTakenTogetherCostOneWrite() throws Exception {
+        try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
+            final ShardHeadStore heads = plane(store).heads();
+            final long term = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a", true).head().term();
+            assertTrue(heads.release("logs-a", 0, "node-a", term, "uuid-a", "eph-a", "node-a"));
+            store.reset();
+            final java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(8);
+            try {
+                final List<java.util.concurrent.Future<Acquisition>> takes = new java.util.ArrayList<>();
+                for (int i = 0; i < 16; i++) {
+                    final boolean a = i % 2 == 0;
+                    takes.add(
+                        pool.submit(() -> heads.acquire(a ? "logs-a" : "logs-b", 0, "node-a", "eph-a", a ? "uuid-a" : "uuid-b", true))
+                    );
+                }
+                for (java.util.concurrent.Future<Acquisition> take : takes) {
+                    assertTrue(take.get().acquired());
+                }
+            } finally {
+                pool.shutdownNow();
+            }
+            assertEquals("one swap takes the bucket back, however many members open at once", 1, store.registerWrites());
+        }
+    }
+
     public void testADeadOwnersBucketIsGivenBackOnce() throws Exception {
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final ShardHeadStore heads = plane(store).heads();
