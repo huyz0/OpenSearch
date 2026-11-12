@@ -229,6 +229,74 @@ public final class BlockCacheDirectory extends FilterDirectory {
     }
 
     /**
+     * Puts the small files of a commit this node just published into the block cache, from its own local copies, so
+     * the next open of the commit on this node -- a hibernated writer waking, a writer taken back after release, a
+     * reader -- reads them from memory rather than the object store.
+     *
+     * <p>Only files held locally, which are this node's own output: Lucene never writes a file name twice in a shard's
+     * history, and the publisher uploaded exactly these bytes. A local file whose length is not the one the commit
+     * records is skipped rather than trusted. Smallest first, up to a budget, so a large segment does not push the
+     * metadata an open reads first out of the cache.
+     *
+     * @param manifest the commit just published from this directory
+     * @param maxBytes the most to cache for it
+     * @return the bytes put into the cache
+     * @throws IOException if a local file cannot be read
+     */
+    public long warmFromLocal(org.opensearch.serverless.store.CommitManifest manifest, long maxBytes) throws IOException {
+        final Set<String> held = new LinkedHashSet<>(java.util.Arrays.asList(in.listAll()));
+        final java.util.List<Map.Entry<String, Long>> candidates = new java.util.ArrayList<>();
+        for (String name : manifest.files().keySet()) {
+            final Long length = manifest.lengthOf(name);
+            if (length == null || held.contains(name) == false || in.fileLength(name) != length) {
+                continue;
+            }
+            candidates.add(Map.entry(name, length));
+        }
+        candidates.sort(Map.Entry.comparingByValue());
+        final int blockSize = cache.blockSize();
+        long cached = 0;
+        for (Map.Entry<String, Long> candidate : candidates) {
+            if (cached + candidate.getValue() > maxBytes) {
+                break;
+            }
+            final FileLocation location = manifest.location(candidate.getKey());
+            final String prefix = keyPrefix(
+                cacheScope,
+                location.isPacked() ? location.referencedBlob() : location.termDir(),
+                candidate.getKey()
+            );
+            try (IndexInput input = in.openInput(candidate.getKey(), IOContext.READONCE)) {
+                final long length = candidate.getValue();
+                for (long block = 0; block * blockSize < length; block++) {
+                    final byte[] bytes = new byte[(int) Math.min(blockSize, length - block * blockSize)];
+                    input.readBytes(bytes, 0, bytes.length);
+                    cache.put(prefix + "#" + block, bytes);
+                }
+            }
+            cached += candidate.getValue();
+        }
+        return cached;
+    }
+
+    /**
+     * Finds the block cache directory under a store's wrappers, or null if the store does not read through one.
+     *
+     * @param directory a shard store's directory
+     * @return the block cache directory beneath it, or null
+     */
+    public static BlockCacheDirectory unwrap(Directory directory) {
+        Directory current = directory;
+        while (current != null) {
+            if (current instanceof BlockCacheDirectory found) {
+                return found;
+            }
+            current = current instanceof FilterDirectory filter ? filter.getDelegate() : null;
+        }
+        return null;
+    }
+
+    /**
      * The prefix of every cache key of one published file. The term directory is part of it: a same-named
      * file from another term is other bytes, and a cache that keyed on the name alone served them as this file's.
      */

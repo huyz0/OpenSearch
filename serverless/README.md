@@ -511,21 +511,29 @@ hints until recovery; reverse lookups verify them against published membership.
 ## Hibernating idle writers
 
 `serverless.activation.hibernate_after_millis` (off by default, `0`) puts a writer to sleep once it has gone unused
-that long: it publishes what it holds, closes its engine and keeps its head. The next write, search or forwarded write
-for it reads the head once and, if it still names this process at the same term, opens it at that term without a
-takeover. A head that moved while the writer slept is taken the ordinary way. A sleeping writer's head is given back
-after `serverless.activation.idle_after_millis`, as an open one's is. A clean shutdown gives the heads back.
+that long: it publishes what it holds, puts the commit's small files into the block cache from its own copies, closes
+its engine and keeps its head. The next write, search or forwarded write for it reads the head once and, if it still
+names this process at the same term, opens it at that term without a takeover. A head that moved while the writer
+slept is taken the ordinary way. A sleeping writer's head is given back after `serverless.activation.idle_after_millis`,
+as an open one's is. A clean shutdown gives the heads back.
 
-Measured by `WriterHibernationMeterTests` (1,000 single-shard indices with a 24-field mapping, a 30 s backstop, 20 ms
-store latency):
+Measured by `WriterHibernationMeterTests` (single-shard indices with a 24-field mapping, a 30 s backstop, a 5 min
+head check, 20 ms store latency):
 
 | | open | asleep | released |
 |---|---|---|---|
-| heap per writer | 144 KB | 25 KB | 21 KB |
+| heap per writer (1,000 writers) | 144 KB | 25 KB | 21 KB |
 | file descriptors per writer | 3 | 0 | 0 |
-| idle store requests per writer-hour | 12 | ~0 | ~0 |
-| first write: open time, store requests | | 293 ms, 12 | 340 ms, 16 |
+| idle store requests per writer-hour | ~12 | ~0 | ~0 |
+| going idle: store requests | | 5 (sleep) | ~4-5 (give back) |
+| first write: open time, store requests | | 230 ms, 8 | 253 ms, 12 |
 
-Putting a writer to sleep costs about 4 requests (a head read, the rollup mark, and a descriptor read), so sleeping
-and waking costs about 14 more requests than staying open. Hibernating sooner than the idle release saves heap, file
-descriptors and idle requests, but costs requests for tenants that write every few minutes.
+An open idle writer's only requests are now the periodic head check (one head read per check). Resyncs carry open
+writers over without reading their heads or descriptors again, when that check ran within two of its intervals and
+last saw the head naming this node at the writer's term; this halved what an open idle writer cost an hour. Sleeping and
+waking costs about as much as an hour open (5 + 8 against 12), and less than giving the head back and taking it back
+(about 17), but only for an idle gap that ends before the head is given back at `idle_after_millis`. Beyond that it
+costs the give-back on top. With the 5 minute idle release on by default, a shorter `hibernate_after_millis` only
+covers gaps under 5 minutes, where it adds requests; so hibernation stays off by default. Setting
+`hibernate_after_millis` to 5 minutes and `idle_after_millis` to, say, 30 minutes trades about 4 requests and 20-80 ms
+saved on each 5-30 minute gap for about 4 requests more on each longer one, at released heap and descriptors.

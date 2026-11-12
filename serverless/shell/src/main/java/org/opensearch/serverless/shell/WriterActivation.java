@@ -126,19 +126,58 @@ public final class WriterActivation {
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(node.threadPool().generic())
         );
         node.reconciler.setOwnershipCheck((id, term) -> node.leases.ownsAtTerm(plane, id, term));
-        // A hibernated writer's claim is left unread: it is woken by the next request for it, and the head is read then.
+        // Writers open here are carried over unread when the periodic head check ran within two of its intervals (it and
+        // resync run on the same cadence, so one interval is often just missed) and the head last seen for each names this
+        // node at the term it is open at. That check reads every held head, notes what it saw and releases a writer whose
+        // head moved, so it is what says whether each is still this node's; the descriptor refresh of open indices keeps
+        // their descriptors current, and the check's index half releases a writer whose index was deleted. Reading both
+        // again here cost each open writer two requests every resync -- most of what an idle open writer cost an hour. A
+        // node that checks heads on every pass (the library default, interval zero) carries nothing over and reads them here.
+        final java.util.Map<String, ShardAssignment> carried = new java.util.LinkedHashMap<>();
+        final java.util.Map<String, IndexDescriptor> carriedDescriptors = new java.util.LinkedHashMap<>();
+        final long carryWithin = node.leases.headVerifyIntervalMillis;
+        for (org.opensearch.core.index.shard.ShardId open : carryWithin <= 0L
+            || node.leases.headsVerifiedWithin(plane, 2 * carryWithin) == false
+                ? java.util.List.<org.opensearch.core.index.shard.ShardId>of()
+                : node.reconciler.openShards()) {
+            if (node.reconciler.isReader(open)) {
+                continue;
+            }
+            final String key = ServerlessNode.shardKey(open.getIndexName(), open.id());
+            final ShardAssignment assignment = node.writerAssignments.get(key);
+            final IndexDescriptor descriptor = node.hosted.get(open.getIndexName());
+            final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> seen = node.sightings()
+                .recentHead(open.getIndexName(), open.id(), Long.MAX_VALUE);
+            if (assignment != null
+                && descriptor != null
+                && descriptor.uuid().equals(open.getIndex().getUUID())
+                && node.leases.namesThisNode(seen, open)
+                && seen.get().term() == assignment.term()) {
+                carried.put(key, assignment);
+                carriedDescriptors.put(open.getIndexName(), descriptor);
+            }
+        }
+        // And a hibernated writer's claim is left unread too: it is woken by the next request for it, and the head is read then.
         final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(
             node.localNode.getId(),
             node.localNode.getEphemeralId(),
-            node.hibernation::isHibernated
+            (indexName, shard) -> node.hibernation.isHibernated(indexName, shard)
+                || carried.containsKey(ServerlessNode.shardKey(indexName, shard))
         );
+        final java.util.Map<String, IndexDescriptor> descriptors = new java.util.LinkedHashMap<>();
+        for (IndexDescriptor descriptor : truth.descriptors()) {
+            descriptors.put(descriptor.name(), descriptor);
+        }
+        carriedDescriptors.forEach(descriptors::putIfAbsent);
+        final java.util.List<ShardAssignment> assignments = new java.util.ArrayList<>(truth.assignments());
+        assignments.addAll(carried.values());
 
         // A node that does not accept writer activation must not open a writer shard. A search-only
         // node opens reader shards instead -- so this gate is on the role, not on "has any role".
         final java.util.Collection<ShardAssignment> assignable = node.roles.contains(ServerlessNode.ROLE_INGEST)
-            ? truth.assignments()
+            ? assignments
             : java.util.List.of();
-        final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyTruth(truth.descriptors(), assignable);
+        final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyTruth(descriptors.values(), assignable);
 
         // Closing here does NOT treat absence from a view as removal, but only because of what the close
         // is keyed on -- and it used to be keyed on the wrong thing. Truth's assignment list is derived
