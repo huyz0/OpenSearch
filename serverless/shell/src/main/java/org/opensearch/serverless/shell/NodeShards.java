@@ -46,7 +46,7 @@ public final class NodeShards {
     public org.opensearch.serverless.store.CommitManifest publishShard(org.opensearch.core.index.shard.ShardId shardId, long term)
         throws java.io.IOException {
         node.ensureStarted();
-        return node.reconciler.publish(shardId, term);
+        return pushed(shardId, node.reconciler.publish(shardId, term));
     }
 
     /**
@@ -61,7 +61,18 @@ public final class NodeShards {
     public org.opensearch.serverless.store.CommitManifest publishRoutine(org.opensearch.core.index.shard.ShardId shardId, long term)
         throws java.io.IOException {
         node.ensureStarted();
-        return node.reconciler.publish(shardId, term, true);
+        return pushed(shardId, node.reconciler.publish(shardId, term, true));
+    }
+
+    /** Tells the shard's search nodes about a commit just published, if this node pushes commits; see {@code CommitPush}. */
+    private org.opensearch.serverless.store.CommitManifest pushed(
+        org.opensearch.core.index.shard.ShardId shardId,
+        org.opensearch.serverless.store.CommitManifest commit
+    ) {
+        if (node.router != null) {
+            node.router.commitPush().published(shardId, commit);
+        }
+        return commit;
     }
 
     /**
