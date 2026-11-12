@@ -168,4 +168,49 @@ public class ChangeStripesTests extends OpenSearchTestCase {
             }
         }
     }
+
+    /** Background stripe reads after lone writes, one every 300 ms, with the given threshold. */
+    private long backgroundReadsAfterLoneWrites(int minAsks) throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final FsBlobStore fs = new FsBlobStore(1024, createTempDir(), false);
+        try (CountingBlobStore store = new CountingBlobStore(fs)) {
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            plane.createIndex(new IndexDescriptor("lone", "uuid-lone-00000000", 1, MAPPING, null));
+            try (ServerlessNode node = new ServerlessNode(nodeSettings("stripes-lone-" + minAsks))) {
+                node.startup().start();
+                node.setMetadataPlane(plane);
+                final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+                loop.want("lone", 0);
+                loop.tick(clock.get());
+                final ShardId shardId = node.reconciler().openShards().iterator().next();
+                node.fences().setIncarnationFenceMillis(200L);
+                node.fences().setStripeRefreshMinAsks(minAsks);
+                node.writes().index(shardId, "0", "{\"msg\":\"by descriptor\"}");
+                TimeUnit.MILLISECONDS.sleep(300);
+                store.traceCallers(4);
+                store.reset();
+                for (int i = 1; i <= 5; i++) {
+                    node.writes().index(shardId, "w" + i, "{\"msg\":\"lone\"}");
+                    TimeUnit.MILLISECONDS.sleep(300);
+                }
+                long background = 0;
+                for (String line : store.byCaller().split("\n")) {
+                    if (line.contains("refreshStripes")) {
+                        background += Long.parseLong(line.trim().split(" ")[0]);
+                    }
+                }
+                logger.info("min_asks={}: {} background stripe reads over 5 lone writes\n{}", minAsks, background, store.byCaller());
+                return background;
+            }
+        }
+    }
+
+    /**
+     * A write alone in its stripe for longer than the window reads its stripe itself and leaves nothing for the background
+     * to keep reading: a stripe read in the background after a lone write was never used.
+     */
+    public void testALoneWriteLeavesNoBackgroundStripeReads() throws Exception {
+        assertEquals(0L, backgroundReadsAfterLoneWrites(2));
+        assertTrue("without the threshold every lone write is followed by background reads", backgroundReadsAfterLoneWrites(0) > 0);
+    }
 }

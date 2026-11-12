@@ -32,6 +32,10 @@ public class CommitPushTests extends OpenSearchTestCase {
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"keyword\"}}}";
 
     private Settings nodeSettings(String name, String roles, boolean push) {
+        return nodeSettings(name, roles, push, CommitPush.DEFAULT_INLINE_BYTES);
+    }
+
+    private Settings nodeSettings(String name, String roles, boolean push, long inlineBytes) {
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-commit-push")
@@ -41,6 +45,7 @@ public class CommitPushTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", roles)
             .put(CommitPush.ENABLED, push)
+            .put(CommitPush.INLINE_BYTES, inlineBytes + "b")
             // The commit alone: what a reader sees of unpublished writes is the overlay's business, measured on its own.
             .put(org.opensearch.serverless.transport.TailOverlays.ENABLED, false)
             .build();
@@ -54,13 +59,17 @@ public class CommitPushTests extends OpenSearchTestCase {
     }
 
     private void run(boolean push) throws Exception {
+        run(push, CommitPush.DEFAULT_INLINE_BYTES);
+    }
+
+    private void run(boolean push, long inlineBytes) throws Exception {
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("pushed", "uuid-pushed-00000000", 1, MAPPING, null));
             try (
-                ServerlessNode writer = joined(new ServerlessNode(nodeSettings("push-writer", "ingest", push)), plane);
-                ServerlessNode reader = joined(new ServerlessNode(nodeSettings("push-reader", "search", push)), plane)
+                ServerlessNode writer = joined(new ServerlessNode(nodeSettings("push-writer", "ingest", push, inlineBytes)), plane);
+                ServerlessNode reader = joined(new ServerlessNode(nodeSettings("push-reader", "search", push, inlineBytes)), plane)
             ) {
                 // The writer ranks readers from its membership snapshot, which a running node refreshes every renewal.
                 plane.membership().refresh();
@@ -98,6 +107,17 @@ public class CommitPushTests extends OpenSearchTestCase {
                         );
                     }
                     assertBusy(() -> assertEquals(1L, writer.router().commitPush().counts()[0] - writerBefore[0]));
+                    final long taken = reader.router().commitPush().counts()[5] - readerBefore[5];
+                    if (inlineBytes > 0) {
+                        // The new segment came with the push: the reopen and the search read no segment block from the store.
+                        assertTrue("the push carried the new segment's blocks", taken > 0);
+                        assertEquals("no segment block read from the store: " + store.byPlace(), 0L, store.blobReads());
+                        // The writer's mapping is the one the reader already serves with: no descriptor read either.
+                        assertEquals("the reopen reused the served descriptor", 1L, reader.readers().descriptorReadsSkipped());
+                    } else {
+                        assertEquals("nothing carried with inlining off", 0L, taken);
+                        assertTrue("the reopen read the new segment from the store", store.blobReads() > 0);
+                    }
                 } else {
                     // Give a push, were there one, the time it would take.
                     Thread.sleep(500);
@@ -118,6 +138,10 @@ public class CommitPushTests extends OpenSearchTestCase {
 
     public void testAPushedCommitMovesTheReaderAtOnce() throws Exception {
         run(true);
+    }
+
+    public void testWithInliningOffTheReaderReadsTheNewSegmentFromTheStore() throws Exception {
+        run(true, 0);
     }
 
     public void testWithoutPushTheReaderStaysUntilItsRegisterLook() throws Exception {
