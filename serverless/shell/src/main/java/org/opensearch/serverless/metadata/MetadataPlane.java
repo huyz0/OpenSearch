@@ -193,14 +193,32 @@ public final class MetadataPlane {
 
     /** Deletes an index and every shard-head belonging to it. */
     public boolean deleteIndex(String indexName) throws IOException {
+        final Optional<IndexDescriptor> before = describe(indexName);
         forgetBucket(indexName);
-        return lifecycle.deleteIndex(indexName);
+        final boolean deleted = lifecycle.deleteIndex(indexName);
+        leaveBucket(deleted, before);
+        return deleted;
     }
 
     /** Deletes only the incarnation the caller selected, preserving a replacement under the same name. */
     public boolean deleteIndex(String indexName, String expectedUuid) throws IOException {
+        final Optional<IndexDescriptor> before = describe(indexName).filter(d -> expectedUuid == null || expectedUuid.equals(d.uuid()));
         forgetBucket(indexName);
-        return lifecycle.deleteIndex(indexName, expectedUuid);
+        final boolean deleted = lifecycle.deleteIndex(indexName, expectedUuid);
+        leaveBucket(deleted, before);
+        return deleted;
+    }
+
+    /** Takes a deleted member out of its bucket's manifest. Best effort: a member with no descriptor is never served. */
+    private void leaveBucket(boolean deleted, Optional<IndexDescriptor> before) {
+        if (deleted == false || before.isEmpty() || before.get().bucket() == null) {
+            return;
+        }
+        try {
+            new org.opensearch.serverless.bucket.BucketAssigner(buckets(), 1).leave(before.get().bucket(), before.get().uuid());
+        } catch (IOException e) {
+            LOGGER.warn("could not take deleted index [{}] out of bucket [{}]", before.get().name(), before.get().bucket(), e);
+        }
     }
 
     private void forgetBucket(String indexName) {

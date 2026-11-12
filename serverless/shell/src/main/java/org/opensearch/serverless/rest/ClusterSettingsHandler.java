@@ -205,6 +205,14 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             RestStatus.NOT_IMPLEMENTED
                         );
                     }
+                    final Object bucketPolicy = flat.get(org.opensearch.serverless.bucket.BucketPolicy.CLUSTER_SETTING);
+                    if (bucketPolicy != null) {
+                        try {
+                            org.opensearch.serverless.bucket.BucketPolicy.check(String.valueOf(bucketPolicy));
+                        } catch (IllegalArgumentException e) {
+                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+                        }
+                    }
                     final Object placement = flat.get(org.opensearch.serverless.shell.SegmentPlacement.CLUSTER_SETTING);
                     if (placement != null) {
                         try {
