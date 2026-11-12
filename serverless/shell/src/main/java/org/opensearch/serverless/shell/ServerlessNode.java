@@ -403,6 +403,7 @@ public final class ServerlessNode implements Closeable {
                 storage.engineFactoryProviders(),
                 storage.directoryFactories()
             );
+            org.opensearch.serverless.schema.SharedAnalysis.install(settings, indicesService);
             this.searchService = services.buildSearchService(clusterSettings, clusterService, indicesService);
 
             this.nodeClient = NodeComponents.nodeClient(settings, threadPool, services);

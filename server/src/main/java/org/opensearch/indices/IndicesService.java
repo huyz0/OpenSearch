@@ -64,6 +64,7 @@ import org.opensearch.common.CheckedConsumer;
 import org.opensearch.common.CheckedFunction;
 import org.opensearch.common.CheckedSupplier;
 import org.opensearch.common.Nullable;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.annotation.InternalApi;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.cache.policy.CachedQueryResult;
@@ -114,6 +115,7 @@ import org.opensearch.index.IngestionPayloadDecoderFactory;
 import org.opensearch.index.MergeSchedulerConfig;
 import org.opensearch.index.ReplicationStats;
 import org.opensearch.index.analysis.AnalysisRegistry;
+import org.opensearch.index.analysis.IndexAnalyzersProvider;
 import org.opensearch.index.cache.request.ShardRequestCache;
 import org.opensearch.index.compositeindex.CompositeIndexSettings;
 import org.opensearch.index.engine.CommitStats;
@@ -464,6 +466,7 @@ public class IndicesService extends AbstractLifecycleComponent
     final AbstractRefCounted indicesRefCount; // pkg-private for testing
     private final CountDownLatch closeLatch = new CountDownLatch(1);
     private volatile boolean idFieldDataEnabled;
+    private volatile IndexAnalyzersProvider indexAnalyzersProvider;
     private volatile boolean allowExpensiveQueries;
     private final RecoverySettings recoverySettings;
     private final RemoteStoreSettings remoteStoreSettings;
@@ -1019,6 +1022,16 @@ public class IndicesService extends AbstractLifecycleComponent
     }
 
     /**
+     * Sets what builds the analyzers of every index this node opens from now on, in place of the analysis registry.
+     *
+     * @param provider the provider, or null to build each index's own
+     */
+    @ExperimentalApi
+    public void setIndexAnalyzersProvider(IndexAnalyzersProvider provider) {
+        this.indexAnalyzersProvider = provider;
+    }
+
+    /**
      * Returns an IndexService for the specified index if exists otherwise returns <code>null</code>.
      */
     @Override
@@ -1199,6 +1212,10 @@ public class IndicesService extends AbstractLifecycleComponent
             indexModule.addIndexOperationListener(operationListener);
         }
         pluginsService.onIndexModule(indexModule);
+        final IndexAnalyzersProvider analyzersProvider = indexAnalyzersProvider;
+        if (analyzersProvider != null) {
+            indexModule.setIndexAnalyzersProvider(analyzersProvider);
+        }
         // Add tiered storage search listeners
         if (FeatureFlags.isEnabled(FeatureFlags.WRITABLE_WARM_INDEX_EXPERIMENTAL_FLAG)) {
             indexModule.addSearchOperationListener(new TieredStorageSearchSlowLog(idxSettings));

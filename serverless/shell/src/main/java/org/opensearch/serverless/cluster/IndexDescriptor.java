@@ -306,7 +306,8 @@ public final class IndexDescriptor {
             );
         }
         this.numberOfShards = numberOfShards;
-        this.mapping = mapping;
+        // One copy per distinct source in heap, however many descriptors carry it.
+        this.mapping = org.opensearch.serverless.schema.MappingSources.intern(mapping);
         this.mappingVersion = mappingVersion;
         this.settingsVersion = settingsVersion;
         this.extraSettings = extraSettings == null ? Settings.EMPTY : extraSettings;
@@ -602,7 +603,7 @@ public final class IndexDescriptor {
                     .build()
             );
         if (mapping != null) {
-            builder.putMapping(mapping);
+            builder.putMapping(org.opensearch.serverless.schema.MappingSources.metadata(mapping));
         }
         // Without this every node would read the new mapping and decline to apply it, because core gates
         // re-applying on the version rather than on the source.
