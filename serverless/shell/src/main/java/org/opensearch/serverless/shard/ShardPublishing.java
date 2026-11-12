@@ -133,11 +133,16 @@ final class ShardPublishing {
             );
             manifest = done.manifest();
             if (done.checkpointed() == false) {
-                // The log is trimmed only behind the register: a successor restores it and replays the rest.
+                // The log is trimmed only behind the register: a successor restores it and replays the rest, from the
+                // newest staged commit it finds logged.
                 stagedTrims.put(shardId, new StagedTrim(term, nodeLogAt));
+                nodeLogHooks.staged(shardId, term, manifest, publisher.stagedAgeMillis(), nodeLogAt);
                 return manifest;
             }
             stagedTrims.remove(shardId);
+            if (nodeLogHooks != null && manifest.stageSequence() >= 0L) {
+                nodeLogHooks.checkpointed(shardId, manifest.stageSequence());
+            }
         }
         trim(shardId, term, nodeLogAt);
         return manifest;
@@ -163,6 +168,10 @@ final class ShardPublishing {
         } catch (IOException | RuntimeException e) {
             stagedTrims.remove(shardId);
             throw e;
+        }
+        final ShardReconciler.NodeLogHooks hooks = reconciler.nodeLog;
+        if (written != null && hooks != null) {
+            hooks.checkpointed(shardId, written.stageSequence());
         }
         if (written != null && pending != null) {
             stagedTrims.remove(shardId, pending);

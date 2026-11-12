@@ -8,6 +8,7 @@
 
 package org.opensearch.serverless.testkit;
 
+import org.apache.logging.log4j.LogManager;
 import org.opensearch.action.admin.indices.forcemerge.ForceMergeRequest;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
@@ -103,7 +104,15 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
         }
         // Activations are paced, so taking a thousand shards takes several passes.
         for (int pass = 0; pass < 50 && node.reconciler().openShards().size() < shards; pass++) {
+            final long started = System.nanoTime();
             loop.tick(clock.get());
+            LogManager.getLogger(NodeLogSoakMeterTests.class)
+                .info(
+                    "SOAKTAKE|pass {} took {} ms, {} shards open",
+                    pass,
+                    (System.nanoTime() - started) / 1_000_000,
+                    node.reconciler().openShards().size()
+                );
         }
         assertEquals(shards, node.reconciler().openShards().size());
         return loop;
@@ -140,7 +149,8 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
         List<ShardId> held,
         long seconds,
         Map<String, ShardId> acked,
-        String tag
+        String tag,
+        boolean publishAtEnd
     ) throws Exception {
         final ExecutorService pool = Executors.newFixedThreadPool(WRITERS);
         try {
@@ -198,7 +208,9 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
             if (failed.get() != null) {
                 throw new AssertionError("a write failed", failed.get());
             }
-            published += loop.publishAll().size();
+            if (publishAtEnd) {
+                published += loop.publishAll().size();
+            }
             final List<Long> sorted = new ArrayList<>(acks);
             Collections.sort(sorted);
             return new Phase(
@@ -237,10 +249,11 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                 final List<ShardId> firstHeld = new ArrayList<>(first.reconciler().openShards());
                 slow.setDelayMillis(REQUEST_MILLIS);
                 slow.setTail(TAIL_EVERY, TAIL_MILLIS);
-                final Phase before = run(first, firstLoop, store, firstHeld, seconds / 2, acked, "a");
+                final Phase before = run(first, firstLoop, store, firstHeld, seconds / 2, acked, "a", false);
                 final String firstId = first.localNode().getId();
 
-                // The writer crashes with whatever it had staged; a successor takes every shard and replays its log.
+                // The writer crashes as its writes stop, with whatever it had not published or had staged; a successor
+                // takes every shard and replays its log.
                 clock.addAndGet(2 * TTL);
                 second.startup().start();
                 second.setMetadataPlane(plane);
@@ -249,6 +262,15 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                 final BackgroundReconciler loop = takeAll(second, plane, clock, shards);
                 final double takeoverSeconds = (System.nanoTime() - takeStarted) / 1e9;
                 final double takeoverRequestsPerShard = (store.total()) / (double) shards;
+                logger.info(
+                    "SOAKTAKE|{}|takeover {} s: {}|open phases ms {}|log records read {}|opened from logged commits {}",
+                    mode,
+                    takeoverSeconds,
+                    store.breakdown(),
+                    java.util.Arrays.toString(second.reconciler().writerOpenPhaseMillis()),
+                    second.reconciler().logRecordsRead(),
+                    second.reconciler().loggedCommitOpens()
+                );
                 final List<ShardId> held = new ArrayList<>(second.reconciler().openShards());
                 final Map<String, ShardId> byName = new ConcurrentHashMap<>();
                 for (ShardId shardId : held) {
@@ -263,7 +285,7 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                     }
                 }
                 assertEquals("acknowledged writes lost in the takeover", 0, lost);
-                final Phase after = run(second, loop, store, held, seconds - seconds / 2, acked, "b");
+                final Phase after = run(second, loop, store, held, seconds - seconds / 2, acked, "b", true);
 
                 // What a manifest names, and what the store holds, before and after the first node's packs are collected.
                 long liveBytes = 0;

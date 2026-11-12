@@ -87,6 +87,12 @@ public final class ShardReconciler {
     final java.util.concurrent.atomic.AtomicLong[] writerOpenNanos = new java.util.concurrent.atomic.AtomicLong[WRITER_OPEN_PHASES.size()];
     final java.util.concurrent.atomic.AtomicLong writerOpens = new java.util.concurrent.atomic.AtomicLong();
     final java.util.concurrent.atomic.AtomicLong logRecordsRead = new java.util.concurrent.atomic.AtomicLong();
+    final java.util.concurrent.atomic.AtomicLong loggedCommitOpens = new java.util.concurrent.atomic.AtomicLong();
+
+    /** Writers' opens that started from a commit a predecessor logged rather than from the register's. */
+    public long loggedCommitOpens() {
+        return loggedCommitOpens.get();
+    }
 
     /** Log records writers' opens have read for replay, summed: with the opens, how much log an open finds. */
     public long logRecordsRead() {
@@ -526,7 +532,7 @@ public final class ShardReconciler {
     final java.util.concurrent.ConcurrentHashMap<String, Long> olderTermsFenced = new java.util.concurrent.ConcurrentHashMap<>();
 
     /** What a shard's open and publish need of the node's per-node write log, when it writes one. */
-    public interface NodeLogHooks {
+    public interface NodeLogHooks extends LoggedCommitHooks {
         /**
          * Returns how far a shard's records have landed in this node's log.
          *

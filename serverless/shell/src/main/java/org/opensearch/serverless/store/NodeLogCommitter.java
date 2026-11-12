@@ -183,38 +183,7 @@ public final class NodeLogCommitter {
         lock.lock();
         try {
             final Window mine = join(shard, term, records);
-            while (mine.done == false) {
-                if (flushing) {
-                    // Uninterruptibly: these records are in a window that will be written whatever this thread does, so
-                    // giving up would report a failure for a write that then lands.
-                    changed.awaitUninterruptibly();
-                    continue;
-                }
-                final Window head = windows.peekFirst();
-                final long left = head.closesAtNanos - System.nanoTime();
-                if (head.full(maxBytes, maxRecords) == false && left > 0) {
-                    awaitNanosUninterruptibly(left);
-                    continue;
-                }
-                windows.pollFirst();
-                flushing = true;
-                try {
-                    lock.unlock();
-                    try {
-                        write(head);
-                    } catch (RuntimeException | Error e) {
-                        // Nobody in the window may read this as landed.
-                        head.failAll(new IOException("node-log write failed", e));
-                        throw e;
-                    } finally {
-                        lock.lock();
-                    }
-                } finally {
-                    head.done = true;
-                    flushing = false;
-                    changed.signalAll();
-                }
-            }
+            awaitLanded(mine);
             final IOException failure = mine.failures.get(shard);
             if (failure != null) {
                 throw failure;
@@ -222,6 +191,94 @@ public final class NodeLogCommitter {
             return mine.landed;
         } finally {
             lock.unlock();
+        }
+    }
+
+    /**
+     * Adds a shard's records to the window now open without waiting for it to land: they ride the blob of whatever is
+     * logged next, and add no write of their own. For records nothing waits on, such as the commits a node's publishes
+     * stage; a node that logs nothing more never writes them.
+     *
+     * @param shard the shard
+     * @param term the term they were written at
+     * @param records the records; empty does nothing
+     * @param onLanded told where they landed, on the thread that wrote them and holding this committer's lock, so it
+     *     must be quick; not told if they did not land
+     */
+    public void enqueue(ShardKey shard, long term, List<WalRecord> records, java.util.function.Consumer<Position> onLanded) {
+        Objects.requireNonNull(shard, "shard");
+        if (records.isEmpty()) {
+            return;
+        }
+        lock.lock();
+        try {
+            final Window window = join(shard, term, records);
+            window.onLanded.add(() -> {
+                if (window.landed != null && window.failures.containsKey(shard) == false) {
+                    onLanded.accept(window.landed);
+                }
+            });
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Writes whatever {@link #enqueue} left in the open windows, so that records nothing else would carry land within a
+     * renewal: one write on a node that logged nothing since, none on a node that is logging.
+     */
+    public void flushQueued() {
+        lock.lock();
+        try {
+            final Window last = windows.peekLast();
+            if (last != null && last.onLanded.isEmpty() == false) {
+                awaitLanded(last);
+            }
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Lingers on, or writes, windows until this one is done. Caller holds the lock. */
+    private void awaitLanded(Window mine) {
+        while (mine.done == false) {
+            if (flushing) {
+                // Uninterruptibly: these records are in a window that will be written whatever this thread does, so
+                // giving up would report a failure for a write that then lands.
+                changed.awaitUninterruptibly();
+                continue;
+            }
+            final Window head = windows.peekFirst();
+            final long left = head.closesAtNanos - System.nanoTime();
+            if (head.full(maxBytes, maxRecords) == false && left > 0) {
+                awaitNanosUninterruptibly(left);
+                continue;
+            }
+            windows.pollFirst();
+            flushing = true;
+            try {
+                lock.unlock();
+                try {
+                    write(head);
+                } catch (RuntimeException | Error e) {
+                    // Nobody in the window may read this as landed.
+                    head.failAll(new IOException("node-log write failed", e));
+                    throw e;
+                } finally {
+                    lock.lock();
+                }
+            } finally {
+                head.done = true;
+                flushing = false;
+                changed.signalAll();
+                for (Runnable each : head.onLanded) {
+                    try {
+                        each.run();
+                    } catch (RuntimeException e) {
+                        // Told where they landed for bookkeeping only; nothing that wrote them waits on it.
+                    }
+                }
+            }
         }
     }
 
@@ -760,6 +817,7 @@ public final class NodeLogCommitter {
         private int records;
         private boolean done;
         private Position landed;
+        private final List<Runnable> onLanded = new ArrayList<>();
 
         private Window(long closesAtNanos) {
             this.closesAtNanos = closesAtNanos;
