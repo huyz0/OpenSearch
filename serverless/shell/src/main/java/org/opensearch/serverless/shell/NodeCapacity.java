@@ -332,6 +332,34 @@ public final class NodeCapacity {
         return placement.handOffTarget(plane);
     }
 
+    /** Where unheld buckets go: the same rendezvous ranking on every node. */
+    final org.opensearch.serverless.bucket.BucketPlacement bucketPlacement = new org.opensearch.serverless.bucket.BucketPlacement();
+
+    /**
+     * Where this node should send a write for an index nobody holds, if anywhere: for a member of a bucket, to the
+     * writer the bucket ranks first, so every node places a bucket alike whichever one a client reached; for any other
+     * index, as {@link #handOffTarget(org.opensearch.serverless.metadata.MetadataPlane)}.
+     *
+     * @param plane the metadata plane
+     * @param descriptor the index written to
+     * @return the member's id, or empty to take it here
+     */
+    public java.util.Optional<String> handOffTarget(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        org.opensearch.serverless.cluster.IndexDescriptor descriptor
+    ) {
+        if (descriptor.bucket() == null) {
+            return handOffTarget(plane);
+        }
+        final java.util.Optional<String> owner = bucketPlacement.ownerFor(
+            descriptor.bucket(),
+            plane.membership().current(),
+            plane.clock().getAsLong(),
+            lease -> lease.roles().contains(ServerlessNode.ROLE_INGEST)
+        );
+        return owner.filter(id -> id.equals(node.localNode.getId()) == false);
+    }
+
     /**
      * Writer activations' time by phase, in milliseconds summed since the node started, and how many opened.
      *

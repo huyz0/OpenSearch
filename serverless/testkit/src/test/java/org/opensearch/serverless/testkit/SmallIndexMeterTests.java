@@ -39,7 +39,7 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
     private static final long IDLE_AFTER = 300_000L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"}}}";
 
-    private Settings nodeSettings(String name, String roles, boolean packs, boolean logCommits) {
+    private Settings nodeSettings(String name, String roles, boolean packs, boolean logCommits, boolean buckets) {
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-small-meter")
@@ -51,6 +51,7 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
             .put("serverless.wal.node_log.enabled", true)
             .put("serverless.wal.node_log.commits", logCommits)
             .put("serverless.segments.node_pack.enabled", packs)
+            .put("serverless.buckets.enabled", buckets)
             .build();
     }
 
@@ -66,17 +67,18 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
         return String.format(Locale.ROOT, "PUT=%.2f LIST=%.2f GET=%.2f", puts, lists, gets);
     }
 
-    private void meter(boolean packs, boolean logCommits, int indices) throws Exception {
-        final String mode = (packs ? "node_pack" : "segment_blob") + (logCommits ? " + log commits" : "");
+    private void meter(boolean packs, boolean logCommits, boolean buckets, int indices) throws Exception {
+        final String mode = (packs ? "node_pack" : "segment_blob") + (logCommits ? " + log commits" : "") + (buckets ? " + buckets" : "");
         final AtomicLong clock = new AtomicLong(1_000_000L);
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             for (int i = 0; i < indices; i++) {
-                plane.createIndex(new IndexDescriptor(name(i), "uuid-" + name(i), 1, MAPPING, null));
+                final IndexDescriptor descriptor = new IndexDescriptor(name(i), "uuid-" + name(i), 1, MAPPING, null);
+                plane.createIndex(buckets ? descriptor.withBucket(String.format(Locale.ROOT, "b-%04d", i / 256)) : descriptor);
             }
             try (
-                ServerlessNode writer = new ServerlessNode(nodeSettings("small-writer", "ingest", packs, logCommits));
-                ServerlessNode reader = new ServerlessNode(nodeSettings("small-reader", "search", packs, logCommits))
+                ServerlessNode writer = new ServerlessNode(nodeSettings("small-writer", "ingest", packs, logCommits, buckets));
+                ServerlessNode reader = new ServerlessNode(nodeSettings("small-reader", "search", packs, logCommits, buckets))
             ) {
                 writer.setHeadVerifyIntervalMillis(300_000L).setDescriptorRefreshIntervalMillis(300_000L);
                 writer.startup().start();
@@ -160,7 +162,8 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
             org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.meter.small", "false"))
         );
         final int indices = Integer.parseInt(System.getProperty("tests.meter.small.indices", "50"));
-        meter(false, false, indices);
-        meter(true, true, indices);
+        meter(false, false, false, indices);
+        meter(true, true, false, indices);
+        meter(true, true, true, indices);
     }
 }
