@@ -68,6 +68,7 @@ import org.opensearch.env.NodeEnvironment;
 import org.opensearch.env.ShardLock;
 import org.opensearch.index.analysis.AnalysisRegistry;
 import org.opensearch.index.analysis.IndexAnalyzers;
+import org.opensearch.index.analysis.IndexAnalyzersProvider;
 import org.opensearch.index.cache.query.DisabledQueryCache;
 import org.opensearch.index.cache.query.IndexQueryCache;
 import org.opensearch.index.cache.query.QueryCache;
@@ -291,6 +292,7 @@ public final class IndexModule {
     private final Map<String, IndexStorePlugin.StoreFactory> storeFactories;
     private final NodeCacheService nodeCacheService;
     private final CompositeIndexSettings compositeIndexSettings;
+    private final SetOnce<IndexAnalyzersProvider> indexAnalyzersProvider = new SetOnce<>();
 
     /**
      * Construct the index module for the index with the specified index settings. The index module contains extension points for plugins
@@ -405,6 +407,17 @@ public final class IndexModule {
      */
     IndexerFactory getIndexerFactory() {
         return indexerFactory;
+    }
+
+    /**
+     * Sets what builds this index's analyzers, in place of the analysis registry. May be set once.
+     *
+     * @param provider the provider
+     */
+    @ExperimentalApi
+    public void setIndexAnalyzersProvider(IndexAnalyzersProvider provider) {
+        ensureNotFrozen();
+        indexAnalyzersProvider.set(Objects.requireNonNull(provider));
     }
 
     /**
@@ -1052,7 +1065,8 @@ public final class IndexModule {
                 queryCache = new DisabledQueryCache(indexSettings);
             }
             if (IndexService.needsMapperService(indexSettings, indexCreationContext)) {
-                indexAnalyzers = analysisRegistry.build(indexSettings);
+                final IndexAnalyzersProvider provider = indexAnalyzersProvider.get();
+                indexAnalyzers = provider == null ? analysisRegistry.build(indexSettings) : provider.build(indexSettings, analysisRegistry);
             }
             final IndexService indexService = new IndexService(
                 indexSettings,

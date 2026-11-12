@@ -31,8 +31,11 @@
 
 package org.opensearch.index.analysis;
 
+import org.opensearch.common.Nullable;
+import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.annotation.PublicApi;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.index.mapper.SharedMappings;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -60,6 +63,10 @@ public final class IndexAnalyzers implements Closeable {
     private final Map<String, NamedAnalyzer> analyzers;
     private final Map<String, NamedAnalyzer> normalizers;
     private final Map<String, NamedAnalyzer> whitespaceNormalizers;
+    @Nullable
+    private final Closeable release;
+    @Nullable
+    private final SharedMappings sharedMappings;
 
     public IndexAnalyzers(
         Map<String, NamedAnalyzer> analyzers,
@@ -75,6 +82,40 @@ public final class IndexAnalyzers implements Closeable {
         this.analyzers = unmodifiableMap(analyzers);
         this.normalizers = unmodifiableMap(normalizers);
         this.whitespaceNormalizers = unmodifiableMap(whitespaceNormalizers);
+        this.release = null;
+        this.sharedMappings = null;
+    }
+
+    private IndexAnalyzers(IndexAnalyzers shared, Closeable release, SharedMappings sharedMappings) {
+        this.analyzers = shared.analyzers;
+        this.normalizers = shared.normalizers;
+        this.whitespaceNormalizers = shared.whitespaceNormalizers;
+        this.release = Objects.requireNonNull(release);
+        this.sharedMappings = sharedMappings;
+    }
+
+    /**
+     * Returns a view of these analyzers for one more index to use. Closing the view runs {@code release} instead of
+     * closing the analyzers, so the owner closes them once the last index using them has released its view.
+     *
+     * @param release what closing the view does
+     * @param sharedMappings parsed mappings the indices sharing these analyzers may reuse, or null for none
+     * @return the view
+     */
+    @ExperimentalApi
+    public IndexAnalyzers sharedView(Closeable release, @Nullable SharedMappings sharedMappings) {
+        return new IndexAnalyzers(this, release, sharedMappings);
+    }
+
+    /**
+     * Returns the parsed mappings shared by the indices that share these analyzers, or null if they are not shared.
+     *
+     * @return the shared mappings, or null
+     */
+    @ExperimentalApi
+    @Nullable
+    public SharedMappings sharedMappings() {
+        return sharedMappings;
     }
 
     /**
@@ -128,6 +169,10 @@ public final class IndexAnalyzers implements Closeable {
 
     @Override
     public void close() throws IOException {
+        if (release != null) {
+            release.close();
+            return;
+        }
         IOUtils.close(
             Stream.of(analyzers.values().stream(), normalizers.values().stream(), whitespaceNormalizers.values().stream())
                 .flatMap(s -> s)
