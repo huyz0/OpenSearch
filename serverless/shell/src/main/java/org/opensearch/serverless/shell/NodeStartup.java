@@ -79,6 +79,7 @@ public final class NodeStartup {
                             org.opensearch.threadpool.ThreadPool.Names.GENERIC
                         )
                 );
+                writer.runAfterOpensOn(node.threadPool().generic());
                 node.nodeLogWriter = writer;
             }
             if (node.reconciler != null && node.nodeLogHooked == false) {
