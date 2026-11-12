@@ -148,6 +148,11 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
                 leaseWriter.write(withInherited(epochs), true);
             }
         }, (shard, term, epoch) -> {
+            if (shard.indexUuid().endsWith(LoggedCommits.KEY_SUFFIX)) {
+                // A logged commit needs no head read: a successor opens only from one staged after the register's commit,
+                // by the register's own writer and term, so one a node logs after losing the shard is never taken.
+                return;
+            }
             final ShardId shardId = shards.get(shard);
             if (shardId == null || ownership.ownsAtTerm(shardId, term) == false) {
                 throw new IOException("this node does not own " + shard + " at term " + term + " by its head");
@@ -157,6 +162,16 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
     }
 
     private final LoggedCommits loggedCommits;
+
+    /**
+     * Has logged commits that nothing else carries written soon after they are staged, by a task this runs later, rather
+     * than at the next renewal: a node whose writes stop as it publishes would otherwise leave its last ones unwritten.
+     *
+     * @param later runs a task a little later, on a thread that may wait for a write
+     */
+    public void flushLoggedCommitsWith(java.util.function.Consumer<Runnable> later) {
+        loggedCommits.flushWith(later);
+    }
 
     @Override
     public void staged(
