@@ -74,15 +74,38 @@ final class NodeStorage {
             );
             return java.util.List.of(indexSettings -> java.util.Optional.of(writer));
         }
-        final org.opensearch.index.engine.EngineFactory readOnly = config -> new org.opensearch.index.engine.ReadOnlyEngine(
+        // The commit, and on top of it the acknowledged writes its writer pushes: see OverlayReadOnlyEngine. Its overlay stays
+        // empty, and the engine is the commit alone, for an index whose writes are not pushed.
+        final org.opensearch.index.engine.EngineFactory readOnly = config -> new org.opensearch.serverless.engine.OverlayReadOnlyEngine(
             config,
-            null,
-            null,
-            true,
-            java.util.function.Function.identity(),
-            false
+            node.router == null ? null : node.router.tailOverlays(),
+            record -> parsePushed(config.getShardId(), record)
         );
         return java.util.List.of(indexSettings -> java.util.Optional.of(readOnly));
+    }
+
+    /**
+     * Parses a pushed record with the index's mapping as this node holds it; null when the document needs a field this
+     * node's mapping does not have yet, which then waits for the commit.
+     */
+    private org.opensearch.index.mapper.ParsedDocument parsePushed(
+        org.opensearch.core.index.shard.ShardId shardId,
+        org.opensearch.serverless.store.WalRecord record
+    ) {
+        final org.opensearch.index.IndexService service = node.indicesService.indexService(shardId.getIndex());
+        final org.opensearch.index.mapper.DocumentMapper mapper = service == null ? null : service.mapperService().documentMapper();
+        if (mapper == null) {
+            return null;
+        }
+        final org.opensearch.index.mapper.ParsedDocument parsed = mapper.parse(
+            new org.opensearch.index.mapper.SourceToParse(
+                shardId.getIndexName(),
+                record.id(),
+                new org.opensearch.core.common.bytes.BytesArray(record.source()),
+                org.opensearch.common.xcontent.XContentType.JSON
+            )
+        );
+        return parsed.dynamicMappingsUpdate() == null ? parsed : null;
     }
 
     Map<String, org.opensearch.plugins.IndexStorePlugin.DirectoryFactory> directoryFactories() {
@@ -213,13 +236,17 @@ final class NodeStorage {
                 frozenCommit
             );
         }
+        // Through the plane, not a publisher of its own over the path: a bucket member's commit is its entry in the
+        // bucket's manifest, and the shard's own register is never written.
+        final String storageUuid = ServerlessNode.storageUuidOf(indexSettings);
         return org.opensearch.serverless.store.BlockCacheDirectory.create(
             local,
             plane.blobStore(),
             shardBase,
             node.blockCache,
             // The uuid, not the name: a recreated index reuses its name and none of its bytes.
-            ServerlessNode.storageUuidOf(indexSettings) + "#" + shardNumber
+            storageUuid + "#" + shardNumber,
+            plane.segmentPublisher(indexName, storageUuid, shardNumber).readManifest().orElse(null)
         );
     }
 }

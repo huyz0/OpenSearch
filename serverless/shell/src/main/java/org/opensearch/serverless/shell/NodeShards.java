@@ -64,6 +64,19 @@ public final class NodeShards {
         return pushed(shardId, node.reconciler.publish(shardId, term, true));
     }
 
+    /** The local checkpoint of the shard's last local commit -- the one just published -- or -1 if it cannot be read. */
+    private long committedLocalCheckpoint(org.opensearch.core.index.shard.ShardId shardId) {
+        try {
+            final var shard = node.reconciler.shard(shardId);
+            final String value = shard == null
+                ? null
+                : shard.commitStats().getUserData().get(org.opensearch.index.seqno.SequenceNumbers.LOCAL_CHECKPOINT_KEY);
+            return value == null ? -1L : Long.parseLong(value);
+        } catch (RuntimeException e) {
+            return -1L;
+        }
+    }
+
     /** Tells the shard's search nodes about a commit just published, if this node pushes commits; see {@code CommitPush}. */
     private org.opensearch.serverless.store.CommitManifest pushed(
         org.opensearch.core.index.shard.ShardId shardId,
@@ -71,6 +84,9 @@ public final class NodeShards {
     ) {
         if (node.router != null) {
             node.router.commitPush().published(shardId, commit);
+            if (node.router.tailPush().keeps(shardId)) {
+                node.router.tailPush().published(shardId, committedLocalCheckpoint(shardId));
+            }
         }
         return commit;
     }

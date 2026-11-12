@@ -51,7 +51,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p><b>What it does not change.</b> The register look stays, as the backstop for a lost push, a reader that placement
  * did not name, and a writer that died. A pushed commit only ever moves a reader forward: one no newer than the commit
  * open is ignored, and a commit is trusted as far as a writer's answer to {@link NewestCommits} is, since it comes from
- * the same authenticated peer. Off unless {@value #ENABLED} is set.
+ * the same authenticated peer. On unless {@value #ENABLED} is set to false.
  */
 public final class CommitPush {
 
@@ -88,7 +88,7 @@ public final class CommitPush {
 
     CommitPush(ShardRouter router) {
         this.router = router;
-        this.enabled = router.node.settings().getAsBoolean(ENABLED, false);
+        this.enabled = router.node.settings().getAsBoolean(ENABLED, true);
     }
 
     /** Registers the handler that takes pushes. Called once, at startup, after the router's own. */
@@ -122,27 +122,9 @@ public final class CommitPush {
         if (enabled == false || commit == null || plane == null) {
             return;
         }
-        final List<String> targets;
-        try {
-            // The candidates a search is sent to: a hot shard's spread, and two at the least.
-            final HotShardSpread spread = HotShardSpread.of(router.node, router.node.settings());
-            targets = ReaderPlacement.candidatesFor(
-                shardId.getIndexName(),
-                shardId.id(),
-                plane.membership().current(),
-                ServerlessNode.ROLE_SEARCH,
-                Math.max(2, spread.maxReaders())
-            );
-        } catch (RuntimeException e) {
-            LOG.debug("could not rank the readers of {} to push its commit", shardId, e);
-            return;
-        }
-        final String self = router.node.localNode().getId();
+        final List<String> targets = readerTargets(router, plane, shardId);
         final CommitPushRequest request = new CommitPushRequest(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id(), commit);
         for (String target : targets) {
-            if (target.equals(self)) {
-                continue;
-            }
             router.node.threadPool().generic().execute(() -> {
                 try {
                     final Optional<DiscoveryNode> peer = router.peer(target, SEND_TIMEOUT);
@@ -156,6 +138,28 @@ public final class CommitPush {
                     LOG.debug("could not push the commit of {} to [{}]", shardId, target, e);
                 }
             });
+        }
+    }
+
+    /**
+     * The search nodes a shard's searches are sent to, best first, other than this node: a hot shard's spread, and two
+     * at the least. Empty if they cannot be ranked.
+     */
+    static List<String> readerTargets(ShardRouter router, MetadataPlane plane, ShardId shardId) {
+        try {
+            final HotShardSpread spread = HotShardSpread.of(router.node, router.node.settings());
+            final List<String> ranked = ReaderPlacement.candidatesFor(
+                shardId.getIndexName(),
+                shardId.id(),
+                plane.membership().current(),
+                ServerlessNode.ROLE_SEARCH,
+                Math.max(2, spread.maxReaders())
+            );
+            final String self = router.node.localNode().getId();
+            return ranked.stream().filter(id -> id.equals(self) == false).toList();
+        } catch (RuntimeException e) {
+            LOG.debug("could not rank the readers of {}", shardId, e);
+            return List.of();
         }
     }
 

@@ -11,7 +11,6 @@ package org.opensearch.serverless.store;
 import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
-import org.apache.lucene.store.IndexOutput;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
@@ -87,6 +86,26 @@ public final class SegmentPublisher {
         this.blobStore = blobStore;
         this.shardBase = shardBase;
         this.container = ConditionalBlobContainer.of(blobStore.blobContainer(shardBase));
+        this.register = CommitRegister.of(container, MANIFEST);
+    }
+
+    private volatile CommitRegister register;
+
+    /**
+     * Records this shard's commit somewhere other than its own manifest register: a bucket member's entry in its
+     * bucket's manifest. Set before the first publish or read.
+     *
+     * @param register where the commit is recorded
+     * @return this
+     */
+    public SegmentPublisher commitRegister(CommitRegister register) {
+        this.register = java.util.Objects.requireNonNull(register);
+        return this;
+    }
+
+    /** Returns where this shard's commit is recorded. */
+    public CommitRegister commitRegister() {
+        return register;
     }
 
     /**
@@ -157,6 +176,25 @@ public final class SegmentPublisher {
      * @throws IOException if the register cannot be written, or a newer term holds it
      */
     public CommitManifest checkpoint() throws IOException {
+        final PendingCheckpoint pending = prepareCheckpoint();
+        if (pending == null) {
+            return null;
+        }
+        return completeCheckpoint(pending, register.compareAndSwap(pending.expected(), pending.commit().toBytes()));
+    }
+
+    /** A staged commit taken for a checkpoint whose swap the caller makes, and the generation it swaps over. */
+    public record PendingCheckpoint(CommitManifest commit, long expected) {
+    }
+
+    /**
+     * Takes the newest staged commit for a checkpoint whose swap the caller makes, such as a bucket's, which writes many
+     * members' commits in one swap. Callers serialise this with the shard's publishes, as {@link #checkpoint}.
+     *
+     * @return the commit and the generation to swap it over, or null if nothing is staged
+     * @throws IOException if the staged commit outlived its packs' deadline
+     */
+    public PendingCheckpoint prepareCheckpoint() throws IOException {
         final CommitStaging stage = staging;
         if (stage == null) {
             return null;
@@ -170,8 +208,23 @@ public final class SegmentPublisher {
         if (commit == null || expected == BlobRegister.ABSENT_GENERATION) {
             return null;
         }
-        final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, expected, commit.toBytes());
-        stage.clear();
+        return new PendingCheckpoint(commit, expected);
+    }
+
+    /**
+     * Records the outcome of a checkpoint's swap. A commit staged after the swap was prepared stays staged for the next.
+     *
+     * @param pending what {@link #prepareCheckpoint} took
+     * @param result the swap's outcome
+     * @return the commit written, or null if this writer's own publish had moved the register
+     * @throws IOException if the register cannot be read, or a newer term holds it
+     */
+    public CommitManifest completeCheckpoint(PendingCheckpoint pending, BlobRegisterCasResult result) throws IOException {
+        final CommitStaging stage = staging;
+        final CommitManifest commit = pending.commit();
+        if (stage != null && stage.staged() == commit) {
+            stage.clear();
+        }
         if (result.applied()) {
             lastPublishedGeneration = result.currentGeneration();
             lastPublished = commit;
@@ -179,7 +232,7 @@ public final class SegmentPublisher {
         }
         lastPublishedGeneration = BlobRegister.ABSENT_GENERATION;
         lastPublished = null;
-        final Optional<BlobRegister> now = container.readRegister(MANIFEST);
+        final Optional<BlobRegister> now = register.read();
         if (now.isPresent()) {
             final CommitManifest current = parse(now.get());
             if (current.term() == commit.term() && commit.writer() != null && commit.writer().equals(current.writer())) {
@@ -405,7 +458,7 @@ public final class SegmentPublisher {
             existingRegister = Optional.empty();
             existing = remembered;
         } else {
-            existingRegister = container.readRegister(MANIFEST);
+            existingRegister = register.read();
             existing = existingRegister.isPresent() ? parse(existingRegister.get()) : null;
         }
         if (existing != null && existing.term() > term) {
@@ -500,7 +553,7 @@ public final class SegmentPublisher {
         final long expected = remembered != null && rememberedGeneration != BlobRegister.ABSENT_GENERATION
             ? rememberedGeneration
             : existingRegister.map(BlobRegister::generation).orElse(BlobRegister.ABSENT_GENERATION);
-        final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, expected, manifest.toBytes());
+        final BlobRegisterCasResult result = register.compareAndSwap(expected, manifest.toBytes());
         if (stage != null) {
             // Whatever was staged is in this commit, or was dropped with the register's move.
             stage.clear();
@@ -522,7 +575,7 @@ public final class SegmentPublisher {
             // same writer is this node's own concurrent publish -- two of them used to race here, the loser
             // was treated as a zombie, and the shard was closed while its head still named this node. The
             // other publish's manifest is a valid commit of ours, so it is the answer.
-            final Optional<BlobRegister> now = container.readRegister(MANIFEST);
+            final Optional<BlobRegister> now = register.read();
             if (now.isPresent()) {
                 final CommitManifest current = parse(now.get());
                 if (current.term() == term && writerId != null && writerId.equals(current.writer())) {
@@ -541,12 +594,12 @@ public final class SegmentPublisher {
      * @throws IOException if the register cannot be read
      */
     public Optional<CommitManifest> readManifest() throws IOException {
-        final Optional<BlobRegister> register = container.readRegister(MANIFEST);
-        if (register.isEmpty()) {
+        final Optional<BlobRegister> stored = register.read();
+        if (stored.isEmpty()) {
             return Optional.empty();
         }
-        final CommitManifest manifest = parse(register.get());
-        lastRead = new ReadRegister(manifest, register.get().generation());
+        final CommitManifest manifest = parse(stored.get());
+        lastRead = new ReadRegister(manifest, stored.get().generation());
         return Optional.of(manifest);
     }
 
@@ -573,7 +626,7 @@ public final class SegmentPublisher {
             return false;
         }
         final CommitManifest written = logged.withStageSequence(-1L);
-        final BlobRegisterCasResult result = container.compareAndSwapRegister(MANIFEST, read.generation(), written.toBytes());
+        final BlobRegisterCasResult result = register.compareAndSwap(read.generation(), written.toBytes());
         if (result.applied()) {
             lastPublishedGeneration = result.currentGeneration();
             lastPublished = written;
@@ -886,7 +939,7 @@ public final class SegmentPublisher {
      * @throws IOException if the commit cannot be read
      */
     public java.util.OptionalLong committedMaxSeqNo(CommitManifest manifest) throws IOException {
-        return committedUserData(manifest, org.opensearch.index.seqno.SequenceNumbers.MAX_SEQ_NO);
+        return CommitDownloads.userData(this, manifest, org.opensearch.index.seqno.SequenceNumbers.MAX_SEQ_NO);
     }
 
     /**
@@ -901,37 +954,7 @@ public final class SegmentPublisher {
      * @throws IOException if the commit cannot be read
      */
     public java.util.OptionalLong committedLocalCheckpoint(CommitManifest manifest) throws IOException {
-        return committedUserData(manifest, org.opensearch.index.seqno.SequenceNumbers.LOCAL_CHECKPOINT_KEY);
-    }
-
-    /** A sequence number recorded in a published commit point's user data, under a key. */
-    private java.util.OptionalLong committedUserData(CommitManifest manifest, String key) throws IOException {
-        // Only the commit point and its segments' info files: a few small blobs, nothing of the segments themselves.
-        try (Directory scratch = new org.apache.lucene.store.ByteBuffersDirectory()) {
-            String commitFile = null;
-            for (Map.Entry<String, String> file : manifest.files().entrySet()) {
-                final String name = file.getKey();
-                final boolean isCommit = name.startsWith(org.apache.lucene.index.IndexFileNames.SEGMENTS + "_");
-                if (isCommit == false && name.endsWith(".si") == false) {
-                    continue;
-                }
-                if (isCommit) {
-                    commitFile = name;
-                }
-                try (InputStream in = openFile(manifest, name); IndexOutput out = scratch.createOutput(name, IOContext.DEFAULT)) {
-                    final byte[] buffer = new byte[8192];
-                    int read;
-                    while ((read = in.read(buffer)) > 0) {
-                        out.writeBytes(buffer, read);
-                    }
-                }
-            }
-            if (commitFile == null) {
-                return java.util.OptionalLong.empty();
-            }
-            final String value = org.apache.lucene.index.SegmentInfos.readCommit(scratch, commitFile).getUserData().get(key);
-            return value == null ? java.util.OptionalLong.empty() : java.util.OptionalLong.of(Long.parseLong(value));
-        }
+        return CommitDownloads.userData(this, manifest, org.opensearch.index.seqno.SequenceNumbers.LOCAL_CHECKPOINT_KEY);
     }
 
     /**
@@ -955,30 +978,7 @@ public final class SegmentPublisher {
         if (manifest.isEmpty() || manifest.get().files().isEmpty()) {
             return Optional.empty();
         }
-        for (Map.Entry<String, String> file : manifest.get().files().entrySet()) {
-            // Local disk is a cache, and a node re-opening onto a newer commit finds files from an earlier
-            // one still there. The segment counter is carried in the commit, so a successor that restored
-            // this node's last published commit mints the same next segment name this node did for a
-            // segment it never published: a same-named file is not necessarily the same bytes. Overwrite
-            // rather than trust the name.
-            try {
-                target.deleteFile(file.getKey());
-            } catch (java.io.IOException ignored) {
-                // absent, which is the normal case on a cold node
-            }
-            try (
-                InputStream in = openFile(manifest.get(), file.getKey());
-                IndexOutput out = target.createOutput(file.getKey(), IOContext.DEFAULT)
-            ) {
-                final byte[] buffer = new byte[8192];
-                int read;
-                while ((read = in.read(buffer)) > 0) {
-                    out.writeBytes(buffer, read);
-                }
-            } catch (org.apache.lucene.store.AlreadyClosedException e) {
-                throw new IOException("directory closed while restoring " + shardId, e);
-            }
-        }
+        CommitDownloads.restore(this, manifest.get(), target, shardId);
         return manifest;
     }
 

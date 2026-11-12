@@ -54,6 +54,7 @@ public final class MetadataPlane {
     private final PointsInTime pits;
     private final TemplateStores stores;
     private final ShardDataPaths paths;
+    private final org.opensearch.serverless.bucket.BucketCommits bucketCommits;
     private final SnapshotRecords snapshots;
 
     /**
@@ -123,7 +124,10 @@ public final class MetadataPlane {
         this.activation = new ShardActivation(blobStore, base, heads, descriptors, this);
         this.aliases = new AliasMutations(descriptors, rollups, clock, leaseTtlMillis, this);
         this.stores = new TemplateStores(blobStore, base);
-        this.paths = new ShardDataPaths(blobStore, base, descriptors);
+        this.bucketCommits = new org.opensearch.serverless.bucket.BucketCommits(
+            new org.opensearch.serverless.bucket.BucketStore(blobStore, base)
+        );
+        this.paths = new ShardDataPaths(blobStore, base, descriptors, bucketHeads, bucketCommits);
         this.pits = new PointsInTime(pointInTimeStore, descriptors);
         this.snapshots = new SnapshotRecords(snapshotStore, blobStore, base, this);
         this.lifecycle = new IndexLifecycle(blobStore, base, clock, descriptors, heads, reclaimQueue, aliases, this);
@@ -817,6 +821,15 @@ public final class MetadataPlane {
      */
     public org.opensearch.serverless.bucket.DescriptorBucketHeads bucketHeads() {
         return bucketHeads;
+    }
+
+    /**
+     * Returns the writer of bucket members' commits, shared by every member publisher this plane makes.
+     *
+     * @return the writer
+     */
+    public org.opensearch.serverless.bucket.BucketCommits bucketCommits() {
+        return bucketCommits;
     }
 
     /**

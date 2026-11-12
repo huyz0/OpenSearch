@@ -13,6 +13,8 @@ package org.opensearch.serverless.shell;
  */
 public final class NodeWritePath {
 
+    private static final org.apache.logging.log4j.Logger LOG = org.apache.logging.log4j.LogManager.getLogger(NodeWritePath.class);
+
     private final ServerlessNode node;
 
     NodeWritePath(ServerlessNode node) {
@@ -313,6 +315,15 @@ public final class NodeWritePath {
                 node.walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
             }
             node.writeBackpressure.onAppend(System.nanoTime() - appendStarted, true);
+            // Acknowledged now: the shard's search nodes may search it before it is published.
+            if (node.router != null) {
+                try {
+                    node.router.tailPush().acked(shardId, records);
+                } catch (RuntimeException e) {
+                    // The write is acknowledged whatever happens here; its readers see it at the next commit.
+                    LOG.debug("could not keep acknowledged records of {} for its search nodes", shardId, e);
+                }
+            }
         } catch (Exception | Error e) {
             node.writeBackpressure.onAppend(System.nanoTime() - appendStarted, false);
             node.writeFenced.add(shardId);
