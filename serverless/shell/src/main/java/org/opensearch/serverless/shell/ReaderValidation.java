@@ -255,6 +255,18 @@ final class ReaderValidation {
         }
     }
 
+    /**
+     * The live writer the last check of a reader found.
+     *
+     * @param indexName the index
+     * @param shardNumber the shard
+     * @return the writer's node id, or null if the check found nobody writing the shard or there was none
+     */
+    String checkedOwner(String indexName, int shardNumber) {
+        final ReaderCheck last = readerChecks.get(ServerlessNode.shardKey(indexName, shardNumber));
+        return last == null ? null : last.owner();
+    }
+
     /** Counts departures from the membership this node consults, once per plane. */
     private void watchDepartures(MetadataPlane plane) {
         if (watchingDepartures.compareAndSet(false, true)) {

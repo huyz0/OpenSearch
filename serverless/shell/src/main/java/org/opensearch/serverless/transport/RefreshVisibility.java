@@ -24,6 +24,12 @@ import java.util.Locale;
  *       write into its tail overlay, and a search node opening the shard waits for the writer's answer to its fetch
  *       before it searches. {@code forced_refresh} is true only when the wait completed; a node that was not reached
  *       is told nothing more and serves what it has.</li>
+ *   <li>{@code everywhere}: {@code serving}, and a search node answers for a shard only while it knows it holds every
+ *       write its writer has answered as refreshed. It knows that for a short grant after it last asked the writer, and
+ *       the writer, before it answers a refreshing write, waits out the grant of any node it stopped pushing to. A node
+ *       without a grant asks the writer first, one round trip; one that cannot know refuses, and the search asks the next
+ *       copy, down to the writer, whose own copy is current. A search starting after a refreshing write's answer then
+ *       finds the write or reports the shard failed, on any node.</li>
  * </ul>
  *
  * <p>The node's setting is the default; the cluster setting, in the {@code cluster/config} register, wins over it.
@@ -36,13 +42,18 @@ public final class RefreshVisibility {
         /** The writer's own copy only. */
         OWNER,
         /** The search nodes serving the shard when it is answered, and those opening it. */
-        SERVING;
+        SERVING,
+        /** Any search node, or the search does not answer for the shard. */
+        EVERYWHERE;
 
         static Mode parse(String value) {
             return switch (value.toLowerCase(Locale.ROOT)) {
                 case "owner" -> OWNER;
                 case "serving" -> SERVING;
-                default -> throw new IllegalArgumentException("refresh visibility must be one of [owner, serving], got [" + value + "]");
+                case "everywhere" -> EVERYWHERE;
+                default -> throw new IllegalArgumentException(
+                    "refresh visibility must be one of [owner, serving, everywhere], got [" + value + "]"
+                );
             };
         }
 
@@ -63,6 +74,16 @@ public final class RefreshVisibility {
 
     /** How long a refreshing write waits for the search nodes serving its shard to take it, at most. */
     public static final long WAIT_MILLIS = 500L;
+
+    /**
+     * How long a search node may answer for a shard after it last asked the shard's writer, in {@code everywhere} mode.
+     * The node counts it from when it sent the request; the writer from when it handled it, plus
+     * {@link #GRANT_MARGIN_MILLIS}, so the writer's end is always the later one.
+     */
+    public static final long GRANT_MILLIS = 500L;
+
+    /** What the writer adds to a grant, for clocks that run at slightly different rates. */
+    public static final long GRANT_MARGIN_MILLIS = 100L;
 
     private final Mode nodeDefault;
     private volatile Mode cluster;
@@ -109,5 +130,10 @@ public final class RefreshVisibility {
     /** @return whether refreshing writes wait for the search nodes serving their shard */
     public boolean waitsForSearchNodes() {
         return mode().compareTo(Mode.SERVING) >= 0;
+    }
+
+    /** @return whether search nodes answer for a shard only under a grant from its writer, and writers wait grants out */
+    public boolean grants() {
+        return mode() == Mode.EVERYWHERE;
     }
 }

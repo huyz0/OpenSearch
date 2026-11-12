@@ -109,6 +109,38 @@ public final class ReaderServing {
         org.opensearch.core.index.shard.ShardId shardId
     ) throws java.io.IOException {
         node.readerValidation.validateReader(plane, indexName, shardNumber, shardId);
+        ensureFresh(indexName, shardNumber, shardId);
+    }
+
+    /**
+     * Refuses a reader that cannot be sure it holds every write its live writer has answered as refreshed, in
+     * {@code everywhere} mode; see {@link org.opensearch.serverless.transport.TailOverlays#ensureFresh}. A shard nobody
+     * writes needs nothing more than the log check: its commit is current or refused already.
+     */
+    private void ensureFresh(String indexName, int shardNumber, org.opensearch.core.index.shard.ShardId shardId)
+        throws ShardBehindLogException {
+        if (node.router() == null || node.router().refreshVisibility().grants() == false) {
+            return;
+        }
+        final String owner = node.readerValidation.checkedOwner(indexName, shardNumber);
+        if (owner == null || owner.equals(node.localNode().getId())) {
+            return;
+        }
+        final var shard = node.reconciler.shard(shardId);
+        if (shard == null || node.reconciler.readerCommit(shardId).isEmpty()) {
+            return;
+        }
+        final boolean fresh = node.router().tailOverlays().ensureFresh(shardId, owner, shard.seqNoStats().getLocalCheckpoint(), () -> {
+            // Acquiring a searcher has the engine take what is held for it.
+            try (var searcher = shard.acquireSearcher("refresh_visibility")) {
+                assert searcher != null;
+            } catch (RuntimeException e) {
+                // The search that follows fails the same way, and asks another copy.
+            }
+        });
+        if (fresh == false) {
+            throw ShardBehindLogException.notCaughtUp(indexName, shardNumber);
+        }
     }
 
     /**

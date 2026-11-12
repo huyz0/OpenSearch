@@ -587,7 +587,12 @@ public final class NodeWritePath {
             return true;
         }
         if (node.router.tailOverlays().onFor(shardId) == false) {
-            return searchedOnlyHere(shardId);
+            if (searchedOnlyHere(shardId) == false) {
+                return false;
+            }
+            // A search node that opens the shard later compares its commit with what this answer claims.
+            node.router.tailPush().claim(shardId);
+            return true;
         }
         return node.router.tailPush().awaitSearchNodes(shardId, org.opensearch.serverless.transport.RefreshVisibility.WAIT_MILLIS);
     }

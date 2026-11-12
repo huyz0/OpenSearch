@@ -197,6 +197,18 @@ unpublished record of every shard is, so a successor reads it without a listing.
   default is `serving`. The wait adds no store request and only the push a write would have had anyway, sent at once
   rather than after its 2 ms linger.
 
+  `everywhere` keeps the stock promise on every node: a search that starts after a write was answered with
+  `forced_refresh: true` finds the write, or reports that shard in `_shards.failures`; it never answers without it.
+  A search node answers for a shard only while it holds a grant from the writer, good for 500 ms after the node last
+  asked; a node without one asks first (one round trip), and one that still cannot be sure (a lost push, a gap, a
+  document its mapping cannot take yet, the overlay off) answers only if its commit holds every write the writer has
+  answered as refreshed, otherwise it refuses and the search asks the next copy, down to the writer. The writer, before it
+  answers a refreshing write, waits out the grant of any node it stopped pushing to, and of any node an earlier writer
+  pushed to. `true` and `wait_for` behave the same. Measured, it adds no store request and no write latency, and costs
+  a search almost nothing on a shard searched continuously (about one round trip per 70 searches) but one round trip
+  on a shard searched less often than every 500 ms (p50 about 3 ms more), so it is opt-in: set
+  `serverless.refresh_visibility: everywhere`.
+
 ## Scaling search nodes without a cold cache
 
 A search node that joins cold reads every block its first searches touch from the object store. If you set

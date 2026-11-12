@@ -125,8 +125,13 @@ public class NodeLogCommitsTests extends OpenSearchTestCase {
                     assertEquals(20L, ShardOps.hits(reader.searchService(), onReader, "msg", "staged"));
                 }
 
-                // Once the oldest staged commit has waited its time, the renewal pass writes it.
-                assertBusy(() -> assertEquals(SHARDS, loop.checkpointDue().size()));
+                // Once the oldest staged commit has waited its time, the renewal pass writes it. Each shard's comes due at
+                // its own publish's time, so one pass may write some and the next the rest.
+                final java.util.Set<ShardId> checkpointed = new java.util.HashSet<>();
+                assertBusy(() -> {
+                    checkpointed.addAll(loop.checkpointDue());
+                    assertEquals(SHARDS, checkpointed.size());
+                });
                 for (ShardId shardId : held) {
                     final CommitManifest written = register(plane, shardId);
                     assertEquals(writer.reconciler().newestCommit(shardId).files(), written.files());
