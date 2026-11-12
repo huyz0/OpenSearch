@@ -46,6 +46,7 @@ public final class ShardHeadStore {
     private final LongSupplier clock;
     private final long leaseTtlMillis;
     private final LivenessOracle oracle;
+    private volatile org.opensearch.serverless.bucket.BucketHeads buckets;
 
     /**
      * Creates a store.
@@ -67,6 +68,77 @@ public final class ShardHeadStore {
         this.clock = clock;
         this.leaseTtlMillis = leaseTtlMillis;
         this.oracle = oracle;
+    }
+
+    /**
+     * Routes bucketed shards to their bucket's head from now on. Unset, every shard is owned through its own head.
+     *
+     * @param buckets which shards belong to buckets, or null for none
+     */
+    public void setBucketHeads(org.opensearch.serverless.bucket.BucketHeads buckets) {
+        this.buckets = buckets;
+    }
+
+    /** The index name a bucket's head is recorded under: never a valid index name, so it cannot collide with one. */
+    public static String bucketHeadIndex(String bucketId) {
+        return "#bucket#" + bucketId;
+    }
+
+    /** Where a shard's ownership is recorded, and for a member, how to show the bucket head as the member's own. */
+    private record HeadRef(String name, String indexName, int shardId, org.opensearch.serverless.bucket.BucketHeads.Member member) {
+
+        boolean bucketed() {
+            return member != null;
+        }
+
+        /** A stored head as the caller asked for it: a bucket head is shown as this member's, at the bucket's term. */
+        ShardHead shown(ShardHead stored) {
+            if (member == null) {
+                return stored;
+            }
+            return new ShardHead(
+                indexName,
+                shardId,
+                stored.term(),
+                stored.ownerNodeId(),
+                stored.ownerEphemeralId(),
+                stored.leaseExpiresAtMillis(),
+                member.indexUuid()
+            ).withWriters(stored.writers()).withShardLogQuietSince(stored.shardLogQuietSince());
+        }
+
+        /** A head to store: a bucket head carries the bucket's identity, never a member's. */
+        ShardHead stored(long term, String owner, String ephemeralId, long expiresAtMillis, String indexUuid) {
+            return member == null
+                ? new ShardHead(indexName, shardId, term, owner, ephemeralId, expiresAtMillis, indexUuid)
+                : new ShardHead(bucketHeadIndex(member.bucketId()), 0, term, owner, ephemeralId, expiresAtMillis, null);
+        }
+    }
+
+    private HeadRef ref(String indexName, int shardId) throws IOException {
+        return ref(indexName, shardId, null);
+    }
+
+    private HeadRef ref(String indexName, int shardId, String indexUuid) throws IOException {
+        final org.opensearch.serverless.bucket.BucketHeads routing = buckets;
+        if (routing != null) {
+            final Optional<org.opensearch.serverless.bucket.BucketHeads.Member> member = routing.bucketOf(indexName, shardId, indexUuid);
+            if (member.isPresent()) {
+                return new HeadRef(
+                    RegisterMap.shardHeadBlob(bucketHeadIndex(member.get().bucketId()), 0),
+                    indexName,
+                    shardId,
+                    member.get()
+                );
+            }
+        }
+        return new HeadRef(RegisterMap.shardHeadBlob(indexName, shardId), indexName, shardId, null);
+    }
+
+    private static ShardHead parse(BlobRegister register) throws IOException {
+        try (InputStream in = register.value().streamInput()) {
+            return ShardHead.fromStream(in);
+        }
     }
 
     /**
@@ -103,13 +175,12 @@ public final class ShardHeadStore {
      * @throws IOException if the register cannot be read or parsed
      */
     public Optional<ShardHead> read(String indexName, int shardId) throws IOException {
-        final Optional<BlobRegister> register = container.readRegister(RegisterMap.shardHeadBlob(indexName, shardId));
+        final HeadRef ref = ref(indexName, shardId);
+        final Optional<BlobRegister> register = container.readRegister(ref.name());
         if (register.isEmpty()) {
             return Optional.empty();
         }
-        try (InputStream in = register.get().value().streamInput()) {
-            return Optional.of(ShardHead.fromStream(in));
-        }
+        return Optional.of(ref.shown(parse(register.get())));
     }
 
     /**
@@ -166,7 +237,11 @@ public final class ShardHeadStore {
      */
     public Acquisition acquire(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid, boolean writesNodeLog)
         throws IOException {
-        final String name = RegisterMap.shardHeadBlob(indexName, shardId);
+        final HeadRef ref = ref(indexName, shardId, indexUuid);
+        if (ref.bucketed()) {
+            return acquireMember(ref, nodeId, ephemeralId, writesNodeLog);
+        }
+        final String name = ref.name();
         final long now = clock.getAsLong();
         final Optional<BlobRegister> existing = container.readRegister(name);
 
@@ -220,6 +295,74 @@ public final class ShardHeadStore {
     }
 
     /**
+     * Takes a bucket member: joins the bucket if this node already holds its head, at the head's term and with no write,
+     * or takes the bucket head as a shard head is taken.
+     *
+     * <p>Joining must not move the term: every member open here serves at the bucket's term, and a new term would fence
+     * them all. A bucket head records no incarnation, since its members' incarnations are their descriptors' business.
+     */
+    private Acquisition acquireMember(HeadRef ref, String nodeId, String ephemeralId, boolean writesNodeLog) throws IOException {
+        final long now = clock.getAsLong();
+        final Optional<BlobRegister> existing = container.readRegister(ref.name());
+        if (existing.isEmpty()) {
+            final ShardHead head = ref.stored(1L, nodeId, ephemeralId, now + leaseTtlMillis, null)
+                .withShardLogQuietSince(writesNodeLog ? 1L : -1L);
+            if (container.createRegisterIfAbsent(ref.name(), head.toBytes()).applied()) {
+                return Acquisition.won(ref.shown(head));
+            }
+            return read(ref.indexName(), ref.shardId()).map(Acquisition::heldByAnother)
+                .orElseThrow(() -> new IOException("bucket head of " + ref.member().bucketId() + " vanished after a lost create race"));
+        }
+        final ShardHead current = parse(existing.get());
+        final boolean ours = nodeId.equals(current.ownerNodeId())
+            && (current.ownerEphemeralId() == null || current.ownerEphemeralId().equals(ephemeralId));
+        if (ours) {
+            return Acquisition.won(ref.shown(current));
+        }
+        if (current.ownerNodeId() != null
+            && (current.isHeldAt(now) || oracle.revokeUnlessLive(current.ownerNodeId(), current.ownerEphemeralId()) == false)) {
+            return Acquisition.heldByAnother(ref.shown(current));
+        }
+        final ShardHead next = ref.stored(current.term() + 1, nodeId, ephemeralId, now + leaseTtlMillis, null)
+            .withWriters(current.writers())
+            .withWriter(current.ownerNodeId())
+            .withShardLogQuietSince(writesNodeLog ? current.shardLogQuietSince() : -1L);
+        if (container.compareAndSwapRegister(ref.name(), existing.get().generation(), next.toBytes()).applied()) {
+            return Acquisition.won(ref.shown(next), current.ownerNodeId());
+        }
+        return read(ref.indexName(), ref.shardId()).map(Acquisition::heldByAnother)
+            .orElseThrow(() -> new IOException("bucket head of " + ref.member().bucketId() + " vanished after a lost CAS"));
+    }
+
+    /**
+     * Gives back a bucket member: only the bucket's last member open here gives back the head.
+     */
+    private boolean releaseMember(HeadRef ref, String nodeId, long expectedTerm, String expectedEphemeralId, String lastWriter)
+        throws IOException {
+        final org.opensearch.serverless.bucket.BucketHeads routing = buckets;
+        if (routing != null && routing.othersOpenOn(ref.member().bucketId(), nodeId, ref.indexName())) {
+            return true;
+        }
+        final Optional<BlobRegister> existing = container.readRegister(ref.name());
+        if (existing.isEmpty()) {
+            return false;
+        }
+        final ShardHead current = parse(existing.get());
+        if (nodeId.equals(current.ownerNodeId()) == false
+            || (expectedTerm >= 0L && current.term() != expectedTerm)
+            || (expectedEphemeralId != null
+                && current.ownerEphemeralId() != null
+                && expectedEphemeralId.equals(current.ownerEphemeralId()) == false)) {
+            return false;
+        }
+        final ShardHead released = ref.stored(current.term(), null, null, 0L, null)
+            .withWriters(current.writers())
+            .withWriter(lastWriter)
+            .withShardLogQuietSince(current.shardLogQuietSince());
+        return container.compareAndSwapRegister(ref.name(), existing.get().generation(), released.toBytes()).applied();
+    }
+
+    /**
      * Extends the current owner's lease without bumping the term.
      *
      * <p>The term stays put on purpose. A term bump means ownership changed, and anything downstream
@@ -232,7 +375,8 @@ public final class ShardHeadStore {
      * @throws IOException if the register cannot be read or written
      */
     public Optional<ShardHead> renew(String indexName, int shardId, String nodeId) throws IOException {
-        final String name = RegisterMap.shardHeadBlob(indexName, shardId);
+        final HeadRef ref = ref(indexName, shardId);
+        final String name = ref.name();
         final Optional<BlobRegister> existing = container.readRegister(name);
         if (existing.isEmpty()) {
             return Optional.empty();
@@ -247,9 +391,7 @@ public final class ShardHeadStore {
         // The uuid travels with the head through a renewal. Dropping it would disable the incarnation
         // check for every later acquirer: a same-name index created after this one was deleted could
         // not tell this owner from a live one of its own.
-        final ShardHead renewed = new ShardHead(
-            indexName,
-            shardId,
+        final ShardHead renewed = ref.stored(
             current.term(),
             nodeId,
             current.ownerEphemeralId(),
@@ -257,7 +399,7 @@ public final class ShardHeadStore {
             current.indexUuid()
         ).withWriters(current.writers()).withShardLogQuietSince(current.shardLogQuietSince());
         final BlobRegisterCasResult result = container.compareAndSwapRegister(name, existing.get().generation(), renewed.toBytes());
-        return result.applied() ? Optional.of(renewed) : Optional.empty();
+        return result.applied() ? Optional.of(ref.shown(renewed)) : Optional.empty();
     }
 
     /**
@@ -275,7 +417,13 @@ public final class ShardHeadStore {
      * @throws IOException if the register cannot be read or written
      */
     public boolean clearWriters(String indexName, int shardId, String nodeId, long expectedTerm) throws IOException {
-        final String name = RegisterMap.shardHeadBlob(indexName, shardId);
+        final HeadRef ref = ref(indexName, shardId);
+        if (ref.bucketed()) {
+            // The writers a bucket head names are every member's: one member's publish cannot drop them. The bucket's
+            // checkpoint, which covers every member, is what clears them.
+            return false;
+        }
+        final String name = ref.name();
         final Optional<BlobRegister> existing = container.readRegister(name);
         if (existing.isEmpty()) {
             return false;
@@ -306,7 +454,12 @@ public final class ShardHeadStore {
      * @throws IOException if the register cannot be read or written
      */
     public boolean markShardLogQuiet(String indexName, int shardId, String nodeId, long expectedTerm) throws IOException {
-        final String name = RegisterMap.shardHeadBlob(indexName, shardId);
+        final HeadRef ref = ref(indexName, shardId);
+        if (ref.bucketed()) {
+            // A bucket is only ever written through node logs: its head is created quiet, and members have no shard log.
+            return false;
+        }
+        final String name = ref.name();
         final Optional<BlobRegister> existing = container.readRegister(name);
         if (existing.isEmpty()) {
             return false;
@@ -410,7 +563,11 @@ public final class ShardHeadStore {
         String expectedEphemeralId,
         String lastWriter
     ) throws IOException {
-        final String name = RegisterMap.shardHeadBlob(indexName, shardId);
+        final HeadRef ref = ref(indexName, shardId, expectedIndexUuid);
+        if (ref.bucketed()) {
+            return releaseMember(ref, nodeId, expectedTerm, expectedEphemeralId, lastWriter);
+        }
+        final String name = ref.name();
         final Optional<BlobRegister> existing = container.readRegister(name);
         if (existing.isEmpty()) {
             return false;
@@ -459,7 +616,8 @@ public final class ShardHeadStore {
      * @throws IOException if the register cannot be read or written
      */
     public Optional<Abandoned> releaseAbandoned(String indexName, int shardId, String deadNodeId) throws IOException {
-        final String name = RegisterMap.shardHeadBlob(indexName, shardId);
+        final HeadRef ref = ref(indexName, shardId);
+        final String name = ref.name();
         final long now = clock.getAsLong();
         final Optional<BlobRegister> existing = container.readRegister(name);
         if (existing.isEmpty()) {
@@ -475,13 +633,15 @@ public final class ShardHeadStore {
             return Optional.empty();
         }
         // The dead owner's log may hold what it never published: whoever takes the shard next reads it.
-        final ShardHead released = new ShardHead(indexName, shardId, current.term() + 1, null, null, 0L, current.indexUuid()).withWriters(
-            current.writers()
-        ).withWriter(deadNodeId).withShardLogQuietSince(current.shardLogQuietSince());
+        final ShardHead released = ref.stored(current.term() + 1, null, null, 0L, current.indexUuid())
+            .withWriters(current.writers())
+            .withWriter(deadNodeId)
+            .withShardLogQuietSince(current.shardLogQuietSince());
         if (container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied() == false) {
             return Optional.empty();
         }
-        return Optional.of(new Abandoned(current, released));
+        // For a bucket, the whole bucket is given back at once; its other members settle as released heads.
+        return Optional.of(new Abandoned(ref.shown(current), ref.shown(released)));
     }
 
     /**
