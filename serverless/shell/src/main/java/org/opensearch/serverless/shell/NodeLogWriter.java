@@ -536,31 +536,68 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
     }
 
     /**
-     * Stops the shard's head naming the logs the open replayed, now that what they held of it is published.
+     * Stops the shard's head naming the logs the open replayed, once what they held of it is in the register.
      *
      * @param shardId the shard
      * @param term the term it opened at
+     * @param settle what writes the register first, if it is not yet written; true once it is
      * @throws IOException if the head cannot be read or written
      */
     @Override
-    public void replayedAndPublished(ShardId shardId, long term) throws IOException {
+    public void replayedAndPublished(ShardId shardId, long term, java.util.concurrent.Callable<Boolean> settle) throws IOException {
         final java.util.concurrent.Executor background = this.background;
         if (background == null) {
-            plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
+            if (settled(shardId, settle, 1)) {
+                plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
+            }
             return;
         }
-        // Off the open: the shard serves as soon as its replay is published, and a head that names the logs a little
-        // longer only has a later successor or a reader read them for nothing.
+        // Off the open: the shard serves as soon as its replay is in, and a head that names the logs a little longer only
+        // has a later successor or a reader read them for nothing.
         try {
             background.execute(() -> {
                 try {
-                    plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
+                    if (settled(shardId, settle, SETTLE_ATTEMPTS)) {
+                        plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
+                    }
                 } catch (IOException | RuntimeException e) {
                     logger.debug("could not stop the head of [{}] naming the logs it replayed", shardId, e);
                 }
             });
         } catch (RuntimeException e) {
             // Shutting down: the head keeps naming them, which costs reads, never records.
+        }
+    }
+
+    /**
+     * How many times a register write that ends an open is tried, a second apart and then further, before it is left to
+     * the shard's next publish. About two minutes in all, well inside the margin a logged commit's packs have before
+     * collection may judge them unreferenced.
+     */
+    static final int SETTLE_ATTEMPTS = 8;
+
+    private static boolean settled(ShardId shardId, java.util.concurrent.Callable<Boolean> settle, int attempts) {
+        long pauseMillis = 1_000L;
+        for (int attempt = 1;; attempt++) {
+            try {
+                if (Boolean.TRUE.equals(settle.call())) {
+                    return true;
+                }
+                // The register moved to another writer: this node no longer holds the shard, and the logs stay named.
+                return false;
+            } catch (Exception e) {
+                if (attempt >= attempts) {
+                    logger.warn("could not write the register of [{}] after its open; its next publish writes it", shardId, e);
+                    return false;
+                }
+            }
+            try {
+                Thread.sleep(pauseMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+            pauseMillis = Math.min(pauseMillis * 2, 60_000L);
         }
     }
 

@@ -544,7 +544,7 @@ public final class SegmentPublisher {
             );
         }
         final CommitManifest unstaged = new CommitManifest(term, published, writerId, lengths, digest, walOrdinal);
-        if (stage != null && mayStage && stage.mayStage(remembered, term, writerId)) {
+        if (stage != null && mayStage && adopting == null && stage.mayStage(remembered, term, writerId)) {
             final CommitManifest staged = unstaged.withStageSequence(stage.next());
             stage.stage(staged, nodePackLandedNanos);
             return new Published(staged, false);
@@ -558,12 +558,16 @@ public final class SegmentPublisher {
             // Whatever was staged is in this commit, or was dropped with the register's move.
             stage.clear();
         }
-        if (result.applied()) {
-            lastPublishedGeneration = result.currentGeneration();
-            lastPublished = manifest;
-        } else {
-            lastPublishedGeneration = BlobRegister.ABSENT_GENERATION;
-            lastPublished = null;
+        synchronized (this) {
+            if (result.applied()) {
+                lastPublishedGeneration = result.currentGeneration();
+                lastPublished = manifest;
+                // Over the adopted commit, or over a register that already held it: either way this holds it.
+                adopting = null;
+            } else {
+                lastPublishedGeneration = BlobRegister.ABSENT_GENERATION;
+                lastPublished = null;
+            }
         }
         if (result.applied() == false && remembered != null) {
             // The register moved under what this instance remembered -- a repair, a restore, a manifest
@@ -635,6 +639,78 @@ public final class SegmentPublisher {
     }
 
     /**
+     * Has the register take a commit a predecessor staged later rather than now: at this publisher's next publish, or at
+     * {@link #writeAdopted}, whichever comes first. Either swaps over the register as this publisher last read it, and a
+     * publish inherits the logged commit's files, so the register goes straight to a commit holding everything the logged
+     * one does. Writes nothing: an open that takes many shards then spends no swap per shard before it serves.
+     *
+     * <p>Until one of them lands the register still holds its older commit, and the predecessor's log is what holds the
+     * rest, so the caller must not let go of that log before then. Nothing is staged in between: staging follows on from
+     * the register, which is not yet this writer's.
+     *
+     * @param logged the commit
+     * @param over the register's commit, as {@link #readManifest} returned it
+     * @return true if it will be written; false if this publisher did not read {@code over}
+     */
+    public boolean adoptAtNextPublish(CommitManifest logged, CommitManifest over) {
+        final ReadRegister read = lastRead;
+        if (read == null || read.manifest() != over) {
+            return false;
+        }
+        final CommitManifest written = logged.withStageSequence(-1L);
+        synchronized (this) {
+            lastPublished = written;
+            lastPublishedGeneration = read.generation();
+            adopting = written;
+        }
+        return true;
+    }
+
+    /** The commit {@link #adoptAtNextPublish} took that the register does not yet hold, or null. */
+    private volatile CommitManifest adopting;
+
+    /**
+     * Returns whether a commit {@link #adoptAtNextPublish} took is still to be written to the register.
+     *
+     * @return true until a publish or {@link #writeAdopted} writes it
+     */
+    public boolean adoptionPending() {
+        return adopting != null;
+    }
+
+    /**
+     * Writes the commit {@link #adoptAtNextPublish} took to the register, unless a publish has already: one swap, with no
+     * upload.
+     *
+     * @return true if the register holds it, or a later commit of this writer's; false if the register moved elsewhere
+     * @throws IOException if the register cannot be written
+     */
+    public boolean writeAdopted() throws IOException {
+        final CommitManifest pending = adopting;
+        final long expected = lastPublishedGeneration;
+        if (pending == null || lastPublished != pending) {
+            // A publish took over from it, and holds what it held once it lands.
+            return pending == null || publishedSince(pending);
+        }
+        final BlobRegisterCasResult result = register.compareAndSwap(expected, pending.toBytes());
+        if (result.applied()) {
+            synchronized (this) {
+                if (lastPublished == pending) {
+                    lastPublishedGeneration = result.currentGeneration();
+                }
+                adopting = null;
+            }
+            return true;
+        }
+        // Lost to this writer's own publish, which then holds it, or to another writer.
+        return publishedSince(pending);
+    }
+
+    private boolean publishedSince(CommitManifest pending) {
+        return adopting != pending;
+    }
+
+    /**
      * Writes the files a publish adds as one blob per segment, and records where each file is in its blob.
      *
      * <p>A segment's files are written together and die together, when a merge or a delete of every document removes
@@ -690,7 +766,7 @@ public final class SegmentPublisher {
         }
         final String last = bySegment.lastKey();
         final NodePackWriter packs = nodePacks;
-        final java.util.List<SegmentBlob> toNodePack = new java.util.ArrayList<>();
+        final java.util.List<SegmentBlobs.Laid> toNodePack = new java.util.ArrayList<>();
         for (Map.Entry<String, java.util.List<String>> segment : bySegment.entrySet()) {
             final java.util.List<String> files = new java.util.ArrayList<>(segment.getValue());
             if (segment.getKey().equals(last)) {
@@ -698,9 +774,9 @@ public final class SegmentPublisher {
             }
             if (packs != null) {
                 final String blobName = publishedSegments.contains(segment.getKey())
-                    ? uniqueSegmentBlob(segment.getKey())
+                    ? SegmentBlobs.uniqueName(segment.getKey())
                     : segment.getKey() + ".seg";
-                final SegmentBlob prepared = prepareSegmentBlob(directory, blobName, files);
+                final SegmentBlobs.Laid prepared = SegmentBlobs.prepare(directory, blobName, files);
                 if (prepared.length() <= nodePackMaxBlobBytes) {
                     toNodePack.add(prepared);
                     continue;
@@ -714,32 +790,13 @@ public final class SegmentPublisher {
                     // An earlier attempt of this term, or a writer that reused the segment's name, left a blob by it.
                 }
             }
-            writeSegmentBlob(directory, termDir, uniqueSegmentBlob(segment.getKey()), files, published, lengths);
+            writeSegmentBlob(directory, termDir, SegmentBlobs.uniqueName(segment.getKey()), files, published, lengths);
         }
         if (toNodePack.isEmpty()) {
             return null;
         }
         writeToNodePack(packs, directory, toNodePack, published, lengths);
         return System.nanoTime();
-    }
-
-    /** A segment blob laid out but not yet written: its name, header, files in blob order and their sizes. */
-    private record SegmentBlob(String name, byte[] header, java.util.List<String> files, Map<String, Long> sizes, long length) {
-    }
-
-    private static SegmentBlob prepareSegmentBlob(Directory directory, String blob, java.util.List<String> fileNames) throws IOException {
-        final Map<String, Long> sizes = new LinkedHashMap<>();
-        for (String fileName : fileNames) {
-            sizes.put(fileName, directory.fileLength(fileName));
-        }
-        final java.util.List<String> ordered = new java.util.ArrayList<>(fileNames);
-        ordered.sort(java.util.Comparator.<String>comparingLong(sizes::get).thenComparing(java.util.Comparator.naturalOrder()));
-        final byte[] header = segmentBlobHeader(ordered, sizes);
-        long length = header.length;
-        for (String fileName : ordered) {
-            length += sizes.get(fileName);
-        }
-        return new SegmentBlob(blob, header, java.util.List.copyOf(ordered), sizes, length);
     }
 
     /**
@@ -750,26 +807,26 @@ public final class SegmentPublisher {
     private void writeToNodePack(
         NodePackWriter packs,
         Directory directory,
-        java.util.List<SegmentBlob> blobs,
+        java.util.List<SegmentBlobs.Laid> blobs,
         Map<String, String> published,
         Map<String, Long> lengths
     ) throws IOException {
         final java.util.List<NodePackStore.Part> parts = new java.util.ArrayList<>(blobs.size());
-        for (SegmentBlob blob : blobs) {
+        for (SegmentBlobs.Laid blob : blobs) {
             parts.add(
                 new NodePackStore.Part(
                     nodePackIndexUuid,
                     nodePackShard,
                     blob.name(),
                     blob.length(),
-                    () -> openSegmentBlob(directory, blob),
+                    () -> SegmentBlobs.open(directory, blob),
                     nodePackIndexName
                 )
             );
         }
         final java.util.List<NodePackWriter.Landed> landed = packs.add(parts);
         for (int i = 0; i < blobs.size(); i++) {
-            final SegmentBlob blob = blobs.get(i);
+            final SegmentBlobs.Laid blob = blobs.get(i);
             long offset = blob.header().length;
             for (String fileName : blob.files()) {
                 final long size = blob.sizes().get(fileName);
@@ -778,46 +835,6 @@ public final class SegmentPublisher {
                 offset += size;
             }
         }
-    }
-
-    /** Opens a laid-out segment blob's bytes from the first, holding its files open until the stream is closed. */
-    private static java.io.InputStream openSegmentBlob(Directory directory, SegmentBlob blob) throws IOException {
-        final java.util.List<IndexInput> opened = new java.util.ArrayList<>();
-        boolean success = false;
-        try {
-            final java.util.List<PackInputStream.Part> parts = new java.util.ArrayList<>();
-            long offset = blob.header().length;
-            for (String fileName : blob.files()) {
-                final IndexInput input = directory.openInput(fileName, IOContext.READONCE);
-                opened.add(input);
-                if (input.length() != blob.sizes().get(fileName)) {
-                    throw new IOException("[" + fileName + "] changed length while it was being published");
-                }
-                parts.add(new PackInputStream.Part(input, offset, input.length()));
-                offset += input.length();
-            }
-            final PackInputStream stream = new PackInputStream(blob.header(), parts);
-            success = true;
-            return new java.io.FilterInputStream(stream) {
-                @Override
-                public void close() throws IOException {
-                    try {
-                        super.close();
-                    } finally {
-                        org.opensearch.common.util.io.IOUtils.close(opened);
-                    }
-                }
-            };
-        } finally {
-            if (success == false) {
-                org.opensearch.common.util.io.IOUtils.closeWhileHandlingException(opened);
-            }
-        }
-    }
-
-    /** A blob name for a segment that cannot take its plain name: its files are already published, or the name is taken. */
-    private static String uniqueSegmentBlob(String segment) {
-        return segment + "-" + org.opensearch.common.UUIDs.randomBase64UUID() + ".seg";
     }
 
     /** Writes one segment's blob: the header, then the files, smallest first so an open's first reads sit together. */
@@ -835,7 +852,7 @@ public final class SegmentPublisher {
         }
         final java.util.List<String> ordered = new java.util.ArrayList<>(fileNames);
         ordered.sort(java.util.Comparator.<String>comparingLong(sizes::get).thenComparing(java.util.Comparator.naturalOrder()));
-        final byte[] header = segmentBlobHeader(ordered, sizes);
+        final byte[] header = SegmentBlobs.header(ordered, sizes);
         final java.util.List<IndexInput> opened = new java.util.ArrayList<>();
         try {
             final java.util.List<PackInputStream.Part> parts = new java.util.ArrayList<>();
@@ -859,39 +876,6 @@ public final class SegmentPublisher {
             org.opensearch.common.util.io.IOUtils.close(opened);
         }
     }
-
-    /**
-     * A segment blob's header: {@code SEG1}, the length of what follows as four bytes, then JSON naming each file's
-     * offset from the start of the blob and its length.
-     */
-    static byte[] segmentBlobHeader(java.util.List<String> ordered, Map<String, Long> sizes) throws IOException {
-        // The offsets count the header itself, whose length depends on how many digits they take: settle it by
-        // encoding until the length stops moving, which a second or third pass always does.
-        byte[] encoded = new byte[0];
-        for (int pass = 0; pass < 8; pass++) {
-            long offset = 8L + encoded.length;
-            try (org.opensearch.core.xcontent.XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
-                builder.startObject().field("version", 1).startObject("files");
-                for (String fileName : ordered) {
-                    builder.startArray(fileName).value(offset).value(sizes.get(fileName)).endArray();
-                    offset += sizes.get(fileName);
-                }
-                builder.endObject().endObject();
-                final byte[] next = org.opensearch.core.common.bytes.BytesReference.toBytes(
-                    org.opensearch.core.common.bytes.BytesReference.bytes(builder)
-                );
-                if (next.length == encoded.length) {
-                    final java.nio.ByteBuffer header = java.nio.ByteBuffer.allocate(8 + next.length);
-                    header.put(SEGMENT_BLOB_MAGIC).putInt(next.length).put(next);
-                    return header.array();
-                }
-                encoded = next;
-            }
-        }
-        throw new IOException("a segment blob's header did not settle");
-    }
-
-    private static final byte[] SEGMENT_BLOB_MAGIC = { 'S', 'E', 'G', '1' };
 
     /**
      * Opens one published file's bytes, whether it is a blob of its own or a range of a pack.
