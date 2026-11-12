@@ -64,12 +64,16 @@ final class ReaderValidation {
      * @param commit the commit the check was made against
      * @param departures the {@link #departures} count at the check
      * @param owner the live owner the check found, or null if nobody was writing the shard
+     * @param ownerEphemeralId the process of the live owner the check found, or null
+     * @param ownerExpiresAtMillis the expiry of that owner's lease as the membership snapshot held it, or
+     *     {@code Long.MIN_VALUE} if the snapshot did not hold it
      * @param headTerm the head's term at the check
      * @param checkedAtNanos when the head was last read for it
      */
-    private record ReaderCheck(CommitManifest commit, long departures, String owner, long headTerm, long checkedAtNanos) {
-        ReaderCheck reread(long nanos) {
-            return new ReaderCheck(commit, departures, owner, headTerm, nanos);
+    private record ReaderCheck(CommitManifest commit, long departures, String owner, String ownerEphemeralId, long ownerExpiresAtMillis,
+        long headTerm, long checkedAtNanos) {
+        ReaderCheck reread(long nanos, long ownerExpiresAt) {
+            return new ReaderCheck(commit, departures, owner, ownerEphemeralId, ownerExpiresAt, headTerm, nanos);
         }
     }
 
@@ -94,6 +98,63 @@ final class ReaderValidation {
      */
     void setReaderCheckMillis(long millis) {
         this.readerCheckMillis = Math.max(0L, millis);
+    }
+
+    /** How long a check that found a live writer stands, in milliseconds, while the membership shows it still live. */
+    static final String LIVE_OWNER_CHECK = "serverless.search.reader_check.live_owner_millis";
+
+    /**
+     * The default of {@value #LIVE_OWNER_CHECK}: one lease renewal interval at the default TTL.
+     *
+     * <p>A check that found the shard's writer live re-read the head every second: one read per searched shard per
+     * second, the largest store cost a searched index had. While that writer stays live a head read cannot refuse the
+     * reader anyway: a newer live owner is recorded and the reader goes on serving, lagging it by the publish window by
+     * design. The read matters once nobody live writes the shard, and while the writer the check found holds its lease
+     * without a gap nobody can have taken the shard from it: a successor takes a shard only after revoking a lease it
+     * judged run out, and a writer that lets go publishes first and pushes the commit to the readers.
+     *
+     * <p>So the check stands, without a read, while the membership snapshot shows the same process holding its lease
+     * and proves it held it throughout: the copy held now is the one the check saw, or a renewal stamped before that
+     * copy ran out (a renewal stamps its time plus the TTL). Any gap -- the snapshot's copy run out, a restart, a lease
+     * that went -- brings the full check back, as does the window passing. Zero, or a value below the reader check
+     * window, keeps one window for both.
+     */
+    static final long LIVE_OWNER_CHECK_MILLIS = 10_000L;
+
+    private volatile long liveOwnerCheckMillis = LIVE_OWNER_CHECK_MILLIS;
+
+    /**
+     * Sets how long a check that found a live writer stands while that writer stays live; see {@link #LIVE_OWNER_CHECK_MILLIS}.
+     *
+     * @param millis the window; zero to use the reader check window for both
+     */
+    void setLiveOwnerCheckMillis(long millis) {
+        this.liveOwnerCheckMillis = Math.max(0L, millis);
+    }
+
+    /** The lease the membership snapshot holds for a node, or null; reads nothing. */
+    private static org.opensearch.serverless.membership.NodeLease snapshotLease(MetadataPlane plane, String nodeId) {
+        for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
+            if (nodeId.equals(lease.nodeId())) {
+                return lease;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Whether the owner a check found has held its lease without a gap since, as far as the membership snapshot can
+     * prove it: the same process, live, and either the same copy or one renewed before the checked copy ran out.
+     */
+    private static boolean ownerHeldThroughout(MetadataPlane plane, ReaderCheck last) {
+        if (last.ownerExpiresAtMillis() == Long.MIN_VALUE || last.ownerEphemeralId() == null) {
+            return false;
+        }
+        final org.opensearch.serverless.membership.NodeLease lease = snapshotLease(plane, last.owner());
+        return lease != null
+            && lease.isExpiredAt(plane.clock().getAsLong()) == false
+            && last.ownerEphemeralId().equals(lease.ephemeralId())
+            && lease.expiresAtMillis() - plane.leaseTtlMillis() <= last.ownerExpiresAtMillis();
     }
 
     /** The last check of each reader, by index and shard number. */
@@ -138,6 +199,18 @@ final class ReaderValidation {
         final long departed = departures.get();
         final long now = System.nanoTime();
         final boolean sameCheck = last != null && last.commit() == commit && last.departures() == departed;
+        final long liveOwnerWindow = readerCheckMillis == 0L ? 0L : Math.max(readerCheckMillis, liveOwnerCheckMillis);
+        if (last != null
+            && last.owner() != null
+            && (last.commit() == commit || (commit.term() == last.headTerm() && last.owner().equals(commit.writer())))
+            && now - last.checkedAtNanos() < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(liveOwnerWindow)
+            && ownerHeldThroughout(plane, last)) {
+            // The writer the last check found has held its lease throughout: see LIVE_OWNER_CHECK_MILLIS. Not tied to the
+            // departure count, which moves whenever the snapshot re-reads any peer's lease. A newer commit that same writer
+            // published in the same term -- the one its push moved the reader onto -- leaves the check standing: a check
+            // that finds a live writer verifies nothing about the commit itself.
+            return;
+        }
         if (sameCheck
             && now - last.checkedAtNanos() < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(readerCheckMillis)
             && (last.owner() == null || liveLease(plane, last.owner()))) {
@@ -150,7 +223,8 @@ final class ReaderValidation {
             // Nobody has acquired the shard since the last check -- every acquisition moves the term -- so nothing can
             // have been written behind the commit that the check did not already account for.
             if (owner == null || liveLease(plane, owner)) {
-                readerChecks.put(key, last.reread(now));
+                final org.opensearch.serverless.membership.NodeLease seen = owner == null ? null : snapshotLease(plane, owner);
+                readerChecks.put(key, last.reread(now, seen == null ? Long.MIN_VALUE : seen.expiresAtMillis()));
                 return;
             }
         }
@@ -159,7 +233,19 @@ final class ReaderValidation {
             && liveLease(plane, owner)
             && head.get().ownerEphemeralId() != null
             && ownerIncarnationLive(plane, owner, head.get().ownerEphemeralId())) {
-            readerChecks.put(key, new ReaderCheck(commit, departed, owner, headTerm, now));
+            final org.opensearch.serverless.membership.NodeLease seen = snapshotLease(plane, owner);
+            readerChecks.put(
+                key,
+                new ReaderCheck(
+                    commit,
+                    departed,
+                    owner,
+                    head.get().ownerEphemeralId(),
+                    seen == null ? Long.MIN_VALUE : seen.expiresAtMillis(),
+                    headTerm,
+                    now
+                )
+            );
             return;
         }
         // Nobody is writing it -- no owner, a dead one, or this node named with nothing open. The commit has to be the
@@ -233,7 +319,7 @@ final class ReaderValidation {
             signals.get().ownershipDoubted(indexName, shardNumber);
             throw new ShardBehindLogException(indexName, shardNumber);
         }
-        readerChecks.put(key, new ReaderCheck(commit, departed, null, headTerm, now));
+        readerChecks.put(key, new ReaderCheck(commit, departed, null, null, Long.MIN_VALUE, headTerm, now));
     }
 
     /** The answer of a log listing run alongside the reader check, its failure rethrown as the check's. */
