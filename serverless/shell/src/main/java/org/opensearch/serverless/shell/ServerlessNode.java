@@ -372,6 +372,9 @@ public final class ServerlessNode implements Closeable {
             threadPool,
             readerServing::forgetReader
         );
+        this.readerValidation.setLiveOwnerCheckMillis(
+            settings.getAsLong(ReaderValidation.LIVE_OWNER_CHECK, ReaderValidation.LIVE_OWNER_CHECK_MILLIS)
+        );
         // An open fetches the blocks it will read concurrently rather than one round trip at a time, on GENERIC as
         // the log replay's reads do; the opening thread reads too, so a busy pool costs width only.
         if (settings.getAsBoolean("serverless.block_cache.prefetch_on_open", true)) {
