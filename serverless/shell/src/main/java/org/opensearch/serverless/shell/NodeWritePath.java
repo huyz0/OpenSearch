@@ -312,6 +312,10 @@ public final class NodeWritePath {
                 node.walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
             }
             node.writeBackpressure.onAppend(System.nanoTime() - appendStarted, true);
+            // Acknowledged now: the shard's search nodes may search it before it is published.
+            if (node.router != null) {
+                node.router.tailPush().acked(shardId, records);
+            }
         } catch (Exception | Error e) {
             node.writeBackpressure.onAppend(System.nanoTime() - appendStarted, false);
             node.writeFenced.add(shardId);

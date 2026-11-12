@@ -90,6 +90,9 @@ public final class SegmentPlacement {
         }
         node.clusterSegmentPlacement = written.get(CLUSTER_SETTING);
         LogCommitCheckpoint.applyCluster(node, written);
+        if (node.router() != null) {
+            node.router().tailOverlays().applyCluster(written);
+        }
         node.clusterSegmentPlacementReadAtNanos = System.nanoTime();
         node.clusterSegmentPlacementRead = true;
     }

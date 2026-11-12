@@ -213,6 +213,14 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
                     }
+                    final Object overlay = flat.get(org.opensearch.serverless.transport.TailOverlays.CLUSTER_SETTING);
+                    if (overlay != null) {
+                        try {
+                            org.opensearch.serverless.transport.TailOverlays.check(String.valueOf(overlay));
+                        } catch (IllegalArgumentException e) {
+                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+                        }
+                    }
                     final Object checkpoint = flat.get(org.opensearch.serverless.shell.LogCommitCheckpoint.SETTING);
                     if (checkpoint != null) {
                         try {

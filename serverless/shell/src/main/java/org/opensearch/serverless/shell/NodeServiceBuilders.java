@@ -283,6 +283,7 @@ final class NodeServiceBuilders {
             )
         );
         known.add(SegmentPlacement.INDEX);
+        known.add(org.opensearch.serverless.transport.TailOverlays.INDEX);
         return new IndexScopedSettings(services.settings, known);
     }
 

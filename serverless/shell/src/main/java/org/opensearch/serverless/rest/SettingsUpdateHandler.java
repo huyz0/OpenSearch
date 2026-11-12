@@ -208,6 +208,15 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
                 }
                 continue;
             }
+            if (org.opensearch.serverless.transport.TailOverlays.INDEX_SETTING.equals(key)) {
+                // Ours, and dynamic: it applies to the shard's next acknowledged write.
+                try {
+                    org.opensearch.serverless.transport.TailOverlays.check(requested.get(key));
+                } catch (IllegalArgumentException e) {
+                    return e.getMessage();
+                }
+                continue;
+            }
             if (scoped.get(key) == null && org.opensearch.serverless.routing.ShardMode.SETTING.equals(key) == false) {
                 unknown.add(key);
             }
