@@ -233,13 +233,15 @@ public class BackgroundRequestMeterTests extends OpenSearchTestCase {
                     report.append(
                         String.format(
                             Locale.ROOT,
-                            "search node: register looks skipped=%d made=%d, pushes received=%d reopened=%d%n",
+                            "search node: register looks skipped=%d made=%d, pushes received=%d reopened=%d, pushed blocks taken=%d%n",
                             looks[0] - looksBefore[0],
                             looks[1] - looksBefore[1],
                             pushes[2] - pushesBefore[2],
-                            pushes[3] - pushesBefore[3]
+                            pushes[3] - pushesBefore[3],
+                            pushes[5] - pushesBefore[5]
                         )
                     );
+                    report.append("search node block cache: ").append(search.blockCache().stats()).append('\n');
                     report.append(store.breakdown()).append('\n');
                     report.append(store.byCaller());
                     logger.info(report.toString());

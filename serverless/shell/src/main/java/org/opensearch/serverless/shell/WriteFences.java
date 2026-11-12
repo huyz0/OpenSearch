@@ -252,6 +252,41 @@ public final class WriteFences {
     private final java.util.concurrent.atomic.AtomicLongArray stripeAskedAtNanos = new java.util.concurrent.atomic.AtomicLongArray(
         org.opensearch.serverless.metadata.ChangeStripes.STRIPES
     );
+    /** Per stripe, how many writes asked for it since the background last looked, and in the look before that. */
+    private final java.util.concurrent.atomic.AtomicIntegerArray stripeAsks = new java.util.concurrent.atomic.AtomicIntegerArray(
+        org.opensearch.serverless.metadata.ChangeStripes.STRIPES
+    );
+    private final int[] stripeAsksBefore = new int[org.opensearch.serverless.metadata.ChangeStripes.STRIPES];
+
+    /**
+     * How many writes must have asked for a stripe within its last two background periods (about four fifths of a fence
+     * window) for the background to keep reading it; node setting, default 2. Below that, a write reads its stripe itself
+     * when its last read is older than the window, which a stripe written that rarely needed anyway: a read the
+     * background made for a lone write was never used by another one, and a lone write cost five reads that way rather
+     * than one. 0 keeps every stripe asked within two windows read in the background, as before.
+     */
+    public static final String STRIPE_REFRESH_MIN_ASKS = "serverless.write.stripe_refresh_min_asks";
+
+    private volatile Integer stripeRefreshMinAsks;
+
+    private int stripeRefreshMinAsks() {
+        Integer min = stripeRefreshMinAsks;
+        if (min == null) {
+            min = node.settings == null ? 2 : Math.max(0, node.settings.getAsInt(STRIPE_REFRESH_MIN_ASKS, 2));
+            stripeRefreshMinAsks = min;
+        }
+        return min;
+    }
+
+    /**
+     * Sets how many asks keep a stripe read in the background; see {@link #STRIPE_REFRESH_MIN_ASKS}.
+     *
+     * @param asks the threshold, 0 for every stripe asked within two windows
+     */
+    public void setStripeRefreshMinAsks(int asks) {
+        this.stripeRefreshMinAsks = Math.max(0, asks);
+    }
+
     private final Object[] stripeLocks = newLocks(org.opensearch.serverless.metadata.ChangeStripes.STRIPES);
     private final java.util.concurrent.atomic.AtomicBoolean stripeRefreshScheduled = new java.util.concurrent.atomic.AtomicBoolean();
 
@@ -268,6 +303,7 @@ public final class WriteFences {
         final String name = shardId.getIndexName();
         final int stripe = org.opensearch.serverless.metadata.ChangeStripes.stripeOf(name);
         stripeAskedAtNanos.set(stripe, System.nanoTime());
+        stripeAsks.incrementAndGet(stripe);
         scheduleStripeRefresh(plane);
         org.opensearch.serverless.metadata.ChangeStripes.Snapshot read = stripeReads.get(stripe);
         if (read == null || System.nanoTime() - read.readStartedNanos() > windowNanos) {
@@ -344,9 +380,13 @@ public final class WriteFences {
 
     private void refreshStripes(org.opensearch.serverless.metadata.MetadataPlane plane) {
         final long active = 2 * java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(Math.max(1L, incarnationFenceMillis));
+        final int minAsks = stripeRefreshMinAsks();
         for (int stripe = 0; stripe < org.opensearch.serverless.metadata.ChangeStripes.STRIPES; stripe++) {
             final long asked = stripeAskedAtNanos.get(stripe);
-            if (asked == 0L || System.nanoTime() - asked > active) {
+            final int now = stripeAsks.getAndSet(stripe, 0);
+            final int recent = now + stripeAsksBefore[stripe];
+            stripeAsksBefore[stripe] = now;
+            if (asked == 0L || System.nanoTime() - asked > active || (minAsks > 0 && recent < minAsks)) {
                 continue;
             }
             try {

@@ -126,6 +126,19 @@ public final class ShardHeadSightings {
     }
 
     /**
+     * Returns the head last read for a shard, if it was read at or after a moment, whatever its age.
+     *
+     * @param index the index
+     * @param shard the shard
+     * @param sinceMillis the earliest the read may have been, by the plane's clock
+     * @return the head, or empty if none was read since then
+     */
+    public Optional<ShardHead> headSeenSince(String index, int shard, long sinceMillis) {
+        final SeenHead seen = recentHeads.get(index + "#" + shard);
+        return seen != null && seen.atMillis() >= sinceMillis ? Optional.of(seen.head()) : Optional.empty();
+    }
+
+    /**
      * Returns the node last seen owning a shard, if the sighting is no older than one lease TTL.
      *
      * <p>Bounded, where it used to be unbounded: a hint is invalidated by a refusal from the node it

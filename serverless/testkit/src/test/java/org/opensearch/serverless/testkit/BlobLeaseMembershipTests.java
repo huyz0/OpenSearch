@@ -246,6 +246,57 @@ public class BlobLeaseMembershipTests extends OpenSearchTestCase {
     }
 
     /**
+     * A peer's renewal, read once the observer's copy of its lease ran out, is no departure and no join: the same process
+     * is still there. Comparing whole leases reported one of each about once a lifetime per peer with nobody leaving, and
+     * every departure count built on it moved constantly. A restart, a new process under the same id, still is both.
+     */
+    public void testARenewalIsNotADepartureButARestartIs() throws Exception {
+        runRenewalDeltas(false);
+    }
+
+    /** With renewals reported as changes, a renewal is a departure and a join, as it was. */
+    public void testRenewalsCanStillBeReportedAsChanges() throws Exception {
+        runRenewalDeltas(true);
+    }
+
+    private void runRenewalDeltas(boolean renewalsAreChanges) throws Exception {
+        final AtomicLong now = new AtomicLong(1_000L);
+        final Path dir = createTempDir();
+        final BlobLeaseMembership observer = new BlobLeaseMembership(container(dir), now::get, TTL).reportRenewalsAsChanges(
+            renewalsAreChanges
+        );
+        final BlobLeaseMembership peer = new BlobLeaseMembership(container(dir), now::get, TTL);
+        final List<MembershipDelta> deltas = new ArrayList<>();
+        observer.subscribe(deltas::add);
+        peer.renew(lease("peer", "search"));
+        observer.refresh();
+        assertEquals(1, deltas.size());
+
+        // The peer renews every third of a lifetime; the observer reads it again only once its copy has run out.
+        now.addAndGet(TTL / 3);
+        peer.renew(lease("peer", "search"));
+        now.addAndGet(TTL / 3);
+        peer.renew(lease("peer", "search"));
+        now.set(1_000L + TTL + 1);
+        assertEquals(1, observer.refresh().size());
+        if (renewalsAreChanges) {
+            assertEquals("a renewal reported as a change", 2, deltas.size());
+            assertEquals(1, deltas.get(1).left().size());
+            assertEquals(1, deltas.get(1).joined().size());
+            return;
+        }
+        assertEquals("a renewal is neither a departure nor a join: " + deltas, 1, deltas.size());
+
+        // A restart under the same id is a new process: the old one left and the new one joined.
+        now.addAndGet(TTL + 1);
+        peer.renew(new NodeLease("peer", "peer-restarted", "127.0.0.1:9300", Set.of("search"), 0L));
+        observer.refresh();
+        assertEquals(2, deltas.size());
+        assertEquals("peer-eph", deltas.get(1).left().iterator().next().ephemeralId());
+        assertEquals("peer-restarted", deltas.get(1).joined().iterator().next().ephemeralId());
+    }
+
+    /**
      * A refresh does not re-read a lease whose own stamp says it cannot have run out.
      *
      * <p><b>The cost this pins.</b> The loop read one register per member on every refresh, and a request

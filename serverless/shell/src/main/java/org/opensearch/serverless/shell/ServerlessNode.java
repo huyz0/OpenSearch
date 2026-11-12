@@ -520,6 +520,23 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * The mapping and settings versions of the descriptor this node writes an index under, or null if it writes none.
+     *
+     * @param indexName the index
+     * @return the mapping version and the settings version, or null
+     */
+    public long[] hostedDescriptorVersions(String indexName) {
+        final IndexDescriptor descriptor = hosted.get(indexName);
+        return descriptor == null ? null : new long[] { descriptor.mappingVersion(), descriptor.settingsVersion() };
+    }
+
+    /**
+     * Whether the membership view reports a peer's renewal as that peer leaving and joining again, as it did before it
+     * compared members rather than whole leases. False by default; true only to compare with the old behaviour.
+     */
+    public static final String MEMBERSHIP_RENEWALS_AS_CHANGES = "serverless.membership.renewals_as_changes";
+
+    /**
      * Gives this node's REST surface a metadata plane to read and write.
      *
      * <p>Set after construction because the plane is a deployment-level object and the REST routes are
@@ -536,6 +553,7 @@ public final class ServerlessNode implements Closeable {
             // on which head owns an index could both take it.
             plane.bucketHeads().register(localNode.getId(), () -> reconciler().openShards());
             plane.buckets().configure(settings);
+            plane.membership().reportRenewalsAsChanges(settings.getAsBoolean(MEMBERSHIP_RENEWALS_AS_CHANGES, false));
             try {
                 // Publish the lease immediately. It is this node's entry in the address book that peers
                 // use to forward writes here, so a node that has not renewed yet is not merely invisible

@@ -52,6 +52,14 @@ import java.util.concurrent.atomic.AtomicLong;
  * did not name, and a writer that died. A pushed commit only ever moves a reader forward: one no newer than the commit
  * open is ignored, and a commit is trusted as far as a writer's answer to {@link NewestCommits} is, since it comes from
  * the same authenticated peer. On unless {@value #ENABLED} is set to false.
+ *
+ * <p><b>New files ride along.</b> The reader's reopen used to fetch every block of the commit's new segment from the
+ * object store, though the writer had just written those bytes and still holds them on disk: at one refresh every ten
+ * seconds that was the largest share of a lightly used index's reads. So a push carries the blocks of the files that
+ * are new since the previous push of the shard, read from the writer's own copies, smallest first and whole files only
+ * up to {@value #INLINE_BYTES} (1 MB by default, 0 turns it off). The reader puts them in its block cache before it
+ * reopens, under the keys its own reads use, so the reopen and the next search read memory. A larger segment, a merge's
+ * say, is left to the reader's reads from the store as before. A block already held is not replaced.
  */
 public final class CommitPush {
 
@@ -59,6 +67,12 @@ public final class CommitPush {
 
     /** Whether this node, as a writer, pushes the commits it publishes to the shard's search nodes. */
     public static final String ENABLED = "serverless.search.commit_push.enabled";
+
+    /** The most bytes of a commit's new files one push carries to each search node; 0 sends the commit alone. */
+    public static final String INLINE_BYTES = "serverless.search.commit_push.inline_bytes";
+
+    /** The default: well above a refresh's segment, well below a merge's. */
+    public static final long DEFAULT_INLINE_BYTES = 1L << 20;
 
     /** How long a push waits for a search node to take it. */
     static final TimeValue SEND_TIMEOUT = TimeValue.timeValueMillis(500);
@@ -74,8 +88,11 @@ public final class CommitPush {
     static final int MAX_PUSHED = 4096;
 
     /** A pushed commit and when it came. */
-    private record Pushed(CommitManifest commit, long atNanos) {
+    private record Pushed(CommitManifest commit, long atNanos, long mappingVersion, long settingsVersion) {
     }
+
+    /** Whether a reader moved onto a pushed commit reuses the descriptor it holds when the writer's is no newer. */
+    public static final String REUSE_DESCRIPTOR = "serverless.search.commit_push.reuse_descriptor";
 
     private final ShardRouter router;
     private final boolean enabled;
@@ -85,12 +102,25 @@ public final class CommitPush {
     private final AtomicLong sendFailures = new AtomicLong();
     private final AtomicLong received = new AtomicLong();
     private final AtomicLong reopened = new AtomicLong();
+    private final AtomicLong blocksSent = new AtomicLong();
+    private final AtomicLong blocksTaken = new AtomicLong();
+    private final long inlineBytes;
+    private final boolean reuseDescriptor;
+    /** Per shard this node writes, the files of the commit it last pushed, so the next push knows which are new. */
+    private final Map<String, Set<String>> lastPushedFiles = new ConcurrentHashMap<>();
 
     private final ReaderRegisterLooks registerLooks;
 
     CommitPush(ShardRouter router) {
         this.router = router;
         this.enabled = router.node.settings().getAsBoolean(ENABLED, true);
+        this.reuseDescriptor = router.node.settings().getAsBoolean(REUSE_DESCRIPTOR, true);
+        this.inlineBytes = Math.max(
+            0L,
+            router.node.settings()
+                .getAsBytesSize(INLINE_BYTES, new org.opensearch.core.common.unit.ByteSizeValue(DEFAULT_INLINE_BYTES))
+                .getBytes()
+        );
         this.registerLooks = new ReaderRegisterLooks(router.node, router.plane, router.node.settings());
     }
 
@@ -114,9 +144,9 @@ public final class CommitPush {
         return enabled;
     }
 
-    /** @return pushes sent, failed, received, and readers reopened on one */
+    /** @return pushes sent, failed, received, readers reopened on one, blocks sent along, and blocks taken into the cache */
     public long[] counts() {
-        return new long[] { sent.get(), sendFailures.get(), received.get(), reopened.get() };
+        return new long[] { sent.get(), sendFailures.get(), received.get(), reopened.get(), blocksSent.get(), blocksTaken.get() };
     }
 
     /**
@@ -131,21 +161,72 @@ public final class CommitPush {
             return;
         }
         final List<String> targets = readerTargets(router, plane, shardId);
-        final CommitPushRequest request = new CommitPushRequest(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id(), commit);
-        for (String target : targets) {
-            router.node.threadPool().generic().execute(() -> {
-                try {
-                    final Optional<DiscoveryNode> peer = router.peer(target, SEND_TIMEOUT);
-                    if (peer.isPresent()) {
-                        router.send(peer.get(), CommitPushRequest.ACTION, request, in -> TransportResponse.Empty.INSTANCE, SEND_TIMEOUT);
-                        sent.incrementAndGet();
+        final String key = key(shardId);
+        final Set<String> previous = inlineBytes > 0 ? lastPushedFiles.put(key, Set.copyOf(commit.files().keySet())) : null;
+        if (lastPushedFiles.size() > MAX_PUSHED) {
+            lastPushedFiles.keySet().removeIf(k -> k.equals(key) == false);
+        }
+        if (targets.isEmpty()) {
+            return;
+        }
+        final long[] versions = router.node.hostedDescriptorVersions(shardId.getIndexName());
+        router.node.threadPool().generic().execute(() -> {
+            final CommitPushRequest request = new CommitPushRequest(
+                shardId.getIndexName(),
+                shardId.getIndex().getUUID(),
+                shardId.id(),
+                commit,
+                previous == null ? Map.of() : newBlocks(shardId, commit, previous),
+                versions == null ? -1L : versions[0],
+                versions == null ? -1L : versions[1]
+            );
+            for (String target : targets) {
+                router.node.threadPool().generic().execute(() -> {
+                    try {
+                        final Optional<DiscoveryNode> peer = router.peer(target, SEND_TIMEOUT);
+                        if (peer.isPresent()) {
+                            router.send(
+                                peer.get(),
+                                CommitPushRequest.ACTION,
+                                request,
+                                in -> TransportResponse.Empty.INSTANCE,
+                                SEND_TIMEOUT
+                            );
+                            sent.incrementAndGet();
+                            blocksSent.addAndGet(request.blocks().size());
+                        }
+                    } catch (Exception e) {
+                        // Lost: the reader's register look moves it, as before pushes existed.
+                        sendFailures.incrementAndGet();
+                        LOG.debug("could not push the commit of {} to [{}]", shardId, target, e);
                     }
-                } catch (Exception e) {
-                    // Lost: the reader's register look moves it, as before pushes existed.
-                    sendFailures.incrementAndGet();
-                    LOG.debug("could not push the commit of {} to [{}]", shardId, target, e);
-                }
-            });
+                });
+            }
+        });
+    }
+
+    /**
+     * The blocks of a commit's files that were not in the previous push, read from this node's own copies; empty if the
+     * shard is not open here or they cannot be read. Without a previous push there is nothing to tell new from old, and
+     * the reader's first open reads the store as before.
+     */
+    private Map<String, byte[]> newBlocks(ShardId shardId, CommitManifest commit, Set<String> previous) {
+        final List<String> added = commit.files().keySet().stream().filter(name -> previous.contains(name) == false).toList();
+        if (added.isEmpty()) {
+            return Map.of();
+        }
+        try {
+            final org.opensearch.index.shard.IndexShard shard = router.node.reconciler() == null
+                ? null
+                : router.node.reconciler().shard(shardId);
+            final org.opensearch.serverless.store.BlockCacheDirectory directory = shard == null
+                ? null
+                : org.opensearch.serverless.store.BlockCacheDirectory.unwrap(shard.store().directory());
+            return directory == null ? Map.of() : directory.localBlocks(commit, added, inlineBytes);
+        } catch (Exception e) {
+            // A file merged away since the publish, or a shard closing: the reader reads the store, as before.
+            LOG.debug("could not read the new files of {}'s pushed commit", shardId, e);
+            return Map.of();
         }
     }
 
@@ -176,7 +257,13 @@ public final class CommitPush {
         channel.sendResponse(TransportResponse.Empty.INSTANCE);
         received.incrementAndGet();
         registerLooks.pushedFrom(request.commit().writer());
-        take(new ShardId(new Index(request.indexName(), request.indexUuid()), request.shard()), request.commit());
+        take(
+            new ShardId(new Index(request.indexName(), request.indexUuid()), request.shard()),
+            request.commit(),
+            request.blocks(),
+            request.mappingVersion(),
+            request.settingsVersion()
+        );
     }
 
     /**
@@ -186,6 +273,20 @@ public final class CommitPush {
      * @param commit the commit its writer pushed
      */
     void take(ShardId shardId, CommitManifest commit) {
+        take(shardId, commit, Map.of(), -1L, -1L);
+    }
+
+    /**
+     * Takes a pushed commit with blocks of its new files: if this node has the shard open as a reader on an older commit,
+     * puts the blocks into its cache, then moves the reader onto the commit.
+     *
+     * @param shardId the shard
+     * @param commit the commit its writer pushed
+     * @param blocks blocks of the commit's new files, by cache key
+     * @param mappingVersion the mapping version the writer holds, or -1
+     * @param settingsVersion the settings version the writer holds, or -1
+     */
+    void take(ShardId shardId, CommitManifest commit, Map<String, byte[]> blocks, long mappingVersion, long settingsVersion) {
         final ShardReconciler reconciler = router.node.reconciler();
         if (reconciler == null || reconciler.frozenShards().contains(shardId)) {
             // A frozen view serves the commit it was made on, by definition.
@@ -196,13 +297,27 @@ public final class CommitPush {
             // Not served here, or already on it: the next open reads the register as it would have.
             return;
         }
+        if (blocks.isEmpty() == false) {
+            final org.opensearch.serverless.store.BlockCache cache = router.node.blockCache();
+            long stored = 0;
+            for (Map.Entry<String, byte[]> block : blocks.entrySet()) {
+                if (cache.putCopied(block.getKey(), block.getValue())) {
+                    stored++;
+                }
+            }
+            blocksTaken.addAndGet(stored);
+        }
         final String key = key(shardId);
         if (pushed.size() > MAX_PUSHED) {
             // A push whose reader was let go and never reopened is not taken; past its age it is only weight.
             final long now = System.nanoTime();
             pushed.values().removeIf(p -> now - p.atNanos() > TimeValue.timeValueMillis(PUSHED_TTL_MILLIS).nanos());
         }
-        pushed.merge(key, new Pushed(commit, System.nanoTime()), (had, now) -> newer(now.commit(), had.commit()) ? now : had);
+        pushed.merge(
+            key,
+            new Pushed(commit, System.nanoTime(), mappingVersion, settingsVersion),
+            (had, now) -> newer(now.commit(), had.commit()) ? now : had
+        );
         if (moving.add(key)) {
             router.node.threadPool().generic().execute(() -> move(shardId, key, 0));
         }
@@ -230,11 +345,21 @@ public final class CommitPush {
             ) != ShardReconciler.ReaderRelease.RELEASED) {
                 return;
             }
+            final org.opensearch.serverless.cluster.IndexDescriptor had = router.node.readers().servedDescriptor(shardId.getIndexName());
             router.node.readers().forgetReader(shardId);
             final MetadataPlane plane = router.plane.get();
             if (plane != null) {
                 // Opened now, so the next search finds it open; the open takes the pushed commit rather than the register.
-                router.node.readers().serveAsReader(plane, shardId.getIndexName(), shardId.id(), shardId.getIndex().getUUID());
+                router.node.readers()
+                    .serveAsReaderOnPush(
+                        plane,
+                        shardId.getIndexName(),
+                        shardId.id(),
+                        shardId.getIndex().getUUID(),
+                        had,
+                        reuseDescriptor ? latest.mappingVersion() : -1L,
+                        reuseDescriptor ? latest.settingsVersion() : -1L
+                    );
                 reopened.incrementAndGet();
             }
         } catch (Exception e) {

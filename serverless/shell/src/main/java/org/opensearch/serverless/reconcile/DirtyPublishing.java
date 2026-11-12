@@ -19,10 +19,38 @@ import java.util.Set;
  */
 final class DirtyPublishing {
 
+    /**
+     * Whether a publish trusts a head it saw naming this node, of any age, while this node's own lease has held since,
+     * rather than reading the head again once the sighting is a renewal old. True by default.
+     */
+    public static final String TRUST_OWN_HEAD = "serverless.publish.trust_own_head";
+
     private final BackgroundReconciler reconciler;
+    /** Null until first asked: the reconciler's node is set after this is built. */
+    private volatile Boolean trustOwnHead;
 
     DirtyPublishing(BackgroundReconciler reconciler) {
         this.reconciler = reconciler;
+    }
+
+    private boolean trustsOwnHead() {
+        Boolean on = trustOwnHead;
+        if (on == null) {
+            on = reconciler.node.settings() == null || reconciler.node.settings().getAsBoolean(TRUST_OWN_HEAD, true);
+            trustOwnHead = on;
+        }
+        return on;
+    }
+
+    /** Reads a shard's head and notes it, as {@code LeaseUpkeep#recentOrReadHead} does when its sighting is old. */
+    private java.util.Optional<org.opensearch.serverless.metadata.ShardHead> readHead(ShardId shardId) {
+        try {
+            final var read = reconciler.plane.heads().read(shardId.getIndexName(), shardId.id());
+            reconciler.node.sightings().noteHead(shardId.getIndexName(), shardId.id(), read.orElse(null));
+            return read;
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
     }
 
     /**
@@ -319,8 +347,13 @@ final class DirtyPublishing {
         }
         try {
             // The heartbeat read this head a moment ago; the manifest's own compare-and-swap is the
-            // fence that matters, so a head up to one renewal old is as good here as a fresh read.
-            final var head = reconciler.leases.recentOrReadHead(shardId);
+            // fence that matters, so a head up to one renewal old is as good here as a fresh read. So is
+            // one of any age that named this node at the shard's term, while this node's lease has held since.
+            final var head = trustsOwnHead()
+                ? reconciler.node.leases()
+                    .ownHeadUnderUnbrokenLease(reconciler.plane, shardId, shard.getOperationPrimaryTerm())
+                    .or(() -> readHead(shardId))
+                : reconciler.leases.recentOrReadHead(shardId);
             if (head.isEmpty() || reconciler.node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
                 return false;
             }
