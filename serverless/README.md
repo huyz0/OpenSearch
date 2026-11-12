@@ -148,7 +148,8 @@ unpublished record of every shard is, so a successor reads it without a listing.
   index that sets no interval waits `serverless.wal.node_log.publish_max_age_millis` (a second by default); one that
   sets `-1` is published only by size or on release. A shard is also published once it holds
   `serverless.publish.max_unpublished_operations`, and the first time this node writes it. Searches read published
-  commits, so the interval is also how long a write takes to be searchable. Each publish of a busy shard is five or
+  commits, so the interval is roughly how long a write takes to be searchable, plus how long a search node takes to
+  notice the new commit (see below). Each publish of a busy shard is five or
   more PUTs: at a one-second interval that is several PUTs a second per busy shard, far more than its log, so an
   index that can wait ten or thirty seconds costs much less.
 - **Deleting.** A node deletes its own blobs behind the trim point its lease records: the oldest record any of its
@@ -159,6 +160,17 @@ unpublished record of every shard is, so a successor reads it without a listing.
   It must exceed the longest any record can stay unpublished, which for a running fleet is the publish age plus a
   takeover. A whole fleet down for longer than the rule loses what its logs held unpublished, so set it beyond any
   outage the deployment means to recover from.
+
+- **Telling search nodes about a new commit.** A search node that has a shard open checks the shard's register
+  for a newer commit every other lease renewal, which is 20 seconds at the default TTL. Until it checks, its searches
+  miss what was published since. With `serverless.search.commit_push.enabled=true` on the writers, each publish
+  is also sent over transport to the search nodes that placement ranks first for the shard. A node with the shard
+  open on an older commit lets that reader go and reopens it on the pushed commit in the background. The push
+  carries the commit, so it adds no PUT, LIST or GET (the reopen reads only the new segment's blocks, which the next
+  search would have read anyway). It is sent after the publish, so it adds nothing to a write's acknowledgement.
+  Locally, with 20 ms per store request, a one-second refresh and the 30-second TTL, an open reader saw a write
+  1.5 s (p50) and 1.7 s (p99) after its acknowledgement with pushes, against 9.9 s and 20 s without. The register
+  check stays, as the backstop for a lost push. Off by default.
 
 ## Scaling search nodes without a cold cache
 

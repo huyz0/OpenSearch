@@ -151,6 +151,7 @@ public final class NodeStartup {
         node.router.registerHandlers();
         org.opensearch.serverless.transport.CacheWarmCopy.of(node).registerHandlers();
         org.opensearch.serverless.transport.NewestCommits.of(node).registerHandlers();
+        node.router.commitPush().registerHandlers();
 
         // Built here rather than in the constructor: both need the node identity, and the identity is
         // not final until the transport has bound and told us the address it got.

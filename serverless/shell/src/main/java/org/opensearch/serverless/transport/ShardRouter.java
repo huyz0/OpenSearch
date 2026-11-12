@@ -72,6 +72,7 @@ public final class ShardRouter {
 
     /** Bytes exchanged with peers, by whether they stayed in this node's zone. */
     final ZoneTraffic zoneTraffic = new ZoneTraffic();
+    private final CommitPush commitPush;
     private final boolean meterZones;
     private final boolean compressCrossZone;
     private final String localZone;
@@ -100,6 +101,16 @@ public final class ShardRouter {
         this.meterZones = node.settings().getAsBoolean(ZoneTraffic.ENABLED, true);
         this.compressCrossZone = node.settings().getAsBoolean(COMPRESS_CROSS_ZONE, true);
         this.localZone = org.opensearch.serverless.cluster.Zones.localZone(node.settings());
+        this.commitPush = new CommitPush(this);
+    }
+
+    /**
+     * Returns what pushes this node's published commits to their search nodes, and takes the pushes of others.
+     *
+     * @return the commit push
+     */
+    public CommitPush commitPush() {
+        return commitPush;
     }
 
     /**
