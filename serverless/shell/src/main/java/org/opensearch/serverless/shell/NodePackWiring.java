@@ -66,9 +66,9 @@ final class NodePackWiring {
      * @return the publisher for a shard
      */
     static Function<ShardId, SegmentPublisher> publishers(ServerlessNode node, MetadataPlane plane) {
-        final long staged = logCommitsStagedMillis(node);
+        final boolean staged = logCommitsStage(node);
         if (node.packSegments == false) {
-            return id -> staging(plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(false), staged);
+            return id -> staging(plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(false), node, staged);
         }
         final boolean enabled = node.settings.getAsBoolean(ENABLED, false);
         if (enabled == false) {
@@ -82,7 +82,7 @@ final class NodePackWiring {
                 .packing(true)
                 .nodePackSource(() -> writer(node, plane), id.getIndexName(), id.getIndex().getUUID(), id.id(), maxBlobBytes);
             publisher.useNodePacks(enabled);
-            return staging(publisher, staged);
+            return staging(publisher, node, staged);
         };
     }
 
@@ -117,19 +117,16 @@ final class NodePackWiring {
      * now behind its own rollout flag, off by default.
      */
     static final String LOG_COMMITS = "serverless.wal.node_log.commits";
-    /** How old a staged commit gets before its manifest is written. */
-    static final String LOG_COMMITS_CHECKPOINT_MILLIS = "serverless.wal.node_log.commits.checkpoint_millis";
+    /** How old a staged commit gets before its manifest is written; see {@link LogCommitCheckpoint}. */
+    static final String LOG_COMMITS_CHECKPOINT_MILLIS = LogCommitCheckpoint.SETTING;
 
-    /** The staging age for a node's shards, or zero when it does not stage. */
-    static long logCommitsStagedMillis(ServerlessNode node) {
-        if (node.nodeLogEnabled == false || node.settings.getAsBoolean(LOG_COMMITS, false) == false) {
-            return 0L;
-        }
-        return node.settings.getAsLong(LOG_COMMITS_CHECKPOINT_MILLIS, CommitStaging.DEFAULT_MAX_STAGED_MILLIS);
+    /** Whether a node's shards stage their commits; the age, checked when the node was made, is the node's. */
+    static boolean logCommitsStage(ServerlessNode node) {
+        return node.nodeLogEnabled && node.settings.getAsBoolean(LOG_COMMITS, false);
     }
 
-    private static SegmentPublisher staging(SegmentPublisher publisher, long stagedMillis) {
-        return stagedMillis > 0L ? publisher.staging(new CommitStaging(stagedMillis)) : publisher;
+    private static SegmentPublisher staging(SegmentPublisher publisher, ServerlessNode node, boolean stages) {
+        return stages ? publisher.staging(new CommitStaging(() -> node.logCommitCheckpointMillis)) : publisher;
     }
 
     static long maxBlobBytes(Settings settings) {

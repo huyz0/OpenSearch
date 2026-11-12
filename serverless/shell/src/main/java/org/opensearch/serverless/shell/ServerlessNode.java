@@ -337,6 +337,11 @@ public final class ServerlessNode implements Closeable {
         this.writeBackpressure = NodeComponents.writeBackpressure(settings, writeBackpressureMax);
         this.walCommitter = NodeComponents.walCommitter(settings);
         this.nodeLogEnabled = settings.getAsBoolean("serverless.wal.node_log.enabled", true);
+        if (nodeLogEnabled && settings.getAsBoolean(NodePackWiring.LOG_COMMITS, false)) {
+            // Refused here, at construction, rather than on the first shard it takes.
+            this.nodeLogCommitCheckpointMillis = LogCommitCheckpoint.nodeValue(settings);
+            this.logCommitCheckpointMillis = nodeLogCommitCheckpointMillis;
+        }
         this.packSegments = settings.getAsBoolean("serverless.segments.pack.enabled", true);
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
@@ -574,6 +579,10 @@ public final class ServerlessNode implements Closeable {
     volatile String clusterSegmentPlacement;
     volatile long clusterSegmentPlacementReadAtNanos;
     volatile boolean clusterSegmentPlacementRead;
+
+    /** The node's own checkpoint age for log commits, and the one in force; see {@link LogCommitCheckpoint}. */
+    volatile long nodeLogCommitCheckpointMillis = org.opensearch.serverless.store.CommitStaging.DEFAULT_MAX_STAGED_MILLIS;
+    volatile long logCommitCheckpointMillis = org.opensearch.serverless.store.CommitStaging.DEFAULT_MAX_STAGED_MILLIS;
 
     /** The planes whose pack ledger this node has looked at for packs to collect; see {@link NodePackWiring}. */
     final java.util.Set<org.opensearch.serverless.metadata.MetadataPlane> packLedgersChecked = java.util.Collections.newSetFromMap(

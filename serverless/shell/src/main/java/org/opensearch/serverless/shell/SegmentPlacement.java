@@ -89,6 +89,7 @@ public final class SegmentPlacement {
             return;
         }
         node.clusterSegmentPlacement = written.get(CLUSTER_SETTING);
+        LogCommitCheckpoint.applyCluster(node, written);
         node.clusterSegmentPlacementReadAtNanos = System.nanoTime();
         node.clusterSegmentPlacementRead = true;
     }

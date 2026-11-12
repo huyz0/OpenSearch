@@ -83,7 +83,10 @@ final class DescriptorRefresh {
             return;
         }
         try {
-            node.clusterSegmentPlacement = plane.clusterConfig().read().settings().get(SegmentPlacement.CLUSTER_SETTING);
+            final org.opensearch.common.settings.Settings cluster = plane.clusterConfig().read().settings();
+            node.clusterSegmentPlacement = cluster.get(SegmentPlacement.CLUSTER_SETTING);
+            // The checkpoint age for log commits rides on the same read.
+            LogCommitCheckpoint.applyCluster(node, cluster);
             node.clusterSegmentPlacementReadAtNanos = now;
             node.clusterSegmentPlacementRead = true;
         } catch (Exception e) {

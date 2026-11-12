@@ -46,6 +46,7 @@ public class NodeLogCommitsTests extends OpenSearchTestCase {
             .put("serverless.wal.node_log.window_millis", 20)
             .put("serverless.wal.node_log.commits", true)
             .put("serverless.wal.node_log.commits.checkpoint_millis", 2_000L)
+            .put("serverless.publish.min_interval_millis", 0L)
             .put("serverless.segments.node_pack.enabled", packs)
             .build();
     }
