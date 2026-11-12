@@ -163,7 +163,7 @@ final class DocumentWrites {
                 ? node.writes().delete(placement.local(), id, ifSeqNo, ifPrimaryTerm)
                 : node.writes().index(placement.local(), id, source, ifSeqNo, ifPrimaryTerm, requireAbsent);
             if (refresh) {
-                node.reconciler().shard(placement.local()).refresh("serverless-ops-refresh");
+                node.writes().refreshWritten(placement.local(), outcome, "serverless-ops-refresh");
             }
             return new Written(node.localNode().getId(), outcome, placement.local());
         }

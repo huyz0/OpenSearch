@@ -202,11 +202,7 @@ final class DocumentWritePlanner {
                     : serving.writes().index(into, id, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent);
                 boolean refreshed = false;
                 if (refresh) {
-                    final var open = serving.reconciler().shard(into);
-                    if (open != null) {
-                        open.refresh("serverless-rest-refresh");
-                        refreshed = true;
-                    }
+                    refreshed = serving.writes().refreshWritten(into, outcome, "serverless-rest-refresh");
                 }
                 listener.onResponse(WriteResult.written(into, id, serving.localNode().getId(), deletion, outcome, refreshed));
             } catch (Exception e) {
