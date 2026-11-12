@@ -165,8 +165,10 @@ final class BulkDispatch {
      * document, and paying per shard instead was the same mistake one level up. Each group touches only
      * its own items, so they do not interact; the outcomes are written into the items themselves and read
      * back after every group has finished.
+     *
+     * @return true if a refresh was asked for and every group that applied is visible as far as it promises
      */
-    void dispatch(ServerlessNode serving, List<BulkHandler.Item> items, boolean refresh) throws IOException {
+    boolean dispatch(ServerlessNode serving, List<BulkHandler.Item> items, boolean refresh) throws IOException {
         final Map<String, List<BulkHandler.Item>> groups = new LinkedHashMap<>();
         for (BulkHandler.Item item : items) {
             if (item.failed() == false && item.status == null) {
@@ -174,9 +176,12 @@ final class BulkDispatch {
             }
         }
         final List<java.util.concurrent.Callable<Void>> tasks = new ArrayList<>(groups.size());
+        final java.util.concurrent.atomic.AtomicBoolean refreshed = new java.util.concurrent.atomic.AtomicBoolean(refresh);
         for (List<BulkHandler.Item> group : groups.values()) {
             tasks.add(() -> {
-                applyGroup(serving, group, refresh);
+                if (applyGroup(serving, group, refresh) == false) {
+                    refreshed.set(false);
+                }
                 return null;
             });
         }
@@ -193,9 +198,16 @@ final class BulkDispatch {
                 item.fail(RestStatus.INTERNAL_SERVER_ERROR, "no_outcome", "the writer returned no outcome for this operation");
             }
         }
+        return refreshed.get();
     }
 
-    void applyGroup(ServerlessNode serving, List<BulkHandler.Item> group, boolean refresh) throws IOException {
+    /**
+     * Applies one shard's group.
+     *
+     * @return false if a refresh was asked for and what the group applied is not visible as far as it promises; true
+     *     otherwise, a failed group included, since it applied nothing to make visible
+     */
+    boolean applyGroup(ServerlessNode serving, List<BulkHandler.Item> group, boolean refresh) throws IOException {
         final String index = group.get(0).writtenIndex;
         final String uuid = group.get(0).writtenUuid;
         final int shard = group.get(0).shard;
@@ -216,7 +228,7 @@ final class BulkDispatch {
                 final List<org.opensearch.serverless.shell.BulkOutcome> outcomes = serving.writes().bulkOperations(local, operations);
                 record(group, outcomes, serving.localNode().getId());
                 if (refresh) {
-                    serving.writes().refreshWritten(local, outcomes, "serverless-bulk-refresh");
+                    return serving.writes().refreshWritten(local, outcomes, "serverless-bulk-refresh");
                 }
             } catch (Exception e) {
                 // A batch that could not be applied here -- the log append failed and the shard was
@@ -242,7 +254,7 @@ final class BulkDispatch {
                         + "; the shard may have moved, retry"
                 );
             }
-            return;
+            return true;
         }
 
         final var head = plane.get().heads().read(index, shard);
@@ -252,7 +264,7 @@ final class BulkDispatch {
             // which just did. Same conclusion the single-document path reaches.
             serving.signals().ownershipDoubted(index, shard);
             failGroup(group, RestStatus.MISDIRECTED_REQUEST, "not_the_writer", "no node currently owns shard " + shard + " of " + index);
-            return;
+            return true;
         }
         if (owner.equals(serving.localNode().getId())) {
             // The head names this node and the shard is not open here: the activation window, brief and
@@ -265,7 +277,7 @@ final class BulkDispatch {
                 "activation_in_progress",
                 "this node is acquiring shard " + shard + " of " + index + "; retry"
             );
-            return;
+            return true;
         }
         try {
             final var peer = serving.router().peer(owner);
@@ -279,7 +291,7 @@ final class BulkDispatch {
                     "owner_unreachable",
                     "shard " + shard + " is owned by " + owner + ", which has no reachable lease"
                 );
-                return;
+                return true;
             }
             final var response = serving.router()
                 .forwardBulk(
@@ -287,9 +299,11 @@ final class BulkDispatch {
                     org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh)
                 );
             record(group, response.outcomes(), response.ownerNodeId());
+            return refresh == false || response.refreshed();
         } catch (Exception e) {
             failForwarded(serving, group, index, shard, owner, e);
         }
+        return true;
     }
 
     /**

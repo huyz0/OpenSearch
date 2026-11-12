@@ -187,6 +187,15 @@ unpublished record of every shard is, so a successor reads it without a listing.
   commit's. Because searches no longer wait for publishes, a shard with overlays on whose index sets no
   `refresh_interval` is published after `serverless.search.tail_overlay.publish_max_age_millis` (10 seconds by default)
   rather than the node's one second, which cuts publish PUTs. A shard with overlays off keeps the node's age.
+- **`refresh=true` and `refresh=wait_for` on search nodes.** Both spellings mean the same here: the writer refreshes
+  its own copy, then waits until every search node serving the shard has taken the write into its overlay, at most
+  500 ms, before it answers. A search node that opens the shard waits for the writer's answer to its fetch before it
+  searches, so a node that joins or opens the shard after the write finds it too. `forced_refresh` is `true` only when
+  that held: a node the push did not reach, a wait that ran out, or an index with the overlay off (whose search nodes see
+  only commits) answers without it. Set `serverless.refresh_visibility` in the cluster settings, or
+  `serverless.search.refresh_visibility` on a node, to `owner` to refresh the writer's copy only, as before; the
+  default is `serving`. The wait adds no store request and only the push a write would have had anyway, sent at once
+  rather than after its 2 ms linger.
 
 ## Scaling search nodes without a cold cache
 

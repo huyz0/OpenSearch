@@ -185,6 +185,8 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
         long releasedAtNanos;
         /** Set when a record did not fit: later ones would leave a gap, so none is taken until an engine opens anew. */
         boolean refusing;
+        /** Set while the writer is being asked for what it acknowledged past the commit an engine just opened on. */
+        boolean fetching;
     }
 
     private final ShardRouter router;
@@ -261,6 +263,29 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
     }
 
     @Override
+    public void awaitFetch(ShardId shardId) {
+        final Held shard = held.get(shardId);
+        if (shard == null) {
+            return;
+        }
+        synchronized (shard) {
+            final long deadline = System.nanoTime() + TailPush.SEND_TIMEOUT.nanos();
+            while (shard.fetching) {
+                final long left = deadline - System.nanoTime();
+                if (left <= 0) {
+                    return;
+                }
+                try {
+                    java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(shard, left);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    @Override
     public void track(ShardId shardId, long localCheckpoint) {
         final Held shard = held.computeIfAbsent(shardId, ignored -> new Held());
         synchronized (shard) {
@@ -306,8 +331,9 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
     }
 
     /**
-     * Asks a shard's writer, in the background, for what it has acknowledged past the commit just opened here, which
-     * also has it push the shard's next writes here. Does nothing if overlays are off for the shard or the commit names
+     * Asks a shard's writer for what it has acknowledged past the commit just opened here, which also has it push the
+     * shard's next writes here. In the background, unless refreshing writes wait for search nodes: then before the reader
+     * answers its first search. Does nothing if overlays are off for the shard or the commit names
      * no writer.
      *
      * @param shardId the shard just opened
@@ -318,7 +344,7 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
         if (writer == null || writer.equals(router.node.localNode().getId()) || onFor(shardId) == false) {
             return;
         }
-        router.node.threadPool().generic().execute(() -> {
+        final Runnable fetch = () -> {
             try {
                 final Optional<DiscoveryNode> peer = router.peer(writer, TailPush.SEND_TIMEOUT);
                 if (peer.isEmpty()) {
@@ -336,6 +362,29 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
                 // The pushes still come; until they do, the commit is what the reader serves.
                 LOG.debug("could not fetch the acknowledged tail of {} from [{}]", shardId, writer, e);
             }
-        });
+        };
+        if (router.refreshVisibility().waitsForSearchNodes()) {
+            // Before the reader answers anything: a write acknowledged before this node subscribed is in the answer and
+            // nowhere else, and its writer does not wait for a node it did not know served the shard. A search that finds
+            // the engine open meanwhile waits for the answer too; see awaitFetch.
+            final Held shard = held.get(shardId);
+            if (shard != null) {
+                synchronized (shard) {
+                    shard.fetching = true;
+                }
+            }
+            try {
+                fetch.run();
+            } finally {
+                if (shard != null) {
+                    synchronized (shard) {
+                        shard.fetching = false;
+                        shard.notifyAll();
+                    }
+                }
+            }
+        } else {
+            router.node.threadPool().generic().execute(fetch);
+        }
     }
 }
