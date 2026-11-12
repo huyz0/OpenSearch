@@ -689,6 +689,27 @@ public final class BlobLeaseMembership implements MembershipSource {
     /** The lease this node last renewed, which {@link #current} includes while it is unexpired. */
     private volatile NodeLease ownLease;
 
+    /** One member as a delta sees it: everything a lease says but when it runs out. */
+    private record Member(String nodeId, String ephemeralId, String address, Set<String> roles, boolean revoked) {
+        static Member of(NodeLease lease) {
+            return new Member(lease.nodeId(), lease.ephemeralId(), lease.address(), lease.roles(), lease.revoked());
+        }
+    }
+
+    private volatile boolean renewalsAreChanges = false;
+
+    /**
+     * Whether a renewal, a lease that changed only its expiry, is reported as a member that left and joined again; the
+     * behaviour before deltas compared members. False by default.
+     *
+     * @param renewalsAreChanges true to report renewals as changes
+     * @return this
+     */
+    public BlobLeaseMembership reportRenewalsAsChanges(boolean renewalsAreChanges) {
+        this.renewalsAreChanges = renewalsAreChanges;
+        return this;
+    }
+
     /**
      * The members as last refreshed, and this node itself.
      *
@@ -844,10 +865,33 @@ public final class BlobLeaseMembership implements MembershipSource {
         }
 
         final Set<NodeLease> previous = observed;
-        final Set<NodeLease> joined = new HashSet<>(live);
-        joined.removeAll(previous);
-        final Set<NodeLease> left = new HashSet<>(previous);
-        left.removeAll(live);
+        // By member, not by lease: a renewal moves only the expiry, and a lease compared whole made every renewal read
+        // here a departure and a join of the same live process, about once a lifetime per peer.
+        final Set<NodeLease> joined;
+        final Set<NodeLease> left;
+        if (renewalsAreChanges) {
+            joined = new HashSet<>(live);
+            joined.removeAll(previous);
+            left = new HashSet<>(previous);
+            left.removeAll(live);
+        } else {
+            final Set<Member> liveMembers = new HashSet<>();
+            live.forEach(lease -> liveMembers.add(Member.of(lease)));
+            final Set<Member> previousMembers = new HashSet<>();
+            previous.forEach(lease -> previousMembers.add(Member.of(lease)));
+            joined = new HashSet<>();
+            for (NodeLease lease : live) {
+                if (previousMembers.contains(Member.of(lease)) == false) {
+                    joined.add(lease);
+                }
+            }
+            left = new HashSet<>();
+            for (NodeLease lease : previous) {
+                if (liveMembers.contains(Member.of(lease)) == false) {
+                    left.add(lease);
+                }
+            }
+        }
         observed = Set.copyOf(live);
 
         final MembershipDelta delta = new MembershipDelta(joined, left);

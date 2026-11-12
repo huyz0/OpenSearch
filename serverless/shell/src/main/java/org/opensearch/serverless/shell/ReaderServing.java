@@ -66,6 +66,73 @@ public final class ReaderServing {
         int shardNumber,
         String expectedUuid
     ) throws Exception {
+        return serveAsReader(plane, indexName, shardNumber, expectedUuid, null);
+    }
+
+    /**
+     * Reopens a reader on a commit its writer pushed, reusing the descriptor this node served it with when the writer
+     * said its mapping and settings are no newer than that copy's; otherwise as {@link #serveAsReader(
+     * org.opensearch.serverless.metadata.MetadataPlane, String, int, String)}.
+     *
+     * <p>What the descriptor read bought on such a reopen was the mapping and settings the new segment was written
+     * under, and the writer's versions say whether this node already has them. The read was not what confirms the index
+     * still exists for a search: every search checks that itself, by the incarnation fence. So a reuse confirms nothing.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index
+     * @param shardNumber the shard
+     * @param expectedUuid the incarnation the push was for
+     * @param had the descriptor this node served the shard with before letting the old reader go, or null
+     * @param mappingVersion the mapping version the writer holds, or -1 if it did not say
+     * @param settingsVersion the settings version the writer holds, or -1 if it did not say
+     * @return the shard now open as a reader
+     * @throws Exception if opening fails
+     */
+    public org.opensearch.core.index.shard.ShardId serveAsReaderOnPush(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String expectedUuid,
+        IndexDescriptor had,
+        long mappingVersion,
+        long settingsVersion
+    ) throws Exception {
+        final IndexDescriptor known = mappingVersion >= 0
+            && settingsVersion >= 0
+            && had != null
+            && had.uuid().equals(expectedUuid)
+            && had.mappingVersion() >= mappingVersion
+            && had.settingsVersion() >= settingsVersion ? had : null;
+        if (known != null) {
+            descriptorReadsSkipped.incrementAndGet();
+        }
+        return serveAsReader(plane, indexName, shardNumber, expectedUuid, known);
+    }
+
+    /**
+     * The descriptor this node serves an index's readers with, or null.
+     *
+     * @param indexName the index
+     * @return the descriptor, or null
+     */
+    public IndexDescriptor servedDescriptor(String indexName) {
+        return node.served.get(indexName);
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong descriptorReadsSkipped = new java.util.concurrent.atomic.AtomicLong();
+
+    /** @return how many pushed reopens reused the descriptor this node held rather than reading it */
+    public long descriptorReadsSkipped() {
+        return descriptorReadsSkipped.get();
+    }
+
+    private org.opensearch.core.index.shard.ShardId serveAsReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String expectedUuid,
+        IndexDescriptor known
+    ) throws Exception {
         node.ensureStarted();
         node.adopt(plane);
         node.reconciler.setSegmentPublishers(NodePackWiring.publishers(node, plane));
@@ -75,7 +142,7 @@ public final class ReaderServing {
         );
         node.reconciler.setOwnershipCheck((id, term) -> node.leases.ownsAtTerm(plane, id, term));
         final String openingKey = indexName + "#" + shardNumber;
-        final org.opensearch.core.index.shard.ShardId served = openOrShareReader(plane, indexName, shardNumber, openingKey);
+        final org.opensearch.core.index.shard.ShardId served = openOrShareReader(plane, indexName, shardNumber, openingKey, known);
         requireReaderIncarnation(served, expectedUuid);
         try {
             validateReader(plane, indexName, shardNumber, served);
@@ -170,6 +237,16 @@ public final class ReaderServing {
         int shardNumber,
         String openingKey
     ) throws Exception {
+        return openOrShareReader(plane, indexName, shardNumber, openingKey, null);
+    }
+
+    org.opensearch.core.index.shard.ShardId openOrShareReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String openingKey,
+        IndexDescriptor known
+    ) throws Exception {
         final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> mine =
             new java.util.concurrent.CompletableFuture<>();
         final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> running = node.readerOpens.putIfAbsent(
@@ -187,11 +264,14 @@ public final class ReaderServing {
         final long describedAt = System.nanoTime();
         node.openingShards.add(openingKey);
         try {
-            final IndexDescriptor descriptor = plane.describe(indexName)
-                .orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
+            final IndexDescriptor descriptor = known != null
+                ? known
+                : plane.describe(indexName).orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
             final org.opensearch.core.index.shard.ShardId opened = openReader(plane, indexName, shardNumber, descriptor, openingKey);
-            // The read above confirmed the incarnation, so the query this open serves need not read it again.
-            node.fences().confirmIncarnation(descriptor.uuid(), describedAt);
+            if (known == null) {
+                // The read above confirmed the incarnation, so the query this open serves need not read it again.
+                node.fences().confirmIncarnation(descriptor.uuid(), describedAt);
+            }
             mine.complete(opened);
             return opened;
         } catch (Exception e) {

@@ -244,24 +244,58 @@ public final class BlockCacheDirectory extends FilterDirectory {
      * @throws IOException if a local file cannot be read
      */
     public long warmFromLocal(org.opensearch.serverless.store.CommitManifest manifest, long maxBytes) throws IOException {
+        // Only into room the cache has free: a block put into a full cache pushes out one somebody may be searching,
+        // for a file that is read only if this shard opens again. Free room is the cache's own bound, so no more heap.
+        final long free = (long) cache.maxBlocks() * cache.blockSize() - cache.bytesResident();
+        maxBytes = Math.min(maxBytes, free);
+        long cached = 0;
+        for (Map.Entry<String, byte[]> block : localBlocks(manifest, manifest.files().keySet(), maxBytes).entrySet()) {
+            cache.put(block.getKey(), block.getValue());
+            cached += block.getValue().length;
+        }
+        return cached;
+    }
+
+    /**
+     * Reads some files of a commit this node just published from its own local copies, as the block cache keys and
+     * holds them on any node that opens the commit: a cache key names the shard's storage and the file, not the node.
+     *
+     * <p>Only files held locally, which are this node's own output: Lucene never writes a file name twice in a shard's
+     * history, and the publisher uploaded exactly these bytes. A local file whose length is not the one the commit
+     * records is skipped rather than trusted. Smallest first, whole files only, up to a budget.
+     *
+     * @param manifest the commit just published from this directory
+     * @param names the files of it wanted
+     * @param maxBytes the most bytes to read
+     * @return the blocks read, by cache key, smallest file first
+     * @throws IOException if a local file cannot be read
+     */
+    public Map<String, byte[]> localBlocks(
+        org.opensearch.serverless.store.CommitManifest manifest,
+        java.util.Collection<String> names,
+        long maxBytes
+    ) throws IOException {
+        final Map<String, byte[]> blocks = new LinkedHashMap<>();
+        if (maxBytes <= 0 || names.isEmpty()) {
+            return blocks;
+        }
         final Set<String> held = new LinkedHashSet<>(java.util.Arrays.asList(in.listAll()));
         final java.util.List<Map.Entry<String, Long>> candidates = new java.util.ArrayList<>();
-        for (String name : manifest.files().keySet()) {
+        for (String name : names) {
             final Long length = manifest.lengthOf(name);
-            if (length == null || held.contains(name) == false || in.fileLength(name) != length) {
+            if (length == null
+                || manifest.files().containsKey(name) == false
+                || held.contains(name) == false
+                || in.fileLength(name) != length) {
                 continue;
             }
             candidates.add(Map.entry(name, length));
         }
         candidates.sort(Map.Entry.comparingByValue());
         final int blockSize = cache.blockSize();
-        // Only into room the cache has free: a block put into a full cache pushes out one somebody may be searching,
-        // for a file that is read only if this shard opens again. Free room is the cache's own bound, so no more heap.
-        final long free = (long) cache.maxBlocks() * blockSize - cache.bytesResident();
-        maxBytes = Math.min(maxBytes, free);
-        long cached = 0;
+        long read = 0;
         for (Map.Entry<String, Long> candidate : candidates) {
-            if (cached + candidate.getValue() > maxBytes) {
+            if (read + candidate.getValue() > maxBytes) {
                 break;
             }
             final FileLocation location = manifest.location(candidate.getKey());
@@ -275,12 +309,12 @@ public final class BlockCacheDirectory extends FilterDirectory {
                 for (long block = 0; block * blockSize < length; block++) {
                     final byte[] bytes = new byte[(int) Math.min(blockSize, length - block * blockSize)];
                     input.readBytes(bytes, 0, bytes.length);
-                    cache.put(prefix + "#" + block, bytes);
+                    blocks.put(prefix + "#" + block, bytes);
                 }
             }
-            cached += candidate.getValue();
+            read += candidate.getValue();
         }
-        return cached;
+        return blocks;
     }
 
     /**

@@ -43,6 +43,8 @@ public final class NodeLeases {
     volatile boolean ownershipUnverified;
     /** Bumped on every lapse, so a verification that began before the renewal cannot lift the suspension. */
     final java.util.concurrent.atomic.AtomicLong lapseEpoch = new java.util.concurrent.atomic.AtomicLong();
+    /** When this node last found its own lease lapsed or revoked, by the plane's clock; never if MIN_VALUE. */
+    volatile long lapsedAtMillis = Long.MIN_VALUE;
     /** How many shard-head reads a verification pass has in flight at once. */
     public static final int HEAD_READ_LANES = 8;
 
@@ -192,6 +194,7 @@ public final class NodeLeases {
             // renewal completes, nothing is acknowledged. The epoch is what tells a verification that
             // began before this moment from one that began after it.
             lapseEpoch.incrementAndGet();
+            lapsedAtMillis = now;
             ownershipUnverified = true;
             ServerlessNode.logger.info(
                 "this node's lease lapsed at {} by its own clock (now {}); acknowledgement is suspended until every held head is re-read",
@@ -227,6 +230,7 @@ public final class NodeLeases {
                 // has had this node serving shards it may have lost. The same suspension as a lapse, and
                 // the same full scan before it lifts. The renewal after this one starts the lease afresh.
                 lapseEpoch.incrementAndGet();
+                lapsedAtMillis = plane.clock().getAsLong();
                 ownershipUnverified = true;
                 revoked = true;
                 ServerlessNode.logger.warn("{}; acknowledgement is suspended until every held head is re-read", e.getMessage());
@@ -293,6 +297,36 @@ public final class NodeLeases {
     /** @return whether acknowledgement is suspended until every held head is read again, after a lapse or a revocation */
     public boolean ownershipUnverified() {
         return ownershipUnverified;
+    }
+
+    /**
+     * The head this node last saw naming itself for a shard it writes at a term, if its own lease has held unbroken since
+     * that sighting: valid now, ownership not suspended, and no lapse or revocation found after it. A head cannot move off
+     * a node while its lease holds -- a taker revokes a lease only once it judges it expired -- so such a head names this
+     * node still, whatever its age. Empty when that cannot be said, and the caller reads the head.
+     *
+     * @param plane the metadata plane
+     * @param shardId the shard
+     * @param term the term the shard is open at here
+     * @return the head, or empty
+     */
+    public java.util.Optional<org.opensearch.serverless.metadata.ShardHead> ownHeadUnderUnbrokenLease(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        org.opensearch.core.index.shard.ShardId shardId,
+        long term
+    ) {
+        final long lapsed = lapsedAtMillis;
+        final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> seen = node.sightings()
+            .headSeenSince(shardId.getIndexName(), shardId.id(), lapsed == Long.MIN_VALUE ? Long.MIN_VALUE : lapsed + 1);
+        if (seen.isEmpty()
+            || seen.get().term() != term
+            || namesThisNode(seen, shardId) == false
+            || ownershipUnverified
+            || lapsedAtMillis != lapsed
+            || plane.membership().selfLeaseValidAt(plane.clock().getAsLong()) == false) {
+            return java.util.Optional.empty();
+        }
+        return seen;
     }
 
     /**
