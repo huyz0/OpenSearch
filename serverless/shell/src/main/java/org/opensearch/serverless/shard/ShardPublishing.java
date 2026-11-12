@@ -171,6 +171,87 @@ final class ShardPublishing {
             stagedTrims.remove(shardId);
             throw e;
         }
+        checkpointed(shardId, written, pending);
+        return written;
+    }
+
+    /**
+     * Writes the staged commits of many shards with one swap, once any of them has waited its time: the rest have
+     * something staged too, and writing it in the same swap costs nothing more.
+     *
+     * <p>Callers hold every shard's publish lock, so no publish moves a shard's register between taking its commit and
+     * recording the swap.
+     *
+     * @param shards the shards, which share one register
+     * @param swap the write
+     * @return what was written and what failed
+     */
+    CheckpointBatch.Outcome checkpointTogether(java.util.Collection<ShardId> shards, CheckpointBatch.Swap swap) {
+        final java.util.Map<ShardId, CommitManifest> written = new java.util.LinkedHashMap<>();
+        final java.util.Map<ShardId, Exception> failed = new java.util.LinkedHashMap<>();
+        final java.util.Map<ShardId, org.opensearch.serverless.store.SegmentPublisher> publishers = new java.util.LinkedHashMap<>();
+        boolean due = false;
+        for (ShardId shardId : shards) {
+            final org.opensearch.serverless.store.SegmentPublisher publisher = reconciler.publisherCache.get(shardId);
+            if (publisher != null) {
+                publishers.put(shardId, publisher);
+                due |= publisher.checkpointDue();
+            }
+        }
+        if (due == false) {
+            return new CheckpointBatch.Outcome(written, failed);
+        }
+        final java.util.Map<ShardId, org.opensearch.serverless.store.SegmentPublisher.PendingCheckpoint> prepared =
+            new java.util.LinkedHashMap<>();
+        final java.util.Map<ShardId, StagedTrim> trims = new java.util.HashMap<>();
+        for (java.util.Map.Entry<ShardId, org.opensearch.serverless.store.SegmentPublisher> entry : publishers.entrySet()) {
+            final ShardId shardId = entry.getKey();
+            trims.put(shardId, stagedTrims.get(shardId));
+            try {
+                final var pending = entry.getValue().prepareCheckpoint();
+                if (pending != null) {
+                    prepared.put(shardId, pending);
+                }
+            } catch (IOException | RuntimeException e) {
+                stagedTrims.remove(shardId);
+                failed.put(shardId, e);
+            }
+        }
+        if (prepared.isEmpty()) {
+            return new CheckpointBatch.Outcome(written, failed);
+        }
+        final java.util.Map<ShardId, org.opensearch.common.blobstore.BlobRegisterCasResult> results;
+        try {
+            results = swap.swap(prepared);
+        } catch (IOException | RuntimeException e) {
+            for (ShardId shardId : prepared.keySet()) {
+                stagedTrims.remove(shardId);
+                failed.put(shardId, e);
+            }
+            return new CheckpointBatch.Outcome(written, failed);
+        }
+        for (java.util.Map.Entry<ShardId, org.opensearch.serverless.store.SegmentPublisher.PendingCheckpoint> entry : prepared.entrySet()) {
+            final ShardId shardId = entry.getKey();
+            try {
+                final var result = results.get(shardId);
+                if (result == null) {
+                    throw new IOException("the batched checkpoint reported nothing for " + shardId);
+                }
+                final CommitManifest commit = publishers.get(shardId).completeCheckpoint(entry.getValue(), result);
+                if (commit != null) {
+                    written.put(shardId, commit);
+                }
+                checkpointed(shardId, commit, trims.get(shardId));
+            } catch (IOException | RuntimeException e) {
+                stagedTrims.remove(shardId);
+                failed.put(shardId, e);
+            }
+        }
+        return new CheckpointBatch.Outcome(written, failed);
+    }
+
+    /** What follows a checkpoint's write: the node log hears it, and the logs it covers are trimmed. */
+    private void checkpointed(ShardId shardId, CommitManifest written, StagedTrim pending) throws IOException {
         final ShardReconciler.NodeLogHooks hooks = reconciler.nodeLog;
         if (written != null && hooks != null) {
             hooks.checkpointed(shardId, written.stageSequence());
@@ -179,7 +260,6 @@ final class ShardPublishing {
             stagedTrims.remove(shardId, pending);
             trim(shardId, pending.term(), pending.nodeLogAt());
         }
-        return written;
     }
 
     private final java.util.Set<ShardId> openPublishes = java.util.concurrent.ConcurrentHashMap.newKeySet();

@@ -98,14 +98,6 @@ public final class BucketStore {
         }
     }
 
-    /**
-     * Writes a bucket's manifest if the register is still at the generation it was read at: one conditional PUT.
-     *
-     * @param manifest the new manifest
-     * @param expectedGeneration the generation read, or {@link BlobRegister#ABSENT_GENERATION} to create the bucket
-     * @return the new generation, or empty if another change landed first
-     * @throws IOException if the register cannot be written
-     */
     /** Where each stripe's open bucket is recorded. */
     public static final String OPEN_ROOT = "bucket-open";
 
@@ -153,6 +145,14 @@ public final class BucketStore {
         ).applied();
     }
 
+    /**
+     * Writes a bucket's manifest if the register is still at the generation it was read at: one conditional PUT.
+     *
+     * @param manifest the new manifest
+     * @param expectedGeneration the generation read, or {@link BlobRegister#ABSENT_GENERATION} to create the bucket
+     * @return the new generation, or empty if another change landed first
+     * @throws IOException if the register cannot be written
+     */
     public Optional<Long> swap(BucketManifest manifest, long expectedGeneration) throws IOException {
         final var result = container(manifest.bucketId()).compareAndSwapRegister(MANIFEST, expectedGeneration, manifest.toBytes());
         return result.applied() ? Optional.of(result.currentGeneration()) : Optional.empty();
