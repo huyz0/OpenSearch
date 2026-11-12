@@ -65,6 +65,8 @@ public final class IndexDescriptor {
     private final int createdVersionId;
     private final List<String> aliasedBy;
     private final org.opensearch.serverless.routing.UnitLayout layout;
+    /** The bucket this index's data lives in, or null for an index on units of its own. */
+    private final String bucket;
     /** The live unit ids, sorted; null for an index without a layout, whose shards are all live. */
     private final int[] unitIds;
 
@@ -224,6 +226,70 @@ public final class IndexDescriptor {
         List<String> aliasedBy,
         org.opensearch.serverless.routing.UnitLayout layout
     ) {
+        this(
+            name,
+            uuid,
+            numberOfShards,
+            mapping,
+            extraSettings,
+            mappingVersion,
+            settingsVersion,
+            createdAtMillis,
+            createdVersionId,
+            aliasedBy,
+            layout,
+            null
+        );
+    }
+
+    /**
+     * Creates a descriptor, optionally of an index whose data lives in a bucket.
+     *
+     * <p>A bucketed index has one shard and no shard mode: a bucket holds small indices only, and one that grows is
+     * promoted to units of its own before it could need more.
+     *
+     * @param name the index name
+     * @param uuid the index uuid
+     * @param numberOfShards the physical shard slots; with a layout, its next unit id
+     * @param mapping the mapping, or null
+     * @param extraSettings the settings beyond the shard count
+     * @param mappingVersion how many times the mapping has changed
+     * @param settingsVersion how many times the settings have changed
+     * @param createdAtMillis when the index was created, or 0 when not recorded
+     * @param createdVersionId the id of the OpenSearch version that created it, or 0 when not recorded
+     * @param aliasedBy the aliases believed to name this index
+     * @param layout the range map from routing hashes to units, or null for an index without a shard mode
+     * @param bucket the bucket holding this index's data, or null for an index on units of its own
+     */
+    public IndexDescriptor(
+        String name,
+        String uuid,
+        int numberOfShards,
+        String mapping,
+        Settings extraSettings,
+        long mappingVersion,
+        long settingsVersion,
+        long createdAtMillis,
+        int createdVersionId,
+        List<String> aliasedBy,
+        org.opensearch.serverless.routing.UnitLayout layout,
+        String bucket
+    ) {
+        if (bucket != null) {
+            org.opensearch.serverless.bucket.BucketIds.validate(bucket);
+            if (numberOfShards != 1 || layout != null) {
+                throw new IllegalArgumentException(
+                    "["
+                        + name
+                        + "] is in bucket ["
+                        + bucket
+                        + "] but has "
+                        + numberOfShards
+                        + " shards or a shard mode; a bucket holds one-shard indices"
+                );
+            }
+        }
+        this.bucket = bucket;
         this.name = Objects.requireNonNull(name);
         this.uuid = Objects.requireNonNull(uuid);
         if (numberOfShards < 1) {
@@ -314,6 +380,39 @@ public final class IndexDescriptor {
     }
 
     /**
+     * Returns the bucket this index's data lives in. A hint, checked against the bucket's manifest, which alone decides
+     * membership; every request already reads the descriptor, so routing a bucketed index costs no extra read.
+     *
+     * @return the bucket id, or null for an index on units of its own
+     */
+    public String bucket() {
+        return bucket;
+    }
+
+    /**
+     * Returns this descriptor in a bucket, or out of one.
+     *
+     * @param newBucket the bucket id, or null for an index promoted to units of its own
+     * @return the new descriptor
+     */
+    public IndexDescriptor withBucket(String newBucket) {
+        return new IndexDescriptor(
+            name,
+            uuid,
+            numberOfShards,
+            mapping,
+            extraSettings,
+            mappingVersion,
+            settingsVersion,
+            createdAtMillis,
+            createdVersionId,
+            aliasedBy,
+            layout,
+            newBucket
+        );
+    }
+
+    /**
      * Returns the shard count the user declared, which every user-facing shard count reports.
      *
      * <p>The same as {@link #numberOfShards()} for an index without a shard mode, and for a fixed one.
@@ -345,7 +444,8 @@ public final class IndexDescriptor {
             createdAtMillis,
             createdVersionId,
             aliasedBy,
-            newLayout
+            newLayout,
+            bucket
         );
     }
 
@@ -401,7 +501,8 @@ public final class IndexDescriptor {
             createdAtMillis,
             createdVersionId,
             aliasedBy,
-            layout
+            layout,
+            bucket
         );
     }
 
@@ -423,7 +524,8 @@ public final class IndexDescriptor {
             createdAtMillis,
             createdVersionId,
             aliases,
-            layout
+            layout,
+            bucket
         );
     }
 
@@ -559,7 +661,8 @@ public final class IndexDescriptor {
             createdAtMillis,
             createdVersionId,
             aliasedBy,
-            layout
+            layout,
+            bucket
         );
     }
 
@@ -590,7 +693,8 @@ public final class IndexDescriptor {
             createdAtMillis,
             createdVersionId,
             aliasedBy,
-            layout
+            layout,
+            bucket
         );
     }
 
@@ -639,6 +743,10 @@ public final class IndexDescriptor {
                 org.opensearch.serverless.routing.UnitLayoutFormat.toXContent(layout, builder);
                 builder.endObject();
             }
+            // Only for a bucketed index, so every other descriptor is byte-identical to what this class wrote before.
+            if (bucket != null) {
+                builder.field("bucket", bucket);
+            }
             // Core's own settings serialization, rather than a flat key-to-string loop.
             //
             // The loop could not carry a list. Settings.get(key) on a list-valued setting returns its
@@ -681,6 +789,7 @@ public final class IndexDescriptor {
             final List<String> aliasedBy = new java.util.ArrayList<>();
             Settings parsedSettings = Settings.EMPTY;
             org.opensearch.serverless.routing.UnitLayout layout = null;
+            String bucket = null;
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != null && token != XContentParser.Token.END_OBJECT) {
@@ -708,6 +817,7 @@ public final class IndexDescriptor {
                         case "number_of_shards" -> shards = parser.intValue();
                         case "created_at_millis" -> createdAtMillis = parser.longValue();
                         case "created_version_id" -> createdVersionId = parser.intValue();
+                        case "bucket" -> bucket = parser.text();
                         default -> {
                             // forward compatibility: a newer node may write fields we do not know
                         }
@@ -728,7 +838,8 @@ public final class IndexDescriptor {
                 createdAtMillis,
                 createdVersionId,
                 aliasedBy,
-                layout
+                layout,
+                bucket
             );
         }
     }
@@ -746,14 +857,15 @@ public final class IndexDescriptor {
                 && mappingVersion == other.mappingVersion
                 && settingsVersion == other.settingsVersion
                 && extraSettings.equals(other.extraSettings)
-                && Objects.equals(layout, other.layout);
+                && Objects.equals(layout, other.layout)
+                && Objects.equals(bucket, other.bucket);
         }
         return false;
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(name, uuid, numberOfShards, mapping, extraSettings, mappingVersion, settingsVersion, layout);
+        return Objects.hash(name, uuid, numberOfShards, mapping, extraSettings, mappingVersion, settingsVersion, layout, bucket);
     }
 
     @Override
