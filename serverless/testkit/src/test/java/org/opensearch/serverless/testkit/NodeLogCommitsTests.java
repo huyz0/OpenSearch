@@ -100,12 +100,21 @@ public class NodeLogCommitsTests extends OpenSearchTestCase {
                     );
                 }
 
+                // The first publish's pushes create the cluster's transport secret, once; that is not a manifest write.
+                assertBusy(() -> {
+                    final long[] pushes = writer.router().commitPush().counts();
+                    assertTrue(pushes[0] + pushes[1] >= SHARDS);
+                });
                 store.reset();
                 for (int round = 0; round < 3; round++) {
                     writeRound(writer, "round" + round, 5);
                     assertEquals(SHARDS, loop.publishAll().size());
                 }
-                assertEquals("routine publishes stage their commits rather than write the manifest", 0L, store.registerWrites());
+                assertEquals(
+                    "routine publishes stage their commits rather than write the manifest:\n" + store.byPlace(),
+                    0L,
+                    store.registerWrites()
+                );
                 for (ShardId shardId : held) {
                     assertTrue(writer.reconciler().newestCommit(shardId).stagedAfter(register(plane, shardId)));
                 }

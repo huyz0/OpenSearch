@@ -41,6 +41,8 @@ public class CommitPushTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", roles)
             .put(CommitPush.ENABLED, push)
+            // The commit alone: what a reader sees of unpublished writes is the overlay's business, measured on its own.
+            .put(org.opensearch.serverless.transport.TailOverlays.ENABLED, false)
             .build();
     }
 

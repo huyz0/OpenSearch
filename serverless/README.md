@@ -163,14 +163,30 @@ unpublished record of every shard is, so a successor reads it without a listing.
 
 - **Telling search nodes about a new commit.** A search node that has a shard open checks the shard's register
   for a newer commit every other lease renewal, which is 20 seconds at the default TTL. Until it checks, its searches
-  miss what was published since. With `serverless.search.commit_push.enabled=true` on the writers, each publish
+  miss what was published since. By default (`serverless.search.commit_push.enabled`, set it to `false` to stop), each publish
   is also sent over transport to the search nodes that placement ranks first for the shard. A node with the shard
   open on an older commit lets that reader go and reopens it on the pushed commit in the background. The push
   carries the commit, so it adds no PUT, LIST or GET (the reopen reads only the new segment's blocks, which the next
   search would have read anyway). It is sent after the publish, so it adds nothing to a write's acknowledgement.
   Locally, with 20 ms per store request, a one-second refresh and the 30-second TTL, an open reader saw a write
   1.5 s (p50) and 1.7 s (p99) after its acknowledgement with pushes, against 9.9 s and 20 s without. The register
-  check stays, as the backstop for a lost push. Off by default.
+  check stays, as the backstop for a lost push. On by default: it adds no store request and nothing to a write's ack.
+- **Searching writes before they are published (tail overlay).** On by default; turn it off per index with
+  `index.serverless.tail_overlay: false`, for the cluster with `serverless.tail_overlay` in the cluster settings, or
+  for a node with `serverless.search.tail_overlay.enabled=false`. The index setting wins over the cluster's, and the
+  cluster's over the node's, and both are dynamic. A search node that opens a shard asks the shard's writer, over
+  transport, for what it has acknowledged past the opened commit, and that subscribes it: the writer then pushes each
+  write it acknowledges to the shard's subscribed search nodes, a couple of milliseconds after the acknowledgement,
+  batched by node. The search node indexes them in memory and searches them together with its commit; a document
+  the overlay replaces or deletes is hidden from the commit. So a write is searchable about a network hop after its
+  acknowledgement, with no PUT, LIST or GET. Pushes go only to the search nodes serving the shard now, normally one or
+  two, so the number of search nodes does not change the cost. A node that has let the shard go answers the next push
+  "not wanted", and the writer stops. Roughly, a writer sends write bytes/s times its subscribed readers; links to
+  another zone are compressed. A lost push, a document that needs a field the search node's mapping lacks, or an overlay
+  past 50,000 documents leaves the search node serving its commit for those writes, never an older version than the
+  commit's. Because searches no longer wait for publishes, a shard with overlays on whose index sets no
+  `refresh_interval` is published after `serverless.search.tail_overlay.publish_max_age_millis` (10 seconds by default)
+  rather than the node's one second, which cuts publish PUTs. A shard with overlays off keeps the node's age.
 
 ## Scaling search nodes without a cold cache
 

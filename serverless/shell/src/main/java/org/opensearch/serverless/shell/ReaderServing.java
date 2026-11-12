@@ -235,7 +235,20 @@ public final class ReaderServing {
         // dual-role node.
         final ShardAssignment opening = new ShardAssignment(indexName, shardNumber, node.readerTerms.getOrDefault(openingKey, 1L));
         final ClusterState view = node.projectAndApply(java.util.List.of(descriptor), java.util.List.of(opening));
-        return node.reconciler.openReader(view, indexName, shardNumber, manifest.orElse(null));
+        final org.opensearch.core.index.shard.ShardId opened = node.reconciler.openReader(
+            view,
+            indexName,
+            shardNumber,
+            manifest.orElse(null)
+        );
+        if (node.router() != null && manifest.isPresent()) {
+            // What the writer acknowledged past this commit, and its next writes, for the reader's tail overlay.
+            final var shard = node.reconciler.shard(opened);
+            if (shard != null) {
+                node.router().tailOverlays().opened(opened, manifest.get().writer(), shard.seqNoStats().getLocalCheckpoint());
+            }
+        }
+        return opened;
     }
 
     /**

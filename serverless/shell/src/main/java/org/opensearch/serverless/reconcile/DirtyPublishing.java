@@ -192,7 +192,7 @@ final class DirtyPublishing {
         }
         // A write reported while a publish was in flight may have lost its stamp; it is aged from now.
         final long since = reconciler.unpublishedSinceMillis.computeIfAbsent(shardId, ignored -> nowMillis);
-        final long age = publishAgeOf(shard, maxAge);
+        final long age = publishAgeOf(shard, overlaidAge(shard, maxAge));
         if (age >= 0) {
             final long tick = reconciler.lazyPublishTickMillis;
             final long dueAt = since + age;
@@ -203,6 +203,18 @@ final class DirtyPublishing {
         }
         final long maxOperations = reconciler.lazyPublishMaxOperations;
         return maxOperations > 0 && maxSeqNo - lastThrough >= maxOperations;
+    }
+
+    /**
+     * The node's publish age for a shard: raised to the tail overlay's when the shard's search nodes see its writes before
+     * they are published, so publishing less often costs no freshness. Unchanged when overlays are off for the shard.
+     */
+    private long overlaidAge(org.opensearch.index.shard.IndexShard shard, long maxAge) {
+        final var router = reconciler.node.router();
+        if (router == null || router.tailOverlays().onFor(shard.indexSettings().getSettings()) == false) {
+            return maxAge;
+        }
+        return Math.max(maxAge, router.tailOverlays().publishMaxAgeMillis());
     }
 
     /** How old a shard's oldest unpublished write may get: its index's refresh interval, or the node's default. */

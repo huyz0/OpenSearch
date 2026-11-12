@@ -21,6 +21,7 @@ import org.opensearch.serverless.shard.ShardReconciler;
 import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.transport.CommitPush;
+import org.opensearch.serverless.transport.TailOverlays;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
@@ -257,6 +258,7 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
                         }, deadline)
                     );
                     final List<Long> acks = new ArrayList<>();
+                    final long writerBytesBefore = writer.router().transportBytesSent();
                     final long started = System.nanoTime();
                     for (int s = 0; s < SAMPLES; s++) {
                         final Sample sample = new Sample(
@@ -278,6 +280,7 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
                         watcher.join(TimeUnit.NANOSECONDS.toMillis(Math.max(1, deadline - System.nanoTime())) + 1_000);
                     }
                     final double elapsed = (System.nanoTime() - started) / 1e9;
+                    final long writerBytes = writer.router().transportBytesSent() - writerBytesBefore;
                     final Map<String, List<Long>> byPath = new java.util.TreeMap<>();
                     int missing = 0;
                     for (Sample sample : samples) {
@@ -300,7 +303,8 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
                     line.append(
                         String.format(
                             Locale.ROOT,
-                            "|requests over %.0f s incl. polling: PUT/s=%.1f LIST/s=%.1f GET/s=%.1f",
+                            "|writer sent %.1f KB/s over transport|requests over %.0f s incl. polling: PUT/s=%.1f LIST/s=%.1f GET/s=%.1f",
+                            writerBytes / 1024.0 / elapsed,
                             elapsed,
                             (store.blobWrites() + store.registerWrites()) / elapsed,
                             store.listings() / elapsed,
@@ -327,14 +331,90 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
     public void testWriteToSearchableDelayByPath() throws Exception {
         final String which = System.getProperty("tests.meter.freshness", "");
         assumeTrue("a freshness meter runs only when -Dtests.meter.freshness is set", which.isEmpty() == false);
+        final Settings commitOnly = Settings.builder().put(TailOverlays.ENABLED, false).put(CommitPush.ENABLED, false).build();
         if ("push".equals(which) == false) {
-            measure("defaults (manifest per publish)", Settings.EMPTY);
-            measure("log commits", Settings.builder().put("serverless.wal.node_log.commits", true).build());
+            measure("commit only (no push, no overlay)", commitOnly);
+            measure("commit push, no overlay", Settings.builder().put(commitOnly).put(CommitPush.ENABLED, true).build());
         }
-        measure("commit push", Settings.builder().put(CommitPush.ENABLED, true).build());
+        measure("overlay + commit push", Settings.builder().put(TailOverlays.ENABLED, true).put(CommitPush.ENABLED, true).build());
         measure(
-            "commit push + log commits",
-            Settings.builder().put(CommitPush.ENABLED, true).put("serverless.wal.node_log.commits", true).build()
+            "overlay + commit push + log commits",
+            Settings.builder()
+                .put(TailOverlays.ENABLED, true)
+                .put(CommitPush.ENABLED, true)
+                .put("serverless.wal.node_log.commits", true)
+                .build()
         );
+    }
+
+    /**
+     * What the longer publish age saves on busy shards: {@value #BUSY_SHARDS} shards each written {@value #BUSY_RATE}
+     * times a second for {@value #BUSY_SECONDS} seconds, with schedulers as a bootstrapped node runs them, counting PUTs
+     * per acknowledged write with overlays off (publish after a second) and on (publish after ten).
+     */
+    public void testPublishPutsOnBusyShards() throws Exception {
+        assumeTrue(
+            "a freshness meter runs only when -Dtests.meter.freshness is set",
+            System.getProperty("tests.meter.freshness", "").isEmpty() == false
+        );
+        busy("overlay off", Settings.builder().put(TailOverlays.ENABLED, false).build());
+        busy("overlay on", Settings.builder().put(TailOverlays.ENABLED, true).build());
+    }
+
+    private static final int BUSY_SHARDS = 8;
+    private static final int BUSY_RATE = 4;
+    private static final int BUSY_SECONDS = 30;
+
+    private void busy(String label, Settings extra) throws Exception {
+        try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
+            final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), System::currentTimeMillis, TTL);
+            for (int i = 0; i < BUSY_SHARDS; i++) {
+                final String name = String.format(Locale.ROOT, "busy-%02d", i);
+                plane.createIndex(new IndexDescriptor(name, "uuid-" + name, 1, MAPPING, null));
+            }
+            try (ServerlessNode writer = joined(new ServerlessNode(nodeSettings("busy-writer", "ingest", extra)), plane)) {
+                final BackgroundReconciler loop = new BackgroundReconciler(writer, plane).setMaxShardsHeld(4 * BUSY_SHARDS);
+                for (int i = 0; i < BUSY_SHARDS; i++) {
+                    loop.want(String.format(Locale.ROOT, "busy-%02d", i), 0);
+                }
+                loop.tick(System.currentTimeMillis());
+                final List<ShardId> held = new ArrayList<>(writer.reconciler().openShards());
+                for (ShardId shardId : held) {
+                    writer.writes().index(shardId, "seed", "{\"msg\":\"seed\",\"n\":0}");
+                }
+                loop.publishAll();
+                final ReconcileScheduler scheduler = scheduled(writer, plane, loop);
+                try {
+                    store.reset();
+                    long writes = 0;
+                    final long started = System.nanoTime();
+                    for (int tick = 0; tick < BUSY_SECONDS * BUSY_RATE; tick++) {
+                        for (ShardId shardId : held) {
+                            writer.writes().index(shardId, "d" + tick, "{\"msg\":\"busy\",\"n\":" + tick + "}");
+                            writes++;
+                        }
+                        final long next = started + TimeUnit.MILLISECONDS.toNanos((tick + 1) * 1000L / BUSY_RATE);
+                        final long wait = next - System.nanoTime();
+                        if (wait > 0) {
+                            TimeUnit.NANOSECONDS.sleep(wait);
+                        }
+                    }
+                    final long puts = store.blobWrites() + store.registerWrites();
+                    logger.info(
+                        "FRESHMETER|busy shards, {}|{} shards x {} writes/s x {} s|{} writes, {} PUT ({} per write), {} LIST",
+                        label,
+                        BUSY_SHARDS,
+                        BUSY_RATE,
+                        BUSY_SECONDS,
+                        writes,
+                        puts,
+                        String.format(Locale.ROOT, "%.3f", puts / (double) writes),
+                        store.listings()
+                    );
+                } finally {
+                    scheduler.close();
+                }
+            }
+        }
     }
 }

@@ -91,6 +91,9 @@ public final class SegmentPlacement {
         node.clusterSegmentPlacement = written.get(CLUSTER_SETTING);
         node.clusterBucketPolicy = written.get(org.opensearch.serverless.bucket.BucketPolicy.CLUSTER_SETTING);
         LogCommitCheckpoint.applyCluster(node, written);
+        if (node.router() != null) {
+            node.router().tailOverlays().applyCluster(written);
+        }
         node.clusterSegmentPlacementReadAtNanos = System.nanoTime();
         node.clusterSegmentPlacementRead = true;
     }
