@@ -219,6 +219,9 @@ public class SegmentPlacementSwitchTests extends OpenSearchTestCase {
                 final BlobContainer packs = plane.blobStore().blobContainer(plane.basePath().add(NodePackStore.ROOT).add(firstId));
                 for (Map.Entry<String, BlobContainer> epoch : packs.children().entrySet()) {
                     for (String blob : epoch.getValue().listBlobs().keySet()) {
+                        if (blob.startsWith("extra")) {
+                            continue; // Lucene's test file system adds stray files to any directory.
+                        }
                         left.add("@" + firstId + "/" + epoch.getKey() + "/" + blob);
                     }
                 }
