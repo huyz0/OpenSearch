@@ -281,25 +281,6 @@ final class ShardPublishing {
         }
     }
 
-    private final java.util.Set<ShardId> openPublishes = java.util.concurrent.ConcurrentHashMap.newKeySet();
-
-    /**
-     * Publishes what an open replayed, before the shard is served.
-     *
-     * @param shardId the shard
-     * @param term the term it was opened at
-     * @return the manifest published
-     * @throws IOException if publication fails
-     */
-    CommitManifest publishAtOpen(ShardId shardId, long term) throws IOException {
-        openPublishes.add(shardId);
-        try {
-            return publish(shardId, term, false);
-        } finally {
-            openPublishes.remove(shardId);
-        }
-    }
-
     /** Forgets a shard's staged trim once it is no longer held here. */
     void forget(ShardId shardId) {
         stagedTrims.remove(shardId);
