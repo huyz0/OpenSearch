@@ -15,6 +15,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
+import org.opensearch.serverless.rest.DocumentRouting;
 import org.opensearch.serverless.shell.BulkOperation;
 import org.opensearch.serverless.shell.BulkOutcome;
 import org.opensearch.serverless.shell.ServerlessNode;
@@ -22,6 +23,13 @@ import org.opensearch.serverless.shell.WriteHold;
 import org.opensearch.serverless.shell.WriteOutcome;
 import org.opensearch.test.OpenSearchTestCase;
 
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
@@ -81,6 +89,52 @@ public class WriteHoldTests extends OpenSearchTestCase {
             ids.add("bulk:" + batch.size());
             return List.of();
         }
+
+        @Override
+        public void refresh(String source) {
+            ids.add("refresh");
+        }
+    }
+
+    /** Applies what it is handed to another shard on the same node, as a split's halves do. */
+    private static final class ToShard implements WriteHold.Target {
+        final ServerlessNode node;
+        final ShardId to;
+        final List<String> refreshes = new CopyOnWriteArrayList<>();
+
+        ToShard(ServerlessNode node, ShardId to) {
+            this.node = node;
+            this.to = to;
+        }
+
+        @Override
+        public WriteOutcome index(
+            ShardId shardId,
+            String id,
+            String source,
+            long ifSeqNo,
+            long ifPrimaryTerm,
+            boolean requireAbsent,
+            boolean mayGrowMapping
+        ) throws IOException {
+            return node.writes().index(to, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
+        }
+
+        @Override
+        public WriteOutcome delete(ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm) throws IOException {
+            return node.writes().delete(to, id, ifSeqNo, ifPrimaryTerm);
+        }
+
+        @Override
+        public List<BulkOutcome> bulk(ShardId shardId, List<BulkOperation> batch) throws IOException {
+            return node.writes().bulkOperations(to, batch);
+        }
+
+        @Override
+        public void refresh(String source) {
+            refreshes.add(source);
+            node.writes().refresh(to, source);
+        }
     }
 
     private interface Body {
@@ -103,6 +157,102 @@ public class WriteHoldTests extends OpenSearchTestCase {
         } finally {
             writers.shutdownNow();
             assertTrue(writers.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    /**
+     * A write with {@code refresh=true} that a hold forwards lands in the hold's target, so the refresh must happen
+     * there: refreshing the shard the write was addressed to left the acknowledged document invisible to search until
+     * the next scheduled refresh, which is how a split under live writes could count one document short.
+     */
+    public void testARefreshAskedOfAForwardedWriteHappensWhereTheWriteLanded() throws Exception {
+        final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        // No scheduled refresh, so only the refresh the write asks for can make it visible.
+        final IndexDescriptor descriptor = new IndexDescriptor(
+            "beta",
+            "uuid-beta-000000000",
+            2,
+            MAPPING,
+            Settings.builder().put("index.refresh_interval", "-1").build()
+        );
+        plane.createIndex(descriptor);
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("write-hold-refresh"))) {
+            node.startup().start();
+            node.setMetadataPlane(plane);
+            node.leases().renewLease(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("beta", 0);
+            loop.want("beta", 1);
+            loop.tick(clock.get());
+            ShardId held = null;
+            ShardId other = null;
+            for (ShardId open : node.reconciler().openShards()) {
+                if (open.id() == 0) {
+                    held = open;
+                } else {
+                    other = open;
+                }
+            }
+            assertNotNull(held);
+            assertNotNull(other);
+            final IndexDescriptor current = plane.describe("beta").orElseThrow();
+            final List<String> toHeld = new java.util.ArrayList<>();
+            for (int i = 0; toHeld.size() < 3; i++) {
+                if (DocumentRouting.shardFor(current, "doc-" + i) == 0) {
+                    toHeld.add("doc-" + i);
+                }
+            }
+
+            final WriteHold hold = node.fences().hold(held, 60_000L);
+            final ToShard target = new ToShard(node, other);
+            assertTrue(hold.forwardTo(target));
+            try {
+                assertEquals(201, send(node, "PUT", "/beta/_doc/" + toHeld.get(0) + "?refresh=true", DOC).status());
+                assertEquals("a single write refreshes where it landed", 1, hits(node, toHeld.get(0)));
+                final String bulk = "{\"index\":{\"_index\":\"beta\",\"_id\":\"" + toHeld.get(1) + "\"}}\n" + DOC + "\n";
+                final Response bulked = send(node, "POST", "/_bulk?refresh=true", bulk);
+                assertEquals(bulked.body(), 200, bulked.status());
+                assertFalse(bulked.body(), bulked.body().contains("\"errors\":true"));
+                assertEquals("a batch refreshes where it landed", 1, hits(node, toHeld.get(1)));
+                assertEquals(2, target.refreshes.size());
+
+                send(node, "PUT", "/beta/_doc/" + toHeld.get(2), DOC);
+                assertEquals("without refresh=true nothing is refreshed", 0, hits(node, toHeld.get(2)));
+                assertEquals(2, target.refreshes.size());
+            } finally {
+                hold.close();
+            }
+            assertFalse("the forwarded writes are not in the addressed shard", node.reads().get(held, toHeld.get(0)).found());
+            assertTrue(node.reads().get(other, toHeld.get(0)).found());
+        }
+    }
+
+    private record Response(int status, String body) {
+    }
+
+    private static long hits(ServerlessNode node, String id) throws Exception {
+        final Response found = send(node, "GET", "/beta/_search?q=_id:" + id, null);
+        assertEquals(found.body(), 200, found.status());
+        final java.util.regex.Matcher total = java.util.regex.Pattern.compile("\"total\":\\{\"value\":(\\d+)").matcher(found.body());
+        assertTrue(found.body(), total.find());
+        return Long.parseLong(total.group(1));
+    }
+
+    private static Response send(ServerlessNode node, String method, String path, String body) throws Exception {
+        final var address = node.boundHttpAddress().publishAddress();
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
+            final HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create("http://" + address.getAddress() + ":" + address.getPort() + path))
+                .timeout(Duration.ofSeconds(60))
+                .header("Content-Type", "application/json")
+                .method(
+                    method,
+                    body == null ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8)
+                )
+                .build();
+            final HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+            return new Response(response.statusCode(), response.body());
         }
     }
 

@@ -199,6 +199,15 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
         final IndexScopedSettings scoped = IndexScopedSettings.DEFAULT_SCOPED_SETTINGS;
         final TreeSet<String> unknown = new TreeSet<>();
         for (String key : requested.keySet()) {
+            if (org.opensearch.serverless.bucket.BucketPolicy.INDEX_SETTING.equals(key)) {
+                // Ours, and dynamic: it decides where the index lives from its next bucket checkpoint on.
+                try {
+                    org.opensearch.serverless.bucket.BucketPolicy.check(requested.get(key));
+                } catch (IllegalArgumentException e) {
+                    return e.getMessage();
+                }
+                continue;
+            }
             if (org.opensearch.serverless.shell.SegmentPlacement.INDEX_SETTING.equals(key)) {
                 // Ours, and dynamic: it applies to each shard's next publish.
                 try {
