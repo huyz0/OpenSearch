@@ -98,7 +98,7 @@ public final class GetHandler extends BaseRestHandler {
         final org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource = org.opensearch.search.fetch.subphase.FetchSourceContext
             .parseFromRestRequest(request);
         final String storedFields = request.param("stored_fields");
-        final String routing = request.param("routing");
+        final String routing = DocumentRouting.normalize(request.param("routing"));
         final String version = request.param("version");
         final String versionType = request.param("version_type");
         // Hints. A get is served by the shard's owner and sees every acknowledged write, which is what
@@ -122,17 +122,6 @@ public final class GetHandler extends BaseRestHandler {
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_read",
                     "stored_fields is not supported: a get here returns the document's source, filtered by _source"
-                )
-            );
-        }
-        if (routing != null) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_read",
-                    "routing is not supported: a document is placed by its id alone, so a routing value would be "
-                        + "accepted and change nothing"
                 )
             );
         }
@@ -174,8 +163,8 @@ public final class GetHandler extends BaseRestHandler {
                     );
                     return;
                 }
-                final int shard = DocumentRouting.shardFor(descriptor.get(), id);
-                answer(channel, serving, metadata, descriptor.get(), id, shard, bodyless, fetchSource, sourceOnly);
+                final int shard = DocumentRouting.shardFor(descriptor.get(), id, routing);
+                answer(channel, serving, metadata, descriptor.get(), id, routing, shard, bodyless, fetchSource, sourceOnly);
             } catch (Exception e) {
                 try {
                     channel.sendResponse(IndexAdminHandler.failure(channel, e));
@@ -192,6 +181,7 @@ public final class GetHandler extends BaseRestHandler {
         MetadataPlane metadata,
         IndexDescriptor descriptor,
         String id,
+        String routing,
         int shard,
         boolean bodyless,
         org.opensearch.search.fetch.subphase.FetchSourceContext fetchSource,
@@ -202,7 +192,7 @@ public final class GetHandler extends BaseRestHandler {
         // Read once, above, for the shard number; not again for the placement.
         operations.assumeDescribed(descriptor);
         try {
-            final var read = operations.get(index, id);
+            final var read = operations.get(index, id, routing);
             respond(
                 channel,
                 read.shardId() == null ? index : read.shardId().getIndexName(),
@@ -274,6 +264,9 @@ public final class GetHandler extends BaseRestHandler {
                 builder.field("_version", document.version());
                 builder.field("_seq_no", document.seqNo());
                 builder.field("_primary_term", document.primaryTerm());
+                if (document.routing() != null) {
+                    builder.field("_routing", document.routing());
+                }
             }
             // Which copy answered, said plainly rather than left to be inferred. A realtime answer comes
             // from the shard's owner and includes writes that are acknowledged but not yet published; a

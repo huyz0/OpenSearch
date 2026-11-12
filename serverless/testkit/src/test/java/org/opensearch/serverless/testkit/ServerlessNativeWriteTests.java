@@ -141,7 +141,6 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
             own(node, plane, clock);
             final var client = node.services().client();
             for (IndexRequest request : List.of(
-                index("routing", "blocked").routing("custom"),
                 index("version", "blocked").version(7).versionType(org.opensearch.index.VersionType.EXTERNAL),
                 index("pipeline", "blocked").setPipeline("transform"),
                 index("alias", "blocked").setRequireAlias(true),
@@ -153,7 +152,6 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
             final var written = client.index(index("retained", "original")).actionGet();
             assertTrue(written.getSeqNo() >= 0L);
             for (DeleteRequest request : List.of(
-                new DeleteRequest("alpha", "retained").routing("custom"),
                 new DeleteRequest("alpha", "retained").version(7).versionType(org.opensearch.index.VersionType.EXTERNAL),
                 new DeleteRequest("alpha", "retained").waitForActiveShards(2)
             )) {
@@ -309,10 +307,7 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
                         .actionGet()
                         .isExists()
                 );
-                for (var request : List.of(
-                    new org.opensearch.action.get.GetRequest("alpha", "versioned").routing("custom"),
-                    new org.opensearch.action.get.GetRequest("alpha", "versioned").storedFields("msg")
-                )) {
+                for (var request : List.of(new org.opensearch.action.get.GetRequest("alpha", "versioned").storedFields("msg"))) {
                     expectThrows(UnsupportedOperationException.class, () -> via.services().client().get(request).actionGet());
                 }
             }

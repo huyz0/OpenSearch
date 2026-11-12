@@ -72,7 +72,7 @@ public final class UpdateHandler extends BaseRestHandler {
         final String versionType = request.param("version_type");
         final boolean detectNoopParam = request.paramAsBoolean("detect_noop", true);
         final int retryOnConflict = request.paramAsInt("retry_on_conflict", 0);
-        final String routing = request.param("routing");
+        final String routing = DocumentRouting.normalize(request.param("routing"));
         final boolean requireAlias = request.paramAsBoolean("require_alias", false);
         final org.opensearch.search.fetch.subphase.FetchSourceContext wantSource = org.opensearch.search.fetch.subphase.FetchSourceContext
             .parseFromRestRequest(request);
@@ -85,16 +85,6 @@ public final class UpdateHandler extends BaseRestHandler {
         if (metadata == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
-            );
-        }
-        if (routing != null) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_write",
-                    "routing is not supported: a document is placed by its id alone"
-                )
             );
         }
         if (requireAlias) {
@@ -144,7 +134,8 @@ public final class UpdateHandler extends BaseRestHandler {
                 )
             );
         }
-        final var parsed = new org.opensearch.action.update.UpdateRequest(index, id).detectNoop(detectNoopParam)
+        final var parsed = new org.opensearch.action.update.UpdateRequest(index, id).routing(routing)
+            .detectNoop(detectNoopParam)
             .retryOnConflict(retryOnConflict)
             .setRefreshPolicy(refreshPolicy)
             .waitForActiveShards(activeShards);

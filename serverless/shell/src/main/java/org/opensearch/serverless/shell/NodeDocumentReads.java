@@ -90,6 +90,9 @@ public final class NodeDocumentReads {
         // The sequence identity comes back with the document, and always did -- ShardGetService reads it
         // out of the same doc-values lookup that finds the source. It was simply dropped here, which is
         // why a caller could never obtain the token it needed to send back as if_seq_no.
-        return new Document(id, true, result.sourceAsString(), result.getSeqNo(), result.getPrimaryTerm(), result.getVersion());
+        final org.opensearch.common.document.DocumentField routing = result.field(org.opensearch.index.mapper.RoutingFieldMapper.NAME);
+        return new Document(id, true, result.sourceAsString(), result.getSeqNo(), result.getPrimaryTerm(), result.getVersion()).withRouting(
+            routing == null ? null : routing.getValue()
+        );
     }
 }

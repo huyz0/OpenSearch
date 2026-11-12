@@ -22,19 +22,11 @@ final class DocumentWriteOutcomes {
     private DocumentWriteOutcomes() {}
 
     static void validateWriteOptions(
-        String routing,
         long version,
         org.opensearch.index.VersionType versionType,
         org.opensearch.action.support.ActiveShardCount activeShards,
         boolean create
     ) {
-        if (routing != null) {
-            throw new WriteRefusal(
-                RestStatus.NOT_IMPLEMENTED,
-                "unsupported_write",
-                "routing is not supported: documents are placed by their id"
-            );
-        }
         if (versionType != org.opensearch.index.VersionType.INTERNAL
             || version != org.opensearch.common.lucene.uid.Versions.MATCH_ANY
                 && (create == false || version != org.opensearch.common.lucene.uid.Versions.MATCH_DELETED)) {

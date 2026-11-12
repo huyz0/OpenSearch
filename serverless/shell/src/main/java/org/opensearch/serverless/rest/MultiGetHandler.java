@@ -71,19 +71,17 @@ public final class MultiGetHandler extends BaseRestHandler {
         final String defaultIndex = request.param("index");
         final FetchSourceContext requestSource = FetchSourceContext.parseFromRestRequest(request);
         final String storedFields = request.param("stored_fields");
-        final String routing = request.param("routing");
+        final String routing = DocumentRouting.normalize(request.param("routing"));
         final String preference = request.param("preference");
         final boolean realtime = request.paramAsBoolean("realtime", true);
         final boolean refresh = request.paramAsBoolean("refresh", false);
-        if (storedFields != null || routing != null) {
+        if (storedFields != null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_read",
-                    storedFields != null
-                        ? "stored_fields is not supported: a get returns source"
-                        : "routing is not supported: documents are placed by id"
+                    "stored_fields is not supported: a get returns source"
                 )
             );
         }
@@ -94,7 +92,7 @@ public final class MultiGetHandler extends BaseRestHandler {
         }
         final MultiGetRequest ask = new MultiGetRequest().preference(preference).realtime(realtime).refresh(refresh);
         try (var parser = request.contentOrSourceParamParser()) {
-            ask.add(defaultIndex, null, requestSource, null, parser, true);
+            ask.add(defaultIndex, null, requestSource, routing, parser, true);
             if (parser.nextToken() != null) {
                 throw new IllegalArgumentException("trailing content after the multi-get request");
             }
@@ -170,9 +168,9 @@ public final class MultiGetHandler extends BaseRestHandler {
                             RestStatus.FORBIDDEN
                         );
                     }
-                    if (item.routing() != null || item.storedFields() != null) {
+                    if (item.storedFields() != null) {
                         throw new OpenSearchStatusException(
-                            "routing and stored_fields are not supported for multi-get items",
+                            "stored_fields is not supported for multi-get items",
                             RestStatus.NOT_IMPLEMENTED
                         );
                     }

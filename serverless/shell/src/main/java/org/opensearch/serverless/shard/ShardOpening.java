@@ -486,7 +486,8 @@ final class ShardOpening {
                         shardId.getIndexName(),
                         record.id(),
                         new org.opensearch.core.common.bytes.BytesArray(record.source()),
-                        org.opensearch.common.xcontent.XContentType.JSON
+                        org.opensearch.common.xcontent.XContentType.JSON,
+                        record.routing()
                     ),
                     org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO,
                     0,
