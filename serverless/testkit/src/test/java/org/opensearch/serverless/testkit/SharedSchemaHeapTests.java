@@ -177,7 +177,7 @@ public class SharedSchemaHeapTests extends OpenSearchTestCase {
         }
     }
 
-    private static String classHistogram(int lines) throws Exception {
+    static String classHistogram(int lines) throws Exception {
         final Object out = ManagementFactory.getPlatformMBeanServer()
             .invoke(
                 new ObjectName("com.sun.management:type=DiagnosticCommand"),
