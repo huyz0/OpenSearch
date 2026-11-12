@@ -18,7 +18,8 @@ import java.io.IOException;
 
 /**
  * A reader that has just opened a shard asking its writer for the acknowledged writes its commit lacks, and to be pushed
- * the shard's next ones.
+ * the shard's next ones; or a reader asking whether it is still pushed to, which renews its grant; or a reader asking
+ * only how far the writer has answered refreshing writes. See {@link TailPush}.
  */
 public final class TailFetchRequest extends TransportRequest {
 
@@ -28,6 +29,13 @@ public final class TailFetchRequest extends TransportRequest {
     private final ShardId shardId;
     private final long afterSeqNo;
     private final String subscriber;
+    private final long subscription;
+
+    /** The {@link #subscription()} of a reader that wants to be pushed to anew, with what is kept past its commit. */
+    public static final long NEW = -1L;
+
+    /** The {@link #subscription()} of a reader that asks only how far refreshing writes have been answered. */
+    public static final long CHECK = -2L;
 
     /**
      * Creates a request.
@@ -37,9 +45,22 @@ public final class TailFetchRequest extends TransportRequest {
      * @param subscriber the asking node, which the writer pushes the shard's next writes to
      */
     public TailFetchRequest(ShardId shardId, long afterSeqNo, String subscriber) {
+        this(shardId, afterSeqNo, subscriber, NEW);
+    }
+
+    /**
+     * Creates a request.
+     *
+     * @param shardId the shard
+     * @param afterSeqNo the commit's local checkpoint: only records above it are wanted
+     * @param subscriber the asking node
+     * @param subscription the subscription the node holds and wants renewed; {@link #NEW} or {@link #CHECK}
+     */
+    public TailFetchRequest(ShardId shardId, long afterSeqNo, String subscriber, long subscription) {
         this.shardId = shardId;
         this.afterSeqNo = afterSeqNo;
         this.subscriber = subscriber;
+        this.subscription = subscription;
     }
 
     /**
@@ -53,6 +74,7 @@ public final class TailFetchRequest extends TransportRequest {
         this.shardId = new ShardId(new Index(in.readString(), in.readString()), in.readVInt());
         this.afterSeqNo = in.readZLong();
         this.subscriber = in.readString();
+        this.subscription = in.readZLong();
     }
 
     @Override
@@ -63,6 +85,12 @@ public final class TailFetchRequest extends TransportRequest {
         out.writeVInt(shardId.id());
         out.writeZLong(afterSeqNo);
         out.writeString(subscriber);
+        out.writeZLong(subscription);
+    }
+
+    /** @return the subscription to renew, {@link #NEW}, or {@link #CHECK} */
+    public long subscription() {
+        return subscription;
     }
 
     /** @return the shard */

@@ -75,7 +75,11 @@ final class SearchShardCalls {
                 // found its commit superseded and released it -- used to be this shard's final answer,
                 // with a peer that could have served it never asked. It is now the first attempt, not
                 // the only one; if nobody else can answer either, its reason is still the one reported.
-                LOG.warn("shard " + shard + " of " + index + " was open here and could not answer; trying elsewhere", e);
+                if (e instanceof org.opensearch.serverless.shell.ShardBehindLogException behind && behind.notCaughtUp()) {
+                    LOG.debug("shard {} of {} here may not hold a refreshed write; trying elsewhere", shard, index);
+                } else {
+                    LOG.warn("shard " + shard + " of " + index + " was open here and could not answer; trying elsewhere", e);
+                }
                 lastFailure = e;
             }
         }

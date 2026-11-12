@@ -115,6 +115,15 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
          * @param shardId the shard
          */
         default void awaitFetch(ShardId shardId) {}
+
+        /**
+         * Hears that the overlay left out a record it was handed for want of room, of a mapping, or of a sequence number,
+         * rather than because what it already holds is newer: it is behind what its writer acknowledged until a newer
+         * commit holds the record.
+         *
+         * @param shardId the shard
+         */
+        default void skipped(ShardId shardId) {}
     }
 
     /** How many documents an overlay holds before it takes no more and waits for the next commit. */
@@ -282,7 +291,11 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
 
         private boolean apply(WalRecord record) throws IOException {
             final long seqNo = record.seqNo();
-            if (record.hasSequenceIdentity() == false || seqNo <= localCheckpoint) {
+            if (seqNo <= localCheckpoint && record.hasSequenceIdentity()) {
+                return false;
+            }
+            if (record.hasSequenceIdentity() == false) {
+                tail.skipped(shardId);
                 return false;
             }
             final Long had = seqById.get(record.id());
@@ -290,6 +303,7 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
                 return false;
             }
             if (had == null && seqById.size() >= MAX_DOCUMENTS) {
+                tail.skipped(shardId);
                 return false;
             }
             final BytesRef uid = Uid.encodeId(record.id());
@@ -306,9 +320,11 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
                     parsed = parser.apply(record);
                 } catch (RuntimeException e) {
                     LOG.debug("could not parse a pushed record of {}; it waits for the commit", shardId, e);
+                    tail.skipped(shardId);
                     return false;
                 }
                 if (parsed == null) {
+                    tail.skipped(shardId);
                     return false;
                 }
                 parsed.updateSeqID(seqNo, record.primaryTerm());
