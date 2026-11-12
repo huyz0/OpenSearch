@@ -25,6 +25,7 @@ public final class WriteOutcome {
     private final long version;
     private final boolean created;
     private final boolean found;
+    private final WriteHold.Target forwardedTo;
 
     /**
      * Creates an outcome.
@@ -36,11 +37,31 @@ public final class WriteOutcome {
      * @param found whether a deletion found anything; always true for a write
      */
     public WriteOutcome(long seqNo, long primaryTerm, long version, boolean created, boolean found) {
+        this(seqNo, primaryTerm, version, created, found, null);
+    }
+
+    private WriteOutcome(long seqNo, long primaryTerm, long version, boolean created, boolean found, WriteHold.Target forwardedTo) {
         this.seqNo = seqNo;
         this.primaryTerm = primaryTerm;
         this.version = version;
         this.created = created;
         this.found = found;
+        this.forwardedTo = forwardedTo;
+    }
+
+    /** The same outcome, marked as applied by a hold's target rather than by the shard the write was addressed to. */
+    WriteOutcome forwardedBy(WriteHold.Target target) {
+        return new WriteOutcome(seqNo, primaryTerm, version, created, found, target);
+    }
+
+    /**
+     * Returns the hold target that applied the write, when a hold on the addressed shard forwarded it; a refresh the
+     * caller asked for belongs where the target put the document, not on the addressed shard.
+     *
+     * @return the target, or null when the addressed shard applied the write itself
+     */
+    public WriteHold.Target forwardedTo() {
+        return forwardedTo;
     }
 
     /**

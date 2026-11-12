@@ -213,12 +213,10 @@ final class BulkDispatch {
 
         if (local != null) {
             try {
-                record(group, serving.writes().bulkOperations(local, operations), serving.localNode().getId());
+                final List<org.opensearch.serverless.shell.BulkOutcome> outcomes = serving.writes().bulkOperations(local, operations);
+                record(group, outcomes, serving.localNode().getId());
                 if (refresh) {
-                    final var open = serving.reconciler().shard(local);
-                    if (open != null) {
-                        open.refresh("serverless-bulk-refresh");
-                    }
+                    serving.writes().refreshWritten(local, outcomes, "serverless-bulk-refresh");
                 }
             } catch (Exception e) {
                 // A batch that could not be applied here -- the log append failed and the shard was
