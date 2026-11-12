@@ -531,8 +531,7 @@ public final class NodeWritePath {
     public boolean refreshWritten(org.opensearch.core.index.shard.ShardId shardId, WriteOutcome outcome, String source)
         throws java.io.IOException {
         if (outcome.forwardedTo() != null) {
-            outcome.forwardedTo().refresh(source);
-            return true;
+            return outcome.forwardedTo().refresh(source);
         }
         return refresh(shardId, source);
     }
@@ -557,18 +556,26 @@ public final class NodeWritePath {
                 targets.add(outcome.forwardedTo());
             }
         }
+        boolean visible = true;
         for (WriteHold.Target target : targets) {
-            target.refresh(source);
+            visible &= target.refresh(source);
         }
-        return (here == false || refresh(shardId, source));
+        return (here == false || refresh(shardId, source)) && visible;
     }
 
     /**
-     * Refreshes a shard open here.
+     * Refreshes a shard open here, and makes what it acknowledged visible as far as
+     * {@link org.opensearch.serverless.transport.RefreshVisibility} says.
+     *
+     * <p>Searches go to search nodes, not to the writer, so the writer's own refresh is not what a search after the
+     * answer reads. In {@code serving} mode this waits, bounded, until every search node serving the shard has taken
+     * what this node has acknowledged for it; a node opening the shard waits for its fetch's answer before it searches,
+     * so it needs no wait here. Without the tail overlay a search node sees only published commits, and no wait can make
+     * the write visible there, so the answer is false unless no other search node could answer for the shard.
      *
      * @param shardId the shard
      * @param source why, for core's refresh stats
-     * @return false if the shard is not open here
+     * @return false if the shard is not open here, or the write is not visible as far as the mode promises
      */
     public boolean refresh(org.opensearch.core.index.shard.ShardId shardId, String source) {
         final var shard = node.reconciler.shard(shardId);
@@ -576,6 +583,33 @@ public final class NodeWritePath {
             return false;
         }
         shard.refresh(source);
+        if (node.router == null || node.router.refreshVisibility().waitsForSearchNodes() == false) {
+            return true;
+        }
+        if (node.router.tailOverlays().onFor(shardId) == false) {
+            return searchedOnlyHere(shardId);
+        }
+        return node.router.tailPush().awaitSearchNodes(shardId, org.opensearch.serverless.transport.RefreshVisibility.WAIT_MILLIS);
+    }
+
+    /** Whether no search node but this one could answer for the shard, so the writer's own refresh is all there is. */
+    private boolean searchedOnlyHere(org.opensearch.core.index.shard.ShardId shardId) {
+        final var plane = node.metadataPlane;
+        if (plane == null) {
+            return true;
+        }
+        final var others = org.opensearch.serverless.cluster.ReaderPlacement.candidatesFor(
+            shardId.getIndexName(),
+            shardId.id(),
+            plane.membership().current(),
+            ServerlessNode.ROLE_SEARCH,
+            2
+        );
+        for (String candidate : others) {
+            if (candidate.equals(node.localNode().getId()) == false) {
+                return false;
+            }
+        }
         return true;
     }
 

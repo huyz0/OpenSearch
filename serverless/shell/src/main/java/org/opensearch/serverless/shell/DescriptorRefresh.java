@@ -91,6 +91,8 @@ final class DescriptorRefresh {
             // And whether writes are searched before they are published.
             if (node.router() != null) {
                 node.router().tailOverlays().applyCluster(cluster);
+                // And how far a refreshing write is made visible before it is answered.
+                node.router().refreshVisibility().applyCluster(cluster);
             }
             node.clusterSegmentPlacementReadAtNanos = now;
             node.clusterSegmentPlacementRead = true;

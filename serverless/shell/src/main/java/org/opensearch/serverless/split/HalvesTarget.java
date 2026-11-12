@@ -97,9 +97,10 @@ final class HalvesTarget implements WriteHold.Target {
     }
 
     @Override
-    public void refresh(String source) {
+    public boolean refresh(String source) {
         // Both halves: cheaper than tracking which one each forwarded write went to, and a refresh with nothing new is free.
-        writes.refresh(left, source);
-        writes.refresh(right, source);
+        final boolean leftVisible = writes.refresh(left, source);
+        final boolean rightVisible = writes.refresh(right, source);
+        return leftVisible && rightVisible;
     }
 }

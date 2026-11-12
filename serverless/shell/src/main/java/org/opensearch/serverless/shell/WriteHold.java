@@ -84,9 +84,11 @@ public final class WriteHold implements AutoCloseable {
          * refresh: the documents are where the target put them, not in the shard the write was addressed to.
          *
          * @param source why, for core's refresh stats
+         * @return true if the writes are visible as far as {@code refresh} promises; see
+         *     {@link org.opensearch.serverless.transport.RefreshVisibility}
          * @throws IOException if it fails
          */
-        void refresh(String source) throws IOException;
+        boolean refresh(String source) throws IOException;
     }
 
     /** Thrown inside the write path, before anything is applied, to send a write to the hold's target. */
