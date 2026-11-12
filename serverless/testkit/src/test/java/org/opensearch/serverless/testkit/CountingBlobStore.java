@@ -170,6 +170,20 @@ public final class CountingBlobStore implements BlobStore {
     }
 
     /**
+     * Returns register compare-and-swaps on registers of one name, wherever they are.
+     *
+     * @param name the register's name, such as {@code manifest}
+     * @return the count
+     */
+    public long registerWritesMatching(String name) {
+        return places.entrySet()
+            .stream()
+            .filter(e -> e.getKey().startsWith("REGISTER_CAS ") && e.getKey().endsWith("/" + name))
+            .mapToLong(e -> e.getValue().get())
+            .sum();
+    }
+
+    /**
      * Returns ordinary blob reads, ranged or whole.
      *
      * @return the count

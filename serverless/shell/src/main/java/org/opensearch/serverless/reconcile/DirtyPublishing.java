@@ -374,8 +374,15 @@ final class DirtyPublishing {
             if (work == null) {
                 return written;
             }
+            // A bucket's members share one register: their commits are written together, in one swap per bucket.
+            final java.util.Map<String, java.util.List<ShardId>> byBucket = new java.util.LinkedHashMap<>();
             for (ShardId shardId : reconciler.node.reconciler().openShards()) {
                 if (reconciler.node.reconciler().isReader(shardId)) {
+                    continue;
+                }
+                final String bucketId = bucketOf(shardId);
+                if (bucketId != null) {
+                    byBucket.computeIfAbsent(bucketId, k -> new java.util.ArrayList<>()).add(shardId);
                     continue;
                 }
                 try {
@@ -393,8 +400,78 @@ final class DirtyPublishing {
                     BackgroundReconciler.logger.warn("could not write " + shardId + "'s staged commit; its next publish will", e);
                 }
             }
+            for (java.util.Map.Entry<String, java.util.List<ShardId>> bucket : byBucket.entrySet()) {
+                checkpointBucket(bucket.getKey(), bucket.getValue(), written);
+            }
         }
         return written;
+    }
+
+    /** The bucket a shard's commit is recorded in, or null for a shard with a register of its own. */
+    private String bucketOf(ShardId shardId) {
+        try {
+            return reconciler.plane.bucketHeads()
+                .bucketOf(shardId.getIndexName(), shardId.id(), shardId.getIndex().getUUID())
+                .map(org.opensearch.serverless.bucket.BucketHeads.Member::bucketId)
+                .orElse(null);
+        } catch (java.io.IOException e) {
+            // Its own path then: a member's publisher resolves its register itself, so this costs batching, not safety.
+            return null;
+        }
+    }
+
+    /**
+     * Checkpoints a bucket's members, every one with something staged once any is due, in one swap of the bucket's
+     * manifest. Every member's publish lock is held throughout, taken in shard order, so no publish moves a member's
+     * entry between taking its commit and recording the swap.
+     */
+    private void checkpointBucket(String bucketId, java.util.List<ShardId> members, Set<ShardId> written) {
+        final java.util.List<ShardId> sorted = new java.util.ArrayList<>(members);
+        java.util.Collections.sort(sorted);
+        final org.opensearch.serverless.bucket.BucketCommits commits = reconciler.plane.bucketCommits();
+        final org.opensearch.serverless.shard.CheckpointBatch.Swap swap = prepared -> {
+            final java.util.Map<String, org.opensearch.serverless.bucket.BucketCommits.Swap> swaps = new java.util.LinkedHashMap<>();
+            for (var entry : prepared.entrySet()) {
+                swaps.put(
+                    entry.getKey().getIndex().getUUID(),
+                    new org.opensearch.serverless.bucket.BucketCommits.Swap(entry.getValue().expected(), entry.getValue().commit())
+                );
+            }
+            final var results = commits.swapAll(bucketId, swaps);
+            final java.util.Map<ShardId, org.opensearch.common.blobstore.BlobRegisterCasResult> byShard = new java.util.LinkedHashMap<>();
+            for (ShardId shardId : prepared.keySet()) {
+                byShard.put(shardId, results.get(shardId.getIndex().getUUID()));
+            }
+            return byShard;
+        };
+        final org.opensearch.serverless.shard.CheckpointBatch.Outcome outcome = locked(sorted, 0, swap);
+        for (var entry : outcome.written().entrySet()) {
+            reconciler.lastManifests.put(entry.getKey(), entry.getValue());
+            written.add(entry.getKey());
+        }
+        for (var entry : outcome.failed().entrySet()) {
+            if (entry.getValue() instanceof org.opensearch.serverless.store.StaleWriterException) {
+                reconciler.fenced.add(entry.getKey());
+            } else {
+                BackgroundReconciler.logger.warn(
+                    "could not write " + entry.getKey() + "'s staged commit to bucket [" + bucketId + "]; its next checkpoint will",
+                    entry.getValue()
+                );
+            }
+        }
+    }
+
+    private org.opensearch.serverless.shard.CheckpointBatch.Outcome locked(
+        java.util.List<ShardId> sorted,
+        int from,
+        org.opensearch.serverless.shard.CheckpointBatch.Swap swap
+    ) {
+        if (from == sorted.size()) {
+            return reconciler.node.reconciler().checkpointTogether(sorted, swap);
+        }
+        synchronized (reconciler.publishLock(sorted.get(from))) {
+            return locked(sorted, from + 1, swap);
+        }
     }
 
     /**

@@ -52,6 +52,14 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
             .put("serverless.wal.node_log.commits", logCommits)
             .put("serverless.segments.node_pack.enabled", packs)
             .put("serverless.buckets.enabled", buckets)
+            // Staged commits age by the real clock, and the meter's minutes pass in about a second of it: a one-second
+            // checkpoint age, waited out once per simulated minute, checkpoints as a minute's age does in service.
+            .put(org.opensearch.serverless.shell.ServerlessBootstrap.NODE_LOG_PUBLISH_MAX_AGE, 0L)
+            .put(org.opensearch.serverless.shell.ServerlessBootstrap.PUBLISH_MIN_INTERVAL, 0L)
+            .put(
+                org.opensearch.serverless.shell.LogCommitCheckpoint.SETTING,
+                org.opensearch.serverless.store.CommitStaging.MIN_STAGED_MILLIS
+            )
             .build();
     }
 
@@ -67,14 +75,32 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
         return String.format(Locale.ROOT, "PUT=%.2f LIST=%.2f GET=%.2f", puts, lists, gets);
     }
 
+    /** Conditional writes of commit registers per index since the last reset: shards' own and buckets'. */
+    private static String manifestSwaps(CountingBlobStore store, int indices) {
+        return String.format(Locale.ROOT, " (commit register CAS=%.2f)", store.registerWritesMatching("manifest") / (double) indices);
+    }
+
     private void meter(boolean packs, boolean logCommits, boolean buckets, int indices) throws Exception {
         final String mode = (packs ? "node_pack" : "segment_blob") + (logCommits ? " + log commits" : "") + (buckets ? " + buckets" : "");
         final AtomicLong clock = new AtomicLong(1_000_000L);
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
+            final java.util.Map<String, org.opensearch.serverless.bucket.BucketManifest> manifests = new java.util.TreeMap<>();
             for (int i = 0; i < indices; i++) {
                 final IndexDescriptor descriptor = new IndexDescriptor(name(i), "uuid-" + name(i), 1, MAPPING, null);
-                plane.createIndex(buckets ? descriptor.withBucket(String.format(Locale.ROOT, "b-%04d", i / 256)) : descriptor);
+                final String bucketId = String.format(Locale.ROOT, "b-%04d", i / 256);
+                if (buckets) {
+                    manifests.merge(
+                        bucketId,
+                        org.opensearch.serverless.bucket.BucketManifest.empty(bucketId)
+                            .withMember(descriptor.uuid(), new org.opensearch.serverless.bucket.BucketManifest.Member(name(i), null)),
+                        (a, b) -> a.withMember(descriptor.uuid(), b.member(descriptor.uuid()).orElseThrow())
+                    );
+                }
+                plane.createIndex(buckets ? descriptor.withBucket(bucketId) : descriptor);
+            }
+            for (org.opensearch.serverless.bucket.BucketManifest manifest : manifests.values()) {
+                plane.buckets().swap(manifest, org.opensearch.common.blobstore.BlobRegister.ABSENT_GENERATION).orElseThrow();
             }
             try (
                 ServerlessNode writer = new ServerlessNode(nodeSettings("small-writer", "ingest", packs, logCommits, buckets));
@@ -112,6 +138,31 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
                 loop.publishAll();
                 loop.checkpointDue();
                 out.append("|one write + publish: ").append(perIndex(store, indices));
+
+                // An hour of steady writes: a tenth of the indices written each minute, published as a routine publish
+                // is, which stages the commit, and checkpointed as it comes due.
+                store.reset();
+                store.traceCallers(6);
+                loop.setIdleAfterMillis(2 * HOUR);
+                final java.util.Random random = new java.util.Random(42);
+                for (int minute = 0; minute < 60; minute++) {
+                    for (int n = 0; n < Math.max(1, held.size() / 10); n++) {
+                        writer.writes().index(held.get(random.nextInt(held.size())), "m" + minute, "{\"msg\":\"small\"}");
+                    }
+                    loop.publishAll();
+                    final long publishedAt = System.nanoTime();
+                    for (int tick = 0; tick < 6; tick++) {
+                        clock.addAndGet(TICK);
+                        loop.tick(clock.get());
+                    }
+                    assertBusy(() -> assertTrue(System.nanoTime() - publishedAt > 1_100_000_000L));
+                    loop.checkpointDue();
+                }
+                loop.setIdleAfterMillis(IDLE_AFTER);
+                if (org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.meter.small.trace", "false"))) {
+                    logger.info("SMALL-STEADY|{}", store.byCaller());
+                }
+                out.append("|10% written per minute, 1 h: ").append(perIndex(store, indices)).append(manifestSwaps(store, indices));
 
                 store.reset();
                 store.traceCallers(5);

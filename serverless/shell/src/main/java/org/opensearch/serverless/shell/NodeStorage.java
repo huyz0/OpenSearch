@@ -236,13 +236,17 @@ final class NodeStorage {
                 frozenCommit
             );
         }
+        // Through the plane, not a publisher of its own over the path: a bucket member's commit is its entry in the
+        // bucket's manifest, and the shard's own register is never written.
+        final String storageUuid = ServerlessNode.storageUuidOf(indexSettings);
         return org.opensearch.serverless.store.BlockCacheDirectory.create(
             local,
             plane.blobStore(),
             shardBase,
             node.blockCache,
             // The uuid, not the name: a recreated index reuses its name and none of its bytes.
-            ServerlessNode.storageUuidOf(indexSettings) + "#" + shardNumber
+            storageUuid + "#" + shardNumber,
+            plane.segmentPublisher(indexName, storageUuid, shardNumber).readManifest().orElse(null)
         );
     }
 }
