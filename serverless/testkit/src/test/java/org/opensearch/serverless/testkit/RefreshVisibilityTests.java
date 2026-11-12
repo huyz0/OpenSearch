@@ -114,7 +114,7 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
     }
 
     public void testARefreshingWriteIsFoundOnTheSearchNodeServingTheShard() throws Exception {
-        withNodes(null, Settings.EMPTY, (plane, writer, reader, join) -> {
+        withNodes(RefreshVisibility.Mode.SERVING.settingValue(), Settings.EMPTY, (plane, writer, reader, join) -> {
             for (String refresh : new String[] { "true", "wait_for" }) {
                 final String id = "direct-" + refresh;
                 final Response put = send(writer, "PUT", "/" + INDEX + "/_doc/" + id + "?refresh=" + refresh, doc(id));
@@ -132,7 +132,7 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
     }
 
     public void testARefreshingBatchIsFoundOnTheSearchNodeServingTheShard() throws Exception {
-        withNodes(null, Settings.EMPTY, (plane, writer, reader, join) -> {
+        withNodes(RefreshVisibility.Mode.SERVING.settingValue(), Settings.EMPTY, (plane, writer, reader, join) -> {
             for (String refresh : new String[] { "true", "wait_for" }) {
                 for (ServerlessNode via : new ServerlessNode[] { writer, reader }) {
                     final String prefix = "bulk-" + refresh + "-" + via.localNode().getName();
@@ -149,7 +149,7 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
     }
 
     public void testASearchNodeOpeningTheShardAfterTheWriteFindsIt() throws Exception {
-        withNodes(null, Settings.EMPTY, (plane, writer, reader, join) -> {
+        withNodes(RefreshVisibility.Mode.SERVING.settingValue(), Settings.EMPTY, (plane, writer, reader, join) -> {
             for (String refresh : new String[] { "true", "wait_for" }) {
                 final String id = "late-" + refresh;
                 assertEquals(201, send(writer, "PUT", "/" + INDEX + "/_doc/" + id + "?refresh=" + refresh, doc(id)).status());
@@ -172,7 +172,7 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
     }
 
     public void testANodeThePushDoesNotReachIsNotClaimedRefreshed() throws Exception {
-        withNodes(null, Settings.EMPTY, (plane, writer, reader, join) -> {
+        withNodes(RefreshVisibility.Mode.SERVING.settingValue(), Settings.EMPTY, (plane, writer, reader, join) -> {
             final String lost = reader.localNode().getId();
             writer.router().injectSendFault((action, target) -> TailPushRequest.ACTION.equals(action) && lost.equals(target) ? -1L : 0L);
             final Response put = send(writer, "PUT", "/" + INDEX + "/_doc/dropped?refresh=true", doc("dropped"));
@@ -183,11 +183,15 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
     }
 
     public void testWithoutTheOverlayARefreshIsNotClaimedOnSearchNodes() throws Exception {
-        withNodes(null, Settings.builder().put(TailOverlays.INDEX_SETTING, "false").build(), (plane, writer, reader, join) -> {
-            final Response put = send(writer, "PUT", "/" + INDEX + "/_doc/commit-only?refresh=true", doc("commit-only"));
-            assertEquals(201, put.status());
-            assertFalse("search nodes see only commits: " + put.body(), put.body().contains("\"forced_refresh\":true"));
-        });
+        withNodes(
+            RefreshVisibility.Mode.SERVING.settingValue(),
+            Settings.builder().put(TailOverlays.INDEX_SETTING, "false").build(),
+            (plane, writer, reader, join) -> {
+                final Response put = send(writer, "PUT", "/" + INDEX + "/_doc/commit-only?refresh=true", doc("commit-only"));
+                assertEquals(201, put.status());
+                assertFalse("search nodes see only commits: " + put.body(), put.body().contains("\"forced_refresh\":true"));
+            }
+        );
     }
 
     private static String doc(String id) {

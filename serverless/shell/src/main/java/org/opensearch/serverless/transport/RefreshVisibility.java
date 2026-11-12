@@ -70,7 +70,7 @@ public final class RefreshVisibility {
     public static final String CLUSTER_SETTING = "serverless.refresh_visibility";
 
     /** The default mode, when neither the cluster nor the node names one. */
-    public static final Mode DEFAULT = Mode.SERVING;
+    public static final Mode DEFAULT = Mode.EVERYWHERE;
 
     /** How long a refreshing write waits for the search nodes serving its shard to take it, at most. */
     public static final long WAIT_MILLIS = 500L;
