@@ -11,7 +11,6 @@ package org.opensearch.serverless.testkit;
 import org.apache.logging.log4j.LogManager;
 import org.opensearch.action.admin.indices.forcemerge.ForceMergeRequest;
 import org.opensearch.common.blobstore.BlobPath;
-import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
@@ -27,8 +26,6 @@ import org.opensearch.serverless.store.NodePackWriter;
 import org.opensearch.serverless.store.SegmentPublisher;
 import org.opensearch.test.OpenSearchTestCase;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
@@ -45,22 +42,23 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.stream.Stream;
 
 /**
  * A soak of each segment placement, with and without log commits: many shards written for minutes against a slow
  * store, with forced merges, and a writer crash and takeover halfway. Off unless {@code -Dtests.soak.seconds} is set, since it
  * runs for minutes; {@code -Dtests.soak.shards} sets the shard count and {@code -Dtests.soak.modes} a comma-separated subset of
- * {@code blob,blob+log,pack,pack+log}.
+ * {@code blob,blob+log,pack,pack+log}. {@link MeterStores} picks the store and the latency: the filesystem with a flat 20 ms by
+ * default, or a live S3-compatible endpoint, with an S3-shaped latency profile or none.
  */
 @com.carrotsearch.randomizedtesting.annotations.TimeoutSuite(millis = 3_600_000) // four soaks of minutes each
 @org.apache.lucene.tests.util.LuceneTestCase.SuppressFileSystems("*") // a thousand shards need more handles than its file system allows
+// On a live endpoint (MeterStores) the S3 client keeps its threads past the test; they are the client's, not leaks.
+@com.carrotsearch.randomizedtesting.annotations.ThreadLeakFilters(filters = {
+    org.opensearch.test.BouncyCastleThreadFilter.class,
+    S3ClientThreads.class })
 public class NodeLogSoakMeterTests extends OpenSearchTestCase {
 
     private static final long TTL = 30_000L;
-    private static final long REQUEST_MILLIS = 20;
-    private static final int TAIL_EVERY = 50;
-    private static final long TAIL_MILLIS = 200;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
     private static final int WRITERS = 16;
     private static final int COLD_SHARDS = 20;
@@ -119,23 +117,16 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
     }
 
     /** Segment data the store holds: node packs, and blobs under any shard's segments. */
-    private static long[] segmentBytesAndBlobs(Path root) throws Exception {
+    private static long[] segmentBytesAndBlobs(org.opensearch.common.blobstore.BlobStore inner) throws Exception {
         final long[] out = new long[2];
-        try (Stream<Path> files = Files.walk(root)) {
-            files.filter(Files::isRegularFile).forEach(file -> {
-                final String rel = root.relativize(file).toString().replace('\\', '/');
-                final String base = file.getFileName().toString();
-                final boolean shardBlob = rel.startsWith("segments/") && base.startsWith(SegmentPublisher.MANIFEST) == false;
-                if (rel.startsWith(NodePackStore.ROOT + "/") || shardBlob) {
-                    try {
-                        out[0] += Files.size(file);
-                        out[1]++;
-                    } catch (Exception e) {
-                        // gone meanwhile
-                    }
-                }
-            });
-        }
+        MeterStores.walk(MeterStores.root(inner), "", (rel, blob) -> {
+            final String base = rel.substring(rel.lastIndexOf('/') + 1);
+            final boolean shardBlob = rel.startsWith("segments/") && base.startsWith(SegmentPublisher.MANIFEST) == false;
+            if (rel.startsWith(NodePackStore.ROOT + "/") || shardBlob) {
+                out[0] += blob.length();
+                out[1]++;
+            }
+        });
         return out;
     }
 
@@ -230,8 +221,8 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
     private void soak(boolean packs, boolean logCommits, int shards, long seconds) throws Exception {
         final String mode = (packs ? "node_pack" : "segment_blob") + (logCommits ? " + log commits" : "");
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        final Path root = createTempDir();
-        final LatencyInjectingBlobStore slow = new LatencyInjectingBlobStore(new FsBlobStore(8192, root, false), 0);
+        final org.opensearch.common.blobstore.BlobStore inner = MeterStores.create(createTempDir(), createTempDir());
+        final LatencyInjectingBlobStore slow = new LatencyInjectingBlobStore(inner, 0);
         final Map<String, ShardId> acked = new ConcurrentHashMap<>();
         try (CountingBlobStore store = new CountingBlobStore(slow)) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
@@ -247,8 +238,7 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                 first.setMetadataPlane(plane);
                 final BackgroundReconciler firstLoop = takeAll(first, plane, clock, shards);
                 final List<ShardId> firstHeld = new ArrayList<>(first.reconciler().openShards());
-                slow.setDelayMillis(REQUEST_MILLIS);
-                slow.setTail(TAIL_EVERY, TAIL_MILLIS);
+                MeterStores.slowDown(slow);
                 final Phase before = run(first, firstLoop, store, firstHeld, seconds / 2, acked, "a", false);
                 final String firstId = first.localNode().getId();
 
@@ -300,9 +290,8 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                     }
                     namedBlobs += blobs.size();
                 }
-                final long[] stored = segmentBytesAndBlobs(root);
-                slow.setDelayMillis(0);
-                slow.setTail(0, 0);
+                final long[] stored = segmentBytesAndBlobs(inner);
+                MeterStores.speedUp(slow);
                 if (packs) {
                     final NodePackCollector collector = new NodePackCollector(
                         new NodePackStore(plane.blobStore(), plane.basePath(), firstId),
@@ -316,11 +305,10 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                         clock.addAndGet(NodePackWriter.COLLECTABLE_AFTER_MILLIS + NodePackCollector.MIN_RECHECK_MILLIS);
                     }
                 }
-                final long[] collected = segmentBytesAndBlobs(root);
+                final long[] collected = segmentBytesAndBlobs(inner);
 
                 // A cold reader opens some shards and runs a first search on each.
-                slow.setDelayMillis(REQUEST_MILLIS);
-                slow.setTail(TAIL_EVERY, TAIL_MILLIS);
+                MeterStores.slowDown(slow);
                 reader.startup().start();
                 reader.setMetadataPlane(plane);
                 reader.leases().renewLease(plane);
@@ -369,8 +357,7 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                     serialKeys
                 );
                 final double coldGets = (store.blobReads() + store.registerReads()) / (double) COLD_SHARDS;
-                slow.setDelayMillis(0);
-                slow.setTail(0, 0);
+                MeterStores.speedUp(slow);
 
                 final List<Long> acks = new ArrayList<>(before.acks());
                 acks.addAll(after.acks());
@@ -379,7 +366,7 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                 final double secondsRun = before.seconds() + after.seconds();
                 final long putsAndLists = before.puts() + before.lists() + after.puts() + after.lists();
                 logger.info(
-                    "SOAK|{}|{} shards, {} s, {} ms per request, 1 in {} at {} ms, {} merge rounds"
+                    "SOAK|{}|{} shards, {} s, {}, {} merge rounds"
                         + "|writes acked={} p50={} ms p99={} ms|shard publishes={} ({}/s)"
                         + "|PUT/s={} LIST/s={} GET/s={} PUT+LIST per shard publish={} GET per shard publish={}"
                         + "|takeover {} s, {} requests per shard, {} sampled writes all found"
@@ -389,9 +376,7 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                     mode,
                     shards,
                     seconds,
-                    REQUEST_MILLIS,
-                    TAIL_EVERY,
-                    TAIL_MILLIS,
+                    MeterStores.describe(),
                     before.merges() + after.merges(),
                     acks.size(),
                     String.format(Locale.ROOT, "%.1f", percentile(acks, 0.50)),

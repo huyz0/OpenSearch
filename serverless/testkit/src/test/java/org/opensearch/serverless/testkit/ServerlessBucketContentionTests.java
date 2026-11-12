@@ -102,13 +102,27 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
     /** Forks a node whose credentials come from a keystore, as a deployed node's would. */
     private NodeProcess bucketNode(String name, String bucket) throws Exception {
         final Path home = createTempDir();
-        NodeProcess.writeKeystore(home, Map.of("s3.client.default.access_key", "minioadmin", "s3.client.default.secret_key", "minioadmin"));
+        NodeProcess.writeKeystore(
+            home,
+            Map.of(
+                "s3.client.default.access_key",
+                org.opensearch.repositories.s3.MinioBlobStores.accessKey(),
+                "s3.client.default.secret_key",
+                org.opensearch.repositories.s3.MinioBlobStores.secretKey()
+            )
+        );
         return NodeProcess.start(name, null, home, bucketSettings(bucket));
     }
 
     private String freshBucket() throws Exception {
         final String bucket = "contend-" + randomAlphaOfLength(12).toLowerCase(Locale.ROOT);
-        org.opensearch.repositories.s3.MinioBlobStores.create(endpoint(), "minioadmin", "minioadmin", bucket, createTempDir());
+        org.opensearch.repositories.s3.MinioBlobStores.create(
+            endpoint(),
+            org.opensearch.repositories.s3.MinioBlobStores.accessKey(),
+            org.opensearch.repositories.s3.MinioBlobStores.secretKey(),
+            bucket,
+            createTempDir()
+        );
         return bucket;
     }
 
@@ -215,7 +229,12 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
                 final Path home = createTempDir();
                 NodeProcess.writeKeystore(
                     home,
-                    Map.of("s3.client.default.access_key", "minioadmin", "s3.client.default.secret_key", "minioadmin")
+                    Map.of(
+                        "s3.client.default.access_key",
+                        org.opensearch.repositories.s3.MinioBlobStores.accessKey(),
+                        "s3.client.default.secret_key",
+                        org.opensearch.repositories.s3.MinioBlobStores.secretKey()
+                    )
                 );
                 final Map<String, String> settings = new java.util.LinkedHashMap<>(bucketSettings(bucket));
                 settings.put(ServerlessBootstrap.MAX_SHARDS, "2");
@@ -291,7 +310,13 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
 
     private MetadataPlane plane(String bucket) throws Exception {
         return new MetadataPlane(
-            org.opensearch.repositories.s3.MinioBlobStores.create(endpoint(), "minioadmin", "minioadmin", bucket, createTempDir()),
+            org.opensearch.repositories.s3.MinioBlobStores.create(
+                endpoint(),
+                org.opensearch.repositories.s3.MinioBlobStores.accessKey(),
+                org.opensearch.repositories.s3.MinioBlobStores.secretKey(),
+                bucket,
+                createTempDir()
+            ),
             BlobPath.cleanPath(),
             System::currentTimeMillis,
             Long.parseLong(TTL)
