@@ -249,9 +249,27 @@ final class ShardOpening {
                         reconciler.nodeLog.replayAfter(shardId, null);
                     }
                 }
-                if (logged != null && publisher.adopt(logged.commit(), fromRegister.get()) == false) {
-                    // Before anything lets go of the predecessor's log, which holds what the register's commit lacks.
-                    throw new IOException("the register of " + shardId + " moved while it opened from a logged commit");
+                if (logged != null) {
+                    // Before anything lets go of the predecessor's log, which holds what the register's commit lacks. An open
+                    // that publishes what it replayed, below, writes the logged commit in that publish's swap rather than in
+                    // one of its own. One with nothing to publish writes it after it serves, in the step that lets go of the
+                    // predecessor's log, so a takeover of many shards spends no swap per shard on its way; one with no such
+                    // step writes it now.
+                    final Long replayedSoFar = reconciler.nodeLogReplayed.get(shardId);
+                    final boolean publishesAtOpen = replayedSoFar != null
+                        && replayedSoFar > 0
+                        && shard.seqNoStats().getMaxSeqNo() > restoredCheckpoint;
+                    final boolean adopted = publishesAtOpen || (armedWriters != null && reconciler.nodeLog != null)
+                        ? publisher.adoptAtNextPublish(logged.commit(), fromRegister.get())
+                        : publisher.adopt(logged.commit(), fromRegister.get());
+                    if (adopted == false) {
+                        throw new IOException("the register of " + shardId + " moved while it opened from a logged commit");
+                    }
+                }
+                if (replayWal && publisher != null) {
+                    // The publishes that follow use this publisher, which remembers the register it read, or what it adopted:
+                    // a fresh one would read the register again before its first swap.
+                    reconciler.publisherCache.put(shardId, publisher);
                 }
                 if (logged != null) {
                     reconciler.loggedCommitOpens.incrementAndGet();
@@ -333,8 +351,13 @@ final class ShardOpening {
                 }
                 final ShardReconciler.NodeLogHooks hooks = reconciler.nodeLog;
                 if (armedWriters != null && hooks != null) {
+                    // The head stops naming the replayed logs only once the register holds what they did: a logged commit
+                    // this open took and has not yet written is written first, unless a publish already has.
+                    final java.util.concurrent.Callable<Boolean> settle = logged == null
+                        ? () -> true
+                        : () -> publisher.adoptionPending() == false || publisher.writeAdopted();
                     try {
-                        hooks.replayedAndPublished(shardId, shardHeadTerm);
+                        hooks.replayedAndPublished(shardId, shardHeadTerm, settle);
                     } catch (IOException | RuntimeException e) {
                         // The head goes on naming logs that hold nothing more of this shard: a successor reads them for
                         // nothing, which costs reads, never records.

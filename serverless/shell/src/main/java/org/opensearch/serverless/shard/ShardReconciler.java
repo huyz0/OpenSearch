@@ -546,9 +546,11 @@ public final class ShardReconciler {
          *
          * @param shardId the shard
          * @param term the term it opened at
+         * @param settle what must hold before the head stops naming them: true once the register holds what the replayed
+         *     logs did; false, or a failure, if it may not
          * @throws IOException if the head cannot be read or written
          */
-        void replayedAndPublished(ShardId shardId, long term) throws IOException;
+        void replayedAndPublished(ShardId shardId, long term, java.util.concurrent.Callable<Boolean> settle) throws IOException;
 
         /**
          * Records in the shard's head that its own write log is quiet: every term of it closed, and whatever it held
