@@ -44,7 +44,9 @@ final class ReconcilePass {
             final Set<ShardId> published = reconciler.lazyPublishMaxAgeMillis > 0
                 ? reconciler.publishing.publishAllDue(nowMillis)
                 : reconciler.publishAll();
-            // After publishing, so a shard released for idleness has just had its chance to flush.
+            // After publishing, so a shard released for idleness has just had its chance to flush. Hibernation first: a writer
+            // it puts to sleep is not open for idle release to give back, which is the point.
+            released.addAll(reconciler.hibernateIdle(nowMillis));
             released.addAll(reconciler.releaseIdle(nowMillis));
             reconciler.trimToCap();
             reconciler.handOffToMemberWithRoom();

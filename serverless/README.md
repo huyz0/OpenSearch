@@ -152,6 +152,22 @@ unpublished record of every shard is, so a successor reads it without a listing.
   notice the new commit (see below). Each publish of a busy shard is five or
   more PUTs: at a one-second interval that is several PUTs a second per busy shard, far more than its log, so an
   index that can wait ten or thirty seconds costs much less.
+- **Acknowledgement.** A write is acknowledged once the blob of its window lands. Against a store at 20 ms a request
+  (1 in 50 at 200 ms) and writes arriving at random, about three quarters of a write's wait is its window: p50 177 ms at
+  100 writes/s, of which 131 ms waiting for the window to close, 25 ms the PUT, 17 ms the incarnation read and ~3 ms
+  the rest (`WriteAckMeterTests`, `-Dtests.ack.seconds=40`). Writers that write again the moment they are answered, as
+  the soak's do, all arrive just after a window lands and wait out a whole one, which is why the soak reports ~300 ms.
+  - `serverless.wal.node_log.hedge_after_millis` (60 by default; 0 turns it off) sends a window's PUT again when it
+    has not answered in that time, or in the 95th percentile of the last 128 PUTs when that is longer, and lands on
+    whichever answers first. A PUT that finds its slot taken reads it back to tell its own other PUT from a fence. It
+    costs about one PUT in a hundred on the meter, and at most one in twenty, and cut p99 from 386 to 350 ms there.
+  - `serverless.wal.node_log.idle_flush` (off by default) paces windows by the last blob instead of by their first
+    record: a write that finds the log quiet for a whole window goes at once. On a quiet node it roughly halves the
+    ack (p50 295 -> 141 ms at 4 writes/s), and a busy one is paced as before, but in between it costs log PUTs: +32%
+    at 4 writes/s, +44% at 10, +3% at 100. A 100 ms window instead gives p50 97 ms at 100 writes/s for 2.3 times the
+    log PUTs. Leave it off on nodes that take writes all day, where it gains little. Turn it on for low-traffic nodes
+    (a few writes a second or fewer) whose clients need a p50 near 150 ms rather than near 250-300 ms, and that can
+    pay roughly a third more log PUTs for it.
 - **Deleting.** A node deletes its own blobs behind the trim point its lease records: the oldest record any of its
   shards has not published. A survivor deletes a dead node's log once every shard it names has published past it.
   Neither lists.
@@ -507,3 +523,33 @@ their previous encoding, but older nodes do not understand the temporary
 preparation and cleanup read only the affected indices and alias, without a
 namespace listing. An abandoned preparation can retain harmless extra reverse
 hints until recovery; reverse lookups verify them against published membership.
+
+## Hibernating idle writers
+
+`serverless.activation.hibernate_after_millis` (off by default, `0`) puts a writer to sleep once it has gone unused
+that long: it publishes what it holds, puts the commit's small files into the block cache from its own copies, closes
+its engine and keeps its head. The next write, search or forwarded write for it reads the head once and, if it still
+names this process at the same term, opens it at that term without a takeover. A head that moved while the writer
+slept is taken the ordinary way. A sleeping writer's head is given back after `serverless.activation.idle_after_millis`,
+as an open one's is. A clean shutdown gives the heads back.
+
+Measured by `WriterHibernationMeterTests` (single-shard indices with a 24-field mapping, a 30 s backstop, a 5 min
+head check, 20 ms store latency):
+
+| | open | asleep | released |
+|---|---|---|---|
+| heap per writer (1,000 writers) | 144 KB | 25 KB | 21 KB |
+| file descriptors per writer | 3 | 0 | 0 |
+| idle store requests per writer-hour | ~12 | ~0 | ~0 |
+| going idle: store requests | | 5 (sleep) | ~4-5 (give back) |
+| first write: open time, store requests | | 230 ms, 8 | 253 ms, 12 |
+
+An open idle writer's only requests are now the periodic head check (one head read per check). Resyncs carry open
+writers over without reading their heads or descriptors again, when that check ran within two of its intervals and
+last saw the head naming this node at the writer's term; this halved what an open idle writer cost an hour. Sleeping and
+waking costs about as much as an hour open (5 + 8 against 12), and less than giving the head back and taking it back
+(about 17), but only for an idle gap that ends before the head is given back at `idle_after_millis`. Beyond that it
+costs the give-back on top. With the 5 minute idle release on by default, a shorter `hibernate_after_millis` only
+covers gaps under 5 minutes, where it adds requests; so hibernation stays off by default. Setting
+`hibernate_after_millis` to 5 minutes and `idle_after_millis` to, say, 30 minutes trades about 4 requests and 20-80 ms
+saved on each 5-30 minute gap for about 4 requests more on each longer one, at released heap and descriptors.

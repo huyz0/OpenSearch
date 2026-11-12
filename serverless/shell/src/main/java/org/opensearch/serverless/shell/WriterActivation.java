@@ -126,14 +126,58 @@ public final class WriterActivation {
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(node.threadPool().generic())
         );
         node.reconciler.setOwnershipCheck((id, term) -> node.leases.ownsAtTerm(plane, id, term));
-        final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(node.localNode.getId(), node.localNode.getEphemeralId());
+        // Writers open here are carried over unread when the periodic head check ran within two of its intervals (it and
+        // resync run on the same cadence, so one interval is often just missed) and the head last seen for each names this
+        // node at the term it is open at. That check reads every held head, notes what it saw and releases a writer whose
+        // head moved, so it is what says whether each is still this node's; the descriptor refresh of open indices keeps
+        // their descriptors current, and the check's index half releases a writer whose index was deleted. Reading both
+        // again here cost each open writer two requests every resync -- most of what an idle open writer cost an hour. A
+        // node that checks heads on every pass (the library default, interval zero) carries nothing over and reads them here.
+        final java.util.Map<String, ShardAssignment> carried = new java.util.LinkedHashMap<>();
+        final java.util.Map<String, IndexDescriptor> carriedDescriptors = new java.util.LinkedHashMap<>();
+        final long carryWithin = node.leases.headVerifyIntervalMillis;
+        for (org.opensearch.core.index.shard.ShardId open : carryWithin <= 0L
+            || node.leases.headsVerifiedWithin(plane, 2 * carryWithin) == false
+                ? java.util.List.<org.opensearch.core.index.shard.ShardId>of()
+                : node.reconciler.openShards()) {
+            if (node.reconciler.isReader(open)) {
+                continue;
+            }
+            final String key = ServerlessNode.shardKey(open.getIndexName(), open.id());
+            final ShardAssignment assignment = node.writerAssignments.get(key);
+            final IndexDescriptor descriptor = node.hosted.get(open.getIndexName());
+            final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> seen = node.sightings()
+                .recentHead(open.getIndexName(), open.id(), Long.MAX_VALUE);
+            if (assignment != null
+                && descriptor != null
+                && descriptor.uuid().equals(open.getIndex().getUUID())
+                && node.leases.namesThisNode(seen, open)
+                && seen.get().term() == assignment.term()) {
+                carried.put(key, assignment);
+                carriedDescriptors.put(open.getIndexName(), descriptor);
+            }
+        }
+        // And a hibernated writer's claim is left unread too: it is woken by the next request for it, and the head is read then.
+        final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(
+            node.localNode.getId(),
+            node.localNode.getEphemeralId(),
+            (indexName, shard) -> node.hibernation.isHibernated(indexName, shard)
+                || carried.containsKey(ServerlessNode.shardKey(indexName, shard))
+        );
+        final java.util.Map<String, IndexDescriptor> descriptors = new java.util.LinkedHashMap<>();
+        for (IndexDescriptor descriptor : truth.descriptors()) {
+            descriptors.put(descriptor.name(), descriptor);
+        }
+        carriedDescriptors.forEach(descriptors::putIfAbsent);
+        final java.util.List<ShardAssignment> assignments = new java.util.ArrayList<>(truth.assignments());
+        assignments.addAll(carried.values());
 
         // A node that does not accept writer activation must not open a writer shard. A search-only
         // node opens reader shards instead -- so this gate is on the role, not on "has any role".
         final java.util.Collection<ShardAssignment> assignable = node.roles.contains(ServerlessNode.ROLE_INGEST)
-            ? truth.assignments()
+            ? assignments
             : java.util.List.of();
-        final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyTruth(truth.descriptors(), assignable);
+        final java.util.Set<org.opensearch.core.index.shard.ShardId> opened = applyTruth(descriptors.values(), assignable);
 
         // Closing here does NOT treat absence from a view as removal, but only because of what the close
         // is keyed on -- and it used to be keyed on the wrong thing. Truth's assignment list is derived
@@ -245,14 +289,18 @@ public final class WriterActivation {
         }
         final long acquiringAt = System.nanoTime();
         node.nodeCapacity().activationPhases[0].addAndGet(acquiringAt - describedAt);
-        final org.opensearch.serverless.metadata.Acquisition acquisition = plane.activate(
-            indexName,
-            shardNumber,
-            node.localNode.getId(),
-            node.localNode.getEphemeralId(),
-            described.get().uuid(),
-            node.nodeLogEnabled
-        );
+        // A writer this node hibernated wakes at the term it was open at, with one head read instead of a takeover.
+        final org.opensearch.serverless.metadata.Acquisition woken = wake(plane, indexName, shardNumber, described.get());
+        final org.opensearch.serverless.metadata.Acquisition acquisition = woken != null
+            ? woken
+            : plane.activate(
+                indexName,
+                shardNumber,
+                node.localNode.getId(),
+                node.localNode.getEphemeralId(),
+                described.get().uuid(),
+                node.nodeLogEnabled
+            );
         node.nodeCapacity().activationPhases[1].addAndGet(System.nanoTime() - acquiringAt);
         if (acquisition.acquired() == false) {
             // The winner's head is the freshest routing fact this node has, and it was paid for: a
@@ -331,5 +379,39 @@ public final class WriterActivation {
         return metadata == null
             ? java.util.Optional.empty()
             : java.util.Optional.of(new org.opensearch.core.index.shard.ShardId(metadata.getIndex(), shardNumber));
+    }
+
+    /**
+     * Wakes a writer this node hibernated, if its head still names this process at the term it hibernated at.
+     *
+     * <p>The head is read, not assumed: a lease that lapsed while the writer slept may have let another node take
+     * it, and the index may have been recreated under the same name. Either way the record is dropped and the
+     * shard is taken the ordinary way, which finds out who holds it.
+     *
+     * @return the head, as if it had just been won; or null to take the shard the ordinary way
+     */
+    private org.opensearch.serverless.metadata.Acquisition wake(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        IndexDescriptor described
+    ) throws java.io.IOException {
+        final WriterHibernation.Hibernated slept = node.hibernation.take(indexName, shardNumber);
+        if (slept == null) {
+            return null;
+        }
+        if (slept.shardId().getIndex().getUUID().equals(described.uuid())) {
+            final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = plane.heads().read(indexName, shardNumber);
+            if (head.isPresent() && head.get().term() == slept.term() && node.leases.namesThisNode(head, slept.shardId())
+            // Live by this node's own lease, which the activation renewed if it was near its end: reading it back would
+            // cost a request to learn what this node already knows.
+                && plane.membership().selfLeaseValidAt(plane.clock().getAsLong())
+                && node.leases().ownershipUnverified == false) {
+                node.hibernation.noteWoken();
+                return org.opensearch.serverless.metadata.Acquisition.won(head.get());
+            }
+        }
+        node.hibernation.noteMissedWake();
+        return null;
     }
 }
