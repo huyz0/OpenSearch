@@ -133,6 +133,8 @@ final class ShardHibernation {
                 }
             }
         }
+        // The commit's small files into the block cache, from this node's own copies, so waking reads them from memory.
+        warm(shard, published);
         final WriterHibernation.Hibernated slept = new WriterHibernation.Hibernated(shardId, term, lastUsed, nowMillis);
         // Recorded before the close: a request that arrives while the engine closes finds the shard hibernated and
         // wakes it, rather than taking over a head this node still holds.
@@ -167,6 +169,27 @@ final class ShardHibernation {
         }
         BackgroundReconciler.logger.debug("hibernated {} at term {}, unused for {}ms", shardId, term, nowMillis - lastUsed);
         return true;
+    }
+
+    /** What a writer going to sleep puts into the block cache at most: an open's metadata, not its postings. */
+    static final long WARM_BYTES = 1L << 20;
+
+    /**
+     * Puts the small files of a writer's published commit into the block cache before it closes. Best effort: a miss
+     * later costs a read from the store, which is what it cost before.
+     */
+    static void warm(org.opensearch.index.shard.IndexShard shard, org.opensearch.serverless.store.CommitManifest published) {
+        if (published == null) {
+            return;
+        }
+        try {
+            final var directory = org.opensearch.serverless.store.BlockCacheDirectory.unwrap(shard.store().directory());
+            if (directory != null) {
+                directory.warmFromLocal(published, WARM_BYTES);
+            }
+        } catch (Exception e) {
+            BackgroundReconciler.logger.debug("could not warm the block cache with " + shard.shardId() + "'s published commit", e);
+        }
     }
 
     /**

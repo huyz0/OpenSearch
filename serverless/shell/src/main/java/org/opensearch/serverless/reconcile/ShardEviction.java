@@ -325,6 +325,8 @@ final class ShardEviction {
                 }
             }
         }
+        // As a writer going to sleep does: the next open of this commit on this node reads its small files from memory.
+        ShardHibernation.warm(shard, reconciler.lastManifests.get(shardId));
         if (reconciler.plane.heads()
             .release(
                 shardId.getIndexName(),
