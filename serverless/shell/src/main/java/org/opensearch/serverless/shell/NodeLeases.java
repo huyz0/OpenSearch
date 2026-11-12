@@ -100,7 +100,7 @@ public final class NodeLeases {
     public static final long DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS = 0L;
 
     volatile long headVerifyIntervalMillis = DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS;
-    volatile long headsVerifiedAtNanos = Long.MIN_VALUE;
+    volatile long headsVerifiedAtMillis = Long.MIN_VALUE;
 
     /**
      * Renews this node's lease and lets go of anything it has lost: {@link #renewLease} then
@@ -288,6 +288,18 @@ public final class NodeLeases {
     }
 
     /**
+     * Whether the periodic head check last read every head within the given time, by the plane's clock.
+     *
+     * @param plane the metadata plane
+     * @param millis how long ago it may have been
+     * @return true if it did, and no lapse since has suspended ownership
+     */
+    boolean headsVerifiedWithin(org.opensearch.serverless.metadata.MetadataPlane plane, long millis) {
+        final long last = headsVerifiedAtMillis;
+        return ownershipUnverified == false && last != Long.MIN_VALUE && plane.clock().getAsLong() - last <= millis;
+    }
+
+    /**
      * Verifies every held head, but only if {@link #DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS} has passed since
      * the last time.
      *
@@ -302,16 +314,18 @@ public final class NodeLeases {
         throws Exception {
         node.ensureStarted();
         node.adopt(plane);
-        final long last = headsVerifiedAtNanos;
+        final long last = headsVerifiedAtMillis;
+        final long now = plane.clock().getAsLong();
         // Due on every pass while acknowledgement is suspended: only a full read of the heads lifts the suspension,
         // and the read right after a lapse fails under exactly the conditions that cause one. Waiting for the interval
         // left a node refusing every write for minutes after a minute of SlowDown had ended.
         final boolean due = ownershipUnverified
             || headVerifyIntervalMillis <= 0L
             || last == Long.MIN_VALUE
-            || System.nanoTime() - last >= java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(headVerifyIntervalMillis);
+            || now - last >= headVerifyIntervalMillis;
         if (due) {
-            headsVerifiedAtNanos = System.nanoTime();
+            // By the plane's clock, which every other interval of the loop is kept on.
+            headsVerifiedAtMillis = now;
         }
         // Not due still runs the pass, minus the per-shard head reads: the index half of it -- releasing a
         // shard whose index was deleted or recreated, and reopening one whose log could not be appended to
