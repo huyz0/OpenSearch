@@ -225,6 +225,20 @@ final class ShardActivation {
      * @throws IOException if a register cannot be read
      */
     public Truth truthFor(String nodeId, String ephemeralId) throws IOException {
+        return truthFor(nodeId, ephemeralId, (indexName, shard) -> false);
+    }
+
+    /**
+     * Reads what one incarnation of a node owns, as {@link #truthFor(String, String)} does, without reading the head
+     * or descriptor of any claim the caller already accounts for.
+     *
+     * @param nodeId the node
+     * @param ephemeralId this incarnation's ephemeral id, or null to inherit by node id alone
+     * @param skip the claims to leave out unread, by index name and shard
+     * @return the descriptors to know about and the shards to serve, less the skipped
+     * @throws IOException if a register cannot be read
+     */
+    public Truth truthFor(String nodeId, String ephemeralId, java.util.function.BiPredicate<String, Integer> skip) throws IOException {
         final Map<String, IndexDescriptor> hosted = new LinkedHashMap<>();
         final List<ShardAssignment> assignments = new ArrayList<>();
 
@@ -244,6 +258,9 @@ final class ShardActivation {
                 continue;
             }
 
+            if (skip.test(indexName, shard)) {
+                continue;
+            }
             // The claim is only a hint. The head decides, so a stale entry costs one read and is then
             // ignored -- which is what makes it safe for the listing to lag reality.
             final Optional<ShardHead> head = heads.read(indexName, shard);

@@ -507,3 +507,25 @@ their previous encoding, but older nodes do not understand the temporary
 preparation and cleanup read only the affected indices and alias, without a
 namespace listing. An abandoned preparation can retain harmless extra reverse
 hints until recovery; reverse lookups verify them against published membership.
+
+## Hibernating idle writers
+
+`serverless.activation.hibernate_after_millis` (off by default, `0`) puts a writer to sleep once it has gone unused
+that long: it publishes what it holds, closes its engine and keeps its head. The next write, search or forwarded write
+for it reads the head once and, if it still names this process at the same term, opens it at that term without a
+takeover. A head that moved while the writer slept is taken the ordinary way. A sleeping writer's head is given back
+after `serverless.activation.idle_after_millis`, as an open one's is. A clean shutdown gives the heads back.
+
+Measured by `WriterHibernationMeterTests` (1,000 single-shard indices with a 24-field mapping, a 30 s backstop, 20 ms
+store latency):
+
+| | open | asleep | released |
+|---|---|---|---|
+| heap per writer | 144 KB | 25 KB | 21 KB |
+| file descriptors per writer | 3 | 0 | 0 |
+| idle store requests per writer-hour | 12 | ~0 | ~0 |
+| first write: open time, store requests | | 293 ms, 12 | 340 ms, 16 |
+
+Putting a writer to sleep costs about 4 requests (a head read, the rollup mark, and a descriptor read), so sleeping
+and waking costs about 14 more requests than staying open. Hibernating sooner than the idle release saves heap, file
+descriptors and idle requests, but costs requests for tenants that write every few minutes.

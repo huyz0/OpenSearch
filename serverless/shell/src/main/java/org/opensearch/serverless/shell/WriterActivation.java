@@ -126,7 +126,12 @@ public final class WriterActivation {
             id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(node.threadPool().generic())
         );
         node.reconciler.setOwnershipCheck((id, term) -> node.leases.ownsAtTerm(plane, id, term));
-        final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(node.localNode.getId(), node.localNode.getEphemeralId());
+        // A hibernated writer's claim is left unread: it is woken by the next request for it, and the head is read then.
+        final org.opensearch.serverless.metadata.Truth truth = plane.truthFor(
+            node.localNode.getId(),
+            node.localNode.getEphemeralId(),
+            node.hibernation::isHibernated
+        );
 
         // A node that does not accept writer activation must not open a writer shard. A search-only
         // node opens reader shards instead -- so this gate is on the role, not on "has any role".
@@ -245,14 +250,18 @@ public final class WriterActivation {
         }
         final long acquiringAt = System.nanoTime();
         node.nodeCapacity().activationPhases[0].addAndGet(acquiringAt - describedAt);
-        final org.opensearch.serverless.metadata.Acquisition acquisition = plane.activate(
-            indexName,
-            shardNumber,
-            node.localNode.getId(),
-            node.localNode.getEphemeralId(),
-            described.get().uuid(),
-            node.nodeLogEnabled
-        );
+        // A writer this node hibernated wakes at the term it was open at, with one head read instead of a takeover.
+        final org.opensearch.serverless.metadata.Acquisition woken = wake(plane, indexName, shardNumber, described.get());
+        final org.opensearch.serverless.metadata.Acquisition acquisition = woken != null
+            ? woken
+            : plane.activate(
+                indexName,
+                shardNumber,
+                node.localNode.getId(),
+                node.localNode.getEphemeralId(),
+                described.get().uuid(),
+                node.nodeLogEnabled
+            );
         node.nodeCapacity().activationPhases[1].addAndGet(System.nanoTime() - acquiringAt);
         if (acquisition.acquired() == false) {
             // The winner's head is the freshest routing fact this node has, and it was paid for: a
@@ -331,5 +340,39 @@ public final class WriterActivation {
         return metadata == null
             ? java.util.Optional.empty()
             : java.util.Optional.of(new org.opensearch.core.index.shard.ShardId(metadata.getIndex(), shardNumber));
+    }
+
+    /**
+     * Wakes a writer this node hibernated, if its head still names this process at the term it hibernated at.
+     *
+     * <p>The head is read, not assumed: a lease that lapsed while the writer slept may have let another node take
+     * it, and the index may have been recreated under the same name. Either way the record is dropped and the
+     * shard is taken the ordinary way, which finds out who holds it.
+     *
+     * @return the head, as if it had just been won; or null to take the shard the ordinary way
+     */
+    private org.opensearch.serverless.metadata.Acquisition wake(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        IndexDescriptor described
+    ) throws java.io.IOException {
+        final WriterHibernation.Hibernated slept = node.hibernation.take(indexName, shardNumber);
+        if (slept == null) {
+            return null;
+        }
+        if (slept.shardId().getIndex().getUUID().equals(described.uuid())) {
+            final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head = plane.heads().read(indexName, shardNumber);
+            if (head.isPresent() && head.get().term() == slept.term() && node.leases.namesThisNode(head, slept.shardId())
+            // Live by this node's own lease, which the activation renewed if it was near its end: reading it back would
+            // cost a request to learn what this node already knows.
+                && plane.membership().selfLeaseValidAt(plane.clock().getAsLong())
+                && node.leases().ownershipUnverified == false) {
+                node.hibernation.noteWoken();
+                return org.opensearch.serverless.metadata.Acquisition.won(head.get());
+            }
+        }
+        node.hibernation.noteMissedWake();
+        return null;
     }
 }

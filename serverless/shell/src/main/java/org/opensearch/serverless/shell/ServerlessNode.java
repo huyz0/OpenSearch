@@ -164,6 +164,7 @@ public final class ServerlessNode implements Closeable {
 
     /** Fences this node's writes. */
     final WriteFences fences = new WriteFences(this);
+    final WriterHibernation hibernation = new WriterHibernation();
 
     /** Grows mappings for this node's writes. */
     final MappingGrowthPath mappings = new MappingGrowthPath(this);
@@ -208,6 +209,15 @@ public final class ServerlessNode implements Closeable {
      */
     public NodeDocumentReads reads() {
         return reads;
+    }
+
+    /**
+     * The writers this node has closed for idleness while keeping their heads.
+     *
+     * @return the WriterHibernation
+     */
+    public WriterHibernation hibernation() {
+        return hibernation;
     }
 
     /**
