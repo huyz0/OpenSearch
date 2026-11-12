@@ -73,6 +73,8 @@ final class LatencyInjectingBlobStore implements BlobStore {
     void setTail(int every, long tailMillis) {
         this.tailNanos = TimeUnit.MILLISECONDS.toNanos(tailMillis);
         this.tailEvery = every;
+        // From the start of the count, so two runs put their slow requests at the same places.
+        requests.set(0);
     }
 
     /** Takes and clears what has been recorded since the last call. */

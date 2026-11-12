@@ -65,6 +65,16 @@ public final class NewestCommits {
         );
     }
 
+    /** Whether the membership snapshot holds an unexpired lease for a node, without reading the store. */
+    private boolean liveInSnapshot(String nodeId) {
+        final MetadataPlane metadata = router.plane.get();
+        if (metadata == null) {
+            return false;
+        }
+        final long now = metadata.clock().getAsLong();
+        return metadata.membership().current().stream().anyMatch(l -> nodeId.equals(l.nodeId()) && l.isExpiredAt(now) == false);
+    }
+
     void handle(NewestCommitRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         router.requireMac(NewestCommitRequest.ACTION, request);
         channel.sendResponse(new NewestCommitResponse(local(request.indexName(), request.indexUuid(), request.shard())));
@@ -107,6 +117,13 @@ public final class NewestCommits {
             if (writer.equals(router.node.localNode().getId())) {
                 newest = local(indexName, indexUuid, shard);
             } else {
+                if (liveInSnapshot(writer) == false) {
+                    // A writer the membership snapshot does not show live is asked nothing. It is most often one that died
+                    // and whose successor has not yet written the register, and finding that out read its lease twice on
+                    // every cold reader open. One that renewed since the snapshot only means this open serves the register,
+                    // which is what any unanswered ask serves.
+                    return register;
+                }
                 final Optional<DiscoveryNode> peer = router.peer(writer, ASK_TIMEOUT);
                 if (peer.isEmpty()) {
                     return register;

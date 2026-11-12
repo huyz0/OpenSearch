@@ -322,7 +322,7 @@ final class ShardOpening {
                     try {
                         // What the commit is certain to hold, read before its flush, as a publish from the loop reads it.
                         final long covered = shard.seqNoStats().getLocalCheckpoint();
-                        reconciler.publish(shardId, shardHeadTerm);
+                        reconciler.publishing.publishAtOpen(shardId, shardHeadTerm);
                         // This is the node's first publish of the shard: recorded, so the loop does not publish the same
                         // operations again under the same term as soon as the take returns.
                         reconciler.publishedThroughAtOpen.put(shardId, covered);

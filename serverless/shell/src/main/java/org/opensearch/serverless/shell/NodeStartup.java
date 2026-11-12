@@ -67,6 +67,18 @@ public final class NodeStartup {
                         org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_MAX_RECORDS
                     )
                 );
+                final long flushAfter = 2 * node.settings.getAsLong(
+                    "serverless.wal.node_log.window_millis",
+                    org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_WINDOW_MILLIS
+                );
+                writer.flushLoggedCommitsWith(
+                    task -> node.threadPool()
+                        .schedule(
+                            task,
+                            org.opensearch.common.unit.TimeValue.timeValueMillis(flushAfter),
+                            org.opensearch.threadpool.ThreadPool.Names.GENERIC
+                        )
+                );
                 node.nodeLogWriter = writer;
             }
             if (node.reconciler != null && node.nodeLogHooked == false) {
