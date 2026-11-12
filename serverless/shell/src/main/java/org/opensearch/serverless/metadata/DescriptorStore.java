@@ -129,7 +129,48 @@ public final class DescriptorStore {
      */
     public long create(IndexDescriptor descriptor) throws IOException {
         Names.validateIndexOrAlias(descriptor.name());
+        // Not recorded in a change stripe: a writer confirms by stripe only an incarnation whose descriptor it has read,
+        // so a new one is read before the stripe vouches for it, and a name created again after a delete was recorded
+        // by that delete.
         return createRegister(descriptor.name(), descriptor.toBytes());
+    }
+
+    /** Where every change to an index descriptor is recorded, for writers that confirm indices by stripe; null for none. */
+    volatile ChangeStripes stripes;
+
+    /**
+     * Records every change to an index descriptor in its change stripe; see {@link ChangeStripes}. Every node of a
+     * cluster must record them for any of its writers to confirm an index by its stripe.
+     *
+     * @param stripes the stripes, or null to record nothing
+     * @return this, for chaining
+     */
+    public DescriptorStore recordChangesIn(ChangeStripes stripes) {
+        this.stripes = stripes;
+        return this;
+    }
+
+    /** Records an applied change. A failure only leaves writers' mapping a little staler; it is logged, not thrown. */
+    private void changed(String name, ChangeStripes.Kind kind) {
+        final ChangeStripes recorded = stripes;
+        if (recorded == null) {
+            return;
+        }
+        try {
+            recorded.bump(name, kind);
+        } catch (IOException | RuntimeException e) {
+            // After a delete, its pending entry stays, and the stripe never confirms the name again: safe, and slower.
+            org.apache.logging.log4j.LogManager.getLogger(DescriptorStore.class)
+                .warn("could not record a change to [" + name + "] in its change stripe", e);
+        }
+    }
+
+    /** Records a delete about to be applied; a failure refuses the delete, since a writer could otherwise go on confirming it. */
+    private void aboutToDelete(String name) throws IOException {
+        final ChangeStripes recorded = stripes;
+        if (recorded != null) {
+            recorded.bump(name, ChangeStripes.Kind.PENDING_DELETE);
+        }
     }
 
     /**
@@ -362,6 +403,7 @@ public final class DescriptorStore {
         );
         if (result.applied()) {
             onChanged.accept(descriptor.name());
+            changed(descriptor.name(), ChangeStripes.Kind.CHANGED);
         }
         return result.applied() ? Optional.of(result.currentGeneration()) : Optional.empty();
     }
@@ -373,7 +415,12 @@ public final class DescriptorStore {
      * @throws IOException if the delete fails
      */
     public void delete(String indexName) throws IOException {
-        container.deleteBlobsIgnoringIfNotExists(List.of(RegisterMap.descriptorBlob(indexName)));
+        aboutToDelete(indexName);
+        try {
+            container.deleteBlobsIgnoringIfNotExists(List.of(RegisterMap.descriptorBlob(indexName)));
+        } finally {
+            changed(indexName, ChangeStripes.Kind.DELETED);
+        }
         onChanged.accept(indexName);
     }
 
@@ -409,6 +456,16 @@ public final class DescriptorStore {
      * @throws IOException if the write fails
      */
     public boolean deleteIfUnchanged(String indexName, long expectedGeneration, long nowMillis) throws IOException {
+        aboutToDelete(indexName);
+        try {
+            return deleteIfUnchangedRecorded(indexName, expectedGeneration, nowMillis);
+        } finally {
+            // Applied or refused, the attempt is over; a crash before this leaves the pending entry, which is safe.
+            changed(indexName, ChangeStripes.Kind.DELETED);
+        }
+    }
+
+    private boolean deleteIfUnchangedRecorded(String indexName, long expectedGeneration, long nowMillis) throws IOException {
         final String blobName = RegisterMap.descriptorBlob(indexName);
         if (conditionalDelete()) {
             // No tombstone and no marker: the store refuses the delete if the register moved, and a

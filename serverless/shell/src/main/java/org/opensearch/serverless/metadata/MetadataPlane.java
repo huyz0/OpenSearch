@@ -58,6 +58,17 @@ public final class MetadataPlane {
     private final org.opensearch.serverless.bucket.BucketStore bucketStore;
     private final SnapshotRecords snapshots;
 
+    private final ChangeStripes changeStripes;
+
+    /**
+     * Returns the registers every descriptor change is recorded in; see {@link ChangeStripes}.
+     *
+     * @return the change stripes
+     */
+    public ChangeStripes changeStripes() {
+        return changeStripes;
+    }
+
     /**
      * Creates a metadata plane over a blob store.
      *
@@ -93,6 +104,8 @@ public final class MetadataPlane {
         // there are eight of those and one forgetting is a stale route.
         this.descriptors.onChanged(this::forgetRouting);
         this.descriptors.probeAt(RegisterMap.probe(base));
+        this.changeStripes = new ChangeStripes(blobStore.blobContainer(base.add("index-changes")));
+        this.descriptors.recordChangesIn(changeStripes);
         this.reclaimQueue = new ReclaimQueue(blobStore, RegisterMap.reclaim(base));
         this.rollups = new DigestRollups(blobStore, RegisterMap.rollups(base));
         final BlobLeaseMembership leases = new BlobLeaseMembership(
