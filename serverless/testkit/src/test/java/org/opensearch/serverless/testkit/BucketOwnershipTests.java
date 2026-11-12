@@ -41,7 +41,7 @@ public class BucketOwnershipTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("logs-a", "uuid-a", 1, MAPPING, null).withBucket("b-1"));
         plane.createIndex(new IndexDescriptor("logs-b", "uuid-b", 1, MAPPING, null).withBucket("b-1"));
         plane.createIndex(new IndexDescriptor("solo", "uuid-solo", 1, MAPPING, null));
-        plane.enableBuckets().register("node-a", () -> openOnA);
+        plane.bucketHeads().register("node-a", () -> openOnA);
         return plane;
     }
 

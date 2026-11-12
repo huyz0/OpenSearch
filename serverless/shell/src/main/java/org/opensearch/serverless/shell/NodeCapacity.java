@@ -348,7 +348,7 @@ public final class NodeCapacity {
         org.opensearch.serverless.metadata.MetadataPlane plane,
         org.opensearch.serverless.cluster.IndexDescriptor descriptor
     ) {
-        if (descriptor.bucket() == null || bucketsOwnedTogether() == false) {
+        if (descriptor.bucket() == null) {
             return handOffTarget(plane);
         }
         final java.util.Optional<String> owner = bucketPlacement.ownerFor(
@@ -358,11 +358,6 @@ public final class NodeCapacity {
             lease -> lease.roles().contains(ServerlessNode.ROLE_INGEST)
         );
         return owner.filter(id -> id.equals(node.localNode.getId()) == false);
-    }
-
-    /** Whether this node owns bucket members through their bucket's head. */
-    boolean bucketsOwnedTogether() {
-        return node.nodeLogEnabled && org.opensearch.serverless.bucket.BucketSettings.enabled(node.settings);
     }
 
     /**

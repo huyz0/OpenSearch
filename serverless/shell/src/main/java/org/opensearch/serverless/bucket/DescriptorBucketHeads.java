@@ -67,6 +67,16 @@ public final class DescriptorBucketHeads implements BucketHeads {
     }
 
     /**
+     * Records an index's bucket from a descriptor a caller has just read, so the head operation that follows costs no
+     * second read.
+     *
+     * @param descriptor the descriptor
+     */
+    public void note(IndexDescriptor descriptor) {
+        known.put(descriptor.name(), new Known(descriptor.uuid(), descriptor.bucket(), clock.getAsLong()));
+    }
+
+    /**
      * Drops what is known of an index's bucket, for an index deleted or moved out of its bucket.
      *
      * @param indexName the index
