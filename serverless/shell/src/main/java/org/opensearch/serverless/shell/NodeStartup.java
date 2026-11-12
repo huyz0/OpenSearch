@@ -80,6 +80,16 @@ public final class NodeStartup {
                         )
                 );
                 writer.runAfterOpensOn(node.threadPool().generic());
+                writer.committer()
+                    .hedgeAppends(
+                        node.settings.getAsLong(
+                            org.opensearch.serverless.store.NodeLogCommitter.HEDGE_AFTER_SETTING,
+                            org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_HEDGE_AFTER_MILLIS
+                        ),
+                        node.threadPool().generic()
+                    );
+                writer.committer()
+                    .flushWhenIdle(node.settings.getAsBoolean(org.opensearch.serverless.store.NodeLogCommitter.IDLE_FLUSH_SETTING, false));
                 node.nodeLogWriter = writer;
             }
             if (node.reconciler != null && node.nodeLogHooked == false) {

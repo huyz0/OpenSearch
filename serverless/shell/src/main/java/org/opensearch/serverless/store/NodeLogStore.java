@@ -116,6 +116,147 @@ public final class NodeLogStore {
         container(epoch).writeBlob(name(ordinal), new ByteArrayInputStream(blob), blob.length, true);
     }
 
+    /** What a hedged append did beyond its first PUT. */
+    public enum HedgeOutcome {
+        /** The first PUT answered within the hedge delay, or failed; no second PUT was sent. */
+        NONE,
+        /** A second PUT was sent, and the first answered first anyway. */
+        SENT,
+        /** A second PUT was sent, and it answered first: the hedge cut the wait. */
+        WON
+    }
+
+    /**
+     * Writes a blob into a slot like {@link #append}, sending the same PUT a second time if the first has not answered
+     * within {@code hedgeAfterNanos}, and returning as soon as either lands.
+     *
+     * <p><b>Why a second identical PUT is safe.</b> Both are create-if-absent of the same bytes at the same name, so at
+     * most one lands, and a fence that takes the slot first makes both fail. What a hedge has to tell apart is a slot
+     * taken by a fence from one taken by its own other PUT, which answers the same way: so when a PUT finds the slot taken
+     * and the other did not answer that it landed, the slot is read back, and holds this blob exactly when one of them
+     * landed it. That read costs one GET, only when a hedge raced itself or a fence.
+     *
+     * <p>A PUT that loses is left to finish on its own; it can only find the slot taken. Nothing waits for it.
+     *
+     * @param epoch the epoch
+     * @param ordinal the slot, which must be the one after the writer's last landed blob
+     * @param blob the encoded blob
+     * @param hedgeAfterNanos how long the first PUT may go unanswered before the second is sent; zero or less never sends one
+     * @param executor where the PUTs run; null sends none and appends on this thread
+     * @return whether a second PUT was sent, and whether it was the one that answered first
+     * @throws FileAlreadyExistsException if the slot is taken by anything but this blob: by a fence, so the epoch is closed
+     * @throws IOException if neither PUT landed, or the outcome is unknown; the writer must not use the epoch again
+     */
+    public HedgeOutcome appendHedged(long epoch, long ordinal, byte[] blob, long hedgeAfterNanos, java.util.concurrent.Executor executor)
+        throws IOException {
+        if (hedgeAfterNanos <= 0 || executor == null) {
+            append(epoch, ordinal, blob);
+            return HedgeOutcome.NONE;
+        }
+        final java.util.concurrent.CompletableFuture<Void> first = put(epoch, ordinal, blob, executor);
+        try {
+            first.get(hedgeAfterNanos, java.util.concurrent.TimeUnit.NANOSECONDS);
+            return HedgeOutcome.NONE;
+        } catch (java.util.concurrent.TimeoutException e) {
+            // Slow: send the same PUT again, below.
+        } catch (java.util.concurrent.ExecutionException e) {
+            if (e.getCause() instanceof FileAlreadyExistsException) {
+                // Only one PUT was sent, so the slot is taken by something else, exactly as a plain append reports.
+                throw (FileAlreadyExistsException) e.getCause();
+            }
+            throw asIOException(e.getCause());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted waiting for a node-log append, whose outcome is unknown", e);
+        }
+        final java.util.concurrent.CompletableFuture<Void> second = put(epoch, ordinal, blob, executor);
+        try {
+            java.util.concurrent.CompletableFuture.anyOf(first, second).get();
+        } catch (java.util.concurrent.ExecutionException e) {
+            // One of them failed; which, and whether the other landed, is judged below.
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted waiting for a node-log append, whose outcome is unknown", e);
+        }
+        if (landed(first)) {
+            return HedgeOutcome.SENT;
+        }
+        if (landed(second)) {
+            return HedgeOutcome.WON;
+        }
+        // The one that answered failed: the other may still land.
+        final java.util.concurrent.CompletableFuture<Void> other = first.isDone() && second.isDone() == false ? second : first;
+        try {
+            other.get();
+            return other == second ? HedgeOutcome.WON : HedgeOutcome.SENT;
+        } catch (java.util.concurrent.ExecutionException e) {
+            // Both failed; judged below.
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted waiting for a node-log append, whose outcome is unknown", e);
+        }
+        final Throwable a = failure(first);
+        final Throwable b = failure(second);
+        if (a instanceof FileAlreadyExistsException || b instanceof FileAlreadyExistsException) {
+            // The slot is taken. By this very blob, when one of the PUTs landed and did not hear so; otherwise by a fence.
+            if (holds(epoch, ordinal, blob)) {
+                return HedgeOutcome.SENT;
+            }
+            throw a instanceof FileAlreadyExistsException ? (FileAlreadyExistsException) a : (FileAlreadyExistsException) b;
+        }
+        throw asIOException(a);
+    }
+
+    private java.util.concurrent.CompletableFuture<Void> put(
+        long epoch,
+        long ordinal,
+        byte[] blob,
+        java.util.concurrent.Executor executor
+    ) {
+        final java.util.concurrent.CompletableFuture<Void> out = new java.util.concurrent.CompletableFuture<>();
+        try {
+            executor.execute(() -> {
+                try {
+                    append(epoch, ordinal, blob);
+                    out.complete(null);
+                } catch (Throwable t) {
+                    out.completeExceptionally(t);
+                }
+            });
+        } catch (RuntimeException e) {
+            out.completeExceptionally(new IOException("could not send a node-log append", e));
+        }
+        return out;
+    }
+
+    private static boolean landed(java.util.concurrent.CompletableFuture<Void> put) {
+        return put.isDone() && put.isCompletedExceptionally() == false;
+    }
+
+    private static Throwable failure(java.util.concurrent.CompletableFuture<Void> put) {
+        try {
+            put.join();
+            return null;
+        } catch (java.util.concurrent.CompletionException e) {
+            return e.getCause();
+        } catch (java.util.concurrent.CancellationException e) {
+            return e;
+        }
+    }
+
+    private static IOException asIOException(Throwable t) {
+        return t instanceof IOException io ? io : new IOException("node-log append failed", t);
+    }
+
+    /** Whether the slot holds exactly these bytes. */
+    private boolean holds(long epoch, long ordinal, byte[] blob) throws IOException {
+        try (InputStream in = container(epoch).readBlob(name(ordinal))) {
+            return java.util.Arrays.equals(in.readAllBytes(), blob);
+        } catch (NoSuchFileException e) {
+            return false;
+        }
+    }
+
     /**
      * Closes an epoch to its writer: puts a fence where the writer must stop, and returns the lowest fence in the epoch.
      *

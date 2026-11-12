@@ -152,6 +152,20 @@ unpublished record of every shard is, so a successor reads it without a listing.
   notice the new commit (see below). Each publish of a busy shard is five or
   more PUTs: at a one-second interval that is several PUTs a second per busy shard, far more than its log, so an
   index that can wait ten or thirty seconds costs much less.
+- **Acknowledgement.** A write is acknowledged once the blob of its window lands. Against a store at 20 ms a request
+  (1 in 50 at 200 ms) and writes arriving at random, about three quarters of a write's wait is its window: p50 177 ms at
+  100 writes/s, of which 131 ms waiting for the window to close, 25 ms the PUT, 17 ms the incarnation read and ~3 ms
+  the rest (`WriteAckMeterTests`, `-Dtests.ack.seconds=40`). Writers that write again the moment they are answered, as
+  the soak's do, all arrive just after a window lands and wait out a whole one, which is why the soak reports ~300 ms.
+  - `serverless.wal.node_log.hedge_after_millis` (60 by default; 0 turns it off) sends a window's PUT again when it
+    has not answered in that time, or in the 95th percentile of the last 128 PUTs when that is longer, and lands on
+    whichever answers first. A PUT that finds its slot taken reads it back to tell its own other PUT from a fence. It
+    costs about one PUT in a hundred on the meter, and at most one in twenty, and cut p99 from 386 to 350 ms there.
+  - `serverless.wal.node_log.idle_flush` (off by default) paces windows by the last blob instead of by their first
+    record: a write that finds the log quiet for a whole window goes at once. On a quiet node it roughly halves the
+    ack (p50 295 -> 141 ms at 4 writes/s), and a busy one is paced as before, but in between it costs log PUTs: +32%
+    at 4 writes/s, +44% at 10, +3% at 100. A 100 ms window instead gives p50 97 ms at 100 writes/s for 2.3 times the
+    log PUTs.
 - **Deleting.** A node deletes its own blobs behind the trim point its lease records: the oldest record any of its
   shards has not published. A survivor deletes a dead node's log once every shard it names has published past it.
   Neither lists.
