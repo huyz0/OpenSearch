@@ -512,8 +512,26 @@ public final class ShardRouter {
      * @return the writer shard, or null when this node holds no such writer
      */
     ShardId writerShard(String index, int shard, String indexUuid) {
-        final ShardId found = localShard(index, shard, indexUuid);
+        ShardId found = localShard(index, shard, indexUuid);
+        if (found == null && node.hibernation().isHibernated(index, shard)) {
+            // Hibernated here: the head names this node, which is why the request came. Woken here and served, rather
+            // than refused so the sender retries against a head that still names this node.
+            found = wakeHibernated(index, shard, indexUuid);
+        }
         return found == null || node.reconciler().isReader(found) ? null : found;
+    }
+
+    /** Wakes a writer hibernated here, waiting as a steered write waits for its activation; null if it did not open. */
+    ShardId wakeHibernated(String index, int shard, String indexUuid) {
+        try {
+            node.signals().activate(index, shard).get(STEERED_ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return null;
+        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
+            return null;
+        }
+        return localShard(index, shard, indexUuid);
     }
 
     /**

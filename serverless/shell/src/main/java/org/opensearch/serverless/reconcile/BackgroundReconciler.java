@@ -174,6 +174,9 @@ public final class BackgroundReconciler implements Closeable {
     /** Zero disables it, which is the library default; {@code ServerlessBootstrap} turns it on. */
     volatile long idleAfterMillis = 0L;
 
+    /** How long a writer may go unused before it hibernates; zero, the library default, never hibernates. See {@link ShardHibernation}. */
+    volatile long hibernateAfterMillis = 0L;
+
     /** When each shard was opened, so one that has never been used is not instantly idle. */
     final java.util.Map<ShardId, Long> openedAt = new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -444,6 +447,19 @@ public final class BackgroundReconciler implements Closeable {
 
     /** The share of its cap a node hands off down to when a member has room. */
     public static final double HAND_OFF_DOWN_TO = 0.8;
+
+    /**
+     * Sets how long a writer may go unused before it hibernates: publishes, closes its engine and keeps its head, so the
+     * next request wakes it at the same term rather than taking it over. Only on a demand-driven node, and only below the
+     * idle threshold, past which the head is given back as before.
+     *
+     * @param hibernateAfterMillis the threshold, or 0 never to hibernate
+     * @return this, for chaining
+     */
+    public BackgroundReconciler setHibernateAfterMillis(long hibernateAfterMillis) {
+        this.hibernateAfterMillis = hibernateAfterMillis;
+        return this;
+    }
 
     /**
      * Sets how long a shard must have gone unused before a full node will evict it to make room.
@@ -953,9 +969,20 @@ public final class BackgroundReconciler implements Closeable {
         return drained;
     }
 
-    /** Publishes and releases every writer shard this node holds, for a clean shutdown. */
+    /** Publishes and releases every writer shard this node holds, and gives back its hibernated writers' heads, for a clean shutdown. */
     public int handOverAll() {
-        return eviction.handOverAll();
+        return eviction.handOverAll() + hibernation.giveBackAll();
+    }
+
+    /**
+     * Hibernates writers unused for the hibernation threshold, and gives back the heads of hibernated writers unused for
+     * the idle threshold.
+     *
+     * @param nowMillis the observer's clock
+     * @return the shards whose heads were given back
+     */
+    public Set<ShardId> hibernateIdle(long nowMillis) {
+        return hibernation.pass(nowMillis);
     }
 
     final java.util.concurrent.ConcurrentHashMap<ShardId, Object> publishLocks = new java.util.concurrent.ConcurrentHashMap<>();
@@ -976,6 +1003,9 @@ public final class BackgroundReconciler implements Closeable {
 
     /** Lets go of this reconciler's shards. */
     final ShardEviction eviction = new ShardEviction(this);
+
+    /** Puts this reconciler's idle writers to sleep, keeping their heads. */
+    final ShardHibernation hibernation = new ShardHibernation(this);
 
     /** Sweeps this reconciler's published files and views. */
     final PublishedSweeps sweeps = new PublishedSweeps(this);
