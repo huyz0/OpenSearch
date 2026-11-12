@@ -238,7 +238,7 @@ final class IndexCreation {
         if (mode == null && declaredShards == 1 && serving.bucketsNewIndex(settings)) {
             assigner = new org.opensearch.serverless.bucket.BucketAssigner(
                 metadata.buckets(),
-                org.opensearch.serverless.bucket.BucketSettings.maxMembers(serving.settings())
+                org.opensearch.serverless.bucket.BucketSettings.limits(serving.settings())
             );
             descriptor = descriptor.withBucket(
                 assigner.join(org.opensearch.serverless.bucket.BucketPolicy.group(index, settings), index, descriptor.uuid())

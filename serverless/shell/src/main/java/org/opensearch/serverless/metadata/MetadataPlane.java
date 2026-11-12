@@ -55,6 +55,7 @@ public final class MetadataPlane {
     private final TemplateStores stores;
     private final ShardDataPaths paths;
     private final org.opensearch.serverless.bucket.BucketCommits bucketCommits;
+    private final org.opensearch.serverless.bucket.BucketStore bucketStore;
     private final SnapshotRecords snapshots;
 
     /**
@@ -124,9 +125,8 @@ public final class MetadataPlane {
         this.activation = new ShardActivation(blobStore, base, heads, descriptors, this);
         this.aliases = new AliasMutations(descriptors, rollups, clock, leaseTtlMillis, this);
         this.stores = new TemplateStores(blobStore, base);
-        this.bucketCommits = new org.opensearch.serverless.bucket.BucketCommits(
-            new org.opensearch.serverless.bucket.BucketStore(blobStore, base)
-        );
+        this.bucketStore = new org.opensearch.serverless.bucket.BucketStore(blobStore, base);
+        this.bucketCommits = new org.opensearch.serverless.bucket.BucketCommits(bucketStore);
         this.paths = new ShardDataPaths(blobStore, base, descriptors, bucketHeads, bucketCommits);
         this.pits = new PointsInTime(pointInTimeStore, descriptors);
         this.snapshots = new SnapshotRecords(snapshotStore, blobStore, base, this);
@@ -838,7 +838,7 @@ public final class MetadataPlane {
      * @return the bucket store
      */
     public org.opensearch.serverless.bucket.BucketStore buckets() {
-        return new org.opensearch.serverless.bucket.BucketStore(blobStore, base);
+        return bucketStore;
     }
 
     /**

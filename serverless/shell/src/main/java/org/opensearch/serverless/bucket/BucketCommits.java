@@ -84,8 +84,8 @@ public final class BucketCommits {
         return new CommitRegister() {
             @Override
             public Optional<BlobRegister> read() throws IOException {
-                final BucketStore.Read read = store.read(bucketId).orElseThrow(() -> notAMember(bucketId, indexUuid));
-                final BucketManifest.Member member = read.manifest().member(indexUuid).orElseThrow(() -> notAMember(bucketId, indexUuid));
+                final BucketManifest.Member member = store.readMember(bucketId, indexUuid)
+                    .orElseThrow(() -> notAMember(bucketId, indexUuid));
                 if (member.commit() == null) {
                     return Optional.empty();
                 }
