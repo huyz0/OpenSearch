@@ -23,6 +23,7 @@ import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.NodePackLedger;
 import org.opensearch.serverless.store.NodePackStore;
 import org.opensearch.serverless.store.NodePackWriter;
+import org.opensearch.serverless.store.SegmentPublisher;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.Files;
@@ -51,6 +52,8 @@ import java.util.stream.Stream;
  * runs for minutes; {@code -Dtests.soak.shards} sets the shard count and {@code -Dtests.soak.modes} a comma-separated subset of
  * {@code blob,blob+log,pack,pack+log}.
  */
+@com.carrotsearch.randomizedtesting.annotations.TimeoutSuite(millis = 3_600_000) // four soaks of minutes each
+@org.apache.lucene.tests.util.LuceneTestCase.SuppressFileSystems("*") // a thousand shards need more handles than its file system allows
 public class NodeLogSoakMeterTests extends OpenSearchTestCase {
 
     private static final long TTL = 30_000L;
@@ -98,7 +101,10 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
         for (int i = 0; i < shards; i++) {
             loop.want(name(i), 0);
         }
-        loop.tick(clock.get());
+        // Activations are paced, so taking a thousand shards takes several passes.
+        for (int pass = 0; pass < 50 && node.reconciler().openShards().size() < shards; pass++) {
+            loop.tick(clock.get());
+        }
         assertEquals(shards, node.reconciler().openShards().size());
         return loop;
     }
@@ -109,7 +115,9 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
         try (Stream<Path> files = Files.walk(root)) {
             files.filter(Files::isRegularFile).forEach(file -> {
                 final String rel = root.relativize(file).toString().replace('\\', '/');
-                if (rel.startsWith(NodePackStore.ROOT + "/") || rel.contains("/segments/")) {
+                final String base = file.getFileName().toString();
+                final boolean shardBlob = rel.startsWith("segments/") && base.startsWith(SegmentPublisher.MANIFEST) == false;
+                if (rel.startsWith(NodePackStore.ROOT + "/") || shardBlob) {
                     try {
                         out[0] += Files.size(file);
                         out[1]++;
