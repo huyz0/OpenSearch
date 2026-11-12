@@ -65,6 +65,7 @@ tasks.named('test').configure {
   exclude '**/ServerlessRealPluginTests.class'
   exclude '**/ServerlessTlsTests.class'
   exclude '**/GcsEmulator*Tests.class'
+  exclude '**/SharedSchemaHeapTests.class'
   exclude '**/Azurite*Tests.class'
 }
 
@@ -239,3 +240,25 @@ tasks.named('processTestResources').configure {
 }
 
 apply from: "${rootDir}/serverless/forbidden-references.gradle"
+
+/*
+ * Heap per open index when many indices share one mapping (SharedSchemaHeapTests). A measurement, not part
+ * of check:
+ *
+ *   ./gradlew :serverless:testkit:schemaHeapTest -Dtests.schema.indices=10000 [-Dtests.schema.mapping=trivial]
+ */
+tasks.register('schemaHeapTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/SharedSchemaHeapTests.class'
+  systemProperty 'tests.security.manager', 'false'
+  maxHeapSize = '10g'
+  systemProperty 'tests.timeoutSuite', '86400000!'
+  systemProperty 'tests.timeout', '86400000!'
+  System.getProperties().each { key, value ->
+    if (key.toString().startsWith('tests.schema.')) {
+      systemProperty key.toString(), value.toString()
+    }
+  }
+  outputs.upToDateWhen { false }
+}
