@@ -102,6 +102,9 @@ public final class NodeLeases {
     volatile long headVerifyIntervalMillis = DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS;
     volatile long headsVerifiedAtMillis = Long.MIN_VALUE;
 
+    /** When a scan last read every held head without a failure, by the plane's clock; what a resync's carry relies on. */
+    volatile long headsReadCleanAtMillis = Long.MIN_VALUE;
+
     /**
      * Renews this node's lease and lets go of anything it has lost: {@link #renewLease} then
      * {@link #verifyHeads}, as one pass.
@@ -287,16 +290,23 @@ public final class NodeLeases {
         }
     }
 
+    /** @return whether acknowledgement is suspended until every held head is read again, after a lapse or a revocation */
+    public boolean ownershipUnverified() {
+        return ownershipUnverified;
+    }
+
     /**
-     * Whether the periodic head check last read every head within the given time, by the plane's clock.
+     * Whether the periodic head check last read every head, with no read failing, within the given time, by the plane's clock.
      *
      * @param plane the metadata plane
      * @param millis how long ago it may have been
      * @return true if it did, and no lapse since has suspended ownership
      */
     boolean headsVerifiedWithin(org.opensearch.serverless.metadata.MetadataPlane plane, long millis) {
-        final long last = headsVerifiedAtMillis;
-        return ownershipUnverified == false && last != Long.MIN_VALUE && plane.clock().getAsLong() - last <= millis;
+        final long last = headsReadCleanAtMillis;
+        final long now = plane.clock().getAsLong();
+        // A clock that stepped back makes the read look younger than it is: not trusted.
+        return ownershipUnverified == false && last != Long.MIN_VALUE && now >= last && now - last <= millis;
     }
 
     /**
@@ -322,7 +332,9 @@ public final class NodeLeases {
         final boolean due = ownershipUnverified
             || headVerifyIntervalMillis <= 0L
             || last == Long.MIN_VALUE
-            || now - last >= headVerifyIntervalMillis;
+            || now - last >= headVerifyIntervalMillis
+            // A wall clock stepped back would otherwise put the next scan off by the size of the step.
+            || now < last;
         if (due) {
             // By the plane's clock, which every other interval of the loop is kept on.
             headsVerifiedAtMillis = now;
@@ -348,6 +360,7 @@ public final class NodeLeases {
         // Taken before any read: a lapse that happens during this pass bumps it, and this pass's reads
         // then predate the renewal and may not lift the suspension.
         final long epoch = lapseEpoch.get();
+        final long startedAtMillis = plane.clock().getAsLong();
 
         // First, shards whose log could not be appended to. Reaching this point means the store answered
         // a lease renewal, so it is time to reopen them from their logs: close, and ask for activation,
@@ -417,6 +430,10 @@ public final class NodeLeases {
         }
         if (failures.isEmpty() == false) {
             throw failures.values().iterator().next();
+        }
+        if (readHeads) {
+            // As of when the reads began: a head read early in a long scan is that old.
+            headsReadCleanAtMillis = startedAtMillis;
         }
         // Only a pass that actually read every head may lift the suspension: that is the whole content of
         // the claim it is making. A pass that skipped the scan has established nothing about ownership.

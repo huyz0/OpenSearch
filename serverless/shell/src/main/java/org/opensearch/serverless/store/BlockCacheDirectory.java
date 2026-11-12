@@ -255,6 +255,10 @@ public final class BlockCacheDirectory extends FilterDirectory {
         }
         candidates.sort(Map.Entry.comparingByValue());
         final int blockSize = cache.blockSize();
+        // Only into room the cache has free: a block put into a full cache pushes out one somebody may be searching,
+        // for a file that is read only if this shard opens again. Free room is the cache's own bound, so no more heap.
+        final long free = (long) cache.maxBlocks() * blockSize - cache.bytesResident();
+        maxBytes = Math.min(maxBytes, free);
         long cached = 0;
         for (Map.Entry<String, Long> candidate : candidates) {
             if (cached + candidate.getValue() > maxBytes) {

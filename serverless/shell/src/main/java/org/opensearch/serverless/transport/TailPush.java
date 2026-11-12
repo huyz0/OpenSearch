@@ -670,6 +670,14 @@ public final class TailPush {
     }
 
     /** Whether this node writes a shard. */
+    private boolean ownershipInDoubt() {
+        final var plane = router.plane.get();
+        if (plane == null) {
+            return false;
+        }
+        return router.node.leases().ownershipUnverified() || plane.membership().selfLeaseValidAt(plane.clock().getAsLong()) == false;
+    }
+
     private boolean writes(ShardId shardId) {
         final var reconciler = router.node.reconciler();
         return reconciler != null && reconciler.shard(shardId) != null && reconciler.isReader(shardId) == false;
@@ -723,8 +731,10 @@ public final class TailPush {
 
     TailFetchResponse answerFetch(TailFetchRequest request) {
         final ShardId shardId = request.shardId();
-        if (writes(shardId) == false) {
-            // Not this node's to say: no grant, and no claim a commit could be compared with.
+        if (writes(shardId) == false || ownershipInDoubt()) {
+            // Not this node's to say: no grant, and no claim a commit could be compared with. Nor while this node's own
+            // lease is past its deadline, or a lapse or a revocation has it re-reading its heads: the shard may have been
+            // taken, and a grant renewed now would have a search node serve on without the new owner's writes.
             return new TailFetchResponse(List.of(), TailFetchResponse.NONE, false, Long.MAX_VALUE);
         }
         if (router.tailOverlays().onFor(shardId) == false
