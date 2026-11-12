@@ -153,19 +153,35 @@ public final class WriteFences {
             node.descriptorRefresh.applyIfNewer(shardId.getIndexName(), routed.get().descriptor(), routed.get().readStartedNanos());
             return;
         }
+        final boolean byStripe = confirmsByStripe();
+        if (byStripe && confirmByStripe(plane, shardId, uuid, window)) {
+            return;
+        }
         synchronized (incarnationLocks[Math.floorMod(uuid.hashCode(), incarnationLocks.length)]) {
             if (confirmedWithin(uuid, window)) {
                 return;
             }
+            // Read before the descriptor, so that a change the stripe does not yet name is one the descriptor read can
+            // still see, or one applied after it, which a later read of the stripe names.
+            final org.opensearch.serverless.metadata.ChangeStripes.Snapshot stripeBefore = byStripe
+                ? stripeBeforeRead(plane, shardId)
+                : null;
             // Stamped with when the read began, never when it returned: the descriptor was live at some
             // instant after this, so this is the earliest the confirmation can honestly claim.
             final long startedAt = System.nanoTime();
             final var descriptor = plane.describe(shardId.getIndexName());
             if (descriptor.isEmpty() || descriptor.get().uuid().equals(uuid) == false) {
                 incarnationConfirmedAtNanos.remove(uuid);
+                stripeMarks.remove(uuid);
                 throw new StaleIncarnationException(shardId);
             }
             incarnationConfirmedAtNanos.put(uuid, startedAt);
+            if (stripeBefore != null && stripeBefore.pending().contains(shardId.getIndexName()) == false) {
+                stripeMarks.put(uuid, new StripeMark(stripeBefore.epoch(), stripeBefore.generation()));
+                if (stripeMarks.size() > 65_536) {
+                    stripeMarks.clear();
+                }
+            }
             // The read is the refresh's read too: apply it, and let the periodic refresh skip this index.
             try {
                 node.descriptorRefresh.applyDescriptor(shardId.getIndexName(), descriptor.get());
@@ -180,6 +196,163 @@ public final class WriteFences {
                 // A confirmation older than the window licenses nothing, so those are all that is dropped.
                 final long now = System.nanoTime();
                 incarnationConfirmedAtNanos.values().removeIf(at -> now - at > window);
+            }
+        }
+    }
+
+    /**
+     * Whether a write may confirm its index's incarnation by the index's change stripe instead of its descriptor, when
+     * the stripe names no change to it since its descriptor was last read here. Node setting {@value #CONFIRM_BY_STRIPE}.
+     *
+     * <p><b>What it saves.</b> A descriptor read per index per fence window, which for an index written less often than
+     * that is a GET on nearly every write, before the engine runs. A stripe is shared by every index hashing to it, and
+     * while writes to it keep arriving it is read in the background about twice a window, so a write finds a stripe read
+     * already in hand and reads nothing. A node writing many indices reads at most {@value
+     * org.opensearch.serverless.metadata.ChangeStripes#STRIPES} stripes twice a window rather than one descriptor per
+     * index.
+     *
+     * <p><b>What it keeps.</b> The fence: a write is acknowledged only after a read that began within the window, of the
+     * stripe or of the descriptor, showed its incarnation live and unchanged; a delete bumps the stripe before it applies
+     * and after it, and answers only after the settle wait. And the freshness: a stripe that names any change to the
+     * index, a mapping or settings update included, sends the write to read the descriptor and apply it, as before.
+     */
+    public static final String CONFIRM_BY_STRIPE = "serverless.write.confirm_incarnation_by_stripe";
+
+    /** Null until first asked, then the node setting unless a caller set it. */
+    private volatile Boolean byStripe;
+
+    /**
+     * Sets whether writes may confirm an incarnation by its change stripe; see {@link #CONFIRM_BY_STRIPE}.
+     *
+     * @param on true to confirm by stripe when it proves the descriptor unchanged
+     */
+    public void setConfirmByStripe(boolean on) {
+        this.byStripe = on;
+    }
+
+    private boolean confirmsByStripe() {
+        Boolean on = byStripe;
+        if (on == null) {
+            on = node.settings == null || node.settings.getAsBoolean(CONFIRM_BY_STRIPE, true);
+            byStripe = on;
+        }
+        return on;
+    }
+
+    /** Where an incarnation's stripe stood when its descriptor was last read live. */
+    private record StripeMark(long epoch, long generation) {
+    }
+
+    /** Per incarnation uuid, the stripe read before its descriptor was last found live. */
+    private final java.util.concurrent.ConcurrentHashMap<String, StripeMark> stripeMarks = new java.util.concurrent.ConcurrentHashMap<>();
+    /** The newest read of each stripe. */
+    private final java.util.concurrent.atomic.AtomicReferenceArray<org.opensearch.serverless.metadata.ChangeStripes.Snapshot> stripeReads =
+        new java.util.concurrent.atomic.AtomicReferenceArray<>(org.opensearch.serverless.metadata.ChangeStripes.STRIPES);
+    /** When each stripe was last asked for by a write, so the background reads only stripes being written. */
+    private final java.util.concurrent.atomic.AtomicLongArray stripeAskedAtNanos = new java.util.concurrent.atomic.AtomicLongArray(
+        org.opensearch.serverless.metadata.ChangeStripes.STRIPES
+    );
+    private final Object[] stripeLocks = newLocks(org.opensearch.serverless.metadata.ChangeStripes.STRIPES);
+    private final java.util.concurrent.atomic.AtomicBoolean stripeRefreshScheduled = new java.util.concurrent.atomic.AtomicBoolean();
+
+    private boolean confirmByStripe(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        org.opensearch.core.index.shard.ShardId shardId,
+        String uuid,
+        long windowNanos
+    ) throws java.io.IOException {
+        final StripeMark mark = stripeMarks.get(uuid);
+        if (mark == null) {
+            return false;
+        }
+        final String name = shardId.getIndexName();
+        final int stripe = org.opensearch.serverless.metadata.ChangeStripes.stripeOf(name);
+        stripeAskedAtNanos.set(stripe, System.nanoTime());
+        scheduleStripeRefresh(plane);
+        org.opensearch.serverless.metadata.ChangeStripes.Snapshot read = stripeReads.get(stripe);
+        if (read == null || System.nanoTime() - read.readStartedNanos() > windowNanos) {
+            synchronized (stripeLocks[stripe]) {
+                read = stripeReads.get(stripe);
+                if (read == null || System.nanoTime() - read.readStartedNanos() > windowNanos) {
+                    read = keepNewest(stripe, plane.changeStripes().read(stripe));
+                }
+            }
+        }
+        if (System.nanoTime() - read.readStartedNanos() > windowNanos
+            || read.unchangedSince(name, mark.epoch(), mark.generation()) == false) {
+            return false;
+        }
+        confirmIncarnation(uuid, read.readStartedNanos());
+        stripeMarks.put(uuid, new StripeMark(read.epoch(), read.generation()));
+        return true;
+    }
+
+    private org.opensearch.serverless.metadata.ChangeStripes.Snapshot stripeBeforeRead(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        org.opensearch.core.index.shard.ShardId shardId
+    ) {
+        final int stripe = org.opensearch.serverless.metadata.ChangeStripes.stripeOf(shardId.getIndexName());
+        // Any read made before the descriptor's will do; an older one only names more changes as newer than it.
+        final org.opensearch.serverless.metadata.ChangeStripes.Snapshot known = stripeReads.get(stripe);
+        if (known != null) {
+            return known;
+        }
+        try {
+            return keepNewest(stripe, plane.changeStripes().read(stripe));
+        } catch (java.io.IOException | RuntimeException e) {
+            // No stripe read: this incarnation is confirmed by its descriptor, as before, until one succeeds.
+            return null;
+        }
+    }
+
+    private org.opensearch.serverless.metadata.ChangeStripes.Snapshot keepNewest(
+        int stripe,
+        org.opensearch.serverless.metadata.ChangeStripes.Snapshot read
+    ) {
+        return stripeReads.accumulateAndGet(
+            stripe,
+            read,
+            (known, fresh) -> known == null || fresh.readStartedNanos() - known.readStartedNanos() > 0 ? fresh : known
+        );
+    }
+
+    /** Reads, about twice a fence window, every stripe a write asked for within the last two windows. */
+    private void scheduleStripeRefresh(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        if (stripeRefreshScheduled.get() || stripeRefreshScheduled.compareAndSet(false, true) == false) {
+            return;
+        }
+        final org.opensearch.threadpool.ThreadPool pool;
+        try {
+            pool = node.threadPool();
+        } catch (RuntimeException e) {
+            return;
+        }
+        if (pool == null) {
+            return;
+        }
+        final long every = Math.max(50L, incarnationFenceMillis * 2 / 5);
+        try {
+            pool.scheduleWithFixedDelay(
+                () -> refreshStripes(plane),
+                org.opensearch.common.unit.TimeValue.timeValueMillis(every),
+                org.opensearch.threadpool.ThreadPool.Names.GENERIC
+            );
+        } catch (RuntimeException e) {
+            // Shutting down: writes read their stripe themselves.
+        }
+    }
+
+    private void refreshStripes(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        final long active = 2 * java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(Math.max(1L, incarnationFenceMillis));
+        for (int stripe = 0; stripe < org.opensearch.serverless.metadata.ChangeStripes.STRIPES; stripe++) {
+            final long asked = stripeAskedAtNanos.get(stripe);
+            if (asked == 0L || System.nanoTime() - asked > active) {
+                continue;
+            }
+            try {
+                keepNewest(stripe, plane.changeStripes().read(stripe));
+            } catch (Exception e) {
+                ServerlessNode.logger.debug("could not read change stripe {}", stripe);
             }
         }
     }

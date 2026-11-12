@@ -212,6 +212,15 @@ unpublished record of every shard is, so a successor reads it without a listing.
     has not answered in that time, or in the 95th percentile of the last 128 PUTs when that is longer, and lands on
     whichever answers first. A PUT that finds its slot taken reads it back to tell its own other PUT from a fence. It
     costs about one PUT in a hundred on the meter, and at most one in twenty, and cut p99 from 386 to 350 ms there.
+  - `serverless.write.confirm_incarnation_by_stripe` (on by default) takes the incarnation read off the ack path.
+    Every descriptor update bumps one of 16 change-stripe registers (`index-changes/stripe-NN`) after it applies,
+    and every delete bumps one before and after; a create bumps none. A writer that has read an index's descriptor
+    confirms it afterwards by the index's stripe, which names every change since; each stripe being written is read
+    in the background about twice a fence window, so a write normally reads nothing. A stripe naming the index, an
+    unfinished delete, or a read older than what the stripe keeps sends the write back to the descriptor read. On
+    the meter: the 17 ms read went to 0.1 ms, p50 173 -> 158 ms, GETs per write 0.75 -> 0.27 (at most about 32 stripe
+    GETs a second per writing node, against one descriptor GET per index written per second). Cost: one PUT per
+    mapping or settings update and two per delete.
   - `serverless.wal.node_log.idle_flush` (off by default) paces windows by the last blob instead of by their first
     record: a write that finds the log quiet for a whole window goes at once. On a quiet node it roughly halves the
     ack (p50 295 -> 141 ms at 4 writes/s), and a busy one is paced as before, but in between it costs log PUTs: +32%
