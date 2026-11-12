@@ -86,9 +86,17 @@ public final class CommitPush {
     private final AtomicLong received = new AtomicLong();
     private final AtomicLong reopened = new AtomicLong();
 
+    private final ReaderRegisterLooks registerLooks;
+
     CommitPush(ShardRouter router) {
         this.router = router;
         this.enabled = router.node.settings().getAsBoolean(ENABLED, true);
+        this.registerLooks = new ReaderRegisterLooks(router.node, router.plane, router.node.settings());
+    }
+
+    /** @return which readers' periodic register looks this node's received pushes make unnecessary */
+    public ReaderRegisterLooks registerLooks() {
+        return registerLooks;
     }
 
     /** Registers the handler that takes pushes. Called once, at startup, after the router's own. */
@@ -167,6 +175,7 @@ public final class CommitPush {
         router.requireMac(CommitPushRequest.ACTION, request);
         channel.sendResponse(TransportResponse.Empty.INSTANCE);
         received.incrementAndGet();
+        registerLooks.pushedFrom(request.commit().writer());
         take(new ShardId(new Index(request.indexName(), request.indexUuid()), request.shard()), request.commit());
     }
 
