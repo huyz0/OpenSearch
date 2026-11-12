@@ -677,6 +677,19 @@ public final class MetadataPlane {
         return activation.truthFor(nodeId, ephemeralId);
     }
 
+    /**
+     * Reads what one incarnation of a node owns, leaving out the claims the caller already accounts for unread.
+     *
+     * @param nodeId the node
+     * @param ephemeralId this incarnation's ephemeral id
+     * @param skip the claims to leave out, by index name and shard
+     * @return the descriptors to know about and the shards to serve
+     * @throws IOException if a register cannot be read
+     */
+    public Truth truthFor(String nodeId, String ephemeralId, java.util.function.BiPredicate<String, Integer> skip) throws IOException {
+        return activation.truthFor(nodeId, ephemeralId, skip);
+    }
+
     /** The registered snapshot repositories; the methods below forward to it. */
     private final RepositoryStore repositories;
 

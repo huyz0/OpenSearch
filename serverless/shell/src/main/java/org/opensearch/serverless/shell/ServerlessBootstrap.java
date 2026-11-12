@@ -74,6 +74,16 @@ public final class ServerlessBootstrap implements Closeable {
     public static final String EVICT_AFTER = "serverless.activation.evict_after_millis";
 
     /**
+     * How long a writer may go unused before it hibernates: it publishes, closes its engine and keeps its head, and the
+     * next request wakes it at the same term with one head read rather than a takeover. Zero never hibernates. Below
+     * {@link #IDLE_AFTER}, which still gives the head back once a writer has been unused that long.
+     */
+    public static final String HIBERNATE_AFTER = "serverless.activation.hibernate_after_millis";
+
+    /** The default for {@link #HIBERNATE_AFTER}: off until it is measured to cost nothing it saves. */
+    public static final long DEFAULT_HIBERNATE_AFTER_MILLIS = 0L;
+
+    /**
      * How many shards a node activates at once; the activation pool is sized from it. An activation spends most of its time
      * waiting on the object store, so a node taking a dead node's shards, or a new node taking its share, is bounded by
      * this times the store's latency rather than by its own work.
@@ -357,6 +367,7 @@ public final class ServerlessBootstrap implements Closeable {
             loop.setDemandDrivenActivation(complete.getAsBoolean(ON_DEMAND, true))
                 .setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD))
                 .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS))
+                .setHibernateAfterMillis(complete.getAsLong(HIBERNATE_AFTER, DEFAULT_HIBERNATE_AFTER_MILLIS))
                 .setEvictAfterMillis(complete.getAsLong(EVICT_AFTER, BackgroundReconciler.DEFAULT_EVICT_AFTER_MILLIS))
                 .setActivationConcurrency(complete.getAsInt(ACTIVATION_CONCURRENCY, BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY))
                 .setActivationTargetMillis(complete.getAsLong(ACTIVATION_TARGET, BackgroundReconciler.DEFAULT_ACTIVATION_TARGET_MILLIS))
