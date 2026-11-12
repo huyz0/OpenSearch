@@ -59,6 +59,25 @@ public final class NodeLogTakeover {
     /** Headers read for one shard, kept for the others in the same blob. */
     private final Map<Long, Map<Long, Header>> headers = new ConcurrentHashMap<>();
 
+    /** The largest body read whole, rather than slice by slice. */
+    static final long MAX_BODY_BYTES = 8L << 20;
+    /** How many bytes of bodies one reader keeps at most. */
+    static final long MAX_KEPT_BYTES = 64L << 20;
+    /** How long bodies are kept from the first one read: a takeover's opens read them within seconds of each other. */
+    static final long KEEP_BODIES_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(60);
+
+    /**
+     * Bodies read whole, per epoch and slot. A takeover of many shards from one node finds most of their records, and
+     * the commits logged for them, in the same few blobs: read slice by slice, that is one read per shard per blob;
+     * read whole, one per blob.
+     */
+    private final Map<BodyKey, java.util.concurrent.CompletableFuture<byte[]>> bodies = new ConcurrentHashMap<>();
+    private final java.util.concurrent.atomic.AtomicLong keptBytes = new java.util.concurrent.atomic.AtomicLong();
+    private volatile long keptSince = Long.MIN_VALUE;
+
+    private record BodyKey(long epoch, long ordinal) {
+    }
+
     /**
      * Creates a reader of one predecessor's log.
      *
@@ -331,8 +350,13 @@ public final class NodeLogTakeover {
                 if (header == null) {
                     continue;
                 }
-                for (Slice slice : header.slicesOf(shard)) {
-                    for (WalRecord record : log.readSlice(epoch, header, slice)) {
+                final List<Slice> slices = header.slicesOf(shard);
+                if (slices.isEmpty()) {
+                    continue;
+                }
+                final byte[] body = header.slices().size() > 1 ? body(epoch, header) : null;
+                for (Slice slice : slices) {
+                    for (WalRecord record : body == null ? log.readSlice(epoch, header, slice) : NodeLogStore.parseSlice(body, slice)) {
                         consumer.accept(record);
                     }
                 }
@@ -371,6 +395,56 @@ public final class NodeLogTakeover {
         final List<WalRecord> out = new ArrayList<>();
         forEachRecord(shard, out::add);
         return out;
+    }
+
+    /** A blob's body read whole and kept for the other shards in it, or null to read it slice by slice. */
+    private byte[] body(long epoch, Header header) throws IOException {
+        final long now = System.nanoTime();
+        final long since = keptSince;
+        if (since != Long.MIN_VALUE && now - since > KEEP_BODIES_NANOS) {
+            // Long past the takeover that read them: let them go, and start again for whatever reads next.
+            synchronized (bodies) {
+                if (keptSince == since) {
+                    bodies.clear();
+                    keptBytes.set(0);
+                    keptSince = Long.MIN_VALUE;
+                }
+            }
+        }
+        final long length = NodeLogStore.bodyLength(header);
+        final BodyKey key = new BodyKey(epoch, header.ordinal());
+        java.util.concurrent.CompletableFuture<byte[]> read = bodies.get(key);
+        if (read == null) {
+            if (length > MAX_BODY_BYTES || keptBytes.get() + length > MAX_KEPT_BYTES) {
+                return null;
+            }
+            final java.util.concurrent.CompletableFuture<byte[]> mine = new java.util.concurrent.CompletableFuture<>();
+            read = bodies.putIfAbsent(key, mine);
+            if (read == null) {
+                keptBytes.addAndGet(length);
+                if (keptSince == Long.MIN_VALUE) {
+                    keptSince = now;
+                }
+                try {
+                    mine.complete(log.readBody(epoch, header));
+                } catch (IOException | RuntimeException e) {
+                    bodies.remove(key, mine);
+                    keptBytes.addAndGet(-length);
+                    mine.completeExceptionally(e);
+                    throw e;
+                }
+                return mine.join();
+            }
+        }
+        try {
+            return read.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IOException("interrupted waiting for a node-log body", e);
+        } catch (java.util.concurrent.ExecutionException e) {
+            // Its reader failed: this one reads its own slices instead.
+            return null;
+        }
     }
 
     private Header header(long epoch, long ordinal, Header last) throws IOException {

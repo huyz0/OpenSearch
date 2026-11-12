@@ -578,7 +578,42 @@ public final class ShardHeadStore {
         if (ref.bucketed()) {
             return releaseMember(ref, nodeId, expectedTerm, expectedEphemeralId, lastWriter);
         }
-        final String name = ref.name();
+        // A swap lost to this owner's own change of the head -- the writers it stops naming once a replay is published,
+        // or its log marked quiet -- is tried again: every check is made again on what is read.
+        for (int attempt = 1;; attempt++) {
+            final Boolean released = releaseOnce(
+                ref.name(),
+                indexName,
+                shardId,
+                nodeId,
+                expectedTerm,
+                expectedIndexUuid,
+                expectedEphemeralId,
+                lastWriter
+            );
+            if (released != null) {
+                return released;
+            }
+            if (attempt >= RELEASE_ATTEMPTS) {
+                return false;
+            }
+        }
+    }
+
+    /** How many times a release whose swap was lost is tried. */
+    static final int RELEASE_ATTEMPTS = 3;
+
+    /** One try of a release: whether it released, false if it may not, or null if its swap was lost. */
+    private Boolean releaseOnce(
+        String name,
+        String indexName,
+        int shardId,
+        String nodeId,
+        long expectedTerm,
+        String expectedIndexUuid,
+        String expectedEphemeralId,
+        String lastWriter
+    ) throws IOException {
         final Optional<BlobRegister> existing = container.readRegister(name);
         if (existing.isEmpty()) {
             return false;
@@ -604,7 +639,7 @@ public final class ShardHeadStore {
         final ShardHead released = new ShardHead(indexName, shardId, current.term(), null, null, 0L, current.indexUuid()).withWriters(
             current.writers()
         ).withWriter(lastWriter).withShardLogQuietSince(current.shardLogQuietSince());
-        return container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied();
+        return container.compareAndSwapRegister(name, existing.get().generation(), released.toBytes()).applied() ? Boolean.TRUE : null;
     }
 
     /** A dead owner's head given back: the head as the owner left it, and the unowned one that replaced it. */

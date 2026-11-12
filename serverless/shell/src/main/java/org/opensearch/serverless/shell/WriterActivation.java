@@ -276,7 +276,10 @@ public final class WriterActivation {
         node.reconciler.noteOlderTermsFenced(indexName, shardNumber, acquisition.head().term());
         if (node.nodeLogEnabled) {
             // Whose node logs the open replays: every node the head names as holding what was not published.
-            node.startup().nodeLog(plane);
+            final NodeLogWriter nodeLog = node.startup().nodeLog(plane);
+            if (nodeLog != null) {
+                nodeLog.noteHeadMoved(indexName, shardNumber);
+            }
             node.reconciler.noteNodeLogWriters(indexName, shardNumber, acquisition.head().writers());
             // And whether the shard's own log has anything for the open to close or replay.
             node.reconciler.noteShardLogQuiet(indexName, shardNumber, acquisition.head().term(), acquisition.head().shardLogQuiet());
