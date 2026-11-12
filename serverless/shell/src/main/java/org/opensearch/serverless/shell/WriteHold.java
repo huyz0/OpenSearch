@@ -78,6 +78,15 @@ public final class WriteHold implements AutoCloseable {
          * @throws IOException if it fails
          */
         List<BulkOutcome> bulk(ShardId shardId, List<BulkOperation> batch) throws IOException;
+
+        /**
+         * Makes the writes this target applied visible to search, for a forwarded write whose caller asked for a
+         * refresh: the documents are where the target put them, not in the shard the write was addressed to.
+         *
+         * @param source why, for core's refresh stats
+         * @throws IOException if it fails
+         */
+        void refresh(String source) throws IOException;
     }
 
     /** Thrown inside the write path, before anything is applied, to send a write to the hold's target. */

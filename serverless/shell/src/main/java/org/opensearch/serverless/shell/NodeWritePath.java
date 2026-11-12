@@ -148,7 +148,8 @@ public final class NodeWritePath {
                 }
             }
         } catch (WriteHold.Forwarded forwarded) {
-            return forwarded.target.index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
+            return forwarded.target.index(shardId, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping)
+                .forwardedBy(forwarded.target);
         }
     }
 
@@ -397,7 +398,7 @@ public final class NodeWritePath {
                 }
             }
         } catch (WriteHold.Forwarded forwarded) {
-            return forwarded.target.delete(shardId, id, ifSeqNo, ifPrimaryTerm);
+            return forwarded.target.delete(shardId, id, ifSeqNo, ifPrimaryTerm).forwardedBy(forwarded.target);
         }
     }
 
@@ -504,8 +505,78 @@ public final class NodeWritePath {
                 }
             }
         } catch (WriteHold.Forwarded forwarded) {
-            return forwarded.target.bulk(shardId, batch);
+            final java.util.List<BulkOutcome> outcomes = forwarded.target.bulk(shardId, batch);
+            for (BulkOutcome outcome : outcomes) {
+                outcome.forwardedBy(forwarded.target);
+            }
+            return outcomes;
         }
+    }
+
+    /**
+     * Makes a write visible to search where it landed, for a caller that was asked to refresh.
+     *
+     * <p>A write addressed to a shard whose writes a hold forwards, such as a unit being split, lands in the hold's
+     * target and not in the addressed shard; refreshing the addressed shard would answer "refreshed" for a document no
+     * search can see yet. So a forwarded write refreshes its target, and only a write the shard applied itself refreshes
+     * the shard. The shard may be closed by then (a split retires it once its writes are forwarded); that is fine for a
+     * forwarded write, as nothing of it is in the shard.
+     *
+     * @param shardId the shard the write was addressed to
+     * @param outcome what the write path answered
+     * @param source why, for core's refresh stats
+     * @return true if what was written is visible to search
+     * @throws java.io.IOException if the target cannot refresh
+     */
+    public boolean refreshWritten(org.opensearch.core.index.shard.ShardId shardId, WriteOutcome outcome, String source)
+        throws java.io.IOException {
+        if (outcome.forwardedTo() != null) {
+            outcome.forwardedTo().refresh(source);
+            return true;
+        }
+        return refresh(shardId, source);
+    }
+
+    /**
+     * Makes a batch visible to search wherever its operations landed, as the single-write form does.
+     *
+     * @param shardId the shard the batch was addressed to
+     * @param outcomes what the write path answered, one per operation
+     * @param source why, for core's refresh stats
+     * @return true if what was written is visible to search
+     * @throws java.io.IOException if a target cannot refresh
+     */
+    public boolean refreshWritten(org.opensearch.core.index.shard.ShardId shardId, java.util.List<BulkOutcome> outcomes, String source)
+        throws java.io.IOException {
+        final java.util.Set<WriteHold.Target> targets = java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>());
+        boolean here = outcomes.isEmpty();
+        for (BulkOutcome outcome : outcomes) {
+            if (outcome.forwardedTo() == null) {
+                here = true;
+            } else {
+                targets.add(outcome.forwardedTo());
+            }
+        }
+        for (WriteHold.Target target : targets) {
+            target.refresh(source);
+        }
+        return (here == false || refresh(shardId, source));
+    }
+
+    /**
+     * Refreshes a shard open here.
+     *
+     * @param shardId the shard
+     * @param source why, for core's refresh stats
+     * @return false if the shard is not open here
+     */
+    public boolean refresh(org.opensearch.core.index.shard.ShardId shardId, String source) {
+        final var shard = node.reconciler.shard(shardId);
+        if (shard == null) {
+            return false;
+        }
+        shard.refresh(source);
+        return true;
     }
 
     java.util.List<BulkOutcome> bulkOperationsUnderFence(

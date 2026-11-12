@@ -95,4 +95,11 @@ final class HalvesTarget implements WriteHold.Target {
         }
         return Arrays.asList(outcomes);
     }
+
+    @Override
+    public void refresh(String source) {
+        // Both halves: cheaper than tracking which one each forwarded write went to, and a refresh with nothing new is free.
+        writes.refresh(left, source);
+        writes.refresh(right, source);
+    }
 }

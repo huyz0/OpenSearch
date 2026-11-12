@@ -106,6 +106,53 @@ public final class BucketStore {
      * @return the new generation, or empty if another change landed first
      * @throws IOException if the register cannot be written
      */
+    /** Where each stripe's open bucket is recorded. */
+    public static final String OPEN_ROOT = "bucket-open";
+
+    /** A stripe's open bucket generation as read, and the register generation it was read at. */
+    public record Open(long bucketGeneration, long generation) {
+    }
+
+    private ConditionalBlobContainer openContainer() {
+        return ConditionalBlobContainer.of(blobStore.blobContainer(base.add(OPEN_ROOT)));
+    }
+
+    /**
+     * Reads which bucket of a stripe new members join.
+     *
+     * @param stripe the stripe
+     * @return its open bucket's generation, or empty if the stripe has none yet
+     * @throws IOException if the register cannot be read
+     */
+    public Optional<Open> readOpen(int stripe) throws IOException {
+        final Optional<BlobRegister> stored = openContainer().readRegister(Integer.toString(stripe));
+        if (stored.isEmpty()) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(new Open(Long.parseLong(stored.get().value().utf8ToString().trim()), stored.get().generation()));
+        } catch (NumberFormatException e) {
+            throw new IOException("malformed open bucket of stripe " + stripe, e);
+        }
+    }
+
+    /**
+     * Moves a stripe on to its next bucket, if no one else has.
+     *
+     * @param stripe the stripe
+     * @param bucketGeneration the new open bucket's generation
+     * @param expectedGeneration the register generation read, or the absent generation to create it
+     * @return true if this swap applied
+     * @throws IOException if the register cannot be written
+     */
+    public boolean swapOpen(int stripe, long bucketGeneration, long expectedGeneration) throws IOException {
+        return openContainer().compareAndSwapRegister(
+            Integer.toString(stripe),
+            expectedGeneration,
+            new org.opensearch.core.common.bytes.BytesArray(Long.toString(bucketGeneration))
+        ).applied();
+    }
+
     public Optional<Long> swap(BucketManifest manifest, long expectedGeneration) throws IOException {
         final var result = container(manifest.bucketId()).compareAndSwapRegister(MANIFEST, expectedGeneration, manifest.toBytes());
         return result.applied() ? Optional.of(result.currentGeneration()) : Optional.empty();

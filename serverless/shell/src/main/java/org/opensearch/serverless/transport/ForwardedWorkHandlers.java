@@ -116,7 +116,7 @@ final class ForwardedWorkHandlers {
                 .index(shardId, request.id(), request.source(), request.ifSeqNo(), request.ifPrimaryTerm(), request.requireAbsent());
         }
         if (request.refresh()) {
-            router.node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
+            router.node.writes().refreshWritten(shardId, outcome, "serverless-forwarded-refresh");
         }
         channel.sendResponse(
             new ForwardedIndexResponse(
@@ -158,7 +158,7 @@ final class ForwardedWorkHandlers {
         router.requireLiveOwnership(shardId);
         final var outcomes = router.node.writes().bulkOperations(shardId, request.batch());
         if (request.refresh()) {
-            router.node.reconciler().shard(shardId).refresh("serverless-forwarded-refresh");
+            router.node.writes().refreshWritten(shardId, outcomes, "serverless-forwarded-refresh");
         }
         channel.sendResponse(new ForwardedBulkResponse(router.node.localNode().getId(), outcomes));
     }

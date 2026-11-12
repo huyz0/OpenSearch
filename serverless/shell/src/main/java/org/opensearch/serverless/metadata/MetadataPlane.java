@@ -46,6 +46,7 @@ public final class MetadataPlane {
     private final BlobPath base;
     private final long leaseTtlMillis;
     private final LongSupplier clock;
+    private final org.opensearch.serverless.bucket.DescriptorBucketHeads bucketHeads;
     private final ShardSettlement settlement;
     private final ShardActivation activation;
     private final AliasMutations aliases;
@@ -99,6 +100,8 @@ public final class MetadataPlane {
         ).conditionalDeletes(descriptors::conditionalDelete);
         final LivenessOracle oracle = new LeaseLivenessOracle(leases, clock);
         this.heads = new ShardHeadStore(blobStore.blobContainer(RegisterMap.shards(base)), clock, leaseTtlMillis, oracle);
+        this.bucketHeads = new org.opensearch.serverless.bucket.DescriptorBucketHeads(this::describeForRouting, clock);
+        this.heads.setBucketHeads(bucketHeads);
         this.clusterConfig = new ClusterConfig(blobStore.blobContainer(RegisterMap.clusterConfig(base)));
         this.membershipField = leases;
         this.blobStore = blobStore;
@@ -190,12 +193,36 @@ public final class MetadataPlane {
 
     /** Deletes an index and every shard-head belonging to it. */
     public boolean deleteIndex(String indexName) throws IOException {
-        return lifecycle.deleteIndex(indexName);
+        final Optional<IndexDescriptor> before = describe(indexName);
+        forgetBucket(indexName);
+        final boolean deleted = lifecycle.deleteIndex(indexName);
+        leaveBucket(deleted, before);
+        return deleted;
     }
 
     /** Deletes only the incarnation the caller selected, preserving a replacement under the same name. */
     public boolean deleteIndex(String indexName, String expectedUuid) throws IOException {
-        return lifecycle.deleteIndex(indexName, expectedUuid);
+        final Optional<IndexDescriptor> before = describe(indexName).filter(d -> expectedUuid == null || expectedUuid.equals(d.uuid()));
+        forgetBucket(indexName);
+        final boolean deleted = lifecycle.deleteIndex(indexName, expectedUuid);
+        leaveBucket(deleted, before);
+        return deleted;
+    }
+
+    /** Takes a deleted member out of its bucket's manifest. Best effort: a member with no descriptor is never served. */
+    private void leaveBucket(boolean deleted, Optional<IndexDescriptor> before) {
+        if (deleted == false || before.isEmpty() || before.get().bucket() == null) {
+            return;
+        }
+        try {
+            new org.opensearch.serverless.bucket.BucketAssigner(buckets(), 1).leave(before.get().bucket(), before.get().uuid());
+        } catch (IOException e) {
+            LOGGER.warn("could not take deleted index [{}] out of bucket [{}]", before.get().name(), before.get().bucket(), e);
+        }
+    }
+
+    private void forgetBucket(String indexName) {
+        bucketHeads.forget(indexName);
     }
 
     /** Reads an alias and its generation together, briefly waiting for a pending mutation. */
@@ -511,7 +538,9 @@ public final class MetadataPlane {
      * @throws IOException if the register cannot be read
      */
     public Optional<IndexDescriptor> describe(String indexName) throws IOException {
-        return descriptors.get(indexName);
+        final Optional<IndexDescriptor> descriptor = descriptors.get(indexName);
+        descriptor.ifPresent(bucketHeads::note);
+        return descriptor;
     }
 
     /**
@@ -777,6 +806,26 @@ public final class MetadataPlane {
      */
     public ShardHeadStore heads() {
         return heads;
+    }
+
+    /**
+     * Returns the resolver that tells the shard-head store which members are owned through their bucket's head, for
+     * nodes to register their open shards with. Always installed: ownership must resolve alike on every node, so it
+     * follows the descriptor's bucket field and never a node's settings.
+     *
+     * @return the resolver
+     */
+    public org.opensearch.serverless.bucket.DescriptorBucketHeads bucketHeads() {
+        return bucketHeads;
+    }
+
+    /**
+     * Returns the store of bucket manifests.
+     *
+     * @return the bucket store
+     */
+    public org.opensearch.serverless.bucket.BucketStore buckets() {
+        return new org.opensearch.serverless.bucket.BucketStore(blobStore, base);
     }
 
     /**
