@@ -75,8 +75,19 @@ public class BatchSearchOptionsTests extends OpenSearchTestCase {
         assertItemRefused("/docs/_msearch/template", "{\"preference\":\"_shards:0\"}", "{\"source\":{\"query\":{\"match_all\":{}}}}");
     }
 
-    public void testMultiTemplateRoutingIsNotIgnored() throws Exception {
-        assertItemRefused("/docs/_msearch/template", "{\"routing\":\"selected\"}", "{\"source\":{\"query\":{\"match_all\":{}}}}");
+    public void testMultiTemplateRoutingNarrowsTheSearch() throws Exception {
+        withNode(new org.opensearch.plugins.Plugin() {
+        }, node -> {
+            // Each of the two shards holds one document, so a search narrowed to one shard finds one.
+            final var answer = send(
+                node,
+                "/docs/_msearch/template",
+                "{\"routing\":\"selected\"}\n{\"source\":{\"query\":{\"match_all\":{}}}}\n"
+            );
+            assertEquals(answer.body(), 200, answer.statusCode());
+            assertTrue(answer.body(), answer.body().contains("\"status\":200"));
+            assertTrue(answer.body(), answer.body().contains("\"value\":1"));
+        });
     }
 
     public void testRankEvalDfsIsNotIgnored() throws Exception {

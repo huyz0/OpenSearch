@@ -50,7 +50,7 @@ public final class ForwardedGetResponse extends TransportResponse {
         final long seqNo = in.readZLong();
         final long primaryTerm = in.readVLong();
         final long version = in.readZLong();
-        this.document = new Document(id, found, source, seqNo, primaryTerm, version);
+        this.document = new Document(id, found, source, seqNo, primaryTerm, version).withRouting(in.readOptionalString());
     }
 
     @Override
@@ -62,6 +62,7 @@ public final class ForwardedGetResponse extends TransportResponse {
         out.writeZLong(document.seqNo());
         out.writeVLong(document.primaryTerm());
         out.writeZLong(document.version());
+        out.writeOptionalString(document.routing());
     }
 
     /**

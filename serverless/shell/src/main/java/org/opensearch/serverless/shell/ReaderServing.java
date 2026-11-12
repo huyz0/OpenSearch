@@ -109,6 +109,38 @@ public final class ReaderServing {
         org.opensearch.core.index.shard.ShardId shardId
     ) throws java.io.IOException {
         node.readerValidation.validateReader(plane, indexName, shardNumber, shardId);
+        ensureFresh(indexName, shardNumber, shardId);
+    }
+
+    /**
+     * Refuses a reader that cannot be sure it holds every write its live writer has answered as refreshed, in
+     * {@code everywhere} mode; see {@link org.opensearch.serverless.transport.TailOverlays#ensureFresh}. A shard nobody
+     * writes needs nothing more than the log check: its commit is current or refused already.
+     */
+    private void ensureFresh(String indexName, int shardNumber, org.opensearch.core.index.shard.ShardId shardId)
+        throws ShardBehindLogException {
+        if (node.router() == null || node.router().refreshVisibility().grants() == false) {
+            return;
+        }
+        final String owner = node.readerValidation.checkedOwner(indexName, shardNumber);
+        if (owner == null || owner.equals(node.localNode().getId())) {
+            return;
+        }
+        final var shard = node.reconciler.shard(shardId);
+        if (shard == null || node.reconciler.readerCommit(shardId).isEmpty()) {
+            return;
+        }
+        final boolean fresh = node.router().tailOverlays().ensureFresh(shardId, owner, shard.seqNoStats().getLocalCheckpoint(), () -> {
+            // Acquiring a searcher has the engine take what is held for it.
+            try (var searcher = shard.acquireSearcher("refresh_visibility")) {
+                assert searcher != null;
+            } catch (RuntimeException e) {
+                // The search that follows fails the same way, and asks another copy.
+            }
+        });
+        if (fresh == false) {
+            throw ShardBehindLogException.notCaughtUp(indexName, shardNumber);
+        }
     }
 
     /**
@@ -234,6 +266,9 @@ public final class ReaderServing {
         // that described only the readers used to drop every writer index from the applied state on a
         // dual-role node.
         final ShardAssignment opening = new ShardAssignment(indexName, shardNumber, node.readerTerms.getOrDefault(openingKey, 1L));
+        final boolean alreadyOpen = node.reconciler.servingShard(
+            new org.opensearch.core.index.shard.ShardId(indexName, descriptor.uuid(), shardNumber)
+        ) != null;
         final ClusterState view = node.projectAndApply(java.util.List.of(descriptor), java.util.List.of(opening));
         final org.opensearch.core.index.shard.ShardId opened = node.reconciler.openReader(
             view,
@@ -241,8 +276,9 @@ public final class ReaderServing {
             shardNumber,
             manifest.orElse(null)
         );
-        if (node.router() != null && manifest.isPresent()) {
-            // What the writer acknowledged past this commit, and its next writes, for the reader's tail overlay.
+        if (node.router() != null && manifest.isPresent() && alreadyOpen == false) {
+            // What the writer acknowledged past this commit, and its next writes, for the reader's tail overlay. Once per
+            // open: a reader already open is subscribed already.
             final var shard = node.reconciler.shard(opened);
             if (shard != null) {
                 node.router().tailOverlays().opened(opened, manifest.get().writer(), shard.seqNoStats().getLocalCheckpoint());

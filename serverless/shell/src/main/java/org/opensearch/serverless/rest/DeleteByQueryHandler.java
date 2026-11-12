@@ -144,7 +144,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_delete_by_query",
-                    "routing is not supported: a document is placed by its id alone"
+                    "routing on delete-by-query is not supported yet; send the query without routing, which visits every shard"
                 )
             );
         }

@@ -28,16 +28,29 @@ public final class ForwardedBulkResponse extends TransportResponse {
 
     private final String ownerNodeId;
     private final List<BulkOutcome> outcomes;
+    private final boolean refreshed;
+
+    /**
+     * Creates a response for a batch that was not asked to be refreshed.
+     *
+     * @param ownerNodeId the node that performed the batch
+     * @param outcomes one outcome per operation, in request order
+     */
+    public ForwardedBulkResponse(String ownerNodeId, List<BulkOutcome> outcomes) {
+        this(ownerNodeId, outcomes, false);
+    }
 
     /**
      * Creates a response.
      *
      * @param ownerNodeId the node that performed the batch
      * @param outcomes one outcome per operation, in request order
+     * @param refreshed whether the batch is visible as far as its refresh promises
      */
-    public ForwardedBulkResponse(String ownerNodeId, List<BulkOutcome> outcomes) {
+    public ForwardedBulkResponse(String ownerNodeId, List<BulkOutcome> outcomes, boolean refreshed) {
         this.ownerNodeId = ownerNodeId;
         this.outcomes = List.copyOf(outcomes);
+        this.refreshed = refreshed;
     }
 
     /**
@@ -82,6 +95,7 @@ public final class ForwardedBulkResponse extends TransportResponse {
             }
         }
         this.outcomes = List.copyOf(read);
+        this.refreshed = in.readBoolean();
     }
 
     @Override
@@ -100,6 +114,16 @@ public final class ForwardedBulkResponse extends TransportResponse {
             out.writeZLong(outcome.version());
             out.writeBoolean(outcome.created());
         }
+        out.writeBoolean(refreshed);
+    }
+
+    /**
+     * Returns whether the batch is visible as far as the refresh it asked for promises.
+     *
+     * @return true if refreshed
+     */
+    public boolean refreshed() {
+        return refreshed;
     }
 
     /**

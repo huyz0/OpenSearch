@@ -68,6 +68,7 @@ public class WriteHoldTests extends OpenSearchTestCase {
         public WriteOutcome index(
             ShardId shardId,
             String id,
+            String routing,
             String source,
             long ifSeqNo,
             long ifPrimaryTerm,
@@ -79,7 +80,7 @@ public class WriteHoldTests extends OpenSearchTestCase {
         }
 
         @Override
-        public WriteOutcome delete(ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm) {
+        public WriteOutcome delete(ShardId shardId, String id, String routing, long ifSeqNo, long ifPrimaryTerm) {
             ids.add("delete:" + id);
             return new WriteOutcome(1_001L, 1L, 2L, false, true);
         }
@@ -91,8 +92,9 @@ public class WriteHoldTests extends OpenSearchTestCase {
         }
 
         @Override
-        public void refresh(String source) {
+        public boolean refresh(String source) {
             ids.add("refresh");
+            return true;
         }
     }
 
@@ -111,18 +113,19 @@ public class WriteHoldTests extends OpenSearchTestCase {
         public WriteOutcome index(
             ShardId shardId,
             String id,
+            String routing,
             String source,
             long ifSeqNo,
             long ifPrimaryTerm,
             boolean requireAbsent,
             boolean mayGrowMapping
         ) throws IOException {
-            return node.writes().index(to, id, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
+            return node.writes().index(to, id, routing, source, ifSeqNo, ifPrimaryTerm, requireAbsent, mayGrowMapping);
         }
 
         @Override
-        public WriteOutcome delete(ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm) throws IOException {
-            return node.writes().delete(to, id, ifSeqNo, ifPrimaryTerm);
+        public WriteOutcome delete(ShardId shardId, String id, String routing, long ifSeqNo, long ifPrimaryTerm) throws IOException {
+            return node.writes().delete(to, id, routing, ifSeqNo, ifPrimaryTerm);
         }
 
         @Override
@@ -131,9 +134,9 @@ public class WriteHoldTests extends OpenSearchTestCase {
         }
 
         @Override
-        public void refresh(String source) {
+        public boolean refresh(String source) {
             refreshes.add(source);
-            node.writes().refresh(to, source);
+            return node.writes().refresh(to, source);
         }
     }
 

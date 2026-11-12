@@ -26,6 +26,7 @@ public final class ShardBehindLogException extends IOException {
     private final String index;
     private final int shard;
     private final boolean superseded;
+    private final boolean notCaughtUp;
 
     /**
      * Creates the refusal.
@@ -45,13 +46,32 @@ public final class ShardBehindLogException extends IOException {
         this.index = index;
         this.shard = shard;
         this.superseded = false;
+        this.notCaughtUp = false;
     }
 
-    private ShardBehindLogException(String index, int shard, String message) {
+    private ShardBehindLogException(String index, int shard, String message, boolean superseded) {
         super(message);
         this.index = index;
         this.shard = shard;
-        this.superseded = true;
+        this.superseded = superseded;
+        this.notCaughtUp = superseded == false;
+    }
+
+    /**
+     * Creates the refusal of a search node's copy that cannot be sure it holds every write its live writer has answered
+     * as refreshed; another copy, down to the writer's own, answers instead.
+     *
+     * @param index the index
+     * @param shard the shard number
+     * @return the refusal
+     */
+    public static ShardBehindLogException notCaughtUp(String index, int shard) {
+        return new ShardBehindLogException(
+            index,
+            shard,
+            "this copy of shard " + shard + " of " + index + " may not hold a write its writer answered as refreshed -- retry",
+            false
+        );
     }
 
     /**
@@ -65,7 +85,8 @@ public final class ShardBehindLogException extends IOException {
         return new ShardBehindLogException(
             index,
             shard,
-            "this copy of shard " + shard + " of " + index + " serves a commit a later publish has replaced -- retry"
+            "this copy of shard " + shard + " of " + index + " serves a commit a later publish has replaced -- retry",
+            true
         );
     }
 
@@ -76,6 +97,16 @@ public final class ShardBehindLogException extends IOException {
      */
     public boolean superseded() {
         return superseded;
+    }
+
+    /**
+     * Whether the refusing copy could not be sure it holds every write its live writer answered as refreshed: an
+     * ordinary step of a search in {@code everywhere} mode, not a fault of the shard.
+     *
+     * @return true if so
+     */
+    public boolean notCaughtUp() {
+        return notCaughtUp;
     }
 
     /**

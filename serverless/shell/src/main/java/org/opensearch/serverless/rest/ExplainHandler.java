@@ -87,22 +87,12 @@ public final class ExplainHandler extends BaseRestHandler {
         // q= with its companions, through core's own query-string parser -- df, analyzer, default_operator,
         // lenient and analyze_wildcard are consumed by it and mean what they mean on _search.
         final QueryBuilder fromUrl = org.opensearch.rest.action.RestActions.urlParamsToQueryBuilder(request);
-        final String routing = request.param("routing");
+        final String routing = DocumentRouting.normalize(request.param("routing"));
         final String storedFields = request.param("stored_fields");
         final org.opensearch.search.fetch.subphase.FetchSourceContext wantSource = org.opensearch.search.fetch.subphase.FetchSourceContext
             .parseFromRestRequest(request);
         // A hint: there is one copy of each shard for preference to choose between.
         request.param("preference");
-        if (routing != null) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_explain",
-                    "routing is not supported: a document is placed by its id alone"
-                )
-            );
-        }
         if (storedFields != null || (wantSource != null && wantSource.fetchSource())) {
             // Refused rather than silently omitted: core answers these with a "get" block carrying the
             // document, and this explains a score without fetching the document back.
@@ -175,7 +165,7 @@ public final class ExplainHandler extends BaseRestHandler {
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 final ShardOperations operations = new ShardOperations(serving, metadata, true);
-                respond(channel, index, id, operations.explain(index, id, query));
+                respond(channel, index, id, operations.explain(index, id, routing, query));
             } catch (NoSuchIndexException e) {
                 sendQuietly(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index);
             } catch (SystemIndexException e) {

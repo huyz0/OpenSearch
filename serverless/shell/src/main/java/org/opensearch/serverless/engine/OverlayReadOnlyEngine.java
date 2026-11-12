@@ -107,6 +107,23 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
          * @return ordinal to record
          */
         Map<Long, WalRecord> from(ShardId shardId, long fromOrdinal);
+
+        /**
+         * Waits, bounded, while the shard's writer is being asked for what it acknowledged past the commit, so a search
+         * does not answer from the commit alone in the moment between the engine opening and the answer arriving.
+         *
+         * @param shardId the shard
+         */
+        default void awaitFetch(ShardId shardId) {}
+
+        /**
+         * Hears that the overlay left out a record it was handed for want of room, of a mapping, or of a sequence number,
+         * rather than because what it already holds is newer: it is behind what its writer acknowledged until a newer
+         * commit holds the record.
+         *
+         * @param shardId the shard
+         */
+        default void skipped(ShardId shardId) {}
     }
 
     /** How many documents an overlay holds before it takes no more and waits for the next commit. */
@@ -141,6 +158,7 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
         if (overlay == null) {
             return super.getReferenceManager(scope);
         }
+        overlay.tail.awaitFetch(shardId);
         overlay.refreshIfBehind();
         return overlay.manager;
     }
@@ -179,6 +197,15 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
         final Manager manager;
         DirectoryReader overlayReader;
         long applied;
+        /**
+         * The ordinal through which the reader handed out holds what was pushed: {@link #applied} as of the last refresh
+         * whose reader has been swapped in. A refresh advances {@code applied} as it goes, before its reader is out, so a
+         * search that compared against {@code applied} while another refresh ran took the old reader and missed records
+         * that had arrived well before it.
+         */
+        volatile long visible;
+        /** What {@link #applied} was when the running refresh finished applying; published once its reader is swapped in. */
+        long appliedByRefresh;
         volatile boolean closed;
 
         Overlay(EngineConfig config, Tail tail, Function<WalRecord, ParsedDocument> parser, long localCheckpoint) throws IOException {
@@ -198,7 +225,7 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
         }
 
         void refreshIfBehind() {
-            if (closed || tail.nextOrdinal(shardId) <= applied) {
+            if (closed || tail.nextOrdinal(shardId) <= visible) {
                 return;
             }
             try {
@@ -219,6 +246,7 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
                 applied = Math.max(applied, entry.getKey() + 1);
                 changed |= apply(entry.getValue());
             }
+            appliedByRefresh = applied;
             if (changed == false) {
                 return null;
             }
@@ -263,7 +291,11 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
 
         private boolean apply(WalRecord record) throws IOException {
             final long seqNo = record.seqNo();
-            if (record.hasSequenceIdentity() == false || seqNo <= localCheckpoint) {
+            if (seqNo <= localCheckpoint && record.hasSequenceIdentity()) {
+                return false;
+            }
+            if (record.hasSequenceIdentity() == false) {
+                tail.skipped(shardId);
                 return false;
             }
             final Long had = seqById.get(record.id());
@@ -271,6 +303,7 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
                 return false;
             }
             if (had == null && seqById.size() >= MAX_DOCUMENTS) {
+                tail.skipped(shardId);
                 return false;
             }
             final BytesRef uid = Uid.encodeId(record.id());
@@ -287,9 +320,11 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
                     parsed = parser.apply(record);
                 } catch (RuntimeException e) {
                     LOG.debug("could not parse a pushed record of {}; it waits for the commit", shardId, e);
+                    tail.skipped(shardId);
                     return false;
                 }
                 if (parsed == null) {
+                    tail.skipped(shardId);
                     return false;
                 }
                 parsed.updateSeqID(seqNo, record.primaryTerm());
@@ -387,6 +422,14 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
             @Override
             protected OpenSearchDirectoryReader refreshIfNeeded(OpenSearchDirectoryReader referenceToRefresh) throws IOException {
                 return refresh();
+            }
+
+            @Override
+            protected void afterMaybeRefresh() throws IOException {
+                // After the swap: what this refresh applied is now in the reader searches acquire.
+                synchronized (Overlay.this) {
+                    visible = Math.max(visible, appliedByRefresh);
+                }
             }
 
             @Override

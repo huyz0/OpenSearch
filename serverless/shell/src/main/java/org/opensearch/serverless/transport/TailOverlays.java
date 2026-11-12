@@ -42,6 +42,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * new commit closes one engine and opens the next, and what was pushed in between is what the next one needs. Each
  * record takes an ordinal as it arrives, so an engine reads each once, in arrival order; the engine orders them by
  * sequence number itself. When an engine opens on a commit it drops every record its commit already holds.
+ *
+ * <p>In {@code everywhere} mode a shard answers here only while this node holds a grant from its writer; see
+ * {@link #ensureFresh}.
  */
 public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
 
@@ -185,6 +188,31 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
         long releasedAtNanos;
         /** Set when a record did not fit: later ones would leave a gap, so none is taken until an engine opens anew. */
         boolean refusing;
+        /** Set while the writer is being asked for what it acknowledged past the commit an engine just opened on. */
+        boolean fetching;
+        /** Set when an engine left out a record for a reason other than holding a newer write; cleared by a new engine. */
+        boolean skipped;
+        /** The writer this node is pushed the shard by, under {@link #subscription}; null if none. */
+        String grantWriter;
+        /** The subscription, or {@link TailFetchResponse#NONE}. */
+        long subscription = TailFetchResponse.NONE;
+        /** Whether what the subscription's fetch answered, with the commit, held every write its writer acknowledged. */
+        boolean complete;
+        /** When this node's grant runs out, on the nano clock. */
+        long grantUntilNanos;
+        /** Held while the writer is asked for a grant, so searches that find none ask once between them. */
+        final Object asking = new Object();
+
+        /** Whether the shard may answer under a grant from this writer now. Under the lock. */
+        boolean granted(String writer, long now) {
+            return engines > 0
+                && refusing == false
+                && skipped == false
+                && complete
+                && subscription >= 0
+                && writer.equals(grantWriter)
+                && grantUntilNanos - now > 0;
+        }
     }
 
     private final ShardRouter router;
@@ -193,6 +221,9 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
     private final long publishMaxAgeMillis;
     private final AtomicLong received = new AtomicLong();
     private final AtomicLong fetched = new AtomicLong();
+    private final AtomicLong grantChecks = new AtomicLong();
+    private final AtomicLong refusals = new AtomicLong();
+    private final AtomicLong unreachable = new AtomicLong();
 
     TailOverlays(ShardRouter router) {
         this.router = router;
@@ -213,6 +244,14 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
     /** @return records taken from pushes, and from fetches */
     public long[] counts() {
         return new long[] { received.get(), fetched.get() };
+    }
+
+    /**
+     * @return round trips made to a writer for a grant before a search, searches refused for want of one, and searches
+     *     answered from the commit because the writer could not be reached
+     */
+    public long[] grantCounts() {
+        return new long[] { grantChecks.get(), refusals.get(), unreachable.get() };
     }
 
     void handle(TailPushRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
@@ -261,6 +300,29 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
     }
 
     @Override
+    public void awaitFetch(ShardId shardId) {
+        final Held shard = held.get(shardId);
+        if (shard == null) {
+            return;
+        }
+        synchronized (shard) {
+            final long deadline = System.nanoTime() + TailPush.SEND_TIMEOUT.nanos();
+            while (shard.fetching) {
+                final long left = deadline - System.nanoTime();
+                if (left <= 0) {
+                    return;
+                }
+                try {
+                    java.util.concurrent.TimeUnit.NANOSECONDS.timedWait(shard, left);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+    }
+
+    @Override
     public void track(ShardId shardId, long localCheckpoint) {
         final Held shard = held.computeIfAbsent(shardId, ignored -> new Held());
         synchronized (shard) {
@@ -268,7 +330,19 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
             shard.localCheckpoint = Math.max(shard.localCheckpoint, localCheckpoint);
             // A new engine fetches what follows its commit, so what was refused is asked for again.
             shard.refusing = false;
+            // It applies every record held from the first, so what an earlier engine left out is tried again.
+            shard.skipped = false;
             shard.byOrdinal.values().removeIf(record -> record.seqNo() <= localCheckpoint);
+        }
+    }
+
+    @Override
+    public void skipped(ShardId shardId) {
+        final Held shard = held.get(shardId);
+        if (shard != null) {
+            synchronized (shard) {
+                shard.skipped = true;
+            }
         }
     }
 
@@ -306,8 +380,9 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
     }
 
     /**
-     * Asks a shard's writer, in the background, for what it has acknowledged past the commit just opened here, which
-     * also has it push the shard's next writes here. Does nothing if overlays are off for the shard or the commit names
+     * Asks a shard's writer for what it has acknowledged past the commit just opened here, which also has it push the
+     * shard's next writes here. In the background, unless refreshing writes wait for search nodes: then before the reader
+     * answers its first search. Does nothing if overlays are off for the shard or the commit names
      * no writer.
      *
      * @param shardId the shard just opened
@@ -318,24 +393,181 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
         if (writer == null || writer.equals(router.node.localNode().getId()) || onFor(shardId) == false) {
             return;
         }
-        router.node.threadPool().generic().execute(() -> {
+        final Runnable fetch = () -> {
             try {
-                final Optional<DiscoveryNode> peer = router.peer(writer, TailPush.SEND_TIMEOUT);
-                if (peer.isEmpty()) {
-                    return;
+                final long sentNanos = System.nanoTime();
+                final TailFetchResponse answer = ask(shardId, writer, localCheckpoint, TailFetchRequest.NEW);
+                if (answer != null) {
+                    answered(shardId, writer, TailFetchRequest.NEW, sentNanos, answer);
                 }
-                final TailFetchResponse answer = router.send(
-                    peer.get(),
-                    TailFetchRequest.ACTION,
-                    new TailFetchRequest(shardId, localCheckpoint, router.node.localNode().getId()),
-                    TailFetchResponse::new,
-                    TailPush.SEND_TIMEOUT
-                );
-                fetched.addAndGet(Math.max(0, take(shardId, answer.records())));
             } catch (Exception e) {
                 // The pushes still come; until they do, the commit is what the reader serves.
                 LOG.debug("could not fetch the acknowledged tail of {} from [{}]", shardId, writer, e);
             }
-        });
+        };
+        if (router.refreshVisibility().waitsForSearchNodes()) {
+            // Before the reader answers anything: a write acknowledged before this node subscribed is in the answer and
+            // nowhere else, and its writer does not wait for a node it did not know served the shard. A search that finds
+            // the engine open meanwhile waits for the answer too; see awaitFetch.
+            final Held shard = held.get(shardId);
+            if (shard != null) {
+                synchronized (shard) {
+                    shard.fetching = true;
+                }
+            }
+            try {
+                fetch.run();
+            } finally {
+                if (shard != null) {
+                    synchronized (shard) {
+                        shard.fetching = false;
+                        shard.notifyAll();
+                    }
+                }
+            }
+        } else {
+            router.node.threadPool().generic().execute(fetch);
+        }
+    }
+
+    /** Asks a shard's writer; null if it holds no live lease. */
+    private TailFetchResponse ask(ShardId shardId, String writer, long afterSeqNo, long subscription) throws Exception {
+        final Optional<DiscoveryNode> peer = router.peer(writer, TailPush.SEND_TIMEOUT);
+        if (peer.isEmpty()) {
+            return null;
+        }
+        return router.send(
+            peer.get(),
+            TailFetchRequest.ACTION,
+            new TailFetchRequest(shardId, afterSeqNo, router.node.localNode().getId(), subscription),
+            TailFetchResponse::new,
+            TailPush.SEND_TIMEOUT
+        );
+    }
+
+    /** Takes a writer's answer to a fetch or a renewal sent at a moment on the nano clock. */
+    private void answered(ShardId shardId, String writer, long asked, long sentNanos, TailFetchResponse answer) {
+        final int taken = take(shardId, answer.records());
+        fetched.addAndGet(Math.max(0, taken));
+        final Held shard = held.get(shardId);
+        if (shard == null) {
+            return;
+        }
+        synchronized (shard) {
+            if (answer.subscription() == TailFetchResponse.NONE) {
+                if (writer.equals(shard.grantWriter)) {
+                    shard.grantWriter = null;
+                    shard.subscription = TailFetchResponse.NONE;
+                }
+                return;
+            }
+            final boolean renewed = asked >= 0 && answer.subscription() == asked && writer.equals(shard.grantWriter);
+            if (renewed == false) {
+                // A subscription anew: the records it answered, with the commit, are all there is to go on.
+                shard.grantWriter = writer;
+                shard.subscription = answer.subscription();
+                shard.complete = answer.complete() && taken >= 0;
+                shard.grantUntilNanos = sentNanos;
+            }
+            final long until = sentNanos + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(RefreshVisibility.GRANT_MILLIS);
+            if (until - shard.grantUntilNanos > 0) {
+                shard.grantUntilNanos = until;
+            }
+        }
+    }
+
+    /**
+     * Whether a shard open here as a reader may answer a search that started before this call, in {@code everywhere}
+     * mode: whether it holds every write its writer may have answered as refreshed. Always true in the other modes.
+     *
+     * <p>Under a grant from the writer, it does: see {@link TailPush}. Without one it asks the writer, once for every
+     * search that finds none meanwhile: for a renewal of the subscription it holds, or a subscription anew with what
+     * is kept past its commit. One that still holds no grant -- no overlay, a gap, a record its engine left out, a
+     * writer that does not answer -- may answer only if its commit holds every write the writer says it may have
+     * answered as refreshed.
+     *
+     * @param shardId the shard
+     * @param writer the shard's live writer, which is not this node
+     * @param commitCheckpoint the local checkpoint of the commit the reader is open on
+     * @param applyPending has the reader's engine take what is held for it, so a record it cannot take is known
+     * @return true if it may answer
+     */
+    public boolean ensureFresh(ShardId shardId, String writer, long commitCheckpoint, Runnable applyPending) {
+        if (router.refreshVisibility().grants() == false) {
+            return true;
+        }
+        if (grantedNow(shardId, writer)) {
+            applyPending.run();
+            if (grantedNow(shardId, writer)) {
+                return true;
+            }
+        }
+        long claimedThrough = Long.MAX_VALUE;
+        boolean asked = false;
+        final Held before = held.get(shardId);
+        synchronized (before == null ? new Object() : before.asking) {
+            if (grantedNow(shardId, writer) == false) {
+                final Held shard = held.get(shardId);
+                long subscription = TailFetchRequest.CHECK;
+                if (shard != null) {
+                    synchronized (shard) {
+                        if (shard.engines > 0 && shard.refusing == false && shard.skipped == false) {
+                            subscription = writer.equals(shard.grantWriter) && shard.subscription >= 0
+                                ? shard.subscription
+                                : TailFetchRequest.NEW;
+                        }
+                    }
+                }
+                grantChecks.incrementAndGet();
+                final long sentNanos = System.nanoTime();
+                try {
+                    final TailFetchResponse answer = ask(shardId, writer, commitCheckpoint, subscription);
+                    if (answer != null) {
+                        asked = true;
+                        claimedThrough = answer.claimedThrough();
+                        if (subscription != TailFetchRequest.CHECK) {
+                            answered(shardId, writer, subscription, sentNanos, answer);
+                        }
+                    }
+                } catch (Exception e) {
+                    LOG.debug("could not ask the writer [{}] of {} for a grant", writer, shardId, e);
+                }
+            }
+        }
+        applyPending.run();
+        if (grantedNow(shardId, writer)) {
+            return true;
+        }
+        if (asked == false) {
+            try {
+                final TailFetchResponse answer = ask(shardId, writer, commitCheckpoint, TailFetchRequest.CHECK);
+                if (answer == null) {
+                    unreachable.incrementAndGet();
+                    return true;
+                }
+                claimedThrough = answer.claimedThrough();
+            } catch (Exception e) {
+                // A writer that cannot be reached is treated as one that died: the reader serves its commit, as it does
+                // for any acknowledged write until the shard is taken over, rather than fail every search meanwhile.
+                LOG.debug("could not reach the writer [{}] of {}; serving its commit", writer, shardId, e);
+                unreachable.incrementAndGet();
+                return true;
+            }
+        }
+        if (commitCheckpoint >= claimedThrough) {
+            return true;
+        }
+        refusals.incrementAndGet();
+        return false;
+    }
+
+    private boolean grantedNow(ShardId shardId, String writer) {
+        final Held shard = held.get(shardId);
+        if (shard == null) {
+            return false;
+        }
+        synchronized (shard) {
+            return shard.granted(writer, System.nanoTime());
+        }
     }
 }
