@@ -521,6 +521,7 @@ public final class ServerlessNode implements Closeable {
             // Members are owned through their bucket's head on every node, whatever its settings: nodes that disagreed
             // on which head owns an index could both take it.
             plane.bucketHeads().register(localNode.getId(), () -> reconciler().openShards());
+            plane.buckets().configure(settings);
             try {
                 // Publish the lease immediately. It is this node's entry in the address book that peers
                 // use to forward writes here, so a node that has not renewed yet is not merely invisible

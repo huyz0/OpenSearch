@@ -21,7 +21,9 @@ import java.util.Optional;
  *
  * <p>Indices are spread over a fixed number of stripes by their group (a tenant, say), so a tenant's indices made around
  * the same time share buckets and creates in different stripes never contend. Each stripe has one open bucket, named by
- * a generation in the stripe's register; a full bucket moves the stripe on to the next generation. Joining is one
+ * a generation in the stripe's register; a full bucket moves the stripe on to the next generation. A bucket is full by
+ * data size: a bucket of a few large indices and one of many tiny ones both stop at the same bytes. The member count and
+ * the stored manifest size are ceilings only, for buckets of indices too small for their bytes ever to fill it. Joining is one
  * compare-and-swap of the bucket's manifest, and is done before the descriptor names the bucket: the manifest is the
  * truth, so an index the manifest does not list is never served as a member.
  */
@@ -32,18 +34,56 @@ public final class BucketAssigner {
 
     private static final int ATTEMPTS = 16;
 
+    /**
+     * When a bucket takes no new members.
+     *
+     * @param targetBytes the data size that fills a bucket
+     * @param maxMembers the most members one bucket holds, whatever its size
+     * @param maxManifestBytes the stored manifest size past which it takes no more
+     */
+    public record Limits(long targetBytes, int maxMembers, int maxManifestBytes) {
+
+        /** Limits that keep every bound positive. */
+        public Limits {
+            targetBytes = Math.max(1L, targetBytes);
+            maxMembers = Math.max(1, maxMembers);
+            maxManifestBytes = Math.max(1, maxManifestBytes);
+        }
+
+        /**
+         * Returns whether a bucket is full.
+         *
+         * @param manifest the bucket's manifest
+         * @param storedBytes its stored size, or negative when not known
+         * @return true if it takes no new members
+         */
+        public boolean full(BucketManifest manifest, int storedBytes) {
+            return manifest.size() >= maxMembers || manifest.dataBytes() >= targetBytes || storedBytes >= maxManifestBytes;
+        }
+    }
+
     private final BucketStore store;
-    private final int maxMembers;
+    private final Limits limits;
 
     /**
-     * Creates an assigner.
+     * Creates an assigner that fills buckets by member count only.
      *
      * @param store the bucket registers
      * @param maxMembers the most members one bucket holds
      */
     public BucketAssigner(BucketStore store, int maxMembers) {
+        this(store, new Limits(Long.MAX_VALUE, maxMembers, Integer.MAX_VALUE));
+    }
+
+    /**
+     * Creates an assigner.
+     *
+     * @param store the bucket registers
+     * @param limits when a bucket is full
+     */
+    public BucketAssigner(BucketStore store, Limits limits) {
         this.store = store;
-        this.maxMembers = Math.max(1, maxMembers);
+        this.limits = limits;
     }
 
     /** The stripe a group's indices go to. */
@@ -77,7 +117,7 @@ public final class BucketAssigner {
             if (current.member(indexUuid).isPresent()) {
                 return bucket;
             }
-            if (current.size() >= maxMembers) {
+            if (limits.full(current, read.map(BucketStore.Read::storedBytes).orElse(0))) {
                 // Full: move the stripe on, whoever gets there first. A lost swap means another create already did.
                 store.swapOpen(stripe, generation + 1, open.map(BucketStore.Open::generation).orElse(BlobRegister.ABSENT_GENERATION));
                 continue;

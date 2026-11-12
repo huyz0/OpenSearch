@@ -18,6 +18,7 @@ import org.opensearch.serverless.bucket.BucketStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.net.URI;
@@ -26,6 +27,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -54,6 +56,38 @@ public class BucketAssignmentTests extends OpenSearchTestCase {
             final BucketManifest left = store.read(first).orElseThrow().manifest();
             assertTrue(left.member("uuid-0").isEmpty());
             assertEquals(2, left.size());
+        }
+    }
+
+    public void testBucketsFillByDataSizeNotMemberCount() throws Exception {
+        try (FsBlobStore blobs = new FsBlobStore(8192, createTempDir(), false)) {
+            final BucketStore store = new BucketStore(blobs, BlobPath.cleanPath());
+            final BucketAssigner assigner = new BucketAssigner(store, new BucketAssigner.Limits(1_000, 1024, Integer.MAX_VALUE));
+            final String first = assigner.join("tenant-1", "big", "uuid-big");
+            assertEquals("an empty member fills nothing", first, assigner.join("tenant-1", "small-0", "uuid-small-0"));
+            // The big index publishes past the target: the bucket now holds two members and is full by its bytes.
+            final BucketStore.Read read = store.read(first).orElseThrow();
+            final CommitManifest commit = new CommitManifest(1, Map.of("_0.cfs", "t=1"), "node-a", Map.of("_0.cfs", 1_200L));
+            store.swap(
+                read.manifest().withMember("uuid-big", read.manifest().member("uuid-big").orElseThrow().advance(commit)),
+                read.generation()
+            ).orElseThrow();
+            assertEquals(1_200L, store.read(first).orElseThrow().manifest().dataBytes());
+            final String second = assigner.join("tenant-1", "small-1", "uuid-small-1");
+            assertNotEquals("a bucket at its target bytes takes no one, at two members of 1024", first, second);
+            assertEquals(2, store.read(first).orElseThrow().manifest().size());
+
+            // Many tiny members fill a bucket only at the manifest ceiling.
+            final BucketAssigner byManifest = new BucketAssigner(store, new BucketAssigner.Limits(Long.MAX_VALUE, 1024, 200));
+            final Set<String> buckets = new HashSet<>();
+            for (int i = 0; i < 20; i++) {
+                buckets.add(byManifest.join("tenant-2", "tiny-" + i, "uuid-tiny-" + i));
+            }
+            assertTrue("a 200 byte manifest ceiling spreads twenty empty members: " + buckets, buckets.size() > 1);
+            for (String bucket : buckets) {
+                final BucketStore.Read stored = store.read(bucket).orElseThrow();
+                assertTrue(stored.manifest().size() < 20);
+            }
         }
     }
 

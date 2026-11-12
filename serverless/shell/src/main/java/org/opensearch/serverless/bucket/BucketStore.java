@@ -14,7 +14,6 @@ import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.ConditionalBlobContainer;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.util.Optional;
 
 /**
@@ -35,12 +34,68 @@ public final class BucketStore {
     /** The folder inside a bucket's container that holds its packs. */
     public static final String PACKS = "p";
 
-    /** A manifest with the register generation it was read at. */
-    public record Read(BucketManifest manifest, long generation) {
+    /**
+     * A manifest with the register generation it was read at, and its stored size.
+     *
+     * @param manifest the manifest
+     * @param generation the register generation
+     * @param storedBytes the manifest's size as stored, or -1 when not known (a manifest this node wrote and cached)
+     */
+    public record Read(BucketManifest manifest, long generation, int storedBytes) {
+
+        /**
+         * A read whose stored size is not known.
+         *
+         * @param manifest the manifest
+         * @param generation the register generation
+         */
+        public Read(BucketManifest manifest, long generation) {
+            this(manifest, generation, -1);
+        }
     }
 
     private final BlobStore blobStore;
     private final BlobPath base;
+    private volatile ManifestCodec codec = BucketSettings.DEFAULT_MANIFEST_CODEC;
+    private volatile boolean compressOnlyIfWorthIt = true;
+
+    /**
+     * Sets how manifests are written from here on; reading takes either encoding and any codec whatever this says.
+     *
+     * @param codec the codec, or null to write JSON, the encoding nodes without the compact one read
+     * @return this
+     */
+    public BucketStore codec(ManifestCodec codec) {
+        return codec(codec, false);
+    }
+
+    /**
+     * Sets how manifests are written from here on; reading takes either encoding and any codec whatever this says.
+     *
+     * @param codec the codec, or null to write JSON, the encoding nodes without the compact one read
+     * @param onlyIfWorthIt true to compress only manifests large enough, and shrunk enough, for it to pay
+     * @return this
+     */
+    public BucketStore codec(ManifestCodec codec, boolean onlyIfWorthIt) {
+        this.codec = codec;
+        this.compressOnlyIfWorthIt = onlyIfWorthIt;
+        return this;
+    }
+
+    /**
+     * Sets how manifests are written from a node's settings ({@link BucketSettings#MANIFEST_CODEC}).
+     *
+     * @param settings the node settings
+     * @return this
+     */
+    public BucketStore configure(org.opensearch.common.settings.Settings settings) {
+        return codec(BucketSettings.manifestCodec(settings), BucketSettings.compressOnlyIfWorthIt(settings));
+    }
+
+    /** @return how manifests are written, or null for JSON */
+    public ManifestCodec codec() {
+        return codec;
+    }
 
     /**
      * Creates the bucket store over a deployment's base path.
@@ -89,13 +144,27 @@ public final class BucketStore {
         if (stored.isEmpty()) {
             return Optional.empty();
         }
-        try (InputStream in = stored.get().value().streamInput()) {
-            final BucketManifest manifest = BucketManifest.fromStream(in);
-            if (manifest.bucketId().equals(bucketId) == false) {
-                throw new IOException("bucket register [" + bucketId + "] holds the manifest of [" + manifest.bucketId() + "]");
-            }
-            return Optional.of(new Read(manifest, stored.get().generation()));
+        final BucketManifest manifest = BucketManifest.parse(stored.get().value());
+        if (manifest.bucketId().equals(bucketId) == false) {
+            throw new IOException("bucket register [" + bucketId + "] holds the manifest of [" + manifest.bucketId() + "]");
         }
+        return Optional.of(new Read(manifest, stored.get().generation(), stored.get().value().length()));
+    }
+
+    /**
+     * Reads one member's entry of a bucket's manifest: one GET, and only that member's entry decoded.
+     *
+     * @param bucketId the bucket
+     * @param indexUuid the member index's uuid
+     * @return its entry, or empty if the bucket was never written or does not hold the index
+     * @throws IOException if the register cannot be read or parsed
+     */
+    public Optional<BucketManifest.Member> readMember(String bucketId, String indexUuid) throws IOException {
+        final Optional<BlobRegister> stored = container(bucketId).readRegister(MANIFEST);
+        if (stored.isEmpty()) {
+            return Optional.empty();
+        }
+        return BucketManifest.parseMember(stored.get().value(), indexUuid);
     }
 
     /** Where each stripe's open bucket is recorded. */
@@ -154,7 +223,14 @@ public final class BucketStore {
      * @throws IOException if the register cannot be written
      */
     public Optional<Long> swap(BucketManifest manifest, long expectedGeneration) throws IOException {
-        final var result = container(manifest.bucketId()).compareAndSwapRegister(MANIFEST, expectedGeneration, manifest.toBytes());
+        final ManifestCodec writing = codec;
+        final var result = container(manifest.bucketId()).compareAndSwapRegister(
+            MANIFEST,
+            expectedGeneration,
+            writing == null ? manifest.toBytes()
+                : compressOnlyIfWorthIt ? manifest.toBytesCompressingIfWorthIt(writing)
+                : manifest.toBytes(writing)
+        );
         return result.applied() ? Optional.of(result.currentGeneration()) : Optional.empty();
     }
 }

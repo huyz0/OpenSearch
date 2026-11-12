@@ -33,7 +33,8 @@ import java.util.TreeMap;
  * the bucket only changes how many registers there are. Membership lives here and nowhere else: an index is in a
  * bucket when this register names it, and its descriptor's bucket field is a hint a reader checks against this.
  *
- * <p>JSON, like every other register, so it can be read in the store's own console.
+ * <p>Written compactly by default ({@link #toBytes(ManifestCodec)}): binary and compressed, because every reader of a
+ * member pays for the whole register. The JSON encoding stays readable everywhere and is still written on request.
  */
 public final class BucketManifest {
 
@@ -133,6 +134,24 @@ public final class BucketManifest {
     }
 
     /**
+     * Returns the bucket's data size: the sum of the file lengths of every member's latest commit. This is what fills a
+     * bucket and what splits it, not how many members it has.
+     *
+     * @return the bytes, zero for members that never published
+     */
+    public long dataBytes() {
+        long total = 0;
+        for (Member member : members.values()) {
+            if (member.commit() != null) {
+                for (Long length : member.commit().lengths().values()) {
+                    total += length == null ? 0 : length;
+                }
+            }
+        }
+        return total;
+    }
+
+    /**
      * Returns one member's entry.
      *
      * @param indexUuid the member index's uuid
@@ -181,7 +200,64 @@ public final class BucketManifest {
     }
 
     /**
-     * Serializes this manifest.
+     * Serializes this manifest compactly: binary, each repeated string once, compressed with a codec its header names.
+     *
+     * @param codec the codec
+     * @return the register bytes
+     * @throws IOException if serialization fails
+     */
+    public BytesReference toBytes(ManifestCodec codec) throws IOException {
+        return CompactManifestFormat.encode(this, codec);
+    }
+
+    /**
+     * Serializes this manifest compactly, compressed with a codec only when that pays: a large enough manifest that the
+     * codec shrinks by at least a fifth. Smaller ones are written uncompressed.
+     *
+     * @param codec the codec to use when compressing pays
+     * @return the register bytes
+     * @throws IOException if serialization fails
+     */
+    public BytesReference toBytesCompressingIfWorthIt(ManifestCodec codec) throws IOException {
+        return CompactManifestFormat.encodeAuto(this, codec);
+    }
+
+    /**
+     * Parses a manifest in either encoding.
+     *
+     * @param bytes the register bytes
+     * @return the manifest
+     * @throws IOException if the bytes are malformed
+     */
+    public static BucketManifest parse(BytesReference bytes) throws IOException {
+        final byte[] raw = BytesReference.toBytes(bytes);
+        if (CompactManifestFormat.isCompact(raw)) {
+            return CompactManifestFormat.decode(raw);
+        }
+        try (InputStream in = bytes.streamInput()) {
+            return fromStream(in);
+        }
+    }
+
+    /**
+     * Reads one member's entry from a manifest in either encoding. The compact one is read only as far as the member
+     * index and that member's entry, so its cost does not grow with what the other members hold.
+     *
+     * @param bytes the register bytes
+     * @param indexUuid the member index's uuid
+     * @return its entry, or empty if the index is not a member
+     * @throws IOException if the bytes are malformed
+     */
+    public static Optional<Member> parseMember(BytesReference bytes, String indexUuid) throws IOException {
+        final byte[] raw = BytesReference.toBytes(bytes);
+        if (CompactManifestFormat.isCompact(raw)) {
+            return CompactManifestFormat.decodeMember(raw, indexUuid);
+        }
+        return parse(bytes).member(indexUuid);
+    }
+
+    /**
+     * Serializes this manifest as JSON, the encoding every node reads, for writers told not to use the compact one.
      *
      * @return the register bytes
      * @throws IOException if serialization fails
@@ -212,7 +288,7 @@ public final class BucketManifest {
     }
 
     /**
-     * Parses a manifest.
+     * Parses a manifest in its JSON encoding; {@link #parse} reads either.
      *
      * @param input the register bytes
      * @return the manifest
