@@ -34,6 +34,10 @@ import java.util.concurrent.atomic.AtomicLong;
  * the writer stops. So a writer pushes only to the search nodes that serve the shard right now -- one to a few --
  * however many search nodes there are, and a shard nobody searches costs no network at all.
  *
+ * <p>What a shard holds here runs without a gap past its commit: a push that is lost, a record the writer had no room
+ * to keep, or one there is no room for here, each stops the pushes until the shard is next opened on a commit, which
+ * fetches what follows it again. Until then the reader serves its commit and what it held before the gap.
+ *
  * <p>Records are kept only for shards with an overlay open here, or that had one a moment ago: a reader moving onto a
  * new commit closes one engine and opens the next, and what was pushed in between is what the next one needs. Each
  * record takes an ordinal as it arrives, so an engine reads each once, in arrival order; the engine orders them by
@@ -179,6 +183,8 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
         int engines;
         long localCheckpoint = -1L;
         long releasedAtNanos;
+        /** Set when a record did not fit: later ones would leave a gap, so none is taken until an engine opens anew. */
+        boolean refusing;
     }
 
     private final ShardRouter router;
@@ -235,9 +241,17 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
                 held.remove(shardId, shard);
                 return -1;
             }
+            if (shard.refusing) {
+                return -1;
+            }
             for (WalRecord record : records) {
-                if (record.seqNo() <= shard.localCheckpoint || shard.byOrdinal.size() >= MAX_RECORDS_PER_SHARD) {
+                if (record.seqNo() <= shard.localCheckpoint) {
                     continue;
+                }
+                if (shard.byOrdinal.size() >= MAX_RECORDS_PER_SHARD) {
+                    // Full: the writer stops pushing, and the reader serves what it holds until it opens a newer commit.
+                    shard.refusing = true;
+                    return -1;
                 }
                 shard.byOrdinal.put(shard.nextOrdinal.getAndIncrement(), record);
                 taken++;
@@ -252,6 +266,8 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
         synchronized (shard) {
             shard.engines++;
             shard.localCheckpoint = Math.max(shard.localCheckpoint, localCheckpoint);
+            // A new engine fetches what follows its commit, so what was refused is asked for again.
+            shard.refusing = false;
             shard.byOrdinal.values().removeIf(record -> record.seqNo() <= localCheckpoint);
         }
     }

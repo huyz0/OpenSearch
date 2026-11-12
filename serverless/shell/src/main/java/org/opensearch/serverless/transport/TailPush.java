@@ -70,6 +70,8 @@ public final class TailPush {
         final ArrayDeque<WalRecord> records = new ArrayDeque<>();
         long bytes;
         long publishedThrough = -1L;
+        /** The highest sequence number acknowledged here and not kept, for want of room: a fetch below it has a gap. */
+        long droppedThrough = -1L;
     }
 
     private record Acked(ShardId shardId, List<WalRecord> records) {
@@ -120,7 +122,11 @@ public final class TailPush {
         final Kept shard = kept.computeIfAbsent(shardId, ignored -> new Kept());
         synchronized (shard) {
             for (WalRecord record : records) {
-                if (record.seqNo() <= shard.publishedThrough || keptBytes.get() > MAX_KEPT_BYTES_PER_NODE) {
+                if (record.seqNo() <= shard.publishedThrough) {
+                    continue;
+                }
+                if (keptBytes.get() > MAX_KEPT_BYTES_PER_NODE) {
+                    shard.droppedThrough = Math.max(shard.droppedThrough, record.seqNo());
                     continue;
                 }
                 shard.records.addLast(record);
@@ -130,6 +136,7 @@ public final class TailPush {
             }
             while (shard.records.size() > MAX_KEPT_PER_SHARD || shard.bytes > MAX_KEPT_BYTES_PER_SHARD) {
                 final WalRecord dropped = shard.records.pollFirst();
+                shard.droppedThrough = Math.max(shard.droppedThrough, dropped.seqNo());
                 final long bytes = WalRecord.contentBytes(dropped.id(), dropped.source());
                 shard.bytes -= bytes;
                 keptBytes.addAndGet(-bytes);
@@ -289,8 +296,12 @@ public final class TailPush {
                 unsubscribe(shardId, target);
             }
         } catch (Exception e) {
-            // Lost: the search node serves its commit for these until the next one, as before overlays.
+            // Lost. Later pushes would leave a gap in what the search node holds, so it is pushed nothing more: it keeps
+            // what it has, which runs without a gap, and subscribes again when it next opens the shard on a commit.
             sendFailures.incrementAndGet();
+            for (ShardId shardId : request.records().keySet()) {
+                unsubscribe(shardId, target);
+            }
             LOG.debug("could not push acknowledged records to [{}]", target, e);
         }
     }
@@ -315,10 +326,25 @@ public final class TailPush {
     void handleFetch(TailFetchRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         router.requireMac(TailFetchRequest.ACTION, request);
         fetchesServed.incrementAndGet();
-        if (router.tailOverlays().onFor(request.shardId())) {
-            // Subscribed before the answer is built, so a write acknowledged in between is pushed if it is not in it.
-            subscribers.computeIfAbsent(request.shardId(), ignored -> ConcurrentHashMap.newKeySet()).add(request.subscriber());
+        if (router.tailOverlays().onFor(request.shardId()) == false || gapAfter(request.shardId(), request.afterSeqNo())) {
+            // Off, or this node let go of writes past that commit for want of room: the search node serves its commit
+            // until it opens a newer one, rather than a tail with a gap in it.
+            channel.sendResponse(new TailFetchResponse(List.of()));
+            return;
         }
+        // Subscribed before the answer is built, so a write acknowledged in between is pushed if it is not in it.
+        subscribers.computeIfAbsent(request.shardId(), ignored -> ConcurrentHashMap.newKeySet()).add(request.subscriber());
         channel.sendResponse(new TailFetchResponse(keptAfter(request.shardId(), request.afterSeqNo())));
+    }
+
+    /** Whether a write past this sequence number was acknowledged here and not kept. */
+    boolean gapAfter(ShardId shardId, long afterSeqNo) {
+        final Kept shard = kept.get(shardId);
+        if (shard == null) {
+            return false;
+        }
+        synchronized (shard) {
+            return shard.droppedThrough > afterSeqNo;
+        }
     }
 }

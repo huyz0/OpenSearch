@@ -139,6 +139,22 @@ public class TailOverlayTests extends OpenSearchTestCase {
         });
     }
 
+    public void testALostPushStopsThePushesToThatReader() throws Exception {
+        withNodes(null, (plane, store, writer, reader, shardId, term) -> {
+            writer.writes().index(shardId, "a", "{\"msg\":\"published\",\"n\":1}");
+            writer.shards().publishShard(shardId, term);
+            assertEquals(1L, hits(reader, plane, "msg", "published"));
+            assertBusy(() -> assertEquals(1, writer.router().tailPush().subscribersOf(shardId).size()));
+
+            // The reader goes away while its lease still stands: the next push fails, and it is pushed nothing more, so
+            // what it holds never has a gap in it.
+            reader.close();
+            writer.writes().index(shardId, "b", "{\"msg\":\"lost\",\"n\":2}");
+            assertBusy(() -> assertTrue(writer.router().tailPush().subscribersOf(shardId).isEmpty()), 10, TimeUnit.SECONDS);
+            assertTrue(writer.router().tailPush().counts()[2] >= 1L);
+        });
+    }
+
     public void testOffForAnIndexTheReaderServesItsCommitOnly() throws Exception {
         withNodes(Settings.builder().put(TailOverlays.INDEX_SETTING, "false").build(), (plane, store, writer, reader, shardId, term) -> {
             writer.writes().index(shardId, "a", "{\"msg\":\"published\",\"n\":1}");
