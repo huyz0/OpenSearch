@@ -144,12 +144,11 @@ final class DocumentUpdates {
             if (selected.scriptedUpsert() && selected.script() == null) {
                 throw new IllegalArgumentException("scripted_upsert was given without a script");
             }
-            if (selected.routing() != null
-                || selected.isRequireAlias()
+            if (selected.isRequireAlias()
                 || selected.waitForActiveShards().validate(0) == false
                 || (selected.fetchSource() != null && selected.fetchSource().fetchSource())) {
                 throw new org.opensearch.OpenSearchStatusException(
-                    "routing, require_alias, source fetching and active-shard counts above one are not supported on updates",
+                    "require_alias, source fetching and active-shard counts above one are not supported on updates",
                     org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
                 );
             }
@@ -169,6 +168,7 @@ final class DocumentUpdates {
                     return executeAcceptedUpdate(
                         selected.index(),
                         selected.id(),
+                        selected.routing(),
                         doc,
                         upsert,
                         selected.docAsUpsert(),
@@ -204,6 +204,7 @@ final class DocumentUpdates {
     UpdateOutcome executeAcceptedUpdate(
         String index,
         String id,
+        String customRouting,
         java.util.Map<String, Object> doc,
         java.util.Map<String, Object> upsert,
         boolean docAsUpsert,
@@ -217,7 +218,7 @@ final class DocumentUpdates {
         // doGet, not get: this whole method is one gated operation under UpdateAction's own name, and
         // calling the public get() here would run the filter chain a second time under GetAction's --
         // which is not what a filter checking "may this caller write" expects to see for an update.
-        final Read current = operations.reads.doGet(index, id);
+        final Read current = operations.reads.doGet(index, id, customRouting);
         final Document existing = current.document();
         if (existing.found()
             && ifSeqNo != org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO
@@ -273,7 +274,7 @@ final class DocumentUpdates {
                 ctx.put("_index", index);
                 ctx.put("_id", id);
                 ctx.put("_version", existing.version());
-                ctx.put("_routing", null);
+                ctx.put("_routing", existing.routing() != null ? existing.routing() : customRouting);
             }
             final var factory = operations.node.services().scriptService().compile(script, org.opensearch.script.UpdateScript.CONTEXT);
             factory.newInstance(script.getParams(), ctx).execute();
@@ -330,11 +331,13 @@ final class DocumentUpdates {
             final DocumentWrites.Written removed = operations.writes.written(
                 index,
                 id,
+                customRouting,
                 "",
                 refresh,
                 true,
                 existing.seqNo(),
-                existing.primaryTerm()
+                existing.primaryTerm(),
+                false
             );
             return new UpdateOutcome(
                 "deleted",
@@ -377,6 +380,7 @@ final class DocumentUpdates {
         final DocumentWrites.Written written = operations.writes.written(
             index,
             id,
+            customRouting,
             mergedJson,
             refresh,
             false,

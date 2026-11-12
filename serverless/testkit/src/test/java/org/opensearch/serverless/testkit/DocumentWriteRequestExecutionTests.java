@@ -357,11 +357,10 @@ public class DocumentWriteRequestExecutionTests extends OpenSearchTestCase {
     }
 
     public void testAdmittedUnsupportedWriteOptionsAreRefusedBeforeWriting() throws Exception {
-        for (String option : List.of("routing", "require_alias", "replicas")) {
+        for (String option : List.of("require_alias", "replicas")) {
             withNode(PolicyFilterPlugin.request(IndexAction.NAME, request -> {
                 final var selected = (IndexRequest) request;
                 switch (option) {
-                    case "routing" -> selected.routing("elsewhere");
                     case "require_alias" -> selected.setRequireAlias(true);
                     case "replicas" -> selected.waitForActiveShards(org.opensearch.action.support.ActiveShardCount.from(2));
                     default -> throw new AssertionError(option);

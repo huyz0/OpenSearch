@@ -53,18 +53,13 @@ final class DocumentWritePlanner {
             if (invalid != null) {
                 throw invalid;
             }
-            DocumentWriteOutcomes.validateWriteOptions(
-                selected.routing(),
-                selected.version(),
-                selected.versionType(),
-                selected.waitForActiveShards(),
-                false
-            );
+            DocumentWriteOutcomes.validateWriteOptions(selected.version(), selected.versionType(), selected.waitForActiveShards(), false);
             planWrite(
                 metadata,
                 serving,
                 selected.index(),
                 selected.id(),
+                selected.routing(),
                 null,
                 null,
                 true,
@@ -81,13 +76,7 @@ final class DocumentWritePlanner {
                 throw invalid;
             }
             final boolean create = selected.opType() == org.opensearch.action.DocWriteRequest.OpType.CREATE;
-            DocumentWriteOutcomes.validateWriteOptions(
-                selected.routing(),
-                selected.version(),
-                selected.versionType(),
-                selected.waitForActiveShards(),
-                create
-            );
+            DocumentWriteOutcomes.validateWriteOptions(selected.version(), selected.versionType(), selected.waitForActiveShards(), create);
             if (selected.isRequireAlias() || selected.getFinalPipeline() != null && "_none".equals(selected.getFinalPipeline()) == false) {
                 throw new WriteRefusal(
                     RestStatus.NOT_IMPLEMENTED,
@@ -107,6 +96,7 @@ final class DocumentWritePlanner {
                 serving,
                 selected.index(),
                 chosenId,
+                selected.routing(),
                 chosenSource,
                 selected.getPipeline(),
                 false,
@@ -124,6 +114,7 @@ final class DocumentWritePlanner {
         ServerlessNode serving,
         String index,
         String id,
+        String routing,
         String source,
         String pipeline,
         boolean deletion,
@@ -171,7 +162,7 @@ final class DocumentWritePlanner {
                 if (outcome.dropped()) {
                     answer.onResponse(
                         WriteResult.dropped(
-                            new ShardId(writtenIndex, descriptor.get().uuid(), DocumentRouting.shardFor(descriptor.get(), id)),
+                            new ShardId(writtenIndex, descriptor.get().uuid(), DocumentRouting.shardFor(descriptor.get(), id, routing)),
                             id,
                             ran,
                             requireAbsent
@@ -187,7 +178,7 @@ final class DocumentWritePlanner {
             }
         }
         final String shapedSource = shaped;
-        final int shard = DocumentRouting.shardFor(descriptor.get(), id);
+        final int shard = DocumentRouting.shardFor(descriptor.get(), id, routing);
         final long inFlightBytes = org.opensearch.serverless.store.WalRecord.contentBytes(id, deletion ? null : shapedSource);
         final java.util.function.BiConsumer<org.opensearch.core.action.ActionListener<WriteResult>, ShardId> writeHere = (
             listener,
@@ -198,8 +189,8 @@ final class DocumentWritePlanner {
                     .markCoordinatingOperationStarted(inFlightBytes, false)
             ) {
                 final WriteOutcome outcome = deletion
-                    ? serving.writes().delete(into, id, ifSeqNo, ifPrimaryTerm)
-                    : serving.writes().index(into, id, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent);
+                    ? serving.writes().delete(into, id, routing, ifSeqNo, ifPrimaryTerm)
+                    : serving.writes().index(into, id, routing, shapedSource, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
                 boolean refreshed = false;
                 if (refresh) {
                     refreshed = serving.writes().refreshWritten(into, outcome, "serverless-rest-refresh");
@@ -269,6 +260,7 @@ final class DocumentWritePlanner {
                                 indexUuid,
                                 shard,
                                 id,
+                                routing,
                                 shapedSource,
                                 refresh,
                                 deletion,
@@ -325,6 +317,7 @@ final class DocumentWritePlanner {
                                                 indexUuid,
                                                 shard,
                                                 id,
+                                                routing,
                                                 shapedSource,
                                                 refresh,
                                                 deletion,
@@ -376,6 +369,7 @@ final class DocumentWritePlanner {
                                 indexUuid,
                                 shard,
                                 id,
+                                routing,
                                 shapedSource,
                                 refresh,
                                 deletion,
@@ -432,6 +426,7 @@ final class DocumentWritePlanner {
                             routedUuid,
                             shard,
                             id,
+                            routing,
                             shapedSource,
                             refresh,
                             deletion,

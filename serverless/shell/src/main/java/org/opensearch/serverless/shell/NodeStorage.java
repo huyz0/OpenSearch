@@ -102,7 +102,8 @@ final class NodeStorage {
                 shardId.getIndexName(),
                 record.id(),
                 new org.opensearch.core.common.bytes.BytesArray(record.source()),
-                org.opensearch.common.xcontent.XContentType.JSON
+                org.opensearch.common.xcontent.XContentType.JSON,
+                record.routing()
             )
         );
         return parsed.dynamicMappingsUpdate() == null ? parsed : null;

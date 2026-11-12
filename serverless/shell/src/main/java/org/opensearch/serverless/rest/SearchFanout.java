@@ -188,10 +188,39 @@ public final class SearchFanout {
      * @param preSkippedShards shards resolution already ruled out, reported as skipped and successful
      * @param nowMillis the request's single now, or zero to take one here
      * @param judged indices the rollups already settled may match, whose shards are not checked again
+     * @param routing the search's custom routing values; when any are given, only the shards they route to are searched
      */
-    public record Options(boolean allowPartialActivation, int preSkippedShards, long nowMillis, java.util.Set<String> judged) {
+    public record Options(boolean allowPartialActivation, int preSkippedShards, long nowMillis, java.util.Set<String> judged, java.util.Set<
+        String> routing) {
         /** Refuse past the budget; nothing skipped before the fan-out; the fan-out's own clock. */
         public static final Options DEFAULT = new Options(false, 0, 0L, java.util.Set.of());
+
+        /** Validates and copies. */
+        public Options {
+            routing = routing == null ? java.util.Set.of() : java.util.Set.copyOf(routing);
+        }
+
+        /**
+         * Options for a search with no custom routing.
+         *
+         * @param allowPartialActivation whether to answer from the shards within the budget
+         * @param preSkippedShards shards resolution already ruled out
+         * @param nowMillis the request's single now, or zero
+         * @param judged indices the rollups already settled may match
+         */
+        public Options(boolean allowPartialActivation, int preSkippedShards, long nowMillis, java.util.Set<String> judged) {
+            this(allowPartialActivation, preSkippedShards, nowMillis, judged, java.util.Set.of());
+        }
+
+        /**
+         * Returns these options narrowed to the shards some routing values route to.
+         *
+         * @param values the routing values, or an empty set for every shard
+         * @return the options
+         */
+        public Options withRouting(java.util.Set<String> values) {
+            return new Options(allowPartialActivation, preSkippedShards, nowMillis, judged, values);
+        }
 
         /**
          * Options with only the partial-activation choice.
@@ -199,7 +228,7 @@ public final class SearchFanout {
          * @param allowPartialActivation whether to answer from the shards within the budget
          */
         public Options(boolean allowPartialActivation) {
-            this(allowPartialActivation, 0, 0L, java.util.Set.of());
+            this(allowPartialActivation, 0, 0L, java.util.Set.of(), java.util.Set.of());
         }
     }
 
@@ -262,6 +291,17 @@ public final class SearchFanout {
         final long nowInMillis = options.nowMillis() > 0L ? options.nowMillis() : System.currentTimeMillis();
         final List<Target> everyShard = new ArrayList<>();
         for (org.opensearch.serverless.cluster.IndexDescriptor descriptor : indices.values()) {
+            // A routed search visits only the shards its routing values route to, as core's does: the routing
+            // decided where each such document was written, so no other shard can hold it.
+            final java.util.Collection<Integer> routed = options.routing().isEmpty()
+                ? null
+                : DocumentRouting.shardsForSearch(descriptor, options.routing());
+            if (routed != null) {
+                for (int shard : routed) {
+                    everyShard.add(new Target(descriptor, shard));
+                }
+                continue;
+            }
             for (int shard : descriptor.unitIds()) {
                 everyShard.add(new Target(descriptor, shard));
             }

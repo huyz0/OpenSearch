@@ -37,7 +37,7 @@ final class DocumentWrites {
             throw invalid;
         }
         final boolean create = accepted.opType() == org.opensearch.action.DocWriteRequest.OpType.CREATE;
-        validateNativeWrite(accepted.routing(), accepted.version(), accepted.versionType(), accepted.waitForActiveShards(), create);
+        validateNativeWrite(accepted.version(), accepted.versionType(), accepted.waitForActiveShards(), create);
         if (accepted.isRequireAlias()) {
             throw new UnsupportedOperationException("require_alias is not supported through the native Client");
         }
@@ -63,6 +63,7 @@ final class DocumentWrites {
             final Written written = written(
                 accepted.index(),
                 id,
+                accepted.routing(),
                 source,
                 refresh,
                 false,
@@ -85,15 +86,11 @@ final class DocumentWrites {
     }
 
     static void validateNativeWrite(
-        String routing,
         long version,
         org.opensearch.index.VersionType versionType,
         org.opensearch.action.support.ActiveShardCount activeShards,
         boolean create
     ) {
-        if (routing != null) {
-            throw new UnsupportedOperationException("routing is not supported: documents are placed by their id");
-        }
         if (versionType != org.opensearch.index.VersionType.INTERNAL
             || (version != org.opensearch.common.lucene.uid.Versions.MATCH_ANY
                 && (create == false || version != org.opensearch.common.lucene.uid.Versions.MATCH_DELETED))) {
@@ -144,7 +141,7 @@ final class DocumentWrites {
 
     Written written(String index, String id, String source, boolean refresh, boolean deletion, long ifSeqNo, long ifPrimaryTerm)
         throws IOException {
-        return written(index, id, source, refresh, deletion, ifSeqNo, ifPrimaryTerm, false);
+        return written(index, id, null, source, refresh, deletion, ifSeqNo, ifPrimaryTerm, false);
     }
 
     Written written(
@@ -157,17 +154,31 @@ final class DocumentWrites {
         long ifPrimaryTerm,
         boolean requireAbsent
     ) throws IOException {
-        final Placement placement = routing.place(index, id);
+        return written(index, id, null, source, refresh, deletion, ifSeqNo, ifPrimaryTerm, requireAbsent);
+    }
+
+    Written written(
+        String index,
+        String id,
+        String customRouting,
+        String source,
+        boolean refresh,
+        boolean deletion,
+        long ifSeqNo,
+        long ifPrimaryTerm,
+        boolean requireAbsent
+    ) throws IOException {
+        final Placement placement = routing.place(index, id, customRouting);
         if (placement.local() != null) {
             final var outcome = deletion
-                ? node.writes().delete(placement.local(), id, ifSeqNo, ifPrimaryTerm)
-                : node.writes().index(placement.local(), id, source, ifSeqNo, ifPrimaryTerm, requireAbsent);
+                ? node.writes().delete(placement.local(), id, customRouting, ifSeqNo, ifPrimaryTerm)
+                : node.writes().index(placement.local(), id, customRouting, source, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
             if (refresh) {
                 node.writes().refreshWritten(placement.local(), outcome, "serverless-ops-refresh");
             }
             return new Written(node.localNode().getId(), outcome, placement.local());
         }
-        return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent);
+        return forwardWritten(index, id, customRouting, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
     }
 
     String forward(String index, String id, String source, boolean refresh, boolean deletion, Placement placement) throws IOException {
@@ -207,12 +218,13 @@ final class DocumentWrites {
         long ifPrimaryTerm,
         boolean requireAbsent
     ) throws IOException {
-        return forwardWritten(index, id, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
+        return forwardWritten(index, id, null, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
     }
 
     Written forwardWritten(
         String index,
         String id,
+        String customRouting,
         String source,
         boolean refresh,
         boolean deletion,
@@ -246,7 +258,7 @@ final class DocumentWrites {
                         ifSeqNo,
                         ifPrimaryTerm,
                         requireAbsent
-                    )
+                    ).routing(customRouting)
                 );
             return new Written(
                 ack.ownerNodeId(),
@@ -262,6 +274,7 @@ final class DocumentWrites {
             return forwardWritten(
                 index,
                 id,
+                customRouting,
                 source,
                 refresh,
                 deletion,

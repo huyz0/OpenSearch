@@ -108,7 +108,7 @@ public final class DocumentHandler extends BaseRestHandler {
         final String version = request.param("version");
         final String versionType = request.param("version_type");
         final String pipeline = request.param("pipeline");
-        final String routing = request.param("routing");
+        final String routing = DocumentRouting.normalize(request.param("routing"));
         final boolean requireAlias = request.paramAsBoolean("require_alias", false);
         // Hints with one possible answer here: there is one copy of each shard, so wait_for_active_shards
         // can only be 1, and a write is acknowledged when its log write returns, which is what timeout
@@ -130,19 +130,6 @@ public final class DocumentHandler extends BaseRestHandler {
                     RestStatus.BAD_REQUEST,
                     "bad_request",
                     "op_type must be create or index, not [" + opType + "]"
-                )
-            );
-        }
-        if (routing != null) {
-            // Refused rather than ignored: a document here is placed by its id alone, and a caller
-            // supplying a routing value expects it to decide the shard.
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_write",
-                    "routing is not supported: a document is placed by its id alone, so a routing value would be "
-                        + "accepted and change nothing"
                 )
             );
         }
@@ -222,6 +209,7 @@ public final class DocumentHandler extends BaseRestHandler {
                     serving,
                     index,
                     id,
+                    routing,
                     source,
                     pipeline,
                     deletion,
@@ -245,6 +233,7 @@ public final class DocumentHandler extends BaseRestHandler {
         ServerlessNode serving,
         String index,
         String id,
+        String routing,
         String source,
         String pipeline,
         boolean deletion,
@@ -269,6 +258,7 @@ public final class DocumentHandler extends BaseRestHandler {
                 serving,
                 index,
                 id,
+                routing,
                 source,
                 pipeline,
                 deletion,
@@ -285,7 +275,8 @@ public final class DocumentHandler extends BaseRestHandler {
             : org.opensearch.action.support.WriteRequest.RefreshPolicy.NONE;
         final org.opensearch.action.ActionRequest request;
         if (deletion) {
-            final var delete = new org.opensearch.action.delete.DeleteRequest(index, id).setIfSeqNo(ifSeqNo)
+            final var delete = new org.opensearch.action.delete.DeleteRequest(index, id).routing(routing)
+                .setIfSeqNo(ifSeqNo)
                 .setIfPrimaryTerm(ifPrimaryTerm)
                 .setRefreshPolicy(policy);
             if (timeoutValue != null) {
@@ -297,6 +288,7 @@ public final class DocumentHandler extends BaseRestHandler {
             request = delete;
         } else {
             final var write = new org.opensearch.action.index.IndexRequest(index).id(id)
+                .routing(routing)
                 .source(source, org.opensearch.common.xcontent.XContentType.JSON)
                 .create(requireAbsent)
                 .setIfSeqNo(ifSeqNo)

@@ -61,8 +61,14 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
         assertNativeRefused(ask().searchType(SearchType.DFS_QUERY_THEN_FETCH));
     }
 
-    public void testNativeRoutingIsNotDroppedBeforeAdmission() throws Exception {
-        assertNativeRefused(ask().routing("selected-route"));
+    public void testNativeRoutingNarrowsTheSearchToTheRoutedShard() throws Exception {
+        withNode(new org.opensearch.plugins.Plugin() {
+        }, node -> {
+            // Each test shard holds one document, written straight into it, so a search that visits one shard finds one.
+            final var routed = node.services().client().search(ask().routing("selected-route")).actionGet();
+            assertEquals(1, routed.getTotalShards());
+            assertEquals(1L, routed.getHits().getTotalHits().value());
+        });
     }
 
     public void testNativeScrollIsNotDroppedBeforeAdmission() throws Exception {
@@ -131,7 +137,6 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
         final var plugin = new ResetOptionsPlugin();
         withNode(plugin, node -> {
             final var request = ask().searchType(SearchType.DFS_QUERY_THEN_FETCH)
-                .routing("selected-route")
                 .pipeline("required-policy")
                 .scroll("1m")
                 .preference("_shards:0");
@@ -139,7 +144,6 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
             final var observed = plugin.observed.get();
             assertNotNull(observed);
             assertEquals(SearchType.DFS_QUERY_THEN_FETCH, observed.searchType());
-            assertEquals("selected-route", observed.routing());
             assertEquals("required-policy", observed.pipeline());
             assertNotNull(observed.scroll());
             assertEquals("_shards:0", observed.preference());

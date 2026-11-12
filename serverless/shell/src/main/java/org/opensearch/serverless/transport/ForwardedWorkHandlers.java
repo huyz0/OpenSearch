@@ -108,12 +108,21 @@ final class ForwardedWorkHandlers {
         router.requireLiveOwnership(shardId);
         final org.opensearch.serverless.shell.WriteOutcome outcome;
         if (request.deletion()) {
-            outcome = router.node.writes().delete(shardId, request.id(), request.ifSeqNo(), request.ifPrimaryTerm());
+            outcome = router.node.writes().delete(shardId, request.id(), request.routing(), request.ifSeqNo(), request.ifPrimaryTerm());
         } else {
             // requireAbsent travels on the wire and used to be dropped here, so a forwarded _create was an
             // overwrite -- and a data-stream write, which is create-only, was one too.
             outcome = router.node.writes()
-                .index(shardId, request.id(), request.source(), request.ifSeqNo(), request.ifPrimaryTerm(), request.requireAbsent());
+                .index(
+                    shardId,
+                    request.id(),
+                    request.routing(),
+                    request.source(),
+                    request.ifSeqNo(),
+                    request.ifPrimaryTerm(),
+                    request.requireAbsent(),
+                    true
+                );
         }
         final boolean refreshed = request.refresh()
             && router.node.writes().refreshWritten(shardId, outcome, "serverless-forwarded-refresh");

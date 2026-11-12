@@ -33,6 +33,7 @@ final class TailRecords {
             out.writeZLong(record.seqNo());
             out.writeZLong(record.primaryTerm());
             out.writeZLong(record.version());
+            out.writeOptionalString(record.routing());
         }
     }
 
@@ -46,8 +47,10 @@ final class TailRecords {
             final long seqNo = in.readZLong();
             final long primaryTerm = in.readZLong();
             final long version = in.readZLong();
+            final String routing = in.readOptionalString();
             records.add(
-                deletion ? WalRecord.deletion(id, seqNo, primaryTerm, version) : new WalRecord(id, source, seqNo, primaryTerm, version)
+                (deletion ? WalRecord.deletion(id, seqNo, primaryTerm, version) : new WalRecord(id, source, seqNo, primaryTerm, version))
+                    .withRouting(routing)
             );
         }
         return records;

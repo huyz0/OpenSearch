@@ -39,6 +39,7 @@ public final class WriteHold implements AutoCloseable {
          *
          * @param shardId the shard the write was addressed to
          * @param id the document id
+         * @param routing the custom routing value, or null when the document is placed by its id
          * @param source the document source
          * @param ifSeqNo the sequence number the document must be at, or unassigned
          * @param ifPrimaryTerm the primary term the document must be at, or 0
@@ -50,6 +51,7 @@ public final class WriteHold implements AutoCloseable {
         WriteOutcome index(
             ShardId shardId,
             String id,
+            String routing,
             String source,
             long ifSeqNo,
             long ifPrimaryTerm,
@@ -62,12 +64,13 @@ public final class WriteHold implements AutoCloseable {
          *
          * @param shardId the shard the write was addressed to
          * @param id the document id
+         * @param routing the custom routing value, or null when the document is placed by its id
          * @param ifSeqNo the sequence number the document must be at, or unassigned
          * @param ifPrimaryTerm the primary term the document must be at, or 0
          * @return the outcome, as the caller is told it
          * @throws IOException if it fails
          */
-        WriteOutcome delete(ShardId shardId, String id, long ifSeqNo, long ifPrimaryTerm) throws IOException;
+        WriteOutcome delete(ShardId shardId, String id, String routing, long ifSeqNo, long ifPrimaryTerm) throws IOException;
 
         /**
          * Applies a forwarded batch.

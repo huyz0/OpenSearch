@@ -50,6 +50,9 @@ public final class ReplaySpool implements AutoCloseable {
         void read(CheckedConsumer<WalRecord, IOException> consumer) throws IOException;
     }
 
+    /** Frame flag: the record carries a custom routing value, written after its body. */
+    private static final int ROUTED = 4;
+
     private final Path path;
     private final Path records;
     private int count;
@@ -103,14 +106,16 @@ public final class ReplaySpool implements AutoCloseable {
                     throw new IOException("too many operations in WAL recovery");
                 }
                 final byte[] body = record.isDeletion() ? new byte[0] : record.source().getBytes(StandardCharsets.UTF_8);
-                final long size = 1L + 3L * Long.BYTES + Integer.BYTES + 2L * record.id().length() + 2L * Integer.BYTES + body.length;
+                final String routing = record.routing();
+                final long size = 1L + 3L * Long.BYTES + Integer.BYTES + 2L * record.id().length() + 2L * Integer.BYTES + body.length
+                    + (routing == null ? 0L : Integer.BYTES + 2L * routing.length());
                 if (size > Integer.MAX_VALUE - Integer.BYTES) {
                     throw new IOException("WAL operation exceeds local replay frame size");
                 }
                 final int length = (int) size;
                 output.writeInt(length);
                 checksum.reset();
-                output.writeByte((record.hasSequenceIdentity() ? 1 : 0) | (record.isDeletion() ? 2 : 0));
+                output.writeByte((record.hasSequenceIdentity() ? 1 : 0) | (record.isDeletion() ? 2 : 0) | (routing != null ? ROUTED : 0));
                 output.writeLong(record.seqNo());
                 output.writeLong(record.primaryTerm());
                 output.writeLong(record.version());
@@ -118,6 +123,11 @@ public final class ReplaySpool implements AutoCloseable {
                 output.writeChars(record.id());
                 output.writeInt(body.length);
                 output.write(body);
+                if (routing != null) {
+                    // After the body, so every offset the id sort and the legacy pass seek to is where it was.
+                    output.writeInt(routing.length());
+                    output.writeChars(routing);
+                }
                 output.writeInt((int) checksum.getValue());
                 if (record.hasSequenceIdentity()) {
                     final byte[] key = new byte[20];
@@ -388,10 +398,11 @@ public final class ReplaySpool implements AutoCloseable {
                     final String id = readId(input);
                     final byte[] source = new byte[input.readInt()];
                     input.readFully(source);
+                    final String routing = (flags & ROUTED) != 0 ? readId(input) : null;
                     input.verify();
                     return (flags & 2) != 0
                         ? new Translog.Delete(id, seqNo, term, version)
-                        : new Translog.Index(id, seqNo, term, version, source, null, -1);
+                        : new Translog.Index(id, seqNo, term, version, source, routing, -1);
                 }
                 return null;
             }
@@ -442,10 +453,11 @@ public final class ReplaySpool implements AutoCloseable {
         final String id = readId(input);
         final byte[] source = new byte[input.readInt()];
         input.readFully(source);
+        final String routing = (flags & ROUTED) != 0 ? readId(input) : null;
         input.verify();
-        return (flags & 2) != 0
+        return ((flags & 2) != 0
             ? WalRecord.deletion(id, seqNo, term, version)
-            : new WalRecord(id, new String(source, StandardCharsets.UTF_8), seqNo, term, version);
+            : new WalRecord(id, new String(source, StandardCharsets.UTF_8), seqNo, term, version)).withRouting(routing);
     }
 
     private static String readId(DataInputStream input) throws IOException {

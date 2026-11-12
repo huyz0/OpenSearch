@@ -19,6 +19,7 @@ import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.index.mapper.IdFieldMapper;
+import org.opensearch.index.mapper.RoutingFieldMapper;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.serverless.routing.RoutingHash;
 import org.opensearch.serverless.routing.UnitLayout;
@@ -26,7 +27,8 @@ import org.opensearch.serverless.routing.UnitLayout;
 import java.io.IOException;
 
 /**
- * One segment seen through a split half: only the live documents whose id hashes into that half.
+ * One segment seen through a split half: only the live documents whose routing (their id, unless custom routing was given)
+ * hashes into that half.
  *
  * <p>Handed to {@code IndexWriter#addIndexes}, which copies postings, doc values and stored fields of the
  * documents this reports live without re-analysing anything. Soft-deleted documents (superseded versions
@@ -62,15 +64,18 @@ final class HalfFilter extends FilterCodecReader {
         final Bits hardLive = segment.getLiveDocs();
         final FixedBitSet softDeleted = softDeleted(segment);
         final StoredFields stored = segment.storedFields();
-        final IdVisitor visitor = new IdVisitor();
+        // A segment with no routed document has no _routing field at all, and is read exactly as before: the id alone.
+        final IdVisitor visitor = new IdVisitor(segment.getFieldInfos().fieldInfo(RoutingFieldMapper.NAME) != null);
         int blockStart = 0;
         for (int doc = 0; doc < maxDoc; doc++) {
             visitor.id = null;
+            visitor.routing = null;
             stored.document(doc, visitor);
             if (visitor.id == null) {
                 continue; // a nested child, or a no-op tombstone: decided with the next document that has an id
             }
-            final boolean inHalf = half.covers(RoutingHash.of(visitor.id));
+            // A routed document lives where its routing hashes, which is where every routed read looks for it.
+            final boolean inHalf = half.covers(RoutingHash.of(visitor.routing != null ? visitor.routing : visitor.id));
             for (int member = blockStart; member <= doc; member++) {
                 final boolean live = (hardLive == null || hardLive.get(member))
                     && (softDeleted == null || softDeleted.get(member) == false);
@@ -120,21 +125,38 @@ final class HalfFilter extends FilterCodecReader {
         return null;
     }
 
-    /** Reads only the stored id, and stops there. */
+    /** Reads only the stored id, and the stored routing when the segment has any, and stops there. */
     private static final class IdVisitor extends StoredFieldVisitor {
+        private final boolean routed;
         String id;
+        String routing;
+
+        IdVisitor(boolean routed) {
+            this.routed = routed;
+        }
 
         @Override
         public Status needsField(FieldInfo fieldInfo) {
-            if (IdFieldMapper.NAME.equals(fieldInfo.name)) {
+            if (IdFieldMapper.NAME.equals(fieldInfo.name) || (routed && RoutingFieldMapper.NAME.equals(fieldInfo.name))) {
                 return Status.YES;
             }
-            return id == null ? Status.NO : Status.STOP;
+            if (id == null) {
+                return Status.NO;
+            }
+            // With routing in the segment, the id alone is not the answer until _routing has been seen or passed.
+            return routed && routing == null ? Status.NO : Status.STOP;
         }
 
         @Override
         public void binaryField(FieldInfo fieldInfo, byte[] value) {
             id = Uid.decodeId(value);
+        }
+
+        @Override
+        public void stringField(FieldInfo fieldInfo, String value) {
+            if (RoutingFieldMapper.NAME.equals(fieldInfo.name)) {
+                routing = value;
+            }
         }
     }
 }

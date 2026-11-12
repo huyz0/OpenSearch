@@ -27,6 +27,7 @@ final class DocumentForwarding {
         String indexUuid,
         int shard,
         String id,
+        String routing,
         String shapedSource,
         boolean refresh,
         boolean deletion,
@@ -41,6 +42,7 @@ final class DocumentForwarding {
             indexUuid,
             shard,
             id,
+            routing,
             shapedSource,
             refresh,
             deletion,
@@ -58,6 +60,7 @@ final class DocumentForwarding {
         String indexUuid,
         int shard,
         String id,
+        String routing,
         String shapedSource,
         boolean refresh,
         boolean deletion,
@@ -96,7 +99,7 @@ final class DocumentForwarding {
                 ifSeqNo,
                 ifPrimaryTerm,
                 requireAbsent
-            );
+            ).routing(routing);
             return serving.router().forwardIndex(peer.get(), steered ? request.steered() : request);
         } catch (Exception e) {
             throw new ForwardFailed(owner, e);

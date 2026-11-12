@@ -55,6 +55,7 @@ public final class WalRecord {
     private final long seqNo;
     private final long primaryTerm;
     private final long version;
+    private final String routing;
 
     /**
      * Creates a record for a deletion, carrying the sequence identity the engine assigned it.
@@ -112,6 +113,14 @@ public final class WalRecord {
     }
 
     private WalRecord(String id, String source, boolean deletion, long seqNo, long primaryTerm, long version) {
+        this(id, source, deletion, seqNo, primaryTerm, version, null);
+    }
+
+    private WalRecord(String id, String source, boolean deletion, long seqNo, long primaryTerm, long version, String routing) {
+        if (routing != null && routing.isEmpty()) {
+            throw new IllegalArgumentException("a routing value must not be empty");
+        }
+        this.routing = routing;
         this.deletion = deletion;
         this.id = Objects.requireNonNull(id);
         this.source = Objects.requireNonNull(source);
@@ -127,6 +136,61 @@ public final class WalRecord {
      */
     public String id() {
         return id;
+    }
+
+    /**
+     * Returns the custom routing value the operation was written with.
+     *
+     * <p><b>Why a log record has to carry it.</b> Routing decides which shard a document lives in, and it is also
+     * stored with the document as {@code _routing}. A record replayed without it would rebuild the document without
+     * its {@code _routing} field, and a unit split -- which partitions documents and log tails by the routing hash --
+     * would put the document in the half its id hashes to rather than the half its routing does, where no routed get
+     * would ever look for it.
+     *
+     * @return the routing value, or null when the document is placed by its id
+     */
+    public String routing() {
+        return routing;
+    }
+
+    /**
+     * Returns the value this record is placed by: its routing when it has one, its id otherwise.
+     *
+     * @return the effective routing value
+     */
+    public String placedBy() {
+        return routing != null ? routing : id;
+    }
+
+    /**
+     * Returns this record with a routing value.
+     *
+     * @param newRouting the routing value, or null for none
+     * @return this record if the routing is unchanged, else a copy carrying it
+     */
+    public WalRecord withRouting(String newRouting) {
+        if (Objects.equals(newRouting, routing)) {
+            return this;
+        }
+        return new WalRecord(id, source, deletion, seqNo, primaryTerm, version, newRouting);
+    }
+
+    /**
+     * Returns this record with a different source, keeping its id, kind and routing but no sequence identity.
+     *
+     * @param newSource the source
+     * @return the copy
+     */
+    public WalRecord withSource(String newSource) {
+        return new WalRecord(
+            id,
+            newSource,
+            deletion,
+            SequenceNumbers.UNASSIGNED_SEQ_NO,
+            SequenceNumbers.UNASSIGNED_PRIMARY_TERM,
+            Versions.MATCH_ANY,
+            routing
+        );
     }
 
     /**
@@ -222,6 +286,11 @@ public final class WalRecord {
                 builder.field("primary_term", primaryTerm);
                 builder.field("version", version);
             }
+            if (routing != null) {
+                // Written only when there is one, so a record without custom routing is byte-for-byte what it
+                // always was, and a reader that predates the field reads the rest of the record unchanged.
+                builder.field("routing", routing);
+            }
             builder.endObject();
             return BytesReference.bytes(builder);
         }
@@ -248,6 +317,7 @@ public final class WalRecord {
             long seqNo = SequenceNumbers.UNASSIGNED_SEQ_NO;
             long primaryTerm = SequenceNumbers.UNASSIGNED_PRIMARY_TERM;
             long version = Versions.MATCH_ANY;
+            String routing = null;
             String field = null;
             XContentParser.Token token;
             while ((token = parser.nextToken()) != XContentParser.Token.END_OBJECT) {
@@ -271,18 +341,24 @@ public final class WalRecord {
                         primaryTerm = parser.longValue();
                     } else if ("version".equals(field)) {
                         version = parser.longValue();
+                    } else if ("routing".equals(field)) {
+                        routing = parser.text();
                     }
                 }
             }
             if (id == null || source == null) {
                 throw new IOException("malformed WAL record");
             }
-            return new WalRecord(id, source, deleted, seqNo, primaryTerm, version);
+            return new WalRecord(id, source, deleted, seqNo, primaryTerm, version, routing);
         }
     }
 
     @Override
     public String toString() {
-        return (deletion ? "WalDelete[" : "WalRecord[") + id + (hasSequenceIdentity() ? "@" + seqNo + "/" + primaryTerm : "") + "]";
+        return (deletion ? "WalDelete[" : "WalRecord[")
+            + id
+            + (routing == null ? "" : "~" + routing)
+            + (hasSequenceIdentity() ? "@" + seqNo + "/" + primaryTerm : "")
+            + "]";
     }
 }

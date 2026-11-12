@@ -244,6 +244,10 @@ final class RequestRouting {
     }
 
     Placement place(String index, String id) throws IOException {
+        return place(index, id, null);
+    }
+
+    Placement place(String index, String id, String customRouting) throws IOException {
         if (refuseSystemIndices && node.isSystemIndex(index)) {
             // Before the descriptor is read: a refusal that first confirmed the index exists would say so.
             throw new SystemIndexException(index);
@@ -252,7 +256,7 @@ final class RequestRouting {
         if (descriptor.isEmpty()) {
             throw new NoSuchIndexException(index);
         }
-        final int shard = org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor.get(), id);
+        final int shard = org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor.get(), id, customRouting);
         // Exact identity keeps routing independent of the number of other shards held here and
         // cannot select a previous incarnation or a frozen view with the same logical name.
         final var writer = node.reconciler().writerShard(new ShardId(index, descriptor.get().uuid(), shard));

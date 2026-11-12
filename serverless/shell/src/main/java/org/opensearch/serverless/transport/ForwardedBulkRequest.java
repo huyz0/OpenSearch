@@ -156,10 +156,11 @@ public final class ForwardedBulkRequest extends TransportRequest {
         for (int i = 0; i < count; i++) {
             final String id = in.readString();
             final String source = in.readString();
-            final WalRecord record = in.readBoolean() ? WalRecord.deletion(id) : new WalRecord(id, source);
+            final boolean deletion = in.readBoolean();
             final long ifSeqNo = in.readZLong();
             final long ifPrimaryTerm = in.readVLong();
             final boolean requireAbsent = in.readBoolean();
+            final WalRecord record = (deletion ? WalRecord.deletion(id) : new WalRecord(id, source)).withRouting(in.readOptionalString());
             read.add(record);
             readBatch.add(new org.opensearch.serverless.shell.BulkOperation(record, ifSeqNo, ifPrimaryTerm, requireAbsent));
             counted += WalRecord.contentBytes(id, source);
@@ -184,6 +185,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
             out.writeZLong(item.ifSeqNo());
             out.writeVLong(item.ifPrimaryTerm());
             out.writeBoolean(item.requireAbsent());
+            out.writeOptionalString(item.record().routing());
         }
         out.writeBoolean(refresh);
         out.writeOptionalString(indexUuid);

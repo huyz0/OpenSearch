@@ -96,21 +96,11 @@ final class SearchPlanner {
                 )
             );
         }
-        if (searchRequest.routing() != null) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_search",
-                    "routing is not supported: a document here is placed by its id alone, so there is no routing "
-                        + "value by which a search could narrow to fewer shards"
-                )
-            );
-        }
         final Boolean partialResults = searchRequest.allowPartialSearchResults();
         // Its own opt-in, not allow_partial_search_results: that defaults to true, and a search wider than
         // the activation budget must be refused unless the caller asked, in so many words, for part of it.
-        final SearchFanout.Options fanoutOptions = new SearchFanout.Options(request.paramAsBoolean("allow_partial_activation", false));
+        final SearchFanout.Options fanoutOptions = new SearchFanout.Options(request.paramAsBoolean("allow_partial_activation", false))
+            .withRouting(DocumentRouting.searchRoutings(searchRequest.routing()));
         // Two more core parses into the request and nothing here reads: cancel_after_time_interval cancels
         // a task, and a search here is not a task -- each shard's query is bounded by the request's own
         // timeout and the fan-out's own deadline, which are the bounds that exist; phase_took asks for
@@ -316,7 +306,8 @@ final class SearchPlanner {
             fanoutOptions.allowPartialActivation(),
             resolved.refused() ? 0 : resolved.prunedShards(),
             nowMillis,
-            resolved.refused() ? java.util.Set.of() : resolved.judged()
+            resolved.refused() ? java.util.Set.of() : resolved.judged(),
+            fanoutOptions.routing()
         );
         if (resolved.refused()) {
             return channel -> channel.sendResponse(IndexAdminHandler.error(channel, resolved.status(), resolved.type(), resolved.reason()));

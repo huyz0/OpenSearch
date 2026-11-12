@@ -85,11 +85,12 @@ public final class MultiSearchHandler extends BaseRestHandler {
      * @param type the refusal's type, or null
      * @param reason the refusal's reason, or null
      * @param partialResults the line's own partial-results policy, or null for the default
+     * @param routing the line's custom routing values, empty to search every shard
      */
     record Sub(String index, SearchSourceBuilder source, boolean ignoreUnavailable, RestStatus status, String type, String reason,
-        Boolean partialResults) {
+        Boolean partialResults, java.util.Set<String> routing) {
         static Sub refuse(String index, RestStatus status, String type, String reason) {
-            return new Sub(index, null, false, status, type, reason, null);
+            return new Sub(index, null, false, status, type, reason, null, java.util.Set.of());
         }
 
         /**
@@ -109,7 +110,6 @@ public final class MultiSearchHandler extends BaseRestHandler {
         ) {
             if (options != null
                 && (options.searchType() != org.opensearch.action.search.SearchType.QUERY_THEN_FETCH
-                    || options.routing() != null
                     || options.scroll() != null
                     || options.pipeline() != null
                     || (options.preference() != null && options.preference().startsWith("_shards")))) {
@@ -123,7 +123,8 @@ public final class MultiSearchHandler extends BaseRestHandler {
                 planned.status(),
                 planned.type(),
                 planned.reason(),
-                options == null ? null : options.allowPartialSearchResults()
+                options == null ? null : options.allowPartialSearchResults(),
+                options == null ? java.util.Set.of() : DocumentRouting.searchRoutings(options.routing())
             );
         }
 
@@ -153,7 +154,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
                     "a search pipeline inside an _msearch line is not applied here; send that search through _search, which runs it"
                 );
             }
-            return new Sub(index, source, ignoreUnavailable, null, null, null, null);
+            return new Sub(index, source, ignoreUnavailable, null, null, null, null, java.util.Set.of());
         }
     }
 
@@ -293,7 +294,13 @@ public final class MultiSearchHandler extends BaseRestHandler {
                         resolved.indices().keySet(),
                         sub.source(),
                         sub.partialResults(),
-                        admitted -> SearchFanout.run(serving, metadata, resolved.indices(), admitted)
+                        admitted -> SearchFanout.run(
+                            serving,
+                            metadata,
+                            resolved.indices(),
+                            admitted,
+                            SearchFanout.Options.DEFAULT.withRouting(sub.routing())
+                        )
                     );
                     keep(
                         items,

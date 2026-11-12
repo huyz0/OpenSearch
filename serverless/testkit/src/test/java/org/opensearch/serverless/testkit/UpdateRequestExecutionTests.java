@@ -149,15 +149,23 @@ public class UpdateRequestExecutionTests extends OpenSearchTestCase {
         });
     }
 
-    public void testUnsupportedAdmittedRoutingIsRefused() throws Exception {
+    public void testAdmittedRoutingPlacesTheUpdate() throws Exception {
         withNode(PolicyFilterPlugin.request(UpdateAction.NAME, request -> {
             ((UpdateRequest) request).routing("elsewhere");
             return request;
         }), (node, metadata) -> {
-            seed(node, "original", "original", "old");
+            node.services()
+                .client()
+                .index(new IndexRequest("original").id("original").routing("elsewhere").source(Map.of("value", "old")))
+                .actionGet();
             final var answer = send(node, "POST", "/original/_update/original", "{\"doc\":{\"value\":\"changed\"}}");
-            assertEquals(answer.body(), 501, answer.statusCode());
-            assertEquals("old", value(node, "original", "original"));
+            assertEquals(answer.body(), 200, answer.statusCode());
+            final var read = node.services()
+                .client()
+                .get(new org.opensearch.action.get.GetRequest("original", "original").routing("elsewhere"))
+                .actionGet();
+            assertEquals("changed", String.valueOf(read.getSourceAsMap().get("value")));
+            assertEquals("elsewhere", read.getField("_routing").getValue());
         });
     }
 

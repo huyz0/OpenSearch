@@ -116,7 +116,7 @@ public final class BulkHandler extends BaseRestHandler {
         final String timeout = request.param("timeout");
         final var activeShards = org.opensearch.action.support.ActiveShardCount.parseString(request.param("wait_for_active_shards"));
         final String defaultPipeline = request.param("pipeline");
-        final String routing = request.param("routing");
+        final String routing = DocumentRouting.normalize(request.param("routing"));
         final boolean requireAlias = request.paramAsBoolean("require_alias", false);
         // Hints with one possible answer here, and the _source trio, which shapes only the response of an
         // update action -- the one action this batch refuses. Consumed so a client that sends them is not
@@ -146,7 +146,7 @@ public final class BulkHandler extends BaseRestHandler {
 
         final List<Item> items;
         try {
-            items = BulkBodyParser.parse(body, defaultIndex);
+            items = BulkBodyParser.parse(body, defaultIndex, routing);
         } catch (BulkBodyParser.BadRequest e) {
             // A body that does not parse is not a batch with some bad items in it -- there is no way to
             // know where the good ones end. The whole request is refused, and the line is named.
@@ -160,17 +160,6 @@ public final class BulkHandler extends BaseRestHandler {
             );
         }
 
-        if (routing != null) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_IMPLEMENTED,
-                    "unsupported_write",
-                    "routing is not supported: a document is placed by its id alone, so a routing value would be "
-                        + "accepted and change nothing"
-                )
-            );
-        }
         if (requireAlias) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
@@ -266,13 +255,14 @@ public final class BulkHandler extends BaseRestHandler {
                 // Update is explicitly refused by this surface; it must still have the correct native type.
                 write = new UpdateRequest(item.index, item.operation.id());
             } else if (item.operation.isDeletion()) {
-                final var delete = new DeleteRequest(item.index, item.operation.id());
+                final var delete = new DeleteRequest(item.index, item.operation.id()).routing(item.operation.routing());
                 if (item.ifSeqNo >= 0L && item.ifPrimaryTerm > 0L) {
                     delete.setIfSeqNo(item.ifSeqNo).setIfPrimaryTerm(item.ifPrimaryTerm);
                 }
                 write = delete;
             } else {
                 final var index = new IndexRequest(item.index).id(item.operation.id())
+                    .routing(item.operation.routing())
                     .source(item.operation.source(), XContentType.JSON)
                     .opType(item.requireAbsent ? DocWriteRequest.OpType.CREATE : DocWriteRequest.OpType.INDEX)
                     .setPipeline(item.pipeline);
