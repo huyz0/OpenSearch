@@ -213,6 +213,14 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
                     }
+                    final Object checkpoint = flat.get(org.opensearch.serverless.shell.LogCommitCheckpoint.SETTING);
+                    if (checkpoint != null) {
+                        try {
+                            org.opensearch.serverless.shell.LogCommitCheckpoint.check(node.get(), checkpoint);
+                        } catch (IllegalArgumentException e) {
+                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+                        }
+                    }
                     final Settings written = metadata.clusterConfig().update(flat);
                     // This node's next publishes follow at once; the others within their next read of the register.
                     org.opensearch.serverless.shell.SegmentPlacement.applyCluster(node.get(), written);

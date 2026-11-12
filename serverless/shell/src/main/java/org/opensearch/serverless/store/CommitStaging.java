@@ -17,7 +17,8 @@ import java.util.function.LongSupplier;
  * <p>With staging on, a routine publish uploads its segment files as usual and keeps its manifest here instead of
  * swapping the register: one PUT fewer for every shard on every publish. The register is written as a checkpoint: on
  * the first publish of a term, which is the fence; on any publish that is not routine (a release, an open's replay, a
- * split); and once the oldest staged commit is {@code maxStagedMillis} old. Readers learn of the commits in between
+ * split); and once the oldest staged commit is as old as the checkpoint age (a minute by default, changeable at
+ * runtime, see {@link #check}). Readers learn of the commits in between
  * from the writer, which hands them the newest one here.
  *
  * <p><b>Why a staged commit loses nothing.</b> The write log is trimmed only behind a commit the register holds, so
@@ -34,10 +35,23 @@ import java.util.function.LongSupplier;
  */
 public final class CommitStaging {
 
-    /** The default age of the oldest staged commit at which the register is written: well inside the pack deadline. */
-    public static final long DEFAULT_MAX_STAGED_MILLIS = 150_000L;
+    /**
+     * The default age of the oldest staged commit at which the register is written. A minute keeps what a successor
+     * replays short and a register-only reader at most a minute behind, while still skipping the manifest PUT on all
+     * but one publish in twelve at the default five-second publish spacing.
+     */
+    public static final long DEFAULT_MAX_STAGED_MILLIS = 60_000L;
 
-    private final long maxStagedNanos;
+    /** The longest a commit may be staged: half the pack deadline, so a slow renewal or store still writes it in time. */
+    public static final long MAX_STAGED_MILLIS = NodePackWriter.SWAP_DEADLINE_MILLIS / 2;
+
+    /** The shortest a commit may be staged, in commit periods: below two, nearly every publish would write anyway. */
+    public static final long MIN_COMMIT_PERIODS = 2;
+
+    /** The shortest a commit may be staged, whatever the commit period. */
+    public static final long MIN_STAGED_MILLIS = 1_000L;
+
+    private final LongSupplier maxStagedMillis;
     private final LongSupplier nanoClock;
 
     private volatile CommitManifest staged;
@@ -46,25 +60,63 @@ public final class CommitStaging {
     private long sequence;
 
     /**
-     * Creates staging that writes the register once the oldest staged commit is this old.
+     * Creates staging that writes the register once the oldest staged commit is as old as the supplier says, read on
+     * every check so the age can change at runtime.
      *
-     * @param maxStagedMillis the age; positive and below {@link NodePackWriter#SWAP_DEADLINE_MILLIS}
+     * @param maxStagedMillis the age; a value outside {@link #check} bounds is held to them
      */
-    public CommitStaging(long maxStagedMillis) {
+    public CommitStaging(LongSupplier maxStagedMillis) {
         this(maxStagedMillis, System::nanoTime);
     }
 
-    CommitStaging(long maxStagedMillis, LongSupplier nanoClock) {
-        if (maxStagedMillis <= 0L || maxStagedMillis >= NodePackWriter.SWAP_DEADLINE_MILLIS) {
-            throw new IllegalArgumentException(
-                "a commit may be staged for more than 0 and less than "
-                    + NodePackWriter.SWAP_DEADLINE_MILLIS
-                    + " ms, got "
-                    + maxStagedMillis
-            );
-        }
-        this.maxStagedNanos = TimeUnit.MILLISECONDS.toNanos(maxStagedMillis);
+    CommitStaging(LongSupplier maxStagedMillis, LongSupplier nanoClock) {
+        this.maxStagedMillis = maxStagedMillis;
         this.nanoClock = nanoClock;
+    }
+
+    /**
+     * Checks a checkpoint age against the commit period: at least {@link #MIN_COMMIT_PERIODS} periods and
+     * {@link #MIN_STAGED_MILLIS}, at most {@link #MAX_STAGED_MILLIS}.
+     *
+     * @param checkpointMillis the age
+     * @param commitPeriodMillis the least time between two publishes of one shard
+     * @return null when valid, else why not
+     */
+    public static String check(long checkpointMillis, long commitPeriodMillis) {
+        final long least = Math.max(MIN_STAGED_MILLIS, MIN_COMMIT_PERIODS * Math.max(0L, commitPeriodMillis));
+        if (least > MAX_STAGED_MILLIS) {
+            return "the commit period of "
+                + commitPeriodMillis
+                + " ms leaves no checkpoint age: it must be at least "
+                + MIN_COMMIT_PERIODS
+                + " commit periods and at most "
+                + MAX_STAGED_MILLIS
+                + " ms (half the "
+                + NodePackWriter.SWAP_DEADLINE_MILLIS
+                + " ms pack deadline)";
+        }
+        if (checkpointMillis < least || checkpointMillis > MAX_STAGED_MILLIS) {
+            return "the checkpoint age must be between "
+                + least
+                + " ms ("
+                + MIN_COMMIT_PERIODS
+                + " commit periods of "
+                + commitPeriodMillis
+                + " ms, and at least "
+                + MIN_STAGED_MILLIS
+                + " ms) and "
+                + MAX_STAGED_MILLIS
+                + " ms (half the "
+                + NodePackWriter.SWAP_DEADLINE_MILLIS
+                + " ms pack deadline), got "
+                + checkpointMillis;
+        }
+        return null;
+    }
+
+    private long maxStagedNanos() {
+        final long millis = Math.min(MAX_STAGED_MILLIS, Math.max(MIN_STAGED_MILLIS, maxStagedMillis.getAsLong()));
+        return TimeUnit.MILLISECONDS.toNanos(millis);
     }
 
     /**
@@ -84,7 +136,7 @@ public final class CommitStaging {
 
     /** Whether the oldest staged commit is old enough that the register should be written now. */
     public boolean due() {
-        return staged != null && nanoClock.getAsLong() - oldestNanos >= maxStagedNanos;
+        return staged != null && nanoClock.getAsLong() - oldestNanos >= maxStagedNanos();
     }
 
     /**
