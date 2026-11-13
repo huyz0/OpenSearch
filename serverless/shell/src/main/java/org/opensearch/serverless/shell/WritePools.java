@@ -73,7 +73,9 @@ public final class WritePools {
      * @return the gate, letting everything through when {@link #ENABLED} is off
      */
     public static WritePools of(Settings settings) {
-        return new WritePools(enabled(settings) ? new Semaphore(applyPermits(settings), true) : null);
+        // Not fair: a fair gate hands each released permit to the longest waiter, a thread switch per apply, and with
+        // thousands of writers queued that handing-over, not CPU, was what bounded a node's bulk rate.
+        return new WritePools(enabled(settings) ? new Semaphore(applyPermits(settings), false) : null);
     }
 
     /**

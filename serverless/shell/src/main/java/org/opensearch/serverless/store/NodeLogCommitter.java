@@ -72,6 +72,12 @@ public final class NodeLogCommitter {
     /** Whether a record that finds the log quiet for a window is written at once; see {@link #flushWhenIdle}. */
     public static final String IDLE_FLUSH_SETTING = "serverless.wal.node_log.idle_flush";
 
+    /** Whether writers that join a window someone already drives wait for it without the lock; see {@link #followUnlocked}. */
+    public static final String FOLLOW_UNLOCKED_SETTING = "serverless.wal.node_log.follow_unlocked";
+
+    /** The default for {@link #FOLLOW_UNLOCKED_SETTING}. */
+    public static final boolean DEFAULT_FOLLOW_UNLOCKED = true;
+
     /**
      * How many shards new to an epoch are checked at once before the window carrying their first records is written; one
      * checks them one after another. See {@link #admitConcurrently}.
@@ -217,11 +223,26 @@ public final class NodeLogCommitter {
         }
         final long joined = System.nanoTime();
         lock.lock();
+        boolean locked = true;
         try {
             final List<Window> joinedWindows = joinAll(shard, term, records);
             final Window mine = joinedWindows.get(joinedWindows.size() - 1);
             // Windows are written in order, one at a time, so the last of them landing means the others were written.
-            awaitLanded(mine);
+            if (followUnlocked && mine.driven) {
+                // Another writer already waits on this window and will write it, or the ones before it, when due: this
+                // one waits for it to land without the lock, so a blob that lands does not wake its hundreds of writers
+                // to take the lock one after another before any of them can return.
+                lock.unlock();
+                locked = false;
+                if (awaitLandedUnlocked(mine) == false) {
+                    lock.lock();
+                    locked = true;
+                    awaitLanded(mine);
+                }
+            } else {
+                mine.driven = true;
+                awaitLanded(mine);
+            }
             timings.caller(joined, mine);
             for (Window each : joinedWindows) {
                 final IOException failure = each.failures.get(shard);
@@ -231,8 +252,55 @@ public final class NodeLogCommitter {
             }
             return mine.landed;
         } finally {
-            lock.unlock();
+            if (locked) {
+                lock.unlock();
+            }
         }
+    }
+
+    /**
+     * Waits for a window another writer drives to land, without the lock.
+     *
+     * @return true once it has landed; false if it took so long that this writer should drive it itself, as when its
+     *     driver failed with an unexpected error and left it
+     */
+    private boolean awaitLandedUnlocked(Window mine) {
+        final long patience = Math.max(4 * windowNanos, TimeUnit.SECONDS.toNanos(1));
+        boolean interrupted = false;
+        try {
+            while (true) {
+                try {
+                    if (mine.landedLatch.await(patience, TimeUnit.NANOSECONDS)) {
+                        return true;
+                    }
+                    return mine.done;
+                } catch (InterruptedException e) {
+                    // Uninterruptibly, as the locked wait: its records will be written whatever this thread does.
+                    interrupted = true;
+                }
+            }
+        } finally {
+            if (interrupted) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /** See {@link #followUnlocked(boolean)}. */
+    private volatile boolean followUnlocked = DEFAULT_FOLLOW_UNLOCKED;
+
+    /**
+     * Whether a writer that joins a window another writer already waits on waits for it without the lock. One writer a
+     * window drives it as before, lingering and writing under the lock; the rest wait on the window alone. Off, every
+     * writer waits under the lock, and a blob landing wakes all of them to take it in turn, which on a busy node is
+     * tens to over a hundred milliseconds before the last of them returns.
+     *
+     * @param on whether followers wait without the lock
+     * @return this
+     */
+    public NodeLogCommitter followUnlocked(boolean on) {
+        this.followUnlocked = on;
+        return this;
     }
 
     /**
@@ -314,6 +382,7 @@ public final class NodeLogCommitter {
             } finally {
                 head.doneNanos = System.nanoTime();
                 head.done = true;
+                head.landedLatch.countDown();
                 flushing = false;
                 changed.signalAll();
                 for (Runnable each : head.onLanded) {
@@ -1263,6 +1332,10 @@ public final class NodeLogCommitter {
         /** Closed before its bounds because the records after it would not fit: written as soon as it can be. */
         private boolean closeEarly;
         private boolean done;
+        /** Counted down once {@link #done}, for writers that wait without the lock. */
+        private final java.util.concurrent.CountDownLatch landedLatch = new java.util.concurrent.CountDownLatch(1);
+        /** Whether a writer already waits on it under the lock, and so will write it when due; guarded by the lock. */
+        private boolean driven;
         private long flushStartedNanos;
         private long doneNanos;
         private Position landed;
