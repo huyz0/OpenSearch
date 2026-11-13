@@ -15,7 +15,6 @@ import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.Index;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.core.transport.TransportResponse;
 import org.opensearch.serverless.cluster.HotShardSpread;
 import org.opensearch.serverless.cluster.ReaderPlacement;
 import org.opensearch.serverless.metadata.MetadataPlane;
@@ -59,7 +58,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * are new since the previous push of the shard, read from the writer's own copies, smallest first and whole files only
  * up to {@value #INLINE_BYTES} (1 MB by default, 0 turns it off). The reader puts them in its block cache before it
  * reopens, under the keys its own reads use, so the reopen and the next search read memory. A larger segment, a merge's
- * say, is left to the reader's reads from the store as before. A block already held is not replaced.
+ * say, is left to the reader's reads from the store as before. A block already held is not replaced. Blocks go only to
+ * readers in the writer's zone that answered the previous push saying they have the shard open: a reader elsewhere
+ * would be billed for the bytes, and one with nothing open would drop them.
  */
 public final class CommitPush {
 
@@ -108,6 +109,8 @@ public final class CommitPush {
     private final boolean reuseDescriptor;
     /** Per shard this node writes, the files of the commit it last pushed, so the next push knows which are new. */
     private final Map<String, Set<String>> lastPushedFiles = new ConcurrentHashMap<>();
+    /** Per shard this node writes, the search nodes that said at the last push that they have it open. */
+    private final Map<String, Set<String>> readersOpen = new ConcurrentHashMap<>();
 
     private final ReaderRegisterLooks registerLooks;
 
@@ -166,34 +169,63 @@ public final class CommitPush {
         if (lastPushedFiles.size() > MAX_PUSHED) {
             lastPushedFiles.keySet().removeIf(k -> k.equals(key) == false);
         }
+        if (readersOpen.size() > MAX_PUSHED) {
+            readersOpen.keySet().removeIf(k -> k.equals(key) == false);
+        }
         if (targets.isEmpty()) {
             return;
         }
         final long[] versions = router.node.hostedDescriptorVersions(shardId.getIndexName());
+        // Blocks go only to readers that will use them: the ones that said, at the last push, that they have the shard
+        // open, and only in this node's zone, where the transfer is not billed. Everyone else gets the commit alone.
+        final Set<String> openOn = readersOpen.getOrDefault(key, Set.of());
         router.node.threadPool().generic().execute(() -> {
-            final CommitPushRequest request = new CommitPushRequest(
+            final Map<String, byte[]> blocks = previous == null || openOn.isEmpty() ? Map.of() : newBlocks(shardId, commit, previous);
+            final CommitPushRequest withBlocks = new CommitPushRequest(
                 shardId.getIndexName(),
                 shardId.getIndex().getUUID(),
                 shardId.id(),
                 commit,
-                previous == null ? Map.of() : newBlocks(shardId, commit, previous),
+                blocks,
                 versions == null ? -1L : versions[0],
                 versions == null ? -1L : versions[1]
             );
+            final CommitPushRequest commitAlone = blocks.isEmpty()
+                ? withBlocks
+                : new CommitPushRequest(
+                    shardId.getIndexName(),
+                    shardId.getIndex().getUUID(),
+                    shardId.id(),
+                    commit,
+                    Map.of(),
+                    versions == null ? -1L : versions[0],
+                    versions == null ? -1L : versions[1]
+                );
             for (String target : targets) {
                 router.node.threadPool().generic().execute(() -> {
                     try {
                         final Optional<DiscoveryNode> peer = router.peer(target, SEND_TIMEOUT);
                         if (peer.isPresent()) {
-                            router.send(
+                            final CommitPushRequest request = openOn.contains(target)
+                                && router.pathTo(peer.get()) != ZoneTraffic.Path.CROSS_ZONE ? withBlocks : commitAlone;
+                            final CommitPushResponse answer = router.send(
                                 peer.get(),
                                 CommitPushRequest.ACTION,
                                 request,
-                                in -> TransportResponse.Empty.INSTANCE,
+                                CommitPushResponse::new,
                                 SEND_TIMEOUT
                             );
                             sent.incrementAndGet();
                             blocksSent.addAndGet(request.blocks().size());
+                            readersOpen.compute(key, (k, had) -> {
+                                final Set<String> now = new java.util.HashSet<>(had == null ? Set.of() : had);
+                                if (answer.open()) {
+                                    now.add(target);
+                                } else {
+                                    now.remove(target);
+                                }
+                                return now.isEmpty() ? null : Set.copyOf(now);
+                            });
                         }
                     } catch (Exception e) {
                         // Lost: the reader's register look moves it, as before pushes existed.
@@ -254,16 +286,12 @@ public final class CommitPush {
 
     void handle(CommitPushRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         router.requireMac(CommitPushRequest.ACTION, request);
-        channel.sendResponse(TransportResponse.Empty.INSTANCE);
+        final ShardReconciler reconciler = router.node.reconciler();
+        final ShardId pushedShard = new ShardId(new Index(request.indexName(), request.indexUuid()), request.shard());
+        channel.sendResponse(new CommitPushResponse(reconciler != null && reconciler.readerCommit(pushedShard).isPresent()));
         received.incrementAndGet();
         registerLooks.pushedFrom(request.commit().writer());
-        take(
-            new ShardId(new Index(request.indexName(), request.indexUuid()), request.shard()),
-            request.commit(),
-            request.blocks(),
-            request.mappingVersion(),
-            request.settingsVersion()
-        );
+        take(pushedShard, request.commit(), request.blocks(), request.mappingVersion(), request.settingsVersion());
     }
 
     /**
