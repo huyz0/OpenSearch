@@ -102,9 +102,14 @@ Through REST (filesystem store, no added latency):
 
 ## Recommendations
 
-- **Write threads (build next).** Run REST and forwarded writes on a pool sized for waiting (many threads), and bound only
-  the engine apply by a gate of processors + 1 permits, so CPU use and the number of Lucene indexing threads per shard
-  (hence segments and publish PUTs) stay what they are today. Behind a switch, measured with this meter.
+- **Write threads (done).** `serverless.write.wait_pool.enabled` (on by default) runs REST, bulk-group, update and
+  forwarded writes on pools of 64 threads a core and bounds only the engine apply by a gate of cores + 1 permits; see
+  "Write threads" in `README.md`. Through REST, off then on: 1 KB at 600/s offered went from 15.9/s acked to 600/s at
+  p50 144 / p99 276 ms; the page mix at 100/s from 14.8/s (p50 60 s) to 99.4/s (4 KB pages p50 156 / p99 304 ms). On the
+  direct path, under the node's capacity, nothing got worse: 1 KB at 200/s p99 395 vs 389 ms, pages at 80/s 4 KB p99 442
+  vs 406 ms, store PUT+LIST per document within run-to-run noise (0.046 vs 0.048, 0.128 vs 0.124), the same publishes.
+  Past the CPU's capacity (pages at 140/s, 2.2-2.5 cores) the node acked slightly more and refused fewer (302 vs 443),
+  with a longer small-document tail (p99 2.8 vs 2.0 s).
 - **Max document size.** Only `http.max_content_length` (100 MB) caps it today. A 100 MB document would take tens of
   seconds to index on one core and briefly 0.6-1 GB of heap (estimated). Suggest a cap switch (e.g.
   `serverless.write.max_source_bytes`, off by default) and chunking very long extracted text in the application; a

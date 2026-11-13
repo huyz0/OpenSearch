@@ -177,30 +177,32 @@ public final class UpdateHandler extends BaseRestHandler {
             );
         }
         final ServerlessNode serving = node.get();
-        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
-            final var operations = new ShardOperations(serving, metadata, true);
-            try {
-                respond(channel, operations.update(parsed));
-            } catch (NoSuchIndexException e) {
-                sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + e.index());
-            } catch (DocumentMissingException e) {
-                sendError(channel, RestStatus.NOT_FOUND, "document_missing_exception", e.getMessage());
-            } catch (SystemIndexException e) {
-                sendError(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage());
-            } catch (NotHereException e) {
-                // The get endpoint's vocabulary, not an update-shaped approximation of it: an update is a
-                // get and a write, and either half can be the one that could not find a home. The status
-                // is the exception's own: "nobody owns the shard" is the 421 PUT answers, not a 503 that
-                // a client treats as "retry" for a state the code itself calls not retryable.
-                sendError(channel, e.restStatus(), e.restType(serving.localNode().getId()), e.getMessage());
-            } catch (Exception e) {
+        return channel -> serving.threadPool()
+            .executor(org.opensearch.serverless.shell.WritePools.writePool(serving.settings()))
+            .execute(() -> {
+                final var operations = new ShardOperations(serving, metadata, true);
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
-                } catch (IOException nested) {
-                    logger.error("failed to report an update failure", nested);
+                    respond(channel, operations.update(parsed));
+                } catch (NoSuchIndexException e) {
+                    sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + e.index());
+                } catch (DocumentMissingException e) {
+                    sendError(channel, RestStatus.NOT_FOUND, "document_missing_exception", e.getMessage());
+                } catch (SystemIndexException e) {
+                    sendError(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage());
+                } catch (NotHereException e) {
+                    // The get endpoint's vocabulary, not an update-shaped approximation of it: an update is a
+                    // get and a write, and either half can be the one that could not find a home. The status
+                    // is the exception's own: "nobody owns the shard" is the 421 PUT answers, not a 503 that
+                    // a client treats as "retry" for a state the code itself calls not retryable.
+                    sendError(channel, e.restStatus(), e.restType(serving.localNode().getId()), e.getMessage());
+                } catch (Exception e) {
+                    try {
+                        channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    } catch (IOException nested) {
+                        logger.error("failed to report an update failure", nested);
+                    }
                 }
-            }
-        });
+            });
     }
 
     private void sendError(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {

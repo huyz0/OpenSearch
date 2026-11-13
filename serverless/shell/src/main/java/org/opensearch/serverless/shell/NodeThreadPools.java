@@ -88,13 +88,21 @@ public final class NodeThreadPools {
                 Math.max(8, 4 * processors),
                 org.opensearch.common.unit.TimeValue.timeValueSeconds(30)
             ),
-            // Sized and queued like WRITE and GET, whose work they take over for requests that were forwarded.
+            // Queued like WRITE, whose work it takes over for requests that were forwarded; sized for waiting on the log
+            // rather than for CPU, as the pool below is, unless that is switched off (see WritePools).
             new org.opensearch.threadpool.FixedExecutorBuilder(
                 settings,
                 FORWARDED_WRITE_POOL,
-                processors,
+                WritePools.threads(settings),
                 10_000,
                 "thread_pool." + FORWARDED_WRITE_POOL
+            ),
+            new org.opensearch.threadpool.FixedExecutorBuilder(
+                settings,
+                WritePools.POOL,
+                WritePools.threads(settings),
+                10_000,
+                "thread_pool." + WritePools.POOL
             ),
             new org.opensearch.threadpool.FixedExecutorBuilder(settings, LEASE_POOL, 1, 16, "thread_pool." + LEASE_POOL),
             // Sized past the default activation concurrency, which is what bounds how many are submitted at once;
