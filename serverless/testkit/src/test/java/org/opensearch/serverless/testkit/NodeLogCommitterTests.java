@@ -345,4 +345,88 @@ public class NodeLogCommitterTests extends OpenSearchTestCase {
             NodeLease.fromStream(new ByteArrayInputStream(BytesReference.toBytes(old.toBytes()))).nodeLog()
         );
     }
+
+    /** Hundreds of writers over several windows, with followers waiting under the lock and without it. */
+    public void testWritersFollowingADrivenWindowAllLandWhereTheyAreToldAndShareItsFailure() throws Exception {
+        for (boolean unlocked : new boolean[] { true, false }) {
+            try (FsBlobStore store = new FsBlobStore(8192, createTempDir(), false)) {
+                final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
+                final NodeLogCommitter committer = committer(log, new CopyOnWriteArrayList<>(), 20L).followUnlocked(unlocked);
+                final int writers = 200;
+                final int rounds = 5;
+                final java.util.Map<ShardKey, List<Position>> landed = new java.util.concurrent.ConcurrentHashMap<>();
+                final AtomicReference<Exception> failed = new AtomicReference<>();
+                final CountDownLatch go = new CountDownLatch(1);
+                final List<Thread> threads = new ArrayList<>();
+                for (int w = 0; w < writers; w++) {
+                    final ShardKey key = new ShardKey("uuid-" + w, 0);
+                    final Thread thread = new Thread(() -> {
+                        try {
+                            go.await();
+                            for (int round = 0; round < rounds; round++) {
+                                final Position at = committer.commit(key, 1L, records(key.indexUuid() + "-" + round + "-", 1));
+                                landed.computeIfAbsent(key, k -> new CopyOnWriteArrayList<>()).add(at);
+                            }
+                        } catch (Exception e) {
+                            failed.set(e);
+                        }
+                    });
+                    thread.start();
+                    threads.add(thread);
+                }
+                go.countDown();
+                for (Thread thread : threads) {
+                    thread.join();
+                }
+                assertNull("unlocked=" + unlocked, failed.get());
+                assertEquals(writers * rounds, committer.recordsCommitted());
+                assertTrue("writers shared blobs: " + committer.blobs(), committer.blobs() < writers * rounds / 4);
+                for (java.util.Map.Entry<ShardKey, List<Position>> entry : landed.entrySet()) {
+                    assertEquals(rounds, entry.getValue().size());
+                    for (Position at : entry.getValue()) {
+                        final NodeLogBlob.Header header = (NodeLogBlob.Header) log.readEntry(at.epoch(), at.ordinal()).orElseThrow();
+                        assertFalse(
+                            "the blob a writer was told carries its shard (unlocked=" + unlocked + ")",
+                            header.slicesOf(entry.getKey()).isEmpty()
+                        );
+                    }
+                }
+
+                // A fenced slot fails every writer in the window, the followers as well as the one driving it.
+                final Position last = committer.lastPosition(new ShardKey("uuid-0", 0));
+                log.fence(last.epoch(), last.ordinal() + 1, "node-2", 5L);
+                final List<Exception> outcomes = new CopyOnWriteArrayList<>();
+                final CountDownLatch again = new CountDownLatch(1);
+                final List<Thread> late = new ArrayList<>();
+                for (int w = 0; w < 50; w++) {
+                    final ShardKey key = new ShardKey("uuid-" + w, 0);
+                    final Thread thread = new Thread(() -> {
+                        try {
+                            again.await();
+                            committer.commit(key, 1L, records("late-" + key.indexUuid(), 1));
+                            outcomes.add(new Exception("landed"));
+                        } catch (IOException e) {
+                            outcomes.add(e);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    });
+                    thread.start();
+                    late.add(thread);
+                }
+                again.countDown();
+                for (Thread thread : late) {
+                    thread.join();
+                }
+                assertEquals(50, outcomes.size());
+                final long refused = outcomes.stream().filter(e -> e instanceof IOException).count();
+                assertTrue("every writer of the fenced window is refused (unlocked=" + unlocked + "): " + refused, refused >= 1);
+                for (Exception outcome : outcomes) {
+                    if (outcome instanceof IOException) {
+                        assertTrue(outcome.getMessage(), outcome.getMessage().contains("fenced"));
+                    }
+                }
+            }
+        }
+    }
 }

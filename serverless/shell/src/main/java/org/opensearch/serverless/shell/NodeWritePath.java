@@ -768,112 +768,116 @@ public final class NodeWritePath {
         while (from < batch.size()) {
             int deferredAt = -1;
             org.opensearch.index.mapper.Mapping required = null;
-            for (int i = from; i < batch.size(); i++) {
-                final BulkOperation item = batch.get(i);
-                final org.opensearch.serverless.store.WalRecord operation = item.record();
-                try {
-                    if (operation.isDeletion()) {
-                        final org.opensearch.index.engine.Engine.DeleteResult result;
-                        try (org.opensearch.common.lease.Releasable gate = node.writePools.enterApply()) {
-                            result = shard.applyDeleteOperationOnPrimary(
-                                org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                                operation.id(),
-                                org.opensearch.index.VersionType.INTERNAL,
-                                item.ifSeqNo(),
-                                item.ifPrimaryTerm()
-                            );
-                        }
-                        if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
-                            // A failure here is a value, and a caller that reads
-                            // only the exception channel reports success for an operation that did nothing.
-                            outcomes[i] = conflicted(result)
-                                ? BulkOutcome.conflicted(operation.id(), describe("deleting", result))
-                                : BulkOutcome.failed(operation.id(), describe("deleting", result));
-                            continue;
-                        }
-                        applied.add(
-                            org.opensearch.serverless.store.WalRecord.deletion(
-                                operation.id(),
-                                result.getSeqNo(),
-                                result.getTerm(),
-                                result.getVersion()
-                            ).withRouting(operation.routing())
-                        );
-                        outcomes[i] = BulkOutcome.deleted(
-                            operation.id(),
-                            result.isFound(),
-                            result.getSeqNo(),
-                            result.getTerm(),
-                            result.getVersion()
-                        );
-                    } else {
-                        final org.opensearch.index.engine.Engine.IndexResult result;
-                        try (org.opensearch.common.lease.Releasable gate = node.writePools.enterApply()) {
-                            result = shard.applyIndexOperationOnPrimary(
-                                item.requireAbsent()
-                                    ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
-                                    : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                                org.opensearch.index.VersionType.INTERNAL,
-                                new org.opensearch.index.mapper.SourceToParse(
-                                    shardId.getIndexName(),
+            // One permit for the pass, not one per item: core's write pool applied a shard's whole bulk on one thread, and
+            // a permit taken per document had thousands of writers queue on the gate ten times a request each.
+            try (org.opensearch.common.lease.Releasable gate = node.writePools.enterApply()) {
+                for (int i = from; i < batch.size(); i++) {
+                    final BulkOperation item = batch.get(i);
+                    final org.opensearch.serverless.store.WalRecord operation = item.record();
+                    try {
+                        if (operation.isDeletion()) {
+                            final org.opensearch.index.engine.Engine.DeleteResult result;
+                            {
+                                result = shard.applyDeleteOperationOnPrimary(
+                                    org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
                                     operation.id(),
-                                    new org.opensearch.core.common.bytes.BytesArray(operation.source()),
-                                    org.opensearch.common.xcontent.XContentType.JSON,
-                                    operation.routing()
-                                ),
-                                item.ifSeqNo(),
-                                item.ifPrimaryTerm(),
-                                org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
-                                false
-                            );
-                        }
-                        if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.MAPPING_UPDATE_REQUIRED) {
-                            if (grewFor[i]) {
-                                // The mapping was grown for this item once already, and it still does
-                                // not fit: something other than a missing field, and growing again
-                                // forever would hide it.
-                                outcomes[i] = BulkOutcome.failed(operation.id(), describe("indexing", result));
+                                    org.opensearch.index.VersionType.INTERNAL,
+                                    item.ifSeqNo(),
+                                    item.ifPrimaryTerm()
+                                );
+                            }
+                            if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
+                                // A failure here is a value, and a caller that reads
+                                // only the exception channel reports success for an operation that did nothing.
+                                outcomes[i] = conflicted(result)
+                                    ? BulkOutcome.conflicted(operation.id(), describe("deleting", result))
+                                    : BulkOutcome.failed(operation.id(), describe("deleting", result));
                                 continue;
                             }
-                            deferredAt = i;
-                            required = result.getRequiredMappingUpdate();
-                            break;
-                        }
-                        if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
-                            // A lost condition is a FAILURE carrying a VersionConflictEngineException rather
-                            // than a thrown one, so the item has to be inspected rather than only its type
-                            // reported -- otherwise a caller that asked a compare-and-swap question is told
-                            // only that "indexing returned FAILURE", which is not an answer to it.
-                            outcomes[i] = conflicted(result)
-                                ? BulkOutcome.conflicted(operation.id(), describe("indexing", result))
-                                : BulkOutcome.failed(operation.id(), describe("indexing", result));
-                            continue;
-                        }
-                        applied.add(
-                            new org.opensearch.serverless.store.WalRecord(
+                            applied.add(
+                                org.opensearch.serverless.store.WalRecord.deletion(
+                                    operation.id(),
+                                    result.getSeqNo(),
+                                    result.getTerm(),
+                                    result.getVersion()
+                                ).withRouting(operation.routing())
+                            );
+                            outcomes[i] = BulkOutcome.deleted(
                                 operation.id(),
-                                operation.source(),
+                                result.isFound(),
                                 result.getSeqNo(),
                                 result.getTerm(),
                                 result.getVersion()
-                            ).withRouting(operation.routing())
-                        );
-                        outcomes[i] = BulkOutcome.indexed(
-                            operation.id(),
-                            result.getSeqNo(),
-                            result.getTerm(),
-                            result.getVersion(),
-                            result.isCreated()
-                        );
+                            );
+                        } else {
+                            final org.opensearch.index.engine.Engine.IndexResult result;
+                            {
+                                result = shard.applyIndexOperationOnPrimary(
+                                    item.requireAbsent()
+                                        ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
+                                        : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                                    org.opensearch.index.VersionType.INTERNAL,
+                                    new org.opensearch.index.mapper.SourceToParse(
+                                        shardId.getIndexName(),
+                                        operation.id(),
+                                        new org.opensearch.core.common.bytes.BytesArray(operation.source()),
+                                        org.opensearch.common.xcontent.XContentType.JSON,
+                                        operation.routing()
+                                    ),
+                                    item.ifSeqNo(),
+                                    item.ifPrimaryTerm(),
+                                    org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
+                                    false
+                                );
+                            }
+                            if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.MAPPING_UPDATE_REQUIRED) {
+                                if (grewFor[i]) {
+                                    // The mapping was grown for this item once already, and it still does
+                                    // not fit: something other than a missing field, and growing again
+                                    // forever would hide it.
+                                    outcomes[i] = BulkOutcome.failed(operation.id(), describe("indexing", result));
+                                    continue;
+                                }
+                                deferredAt = i;
+                                required = result.getRequiredMappingUpdate();
+                                break;
+                            }
+                            if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
+                                // A lost condition is a FAILURE carrying a VersionConflictEngineException rather
+                                // than a thrown one, so the item has to be inspected rather than only its type
+                                // reported -- otherwise a caller that asked a compare-and-swap question is told
+                                // only that "indexing returned FAILURE", which is not an answer to it.
+                                outcomes[i] = conflicted(result)
+                                    ? BulkOutcome.conflicted(operation.id(), describe("indexing", result))
+                                    : BulkOutcome.failed(operation.id(), describe("indexing", result));
+                                continue;
+                            }
+                            applied.add(
+                                new org.opensearch.serverless.store.WalRecord(
+                                    operation.id(),
+                                    operation.source(),
+                                    result.getSeqNo(),
+                                    result.getTerm(),
+                                    result.getVersion()
+                                ).withRouting(operation.routing())
+                            );
+                            outcomes[i] = BulkOutcome.indexed(
+                                operation.id(),
+                                result.getSeqNo(),
+                                result.getTerm(),
+                                result.getVersion(),
+                                result.isCreated()
+                            );
+                        }
+                    } catch (Exception e) {
+                        // One bad document does not fail the batch. A mapping conflict on item 40 is item 40's
+                        // problem, and failing the other 99 would make a bulk request less useful than the loop
+                        // it replaces.
+                        final String message = e.getMessage() == null ? e.toString() : e.getMessage();
+                        outcomes[i] = e instanceof org.opensearch.index.engine.VersionConflictEngineException
+                            ? BulkOutcome.conflicted(operation.id(), message)
+                            : BulkOutcome.failed(operation.id(), message);
                     }
-                } catch (Exception e) {
-                    // One bad document does not fail the batch. A mapping conflict on item 40 is item 40's
-                    // problem, and failing the other 99 would make a bulk request less useful than the loop
-                    // it replaces.
-                    final String message = e.getMessage() == null ? e.toString() : e.getMessage();
-                    outcomes[i] = e instanceof org.opensearch.index.engine.VersionConflictEngineException
-                        ? BulkOutcome.conflicted(operation.id(), message)
-                        : BulkOutcome.failed(operation.id(), message);
                 }
             }
             if (deferredAt < 0) {

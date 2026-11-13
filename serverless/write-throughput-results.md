@@ -177,6 +177,41 @@ and writing to 10,000 shards ran out of files. With #131 those files stay in mem
 Holding 10,000 writers is not the limit. CPU per document is, as at 3,000. So is open time, which concurrency 8 makes
 3 to 5 times longer than it needs to be.
 
+## By core count (2026-11-13)
+
+The same meter, pinned to 1, 2 and 4 cores with `taskset` (the JVM sizes its pools from the cores it can use).
+3,000 shards, all written, memory tier on, activation 32. The meter's clients call the write path on their own
+threads, so "client" CPU in the raw lines is write-path work too. The bar: every write acked, p99 under ~800 ms.
+
+| cores | single docs/s at the bar | p99 | bulk-of-10 docs/s at the bar | p99 |
+| --- | --- | --- | --- | --- |
+| 1 | ~250 (500: 1% refused, p99 1.1 s) | 568 ms | ~1,000 (before the fixes below) | 1,059 ms |
+| 2 | ~1,000-1,500 | 579-626 ms | 4,000 | 644 ms |
+| 4 | ~2,000-3,000 | 465-783 ms | 8,000 | 622 ms |
+
+Throughput grows about in line with cores up to 4. A core does about 750-1,000 single docs/s or about 2,000 bulk
+docs/s. What stopped it being linear before, both fixed here:
+
+- **The apply gate, per document.** A bulk took the gate (cores + 1 permits, fair) once per item, so thousands of
+  writers handed permits to one another ten times a request. With 4 cores, bulks topped out near 5,300 docs/s with
+  2.5 cores busy and p50 2 s. One permit per bulk pass (what core's write pool did) and an unfair gate: 8,000 docs/s
+  at p99 622 ms, and 11,700 docs/s with 2.6% refused. With the gate off entirely, the result was the same.
+- **Every writer retaking the log lock.** When a blob landed, all its writers woke and took the committer's lock
+  one at a time before returning, while the flusher waited on the same lock for the next blob. With
+  `serverless.wal.node_log.follow_unlocked`, one writer a window drives it under the lock, and the rest wait on the
+  window. At 3,000 docs/s on 4 cores: log wait 410 -> 304 ms, flusher time per blob 170 -> 103 ms, p99 831 -> 707 ms.
+
+What limits it now, and will limit more cores:
+
+- **The in-flight cap.** At 384 per core it allows about 0.35 s of writes in flight, and an ack takes 0.25-0.35 s. At
+  4 cores, single docs past ~3,000/s are refused by the cap with CPU to spare: with the cap at 4,096, 4,000 docs/s
+  passed (1.6% refused, p99 1,050 ms).
+- **The one log flusher.** Encoding a blob, admission and the per-shard bookkeeping (`write` minus `put` in the raw
+  lines) run on one thread: 20 ms per blob at 1,000 docs/s, about 70 ms at 3,000, and about 100 ms at 11,700 bulk docs/s.
+  Past roughly 20-25K docs/s it cannot finish a blob within the 250 ms window, however many cores there are.
+- **Waking writers.** After a blob lands, its writers take 10-200 ms to return (`gap` in the summaries), which grows
+  with how many there are per blob. That is the scheduler waking hundreds of threads on a few cores.
+
 ## Not measured here
 
 - All 3,000 shards written at once (the sandbox's descriptor limit is 20,000).

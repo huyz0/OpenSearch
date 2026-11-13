@@ -230,6 +230,12 @@ unpublished record of every shard is, so a successor reads it without a listing.
     log PUTs. Leave it off on nodes that take writes all day, where it gains little. Turn it on for low-traffic nodes
     (a few writes a second or fewer) whose clients need a p50 near 150 ms rather than near 250-300 ms, and that can
     pay roughly a third more log PUTs for it.
+  - `serverless.wal.node_log.follow_unlocked` (on by default): of the writers waiting on one window, one waits under
+    the committer's lock and writes it when due; the rest wait on the window alone. Off, a landed blob woke all of its
+    writers to retake the lock one at a time, hundreds of them on a busy node. 4 vCPU, 3,000 single docs/s: log wait
+    410 -> 304 ms, p99 831 -> 707 ms. The apply gate (`serverless.write.wait_pool.enabled`) is now taken once per
+    bulk pass, not once per document, and is not fair: bulks of 10 on 4 vCPU went from about 5,300 docs/s
+    (p50 2 s) to 8,000 docs/s at p99 622 ms. See `write-throughput-results.md` for the numbers by core count.
 - **Deleting.** A node deletes its own blobs behind the trim point its lease records: the oldest record any of its
   shards has not published. A survivor deletes a dead node's log once every shard it names has published past it.
   Neither lists.
