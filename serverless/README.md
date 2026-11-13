@@ -689,6 +689,22 @@ preparation and cleanup read only the affected indices and alias, without a
 namespace listing. An abandoned preparation can retain harmless extra reverse
 hints until recovery; reverse lookups verify them against published membership.
 
+## Write threads
+
+A write is acknowledged once its node-log window lands, so its thread mostly waits. On core's `write` pool (one thread per
+core, plus one at most) that waiting capped REST single-document writes at about 16 a second on a 4-core node, whatever
+the document size, with the rest queued for seconds. `serverless.write.wait_pool.enabled` (on by default) runs REST
+writes, bulk shard groups and updates on `serverless_write`, and forwarded writes on `serverless_forwarded_write`, both
+with `serverless.write.wait_pool.threads_per_core` threads per core (64 by default). The engine apply itself still goes
+through a gate of cores + 1 permits, as many as the old pool had threads, so CPU use and the number of Lucene indexing
+threads per shard (hence segments and publish PUTs) stay as they were. With the switch on, the write limiter's default
+`serverless.write.backpressure.max_in_flight` grows with the cores: 384 per core, never below 1,024.
+
+Measured through REST on 4 cores (`LargeDocumentMeterTests`, `-Dtests.bigdoc.rest_seconds=30`, filesystem store), off
+then on: 1 KB documents at 40/s offered, 15.6/s acked at p50 24 s, then 39.6/s at p50 159 / p99 265 ms; at 600/s,
+15.9/s with most refused or failed, then 600/s at p50 144 / p99 276 ms; the page mix at 100/s, 14.8/s at p50 60 s,
+then 99.4/s with 4 KB pages at p50 156 / p99 304 ms. See `large-document-results.md`.
+
 ## Open files per node
 
 Each open writer shard holds three file descriptors: Lucene's `write.lock`, and the current file and checkpoint of

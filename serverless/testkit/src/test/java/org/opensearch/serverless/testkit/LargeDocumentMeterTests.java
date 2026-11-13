@@ -541,7 +541,10 @@ public class LargeDocumentMeterTests extends OpenSearchTestCase {
                 org.opensearch.serverless.shell.ServerlessBootstrap boot = org.opensearch.serverless.shell.ServerlessBootstrap.start(
                     settings.build()
                 );
-                java.net.http.HttpClient http = java.net.http.HttpClient.newBuilder().executor(httpThreads).build()
+                java.net.http.HttpClient http = java.net.http.HttpClient.newBuilder()
+                    .version(java.net.http.HttpClient.Version.HTTP_1_1)
+                    .executor(httpThreads)
+                    .build()
             ) {
                 final int port = boot.node().boundHttpAddress().publishAddress().getPort();
                 final String body = "{\"settings\":{\"number_of_shards\":1},\"mappings\":" + MAPPING + "}";

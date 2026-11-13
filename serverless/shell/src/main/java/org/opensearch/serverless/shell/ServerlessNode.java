@@ -173,6 +173,8 @@ public final class ServerlessNode implements Closeable {
 
     /** How many writes may wait on the object store at once; see WriteBackpressure. */
     final org.opensearch.serverless.store.WriteBackpressure writeBackpressure;
+    /** Bounds how many writes apply to the engine at once; see {@link WritePools}. */
+    final WritePools writePools;
     final int writeBackpressureMax;
 
     /**
@@ -380,7 +382,11 @@ public final class ServerlessNode implements Closeable {
         // environment variable, and role switching under load stays a policy question.
         this.roles = rolesFrom(settings);
         this.blockCache = NodeComponents.blockCache(settings);
-        this.writeBackpressureMax = settings.getAsInt("serverless.write.backpressure.max_in_flight", 1_024);
+        this.writeBackpressureMax = settings.getAsInt(
+            "serverless.write.backpressure.max_in_flight",
+            WritePools.defaultMaxInFlight(settings)
+        );
+        this.writePools = WritePools.of(settings);
         this.writeBackpressure = NodeComponents.writeBackpressure(settings, writeBackpressureMax);
         this.walCommitter = NodeComponents.walCommitter(settings);
         this.nodeLogEnabled = settings.getAsBoolean("serverless.wal.node_log.enabled", true);

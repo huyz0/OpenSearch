@@ -191,7 +191,11 @@ final class BulkDispatch {
             });
         }
         try {
-            Fanout.run(serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE), Fanout.DEFAULT_CONCURRENCY, tasks);
+            Fanout.run(
+                serving.threadPool().executor(org.opensearch.serverless.shell.WritePools.writePool(serving.settings())),
+                Fanout.DEFAULT_CONCURRENCY,
+                tasks
+            );
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted while writing a batch", e);
