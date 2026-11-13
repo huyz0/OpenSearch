@@ -180,6 +180,12 @@ request wrapper or interceptors; their node and index settings are registered an
 Management (policy create/get on its own system index), Query Insights, custom codecs, system templates and Flow
 Framework start. Most of the rest stop on jar hell, because the shell's classpath carries the module and S3 jars a
 classic node keeps in their own class loaders; see the plugin compatibility work.
+Plugin objects are built by core's own injector (`serverless.plugin_injector.enabled`, on): a plugin's Guice modules,
+`Provider` parameters and `getGuiceServiceClasses()` lifecycle services work as on a classic node, actions are eager
+singletons, and the node's services are bound by their class and supertypes. Core services the shell does not run
+(repositories, point-in-time transport, extensions) are bound as empty stand-ins. Plugins hear `onNodeStarted` once the
+node is started and has its metadata plane. With this, the security plugin (with the rule framework) starts over TLS
+and creates its configuration index; it then waits for cluster health, which the plugin client does not yet answer.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,

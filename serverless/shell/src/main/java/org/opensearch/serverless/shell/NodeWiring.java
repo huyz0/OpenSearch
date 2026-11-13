@@ -239,10 +239,13 @@ final class NodeWiring {
         final java.util.List<org.opensearch.plugins.ActionPlugin> actionPlugins = node.plugins.filter(
             org.opensearch.plugins.ActionPlugin.class
         );
-        if (actionPlugins.isEmpty()) {
+        final boolean inject = PluginInjector.enabled(node.settings) && node.plugins.plugins().isEmpty() == false;
+        if (actionPlugins.isEmpty() && inject == false) {
             return PluginActions.none();
         }
         final java.util.List<Object> services = java.util.List.of(
+            // First, so a plugin asking core's injector for a Client gets the NodeClient, as on a classic node.
+            node.nodeClient,
             new org.opensearch.action.support.ActionFilters(new java.util.HashSet<>(node.plugins.actionFilters())),
             node.transportService,
             node.transportService.getTaskManager(),
@@ -271,8 +274,29 @@ final class NodeWiring {
             // Index management validates replica counts against zone awareness with it; core builds it from
             // the same two arguments in ClusterModule.
             new org.opensearch.cluster.routing.allocation.AwarenessReplicaBalance(node.settings, node.clusterService.getClusterSettings()),
-            new org.opensearch.env.Environment(node.settings, null)
+            new org.opensearch.env.Environment(node.settings, null),
+            // An action asks for these where a classic node's injector binds them; the shell traces and meters
+            // its own work, so a plugin's spans and metrics go nowhere rather than failing its start.
+            org.opensearch.telemetry.tracing.noop.NoopTracer.INSTANCE,
+            org.opensearch.telemetry.metrics.noop.NoopMetricsRegistry.INSTANCE,
+            // Core services the shell does not run, which plugins take as constructor arguments and use only on
+            // paths that do not arise here. The security plugin takes all three: the repositories to check a
+            // snapshot restore against (the shell's snapshots go to its own store, so none are registered),
+            // the point-in-time service, and the extensions manager (the shell hosts no extensions).
+            new org.opensearch.repositories.RepositoriesService(
+                node.settings,
+                node.clusterService,
+                node.transportService,
+                java.util.Map.of(),
+                java.util.Map.of(),
+                node.threadPool
+            ),
+            new org.opensearch.action.search.SearchTransportService(node.transportService, NodeWiring.unwrapped()),
+            noExtensions()
         );
+        if (inject) {
+            node.pluginInjector = PluginInjector.build(node.plugins.plugins(), services, node.plugins.components());
+        }
         // Each action's constructor is resolved against the node's services and the components *its own*
         // plugin built -- never another plugin's. The aggregate list used to be offered to every action,
         // so a plugin could take a constructor argument of a type only some other plugin's component
@@ -283,6 +307,24 @@ final class NodeWiring {
             );
             available.addAll(services);
             return available;
-        });
+        }, node.pluginInjector);
+    }
+
+    private org.opensearch.extensions.ExtensionsManager noExtensions() {
+        try {
+            return new org.opensearch.extensions.NoopExtensionsManager(node.services().identityService());
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException(e);
+        }
+    }
+
+    /** Search responses passed on as they are: core wraps them to collect per-node stats, which nothing reads here. */
+    @SuppressWarnings("rawtypes")
+    private static <
+        C,
+        L extends org.opensearch.core.action.ActionListener>
+        java.util.function.BiFunction<C, L, org.opensearch.core.action.ActionListener>
+        unwrapped() {
+        return (connection, listener) -> listener;
     }
 }
