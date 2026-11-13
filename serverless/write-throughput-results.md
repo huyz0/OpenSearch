@@ -49,7 +49,8 @@ before the Gradle daemon starts (`./gradlew --stop` first); see "File descriptor
 | 2,000 | 1,996 | 263 ms | 551 ms | 0.25% | 2.6 | 1.3 |
 
 The 2,000 step's refusals are the node's in-flight cap (`serverless.write.backpressure.max_in_flight`, 1,024): every
-write waits out part of a 250 ms window, so 2,000 docs/s keeps ~600 in flight on average and bursts pass 1,024.
+write waits out part of a 250 ms window, so 2,000 docs/s keeps ~600 in flight on average and bursts pass 1,024. The
+default now scales with the cores (see "What limits a node").
 
 2,000 shards with the cap at 8,192:
 
@@ -80,17 +81,44 @@ At 3,000 the box is CPU-bound and the oldest write passes the limiter's 1 s targ
    path itself (parse, Lucene, log record); the node's background work is a steady ~0.6-0.8 cores here. A 16-core
    node would sustain roughly 12-16K single-document writes/s, more in bulks.
 2. **The in-flight cap, for single-document writes.** With a 250 ms window, a node needs `max_in_flight` of about
-   0.35 s x its write rate. The default 1,024 tops out near 3,000 single-document writes/s whatever the cores; bulks
-   count once per request, so they are not affected. Raise it with the core count.
+   0.35 s x its write rate. The default now scales with the cores (`WritePools`: 384 per core, at least 1,024;
+   6,144 on 16 cores), about 1,100 single-document writes/s per core, past what a core's CPU takes. Bulks count
+   once per request, so they are not affected.
 3. **The node-log flusher, for bulk at high rates.** One blob is in flight at a time and the flusher encodes it
    before the PUT. At 20,000 docs/s offered a blob held ~6,000 docs and took 263 ms against a 31 ms PUT, so log PUTs
    fell to 2.4/s and writes queued behind it. On 4 cores CPU binds first; on a bigger node this is the next ceiling
    (roughly 20-25K docs/s), and encoding the next blob while the previous PUT is in flight would lift it.
-4. **File descriptors.** 3 per open writer plus ~3.7 per writer being written: 3,000 shards all taking writes need
-   ~21,000. Set `nofile` to 65,536 or more on a node meant to hold thousands of shards. Heap is not the limit: ~400 MB
+4. **File descriptors.** 1 per open writer (Lucene's `write.lock`; 3 with `serverless.translog.local`) plus ~3.7 per
+   writer being written: 3,000 shards all taking writes need ~14,000. Set `nofile` to 65,536 or more on a node meant to hold thousands of shards. Heap is not the limit: ~400 MB
    for 3,000 idle writers.
 5. **Open time.** 30 ms a shard at 20 ms a request: a node taking 3,000 shards takes 1.5 min, and one pass of that
    is longer than a lease TTL, so a pass that opens thousands of shards must not hold back renewals.
+
+## No local translog by default
+
+A writer's disk translog was never replayed: an acknowledged write is durable in the node log, and a shard opens from
+its published commit plus that log. It cost every open writer two descriptors (`.tlog`, `.ckp`), a 16 KB write buffer,
+and every acknowledged write a local fsync. `serverless.translog.local` (node setting, default `false`) now swaps it for
+`DiscardingTranslogManager`, which keeps nothing: locations still grow for `wait_for` refresh listeners, and a sync marks
+the operations added since the last one persisted, as the fsync did. A realtime get of a document not yet refreshed
+refreshes the shard instead of reading the translog (core's own fallback); a local refresh, not a publish.
+
+Same run both ways, 2,000 shards, flat 20 ms, C2 JIT:
+
+| | disk translog | none (default) |
+| --- | --- | --- |
+| fds per idle writer | 3.0 | 1.0 |
+| heap per idle writer | 129 KB | 114 KB |
+| heap used, 1,000 docs/s | 2,343 MB | 1,488 MB |
+| heap used, 2,000 docs/s | 3,386 MB | 2,232 MB |
+| p50 / p99, 1,000 docs/s | 203 / 372 ms | 187 / 344 ms |
+| p50 / p99, 2,000 docs/s | 254 / 566 ms | 229 / 476 ms |
+| ms CPU per doc, 1,000 / 2,000 docs/s | 2.0 / 1.27 | 1.6 / 1.10 |
+| refused at 2,000 docs/s | 0.5% | 0 |
+| store requests | same | same |
+
+Heap used is a sample of a live heap, not a post-GC floor, but the gap held at both rates. The disk run's refusals were
+the limiter shedding when an append passed ~0.9 s.
 
 ## Fixed: checking new shards one at a time stalled the whole node
 

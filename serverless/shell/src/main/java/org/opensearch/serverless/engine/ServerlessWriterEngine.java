@@ -90,6 +90,46 @@ public final class ServerlessWriterEngine extends InternalEngine {
         this.replayLog = replayLog;
     }
 
+    /**
+     * Whether a writer keeps core's translog on local disk. Off, the writer keeps none ({@link DiscardingTranslogManager}): an
+     * acknowledged write is durable in the node log, and nothing ever replays a local translog, which cost every open writer two
+     * file descriptors and every acknowledged write a local fsync.
+     */
+    public static final String LOCAL_TRANSLOG_SETTING = "serverless.translog.local";
+
+    /** The default {@link #LOCAL_TRANSLOG_SETTING}. */
+    public static final boolean DEFAULT_LOCAL_TRANSLOG = false;
+
+    /**
+     * Returns whether writers on a node with these settings keep a translog on local disk.
+     *
+     * @param nodeSettings the node's settings
+     * @return true to keep core's disk translog
+     */
+    public static boolean keepsLocalTranslog(org.opensearch.common.settings.Settings nodeSettings) {
+        return nodeSettings.getAsBoolean(LOCAL_TRANSLOG_SETTING, DEFAULT_LOCAL_TRANSLOG);
+    }
+
+    @Override
+    protected org.opensearch.index.translog.TranslogManager createTranslogManager(
+        String translogUUID,
+        org.opensearch.index.translog.TranslogDeletionPolicy translogDeletionPolicy,
+        org.opensearch.index.translog.listener.CompositeTranslogEventListener translogEventListener
+    ) throws IOException {
+        // Called from core's constructor, before this class's fields are set: decide from the configuration alone.
+        if (keepsLocalTranslog(engineConfig.getIndexSettings().getNodeSettings())) {
+            return super.createTranslogManager(translogUUID, translogDeletionPolicy, translogEventListener);
+        }
+        return new DiscardingTranslogManager(
+            translogUUID,
+            translogDeletionPolicy,
+            engineConfig.getGlobalCheckpointSupplier(),
+            translogEventListener,
+            // Read when a sync runs, by which time core's constructor has set the tracker.
+            seqNo -> localCheckpointTracker.markSeqNoAsPersisted(seqNo)
+        );
+    }
+
     private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(
         ServerlessWriterEngine.class
     );

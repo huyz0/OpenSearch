@@ -707,12 +707,13 @@ then 99.4/s with 4 KB pages at p50 156 / p99 304 ms. See `large-document-results
 
 ## Open files per node
 
-Each open writer shard holds three file descriptors: Lucene's `write.lock`, and the current file and checkpoint of
-its local translog. Segment files hold none, since reads go through the block cache. A hibernated or released writer
+Each open writer shard holds one file descriptor, Lucene's `write.lock`: a writer keeps no local translog, since an
+acknowledged write is durable in the node log (`serverless.translog.local: true` brings core's disk translog back, and
+two more descriptors per writer). Segment files hold none, since reads go through the block cache. A hibernated or released writer
 holds none. Sockets, the node's own files and the JVM come on top, a few hundred in all.
 
 Deploy with the open-file limit at 1,048,576 (`nofile`, soft and hard). It is the most Linux allows a process by
-default (`fs.nr_open`), each descriptor costs the kernel about a kilobyte, and at three per writer it fits about
+default (`fs.nr_open`), each descriptor costs the kernel about a kilobyte, and even at three per writer it fits about
 330,000 open writers, far past where heap, open time and takeover time stop a node first.
 
 - **Kubernetes** has no pod-level setting: the container runtime sets the limit. With containerd, set
