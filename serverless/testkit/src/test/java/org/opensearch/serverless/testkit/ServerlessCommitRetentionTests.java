@@ -116,10 +116,18 @@ public class ServerlessCommitRetentionTests extends OpenSearchTestCase {
             // The writer keeps only the commit it published. The one its recovery made at the takeover -- which names
             // the files it inherited, the ones just collected -- is gone, so its deletion policy cannot read it back.
             final java.util.List<String> localCommits = new java.util.ArrayList<>();
-            try (var files = java.nio.file.Files.list(shard.shardPath().resolveIndex())) {
-                files.map(f -> f.getFileName().toString()).filter(n -> n.startsWith("segments_")).forEach(localCommits::add);
+            // Local means on disk or in the memory fresh files are held in: the directory beneath the published files.
+            org.apache.lucene.store.Directory local = shard.store().directory();
+            while (local instanceof org.apache.lucene.store.FilterDirectory filter
+                && (local instanceof org.opensearch.serverless.store.TieredSegmentDirectory) == false) {
+                local = filter.getDelegate();
             }
-            assertEquals("one commit kept on disk, the published one: " + localCommits, 1, localCommits.size());
+            for (String name : local.listAll()) {
+                if (name.startsWith("segments_")) {
+                    localCommits.add(name);
+                }
+            }
+            assertEquals("one commit kept locally, the published one: " + localCommits, 1, localCommits.size());
 
             // And the writer goes on: it writes, commits and publishes.
             for (int i = 5; i < 10; i++) {

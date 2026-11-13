@@ -476,6 +476,7 @@ public final class StatsHandler extends BaseRestHandler {
             objectStore(builder, metadata);
             zoneTraffic(builder, serving);
             blockCache(builder, serving);
+            localSegments(builder, serving);
             scheduler(builder, serving);
             lease(builder, serving, metadata);
             heldShards(builder, serving, readers, frozen);
@@ -535,6 +536,26 @@ public final class StatsHandler extends BaseRestHandler {
         builder.field("hits", cache.hits());
         builder.field("misses", cache.misses());
         builder.field("bytes_fetched", cache.bytesFetched());
+        builder.endObject();
+    }
+
+    /** What this node's writers have written to local disk, and what its memory tier for fresh segments holds. */
+    private static void localSegments(XContentBuilder builder, ServerlessNode serving) throws IOException {
+        final var stats = serving.localSegments().stats();
+        builder.startObject("local_segments");
+        builder.field("memory_enabled", serving.localSegments().enabled());
+        builder.field("memory_max_bytes", serving.localSegments().maxBytes());
+        builder.field("disk_bytes_flush", stats.diskFlush());
+        builder.field("disk_bytes_merge", stats.diskMerge());
+        builder.field("disk_bytes_other", stats.diskOther());
+        builder.field("memory_bytes_flush", stats.memoryFlush());
+        builder.field("memory_bytes_other", stats.memoryOther());
+        builder.field("spilled_while_writing_bytes", stats.spilledWhileWriting());
+        builder.field("evicted_bytes", stats.evicted());
+        builder.field("deleted_in_memory_bytes", stats.deletedInMemory());
+        builder.field("held_bytes", stats.heldBytes());
+        builder.field("held_files", stats.heldFiles());
+        builder.field("peak_bytes", stats.peakBytes());
         builder.endObject();
     }
 
