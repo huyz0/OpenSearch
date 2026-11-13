@@ -91,11 +91,16 @@ public final class NodeServices implements Closeable {
      * lookup with a single possible answer only creates a way to misconfigure it.
      */
     static Settings withShellDefaults(Settings supplied) {
-        return Settings.builder()
+        final Settings.Builder builder = Settings.builder()
             .put(NetworkModule.TRANSPORT_TYPE_KEY, Netty4ModulePlugin.NETTY_TRANSPORT_NAME)
-            .put(NetworkModule.HTTP_TYPE_KEY, Netty4ModulePlugin.NETTY_HTTP_TRANSPORT_NAME)
-            .put(supplied)
-            .build();
+            .put(NetworkModule.HTTP_TYPE_KEY, Netty4ModulePlugin.NETTY_HTTP_TRANSPORT_NAME);
+        if (org.opensearch.serverless.rest.BulkHandler.streams(supplied)) {
+            // Streamed batches need an HTTP transport that hands a body over as it arrives, and reads it only as fast as the
+            // handler asks: core's Reactor Netty transport, with its demand-driven reads on.
+            builder.put(NetworkModule.HTTP_TYPE_KEY, org.opensearch.transport.reactor.ReactorNetty4Plugin.REACTOR_NETTY_HTTP_TRANSPORT_NAME)
+                .put(org.opensearch.http.reactor.netty4.ReactorNetty4HttpServerTransport.SETTING_STREAMING_DEMAND_DRIVEN.getKey(), true);
+        }
+        return builder.put(supplied).build();
     }
 
     ClusterService buildClusterService(ClusterSettings clusterSettings, DiscoveryNode localNode) {

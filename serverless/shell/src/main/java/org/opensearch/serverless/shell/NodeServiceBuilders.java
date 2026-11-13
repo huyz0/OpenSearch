@@ -330,6 +330,9 @@ final class NodeServiceBuilders {
         // default, so a node with no such plugin is unchanged.
         final java.util.List<org.opensearch.plugins.NetworkPlugin> networkPlugins = new java.util.ArrayList<>();
         networkPlugins.add(new Netty4ModulePlugin());
+        if (org.opensearch.serverless.rest.BulkHandler.streams(services.settings)) {
+            networkPlugins.add(new org.opensearch.transport.reactor.ReactorNetty4Plugin());
+        }
         networkPlugins.addAll(services.plugins.filter(org.opensearch.plugins.NetworkPlugin.class));
         return new NetworkModule(
             services.settings,

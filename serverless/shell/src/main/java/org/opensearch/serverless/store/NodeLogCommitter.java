@@ -84,6 +84,18 @@ public final class NodeLogCommitter {
     /** The default of {@link #HEDGE_AFTER_SETTING}. */
     public static final long DEFAULT_HEDGE_AFTER_MILLIS = 60L;
 
+    /**
+     * Whether one shard's records that would carry a window past its byte or record bound are split across consecutive
+     * windows, so that no blob grows far past the bound; off, they join one window whole, however many there are.
+     */
+    public static final String SPLIT_SETTING = "serverless.wal.node_log.split_large_batches";
+
+    /**
+     * Whether a window's hedge waits longer in proportion to how much larger its blob is than the recent ones; off, every
+     * blob waits the same, and a blob many times the usual size is nearly always sent twice.
+     */
+    public static final String HEDGE_BY_SIZE_SETTING = "serverless.wal.node_log.hedge_by_size";
+
     /** Roughly the most bytes of id and source one window takes before the next arrival opens another. */
     public static final long DEFAULT_MAX_BYTES = 8L * 1024 * 1024;
     /** The most records one window takes before the next arrival opens another. */
@@ -139,6 +151,8 @@ public final class NodeLogCommitter {
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition changed = lock.newCondition();
     private final Deque<Window> windows = new ArrayDeque<>();
+    private volatile boolean splitLargeBatches = true;
+    private volatile boolean hedgeBySize = true;
     private final TreeMap<Long, EpochState> epochs = new TreeMap<>();
     private boolean flushing;
     /** The epoch being written, or -1 when the next window must open one. */
@@ -204,12 +218,16 @@ public final class NodeLogCommitter {
         final long joined = System.nanoTime();
         lock.lock();
         try {
-            final Window mine = join(shard, term, records);
+            final List<Window> joinedWindows = joinAll(shard, term, records);
+            final Window mine = joinedWindows.get(joinedWindows.size() - 1);
+            // Windows are written in order, one at a time, so the last of them landing means the others were written.
             awaitLanded(mine);
             timings.caller(joined, mine);
-            final IOException failure = mine.failures.get(shard);
-            if (failure != null) {
-                throw failure;
+            for (Window each : joinedWindows) {
+                final IOException failure = each.failures.get(shard);
+                if (failure != null) {
+                    throw failure;
+                }
             }
             return mine.landed;
         } finally {
@@ -235,9 +253,10 @@ public final class NodeLogCommitter {
         }
         lock.lock();
         try {
-            final Window window = join(shard, term, records);
+            final List<Window> joinedWindows = joinAll(shard, term, records);
+            final Window window = joinedWindows.get(joinedWindows.size() - 1);
             window.onLanded.add(() -> {
-                if (window.landed != null && window.failures.containsKey(shard) == false) {
+                if (window.landed != null && joinedWindows.stream().noneMatch(each -> each.failures.containsKey(shard))) {
                     onLanded.accept(window.landed);
                 }
             });
@@ -314,6 +333,56 @@ public final class NodeLogCommitter {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
+    }
+
+    /**
+     * Adds a shard's records to the youngest window, splitting them across new windows in order where they would carry
+     * one past its bounds. Caller holds the lock.
+     *
+     * @return the windows they joined, oldest first
+     */
+    private List<Window> joinAll(ShardKey shard, long term, List<WalRecord> records) {
+        if (splitLargeBatches == false) {
+            return List.of(join(shard, term, records));
+        }
+        final List<Window> joined = new ArrayList<>(1);
+        int from = 0;
+        while (from < records.size()) {
+            Window last = windows.peekLast();
+            final long roomBytes = last == null || last.full(maxBytes, maxRecords) ? maxBytes : maxBytes - last.bytes;
+            final int roomRecords = last == null || last.full(maxBytes, maxRecords) ? maxRecords : maxRecords - last.records;
+            int to = from;
+            long bytes = 0;
+            while (to < records.size() && to - from < roomRecords) {
+                final long next = WalRecord.contentBytes(records.get(to).id(), records.get(to).source());
+                if (to > from && bytes + next > roomBytes) {
+                    break;
+                }
+                if (to == from && next > roomBytes && last != null && last.records > 0 && last.full(maxBytes, maxRecords) == false) {
+                    // Does not fit what is left of a window others have joined: it starts the next one.
+                    last.closeEarly = true;
+                    break;
+                }
+                bytes += next;
+                to++;
+            }
+            if (to == from) {
+                // The open window was closed for it; the next pass opens a new one.
+                changed.signalAll();
+                continue;
+            }
+            final Window window = join(shard, term, from == 0 && to == records.size() ? records : records.subList(from, to));
+            if (to < records.size()) {
+                // More of this shard's records follow in the next window: this one is as full as it will get.
+                window.closeEarly = true;
+                changed.signalAll();
+            }
+            if (joined.isEmpty() || joined.get(joined.size() - 1) != window) {
+                joined.add(window);
+            }
+            from = to;
+        }
+        return joined;
     }
 
     /** Adds to the youngest window that will take them, or opens one. Caller holds the lock. */
@@ -406,7 +475,13 @@ public final class NodeLogCommitter {
         IOException failure = null;
         final long putting = System.nanoTime();
         try {
-            final NodeLogStore.HedgeOutcome hedged = store.appendHedged(epoch, ordinal, encoded.bytes(), hedgeDelayNanos(), hedgeExecutor);
+            final NodeLogStore.HedgeOutcome hedged = store.appendHedged(
+                epoch,
+                ordinal,
+                encoded.bytes(),
+                hedgeDelayNanos(encoded.bytes().length),
+                hedgeExecutor
+            );
             if (hedged != NodeLogStore.HedgeOutcome.NONE) {
                 timings.hedges.increment();
                 if (hedged == NodeLogStore.HedgeOutcome.WON) {
@@ -422,7 +497,7 @@ public final class NodeLogCommitter {
             timings.putNanos.add(took);
             timings.puts.increment();
             if (failure == null) {
-                notePutTook(took);
+                notePutTook(took, encoded.bytes().length);
             }
         }
 
@@ -942,13 +1017,16 @@ public final class NodeLogCommitter {
 
     /** The most recent PUT durations, for the hedge delay; guarded by itself. */
     private final long[] recentPutNanos = new long[RECENT_PUTS];
+    /** The sizes of the same PUTs, for {@link #HEDGE_BY_SIZE_SETTING}; guarded by {@link #recentPutNanos}. */
+    private final long[] recentPutBytes = new long[RECENT_PUTS];
     private int recentPuts;
     private static final int RECENT_PUTS = 128;
     /** The share of PUTs, at most, that hedging may send twice: the hedge waits at least this quantile of recent ones. */
     private static final double HEDGE_QUANTILE = 0.95;
 
-    private void notePutTook(long nanos) {
+    private void notePutTook(long nanos, long bytes) {
         synchronized (recentPutNanos) {
+            recentPutBytes[recentPuts % RECENT_PUTS] = bytes;
             recentPutNanos[recentPuts++ % RECENT_PUTS] = nanos;
         }
     }
@@ -959,19 +1037,53 @@ public final class NodeLogCommitter {
      * rather than on most of its PUTs.
      */
     long hedgeDelayNanos() {
+        return hedgeDelayNanos(0L);
+    }
+
+    /**
+     * How long a PUT of this many bytes waits before it is sent again: {@link #hedgeDelayNanos()}, scaled up by how many
+     * times the median of the recent PUTs' sizes it is when {@link #HEDGE_BY_SIZE_SETTING} is on. A blob ten times the
+     * usual size takes about ten times as long to send; hedged on the usual PUTs' tail, it was nearly always sent twice.
+     *
+     * @param blobBytes the blob's size; zero or less scales nothing
+     */
+    public long hedgeDelayNanos(long blobBytes) {
         final long configured = hedgeAfterNanos;
         if (configured <= 0) {
             return 0L;
         }
         final long[] sorted;
+        final long[] sizes;
         synchronized (recentPutNanos) {
-            sorted = java.util.Arrays.copyOf(recentPutNanos, Math.min(recentPuts, RECENT_PUTS));
+            final int n = Math.min(recentPuts, RECENT_PUTS);
+            sorted = java.util.Arrays.copyOf(recentPutNanos, n);
+            sizes = java.util.Arrays.copyOf(recentPutBytes, n);
         }
         if (sorted.length == 0) {
             return configured;
         }
         java.util.Arrays.sort(sorted);
-        return Math.max(configured, sorted[(int) Math.min(sorted.length - 1, Math.floor(HEDGE_QUANTILE * sorted.length))]);
+        final long delay = Math.max(configured, sorted[(int) Math.min(sorted.length - 1, Math.floor(HEDGE_QUANTILE * sorted.length))]);
+        if (hedgeBySize == false || blobBytes <= 0) {
+            return delay;
+        }
+        java.util.Arrays.sort(sizes);
+        final long median = Math.max(1L, sizes[sizes.length / 2]);
+        if (blobBytes <= median) {
+            return delay;
+        }
+        return (long) Math.min(Long.MAX_VALUE / 4.0, delay * ((double) blobBytes / median));
+    }
+
+    /**
+     * Sets {@link #SPLIT_SETTING} and {@link #HEDGE_BY_SIZE_SETTING}.
+     *
+     * @param split whether a shard's records that would carry a window past its bounds are split across windows
+     * @param bySize whether a larger blob waits longer before it is hedged
+     */
+    public void boundBlobs(boolean split, boolean bySize) {
+        this.splitLargeBatches = split;
+        this.hedgeBySize = bySize;
     }
 
     private volatile java.util.concurrent.Executor hedgeExecutor;
@@ -1052,6 +1164,15 @@ public final class NodeLogCommitter {
          */
         public long hedges() {
             return hedges.sum();
+        }
+
+        /**
+         * Returns how many of those hedges landed before the PUT they repeated.
+         *
+         * @return the count
+         */
+        public long hedgesWon() {
+            return hedgesWon.sum();
         }
 
         /** Starts the sums over. */
@@ -1139,6 +1260,8 @@ public final class NodeLogCommitter {
         private final Map<ShardKey, IOException> failures = new HashMap<>();
         private long bytes;
         private int records;
+        /** Closed before its bounds because the records after it would not fit: written as soon as it can be. */
+        private boolean closeEarly;
         private boolean done;
         private long flushStartedNanos;
         private long doneNanos;
@@ -1158,7 +1281,7 @@ public final class NodeLogCommitter {
         }
 
         private boolean full(long maxBytes, int maxRecords) {
-            return bytes >= maxBytes || records >= maxRecords;
+            return closeEarly || bytes >= maxBytes || records >= maxRecords;
         }
 
         private void failAll(IOException failure) {

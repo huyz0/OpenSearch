@@ -105,8 +105,241 @@ public final class BulkHandler extends BaseRestHandler {
         );
     }
 
+    /**
+     * Whether a batch's memory is charged to indexing pressure before its body is copied and parsed, at
+     * {@link #MEMORY_FACTOR_SETTING} times its length; off, it is charged its length once, after parsing, as before.
+     */
+    public static final String CHARGE_BEFORE_PARSE_SETTING = "serverless.write.bulk.charge_before_parse";
+
+    /** The default {@link #CHARGE_BEFORE_PARSE_SETTING}. */
+    public static final boolean DEFAULT_CHARGE_BEFORE_PARSE = true;
+
+    /**
+     * How many times its length a batch is charged when {@link #CHARGE_BEFORE_PARSE_SETTING} is on: what a node holds of
+     * it at once, the body, each source as a string, the bytes the engine parses and the node-log blob carrying it.
+     */
+    public static final String MEMORY_FACTOR_SETTING = "serverless.write.bulk.memory_factor";
+
+    /** The default {@link #MEMORY_FACTOR_SETTING}. */
+    public static final double DEFAULT_MEMORY_FACTOR = 4.0;
+
+    /**
+     * The bytes a batch of this length is charged up front.
+     *
+     * @param contentLength the body's length
+     * @param settings the node settings
+     * @return the charge
+     */
+    static long upFrontCharge(long contentLength, org.opensearch.common.settings.Settings settings) {
+        final double factor = Math.max(1.0, settings.getAsDouble(MEMORY_FACTOR_SETTING, DEFAULT_MEMORY_FACTOR));
+        return (long) Math.min(Long.MAX_VALUE / 2.0, contentLength * factor);
+    }
+
+    /** A charge released once, by whichever of the request's paths ends it. */
+    static final class Charge implements org.opensearch.common.lease.Releasable {
+        private final java.util.concurrent.atomic.AtomicReference<org.opensearch.common.lease.Releasable> held;
+        /** Set once the batch's own work owns the charge; until then the refusals that return early release it. */
+        volatile boolean handedOff;
+
+        Charge(org.opensearch.common.lease.Releasable held) {
+            this.held = new java.util.concurrent.atomic.AtomicReference<>(held);
+        }
+
+        @Override
+        public void close() {
+            final org.opensearch.common.lease.Releasable releasing = held.getAndSet(null);
+            if (releasing != null) {
+                releasing.close();
+            }
+        }
+    }
+
+    /**
+     * Whether {@code _bulk} bodies are streamed: read as they arrive, a slice at a time, with memory per request bounded
+     * whatever the body's size ({@link BulkStream}). Needs the streaming HTTP transport, which the same setting selects.
+     */
+    public static final String STREAMING_SETTING = "serverless.http.streaming";
+
+    /** The default {@link #STREAMING_SETTING}. */
+    public static final boolean DEFAULT_STREAMING = false;
+
+    /** How much of a streamed body is parsed and applied at once. */
+    public static final String SLICE_BYTES_SETTING = "serverless.write.bulk.slice_bytes";
+
+    /** The default {@link #SLICE_BYTES_SETTING}: one node-log blob's worth. */
+    public static final long DEFAULT_SLICE_BYTES = 8L * 1024 * 1024;
+
+    /** The heap all streamed batches on a node may hold at once while being applied. */
+    public static final String BUDGET_SETTING = "serverless.write.bulk.memory_budget";
+
+    /** How long a streamed slice waits for its share of the budget before its request is refused with a 429. */
+    public static final String WAIT_SETTING = "serverless.write.bulk.max_wait";
+
+    /** How many streamed slices a node applies at once, across all batches; the node's cores by default. */
+    public static final String MAX_APPLYING_SETTING = "serverless.write.bulk.max_applying_slices";
+
+    /** The default {@link #WAIT_SETTING}. */
+    public static final org.opensearch.common.unit.TimeValue DEFAULT_WAIT = org.opensearch.common.unit.TimeValue.timeValueMinutes(2);
+
+    private volatile BulkMemoryBudget budget;
+
+    /**
+     * Whether a node with these settings streams batches.
+     *
+     * @param settings the node settings
+     * @return true to stream
+     */
+    public static boolean streams(org.opensearch.common.settings.Settings settings) {
+        return settings.getAsBoolean(STREAMING_SETTING, DEFAULT_STREAMING);
+    }
+
+    @Override
+    public boolean supportsStreaming() {
+        final ServerlessNode serving = node.get();
+        // A node with action filters runs every batch through them whole, so it takes the body whole.
+        return serving != null && streams(serving.settings()) && serving.services().actionGate().isEmpty();
+    }
+
+    BulkDispatch dispatcher() {
+        return dispatcher;
+    }
+
+    private BulkMemoryBudget budget(ServerlessNode serving) {
+        BulkMemoryBudget current = budget;
+        if (current == null) {
+            synchronized (this) {
+                if (budget == null) {
+                    budget = new BulkMemoryBudget(
+                        org.opensearch.common.unit.MemorySizeValue.parseBytesSizeValueOrHeapRatio(
+                            serving.settings().get(BUDGET_SETTING, "10%"),
+                            BUDGET_SETTING
+                        ).getBytes(),
+                        serving.settings()
+                            .getAsInt(
+                                MAX_APPLYING_SETTING,
+                                org.opensearch.common.util.concurrent.OpenSearchExecutors.allocatedProcessors(serving.settings())
+                            ),
+                        serving.threadPool()
+                    );
+                }
+                current = budget;
+            }
+        }
+        return current;
+    }
+
+    private RestChannelConsumer prepareStreaming(RestRequest request, ServerlessNode serving) {
+        final String defaultIndex = request.param("index");
+        final var refreshPolicy = WriteRequest.RefreshPolicy.parse(request.param("refresh", "false"));
+        final String defaultPipeline = request.param("pipeline");
+        final String routing = DocumentRouting.normalize(request.param("routing"));
+        final boolean requireAlias = request.paramAsBoolean("require_alias", false);
+        for (String hint : new String[] {
+            "timeout",
+            "wait_for_active_shards",
+            "_source",
+            "_source_includes",
+            "_source_excludes",
+            "type" }) {
+            request.param(hint);
+        }
+        final MetadataPlane metadata = plane.get();
+        return channel -> {
+            if (channel instanceof org.opensearch.rest.StreamingRestChannel == false) {
+                channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.INTERNAL_SERVER_ERROR,
+                        "not_streaming",
+                        "the transport did not stream this body"
+                    )
+                );
+                return;
+            }
+            if (metadata == null) {
+                channel.sendResponse(
+                    IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                );
+                return;
+            }
+            if (requireAlias) {
+                channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.NOT_IMPLEMENTED,
+                        "unsupported_write",
+                        "require_alias is not supported: writes here name an index, and an alias resolves on read"
+                    )
+                );
+                return;
+            }
+            final var settings = serving.settings();
+            new BulkStream(
+                this,
+                (org.opensearch.rest.StreamingRestChannel) channel,
+                serving,
+                metadata,
+                new BulkStream.Request(defaultIndex, routing, defaultPipeline, refreshPolicy != WriteRequest.RefreshPolicy.NONE),
+                budget(serving),
+                Math.max(
+                    64 * 1024,
+                    settings.getAsBytesSize(SLICE_BYTES_SETTING, new org.opensearch.core.common.unit.ByteSizeValue(DEFAULT_SLICE_BYTES))
+                        .getBytes()
+                ),
+                org.opensearch.http.HttpTransportSettings.SETTING_HTTP_MAX_CONTENT_LENGTH.get(settings).getBytes(),
+                Math.max(1.0, settings.getAsDouble(MEMORY_FACTOR_SETTING, DEFAULT_MEMORY_FACTOR)),
+                settings.getAsTime(WAIT_SETTING, DEFAULT_WAIT)
+            ).start();
+        };
+    }
+
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
+        final ServerlessNode serving = node.get();
+        if (supportsStreaming()) {
+            return prepareStreaming(request, serving);
+        }
+        if (serving == null
+            || request.hasContent() == false
+            || serving.settings().getAsBoolean(CHARGE_BEFORE_PARSE_SETTING, DEFAULT_CHARGE_BEFORE_PARSE) == false) {
+            return prepareCharged(request, null);
+        }
+        // Charged before the body is copied or parsed, so a node at its limit refuses a large batch before holding any
+        // more of it, and at what the batch will hold rather than its length alone: a 100 MB body is a few hundred MB
+        // of heap at its peak, and charging 100 MB let the limit admit several times what the heap could take.
+        final Charge charge;
+        try {
+            charge = new Charge(
+                serving.services()
+                    .indexingPressure()
+                    .markCoordinatingOperationStarted(upFrontCharge(request.content().length(), serving.settings()), false)
+            );
+        } catch (org.opensearch.core.concurrency.OpenSearchRejectedExecutionException e) {
+            // Every parameter still has to be read, or the refusal becomes a 400 about unread parameters.
+            for (String param : request.params().keySet().toArray(new String[0])) {
+                request.param(param);
+            }
+            return channel -> channel.sendResponse(IndexAdminHandler.failure(channel, e));
+        }
+        final RestChannelConsumer consumer;
+        try {
+            consumer = prepareCharged(request, charge);
+        } catch (IOException | RuntimeException | Error e) {
+            charge.close();
+            throw e;
+        }
+        return channel -> {
+            try {
+                consumer.accept(channel);
+            } finally {
+                if (charge.handedOff == false) {
+                    charge.close();
+                }
+            }
+        };
+    }
+
+    private RestChannelConsumer prepareCharged(RestRequest request, Charge charge) throws IOException {
         // Every parameter read before any early return: BaseRestHandler rejects a request whose
         // parameters were not all consumed, which would turn a deliberate refusal into a 400 about
         // something else.
@@ -182,16 +415,60 @@ public final class BulkHandler extends BaseRestHandler {
         // that need WRITE slots to start. Nothing on WRITE now waits on WRITE.
         // What this batch is holding in memory, for as long as it holds it.
         final long inFlightBytes = request.content().length();
-        return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
+        return channel -> {
+            if (charge != null) {
+                charge.handedOff = true;
+            }
+            try {
+                serving.threadPool()
+                    .executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC)
+                    .execute(
+                        () -> runBatch(
+                            channel,
+                            serving,
+                            metadata,
+                            items,
+                            refresh,
+                            refreshPolicy,
+                            defaultPipeline,
+                            activeShards,
+                            timeout,
+                            charge,
+                            inFlightBytes
+                        )
+                    );
+            } catch (RuntimeException e) {
+                if (charge != null) {
+                    charge.close();
+                }
+                throw e;
+            }
+        };
+    }
+
+    private void runBatch(
+        org.opensearch.rest.RestChannel channel,
+        ServerlessNode serving,
+        MetadataPlane metadata,
+        List<Item> items,
+        boolean refresh,
+        WriteRequest.RefreshPolicy refreshPolicy,
+        String defaultPipeline,
+        org.opensearch.action.support.ActiveShardCount activeShards,
+        String timeout,
+        Charge charge,
+        long inFlightBytes
+    ) {
+        {
             final long startedAt = System.nanoTime();
             // Accounted before any work, released when the batch is done however it ends. A node with no
             // bound here is one large enough batch away from dying, and dying loses every other request
             // too; rejecting this one is the cheaper failure. Core's own accounting, so the rejection is
-            // the 429 an operator has seen before.
+            // the 429 an operator has seen before. Charged already, before parsing, when that is on.
             try (
-                org.opensearch.common.lease.Releasable inFlight = serving.services()
-                    .indexingPressure()
-                    .markCoordinatingOperationStarted(inFlightBytes, false)
+                org.opensearch.common.lease.Releasable inFlight = charge != null
+                    ? charge
+                    : serving.services().indexingPressure().markCoordinatingOperationStarted(inFlightBytes, false)
             ) {
                 if (serving.services().actionGate().isEmpty()) {
                     // The usual path needs no second UTF-8 source encoding or native response objects.
@@ -236,7 +513,7 @@ public final class BulkHandler extends BaseRestHandler {
                     logger.error("failed to report a bulk failure", nested);
                 }
             }
-        });
+        }
     }
 
     record NativeBatch(BulkRequest request, Map<DocWriteRequest<?>, Item> rejected) {
@@ -562,6 +839,13 @@ public final class BulkHandler extends BaseRestHandler {
             this.status = status;
             this.errorType = type;
             this.errorReason = reason;
+        }
+
+        /** Forgets a refusal that applied nothing, so the operation can be sent again. */
+        void clearRefusal() {
+            this.status = null;
+            this.errorType = null;
+            this.errorReason = null;
         }
 
         /** Dropped by its pipeline: answered, not written. */

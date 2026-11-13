@@ -98,6 +98,74 @@ public class NodeLogCommitterTests extends OpenSearchTestCase {
         }
     }
 
+    private static List<WalRecord> bigRecords(String prefix, int count, int sourceBytes) {
+        final List<WalRecord> out = new ArrayList<>();
+        final String filler = "x".repeat(sourceBytes);
+        for (int i = 0; i < count; i++) {
+            out.add(new WalRecord(prefix + i, "{\"s\":\"" + filler + "\"}", i, 1L, 1L));
+        }
+        return out;
+    }
+
+    private static List<Long> blobSizes(java.nio.file.Path root) throws IOException {
+        try (var files = java.nio.file.Files.walk(root)) {
+            final List<Long> sizes = new ArrayList<>();
+            for (java.nio.file.Path file : (Iterable<java.nio.file.Path>) files::iterator) {
+                if (java.nio.file.Files.isRegularFile(file) && file.getFileName().toString().startsWith("extra") == false) {
+                    sizes.add(java.nio.file.Files.size(file));
+                }
+            }
+            return sizes;
+        }
+    }
+
+    public void testOneShardsLargeBatchIsSplitAcrossBlobsNearTheBound() throws Exception {
+        final java.nio.file.Path dir = createTempDir();
+        try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, dir, false))) {
+            final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
+            final NodeLogCommitter committer = new NodeLogCommitter(log, 0L, epochs -> {}, (s, t, e) -> {}, 0L, 20_000L, 1_000_000);
+            // 200 records of ~1 KB: ~200 KB for one shard against a 20 KB bound.
+            final Position landed = committer.commit(A, 1L, bigRecords("a", 200, 1_000));
+            assertEquals(200L, committer.recordsCommitted());
+            assertTrue("split into about ten blobs, got " + committer.blobs(), committer.blobs() >= 10);
+            assertEquals("the caller is told where the last of them landed", new Position(0L, committer.blobs() - 1), landed);
+            for (long size : blobSizes(dir)) {
+                assertTrue("no blob far past the bound: " + size, size < 30_000L);
+            }
+            // A record larger than the bound goes alone, not refused.
+            committer.commit(B, 1L, bigRecords("b", 1, 50_000));
+            assertEquals(201L, committer.recordsCommitted());
+        }
+    }
+
+    public void testWithSplittingOffALargeBatchIsOneBlob() throws Exception {
+        try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
+            final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
+            final NodeLogCommitter committer = new NodeLogCommitter(log, 0L, epochs -> {}, (s, t, e) -> {}, 0L, 20_000L, 1_000_000);
+            committer.boundBlobs(false, true);
+            committer.commit(A, 1L, bigRecords("a", 200, 1_000));
+            assertEquals(1L, committer.blobs());
+        }
+    }
+
+    public void testALargerBlobWaitsLongerBeforeItIsHedged() throws Exception {
+        final java.util.concurrent.Executor hedges = task -> new Thread(task).start();
+        try (FsBlobStore store = new FsBlobStore(8192, createTempDir(), false)) {
+            final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
+            final NodeLogCommitter committer = new NodeLogCommitter(log, 0L, epochs -> {}, (s, t, e) -> {}, 0L, 1L << 30, 1_000_000);
+            committer.hedgeAppends(1L, hedges);
+            for (int i = 0; i < 20; i++) {
+                committer.commit(A, 1L, records("a" + i + "-", 1));
+            }
+            final long usual = committer.hedgeDelayNanos(0L);
+            assertTrue(usual > 0);
+            final long big = committer.hedgeDelayNanos(100L * 1024 * 1024);
+            assertTrue("a blob far larger than the recent ones waits longer: " + usual + " vs " + big, big > 100 * usual);
+            committer.boundBlobs(true, false);
+            assertEquals(usual, committer.hedgeDelayNanos(100L * 1024 * 1024));
+        }
+    }
+
     public void testAFullWindowIsWrittenWithoutWaitingOutItsTime() throws Exception {
         try (FsBlobStore store = new FsBlobStore(8192, createTempDir(), false)) {
             final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
