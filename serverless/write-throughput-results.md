@@ -150,6 +150,33 @@ Same run, 3,000 shards, writes over 2,000, 1,000 docs/s:
 | one at a time (`admission_concurrency=1`) | 109 s | 9% | 1,747 ms |
 | 32 at a time (default) | 7.9 s | 0 | 352 ms |
 
+## 10,000 shards on one writer (2026-11-13)
+
+On the same 4 vCPU box, after #129 (no local translog) and #131 (fresh segment files in memory). `-Dtests.tput.activation`
+sets how many shards the take opens at once; pair it with `serverless.activation.concurrency` so the pool matches.
+
+| shards opened at once (4,000 shards) | open time | per shard | cores used |
+| --- | --- | --- | --- |
+| 8 (default) | 130 s | 32.5 ms | 1.1 |
+| 32 | 39 s | 9.8 ms | 2.7 |
+| 64 | 26 s | 6.4 ms | 3.1 |
+
+Every shard costs 9 requests to open whatever the concurrency. At 8, the take waits on the store and leaves the CPU idle.
+
+10,000 shards held, opened 32 at a time in 112 s, writes over 3,000 of them:
+
+| | value |
+| --- | --- |
+| per open writer | 1.0 fd, 112 KB heap, 0.42 threads (node: 10,284 fds, 1.15 GB heap, 4,236 threads) |
+| 1,000 docs/s | all acked, p50 226 ms, p99 443 ms, 2.3 cores |
+| 2,000 docs/s | 99.2% acked, p50 381 ms, p99 896 ms, 3.3 cores; refusals are the in-flight cap (1,024), as at 3,000 shards |
+| log PUTs | 3.9/s at both rates |
+
+Before #131, the same run broke on this sandbox's 20,000-file cap: a shard being written kept about five segment files open,
+and writing to 10,000 shards ran out of files. With #131 those files stay in memory, so the node holds one file per shard.
+Holding 10,000 writers is not the limit. CPU per document is, as at 3,000. So is open time, which concurrency 8 makes
+3 to 5 times longer than it needs to be.
+
 ## Not measured here
 
 - All 3,000 shards written at once (the sandbox's descriptor limit is 20,000).
