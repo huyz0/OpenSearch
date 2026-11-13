@@ -714,7 +714,7 @@ then 99.4/s with 4 KB pages at p50 156 / p99 304 ms. See `large-document-results
 ## Big bulk requests
 
 A `_bulk` taken whole holds its body several times over while it is parsed and applied, so many 100 MB batches at once
-can exhaust the heap. `serverless.http.streaming` (off by default) reads a batch's body as it arrives instead, a slice at
+can exhaust the heap. `serverless.http.streaming` (on by default; `false` takes bodies whole on the Netty 4 transport) reads a batch's body as it arrives instead, a slice at
 a time, so each connection holds at most two 8 MB slices whatever the batch's size, and slices wait their turn for the
 node's batch memory (`serverless.write.bulk.memory_budget`, 10% of the heap) and cores rather than being refused; a
 client sending faster than the node indexes is slowed by TCP. The response is the ordinary bulk response. It serves HTTP
