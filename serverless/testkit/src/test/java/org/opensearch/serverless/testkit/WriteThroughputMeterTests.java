@@ -51,7 +51,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * of the shards the writes go to (all), {@code -Dtests.tput.clients} the most
  * requests in flight (4096), {@code -Dtests.tput.cadence} {@code node} (default: publishes and renewals driven by the node's own
  * scheduler with its defaults, as a running node) or {@code meter} (every shard with anything new published once a second, as
- * the soak does), {@code -Dtests.tput.takeover} true to time a takeover at the end, and {@code -Dtests.tput.settings}
+ * the soak does), {@code -Dtests.tput.takeover} true to time a takeover at the end, {@code -Dtests.tput.activation} how many shards the take opens at once (8; pair it with {@code serverless.activation.concurrency} in the settings so the pool is sized to match), and {@code -Dtests.tput.settings}
  * extra node settings as {@code key=value,key=value}. {@link MeterStores} picks the store and the latency.
  */
 @com.carrotsearch.randomizedtesting.annotations.TimeoutSuite(millis = 7_200_000)
@@ -289,7 +289,12 @@ public class WriteThroughputMeterTests extends OpenSearchTestCase {
     ) throws Exception {
         node.leases().renewLease(plane);
         plane.membership().refresh();
-        final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setMaxShardsHeld(shards * 2);
+        final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setMaxShardsHeld(shards * 2)
+            .setActivationConcurrency(
+                Integer.parseInt(
+                    System.getProperty("tests.tput.activation", String.valueOf(BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY))
+                )
+            );
         for (int i = 0; i < shards; i++) {
             loop.want(name(i), 0);
         }
