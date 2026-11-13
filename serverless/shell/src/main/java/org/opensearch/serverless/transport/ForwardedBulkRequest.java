@@ -42,6 +42,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
     private final List<org.opensearch.serverless.shell.BulkOperation> batch;
     private final boolean refresh;
     private final long bytes;
+    private boolean steered;
 
     /**
      * Creates a forwarded batch.
@@ -169,6 +170,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
         this.batch = List.copyOf(readBatch);
         this.refresh = in.readBoolean();
         this.indexUuid = in.readOptionalString();
+        this.steered = in.readBoolean();
         this.bytes = counted;
     }
 
@@ -189,6 +191,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
         }
         out.writeBoolean(refresh);
         out.writeOptionalString(indexUuid);
+        out.writeBoolean(steered);
     }
 
     /**
@@ -246,5 +249,26 @@ public final class ForwardedBulkRequest extends TransportRequest {
      */
     public boolean refresh() {
         return refresh;
+    }
+
+    /**
+     * Marks this batch as sent here to be taken: its shard has no owner, and the sender, which takes no writers, chose
+     * this node to take it. As for {@link ForwardedIndexRequest#steered()}, an ordinary forward that finds the shard not
+     * held here is refused, so a stale view of who owns a shard can never make a batch land somewhere else.
+     *
+     * @return this
+     */
+    public ForwardedBulkRequest steered() {
+        this.steered = true;
+        return this;
+    }
+
+    /**
+     * Whether the sender chose this node to take an unowned shard; see {@link #steered()}.
+     *
+     * @return true if steered
+     */
+    public boolean isSteered() {
+        return steered;
     }
 }
