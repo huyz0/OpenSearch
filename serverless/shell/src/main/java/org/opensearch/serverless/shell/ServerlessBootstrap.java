@@ -49,6 +49,35 @@ public final class ServerlessBootstrap implements Closeable {
 
     private static final Logger logger = LogManager.getLogger(ServerlessBootstrap.class);
 
+    /** File descriptors an open writer shard holds: Lucene's write lock, and its local translog's file and checkpoint. */
+    static final int FILES_PER_OPEN_WRITER = 3;
+
+    /** What a node needs open besides its writers: sockets, its own files, the JVM. */
+    static final int FILES_BESIDES_WRITERS = 10_000;
+
+    /**
+     * Warns when the process may open fewer files than this node's writers would need at its shard cap. A writer that
+     * cannot open fails its activation, and a node taking a dead node's shards opens many at once. See the README's
+     * "Open files per node": deploy with 1,048,576.
+     *
+     * @param maxShards the most shards this node takes
+     */
+    static void warnIfTooFewOpenFiles(int maxShards) {
+        final long limit = org.opensearch.monitor.process.ProcessProbe.getInstance().getMaxFileDescriptorCount();
+        final long needed = (long) FILES_PER_OPEN_WRITER * Math.max(0, maxShards) + FILES_BESIDES_WRITERS;
+        if (limit > 0 && limit < needed) {
+            logger.warn(
+                "this process may open {} files, fewer than the {} that {} open writers need ({} each, plus {}); raise nofile, "
+                    + "to 1048576 in production",
+                limit,
+                needed,
+                maxShards,
+                FILES_PER_OPEN_WRITER,
+                FILES_BESIDES_WRITERS
+            );
+        }
+    }
+
     /** Where the stand-in object store lives. Required. */
     public static final String STORE_PATH = "serverless.store.path";
 
@@ -367,6 +396,7 @@ public final class ServerlessBootstrap implements Closeable {
                     window
                 );
             }
+            warnIfTooFewOpenFiles(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD));
             loop.setDemandDrivenActivation(complete.getAsBoolean(ON_DEMAND, true))
                 .setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD))
                 .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS))

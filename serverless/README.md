@@ -156,7 +156,8 @@ from a seeded random) or `none`. On RustFS, `none` leaves RustFS's own latency.
     -Dtests.serverless.meter.latency=none -Dtests.soak.seconds=150 -Dtests.soak.shards=1000 -Dtests.soak.modes=pack+log
 ```
 
-A thousand shards need `ulimit -n 20000` before the Gradle daemon starts (`./gradlew --stop` first).
+A thousand shards need `ulimit -n 20000` or more before the Gradle daemon starts (`./gradlew --stop` first); raise it
+to the hard limit, 1,048,576 where the machine allows (see [Open files per node](#open-files-per-node)).
 Buckets the meters create are not removed; delete the container to reclaim them.
 
 Two dependency-direction rules are enforced as build tasks rather than conventions:
@@ -584,6 +585,27 @@ their previous encoding, but older nodes do not understand the temporary
 preparation and cleanup read only the affected indices and alias, without a
 namespace listing. An abandoned preparation can retain harmless extra reverse
 hints until recovery; reverse lookups verify them against published membership.
+
+## Open files per node
+
+Each open writer shard holds three file descriptors: Lucene's `write.lock`, and the current file and checkpoint of
+its local translog. Segment files hold none, since reads go through the block cache. A hibernated or released writer
+holds none. Sockets, the node's own files and the JVM come on top, a few hundred in all.
+
+Deploy with the open-file limit at 1,048,576 (`nofile`, soft and hard). It is the most Linux allows a process by
+default (`fs.nr_open`), each descriptor costs the kernel about a kilobyte, and at three per writer it fits about
+330,000 open writers, far past where heap, open time and takeover time stop a node first.
+
+- **Kubernetes** has no pod-level setting: the container runtime sets the limit. With containerd, set
+  `LimitNOFILE=1048576` in its systemd unit (EKS and GKE node images usually already do), or the runtime's default
+  `rlimits` in a custom base spec. With Docker, `--ulimit nofile=1048576:1048576` or `default-ulimits` in
+  `daemon.json`. Check from inside the pod with `ulimit -n` and `ulimit -Hn`.
+- **The node warns at startup** when the limit is below three per writer it may hold
+  (`serverless.activation.max_shards`) plus 10,000 for everything else.
+- **Tests and soaks** run with the limit raised as far as the machine's hard limit allows before the Gradle daemon
+  starts (`ulimit -n`, then `./gradlew --stop`). Lucene's test filesystem caps a test JVM at 2,048 open handles
+  regardless (`HandleLimitFS`); a test that opens more than about 600 writers suppresses it, as
+  `WriterHibernationMeterTests` does.
 
 ## Hibernating idle writers
 
