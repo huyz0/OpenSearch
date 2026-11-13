@@ -52,6 +52,9 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
         final Settings.Builder builder = Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-breaker")
+            // Batches taken whole, which are refused at the indexing budget; a streamed batch waits for the node's batch
+            // memory instead, as StreamingBulkTests checks.
+            .put(org.opensearch.serverless.rest.BulkHandler.STREAMING_SETTING, false)
             .put("path.home", createTempDir())
             .put("network.host", "127.0.0.1")
             .put("http.port", "0")

@@ -161,7 +161,7 @@ public final class BulkHandler extends BaseRestHandler {
     public static final String STREAMING_SETTING = "serverless.http.streaming";
 
     /** The default {@link #STREAMING_SETTING}. */
-    public static final boolean DEFAULT_STREAMING = false;
+    public static final boolean DEFAULT_STREAMING = true;
 
     /** How much of a streamed body is parsed and applied at once. */
     public static final String SLICE_BYTES_SETTING = "serverless.write.bulk.slice_bytes";
@@ -246,14 +246,9 @@ public final class BulkHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         return channel -> {
             if (channel instanceof org.opensearch.rest.StreamingRestChannel == false) {
-                channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.INTERNAL_SERVER_ERROR,
-                        "not_streaming",
-                        "the transport did not stream this body"
-                    )
-                );
+                // A wrapper in front of this handler (an auth plugin's, say) that does not pass on supportsStreaming has
+                // the transport take the body whole: apply it whole.
+                prepareWhole(request, serving).accept(channel);
                 return;
             }
             if (metadata == null) {
@@ -299,6 +294,11 @@ public final class BulkHandler extends BaseRestHandler {
         if (supportsStreaming()) {
             return prepareStreaming(request, serving);
         }
+        return prepareWhole(request, serving);
+    }
+
+    /** Takes the body whole: charged up front, then parsed and applied. */
+    private RestChannelConsumer prepareWhole(RestRequest request, ServerlessNode serving) throws IOException {
         if (serving == null
             || request.hasContent() == false
             || serving.settings().getAsBoolean(CHARGE_BEFORE_PARSE_SETTING, DEFAULT_CHARGE_BEFORE_PARSE) == false) {
