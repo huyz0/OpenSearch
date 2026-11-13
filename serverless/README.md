@@ -594,23 +594,29 @@ names this process at the same term, opens it at that term without a takeover. A
 slept is taken the ordinary way. A sleeping writer's head is given back after `serverless.activation.idle_after_millis`,
 as an open one's is. A clean shutdown gives the heads back.
 
-Measured by `WriterHibernationMeterTests` (single-shard indices with a 24-field mapping, a 30 s backstop, a 5 min
-head check, 20 ms store latency):
+Measured by `WriterHibernationMeterTests` (single-shard indices with a 24-field mapping, a 30 s backstop, the
+bootstrapped head check of an hour, 20 ms store latency):
 
 | | open | asleep | released |
 |---|---|---|---|
 | heap per writer (1,000 writers) | 144 KB | 25 KB | 21 KB |
 | file descriptors per writer | 3 | 0 | 0 |
-| idle store requests per writer-hour | ~12 | ~0 | ~0 |
+| idle head reads per writer-hour | ~1 | ~0 | ~0 |
 | going idle: store requests | | 5 (sleep) | ~4-5 (give back) |
 | first write: open time, store requests | | 230 ms, 8 | 253 ms, 12 |
 
-An open idle writer's only requests are now the periodic head check (one head read per check). Resyncs carry open
-writers over without reading their heads or descriptors again, when that check ran within two of its intervals and
-last saw the head naming this node at the writer's term; this halved what an open idle writer cost an hour. Sleeping and
-waking costs about as much as an hour open (5 + 8 against 12), and less than giving the head back and taking it back
-(about 17), but only for an idle gap that ends before the head is given back at `idle_after_millis`. Beyond that it
-costs the give-back on top. With the 5 minute idle release on by default, a shorter `hibernate_after_millis` only
-covers gaps under 5 minutes, where it adds requests; so hibernation stays off by default. Setting
-`hibernate_after_millis` to 5 minutes and `idle_after_millis` to, say, 30 minutes trades about 4 requests and 20-80 ms
-saved on each 5-30 minute gap for about 4 requests more on each longer one, at released heap and descriptors.
+An open idle writer's head is read once an hour by the periodic head check, which was every five minutes: a taker
+revokes the owner's lease before taking a shard, and the owner's next renewal fails on it and re-reads every head at
+once, so the scan is only a backstop. Resyncs carry open writers over without reading their heads or descriptors again,
+when that check last read every head without a failure within two of its intervals and saw the head naming this node
+at the writer's term. The descriptor refresh of open indices (`serverless.descriptors.refresh_interval_millis`, five
+minutes) still reads each open index's descriptor; the meter does not count it, since it runs on the monotonic clock,
+so add about 12 reads per open index-hour.
+
+Sleeping and waking (5 + 8) costs less than giving the head back and taking it back (about 17), but only for an idle
+gap that ends before the head is given back at `idle_after_millis`; beyond that it costs the give-back on top. With the
+5 minute idle release on by default, a shorter `hibernate_after_millis` only covers gaps under 5 minutes, where it
+adds requests; so hibernation stays off by default. Setting `hibernate_after_millis` to 5 minutes and
+`idle_after_millis` to, say, 30 minutes trades about 4 requests and 20-80 ms saved on each 5-30 minute gap for about 4
+requests more on each longer one, at released heap and descriptors. The cache warm before closing fills only free
+cache room, so it never evicts a block in use and never adds heap.

@@ -114,16 +114,19 @@ public final class ServerlessBootstrap implements Closeable {
      * How long a node goes between re-reading the head of every writer shard it holds. Zero reads them on
      * every pass, which is the library default.
      *
-     * <p>On here and at five minutes, because a head cannot move away from a node whose renewals succeed
+     * <p>On here and at an hour, because a head cannot move away from a node whose renewals succeed
      * without that node being told: a taker revokes the owner's lease before taking its shard, and the
-     * owner's next renewal fails on it (see {@code BlobLeaseMembership#revoke}). What the scan still catches
-     * is a head released by someone other than its owner, which nothing in this shell does; five minutes
-     * bounds how long that would go unnoticed, where every pass cost a read per held shard.
+     * owner's next renewal fails on it (see {@code BlobLeaseMembership#revoke}), which re-reads every head at
+     * once. What the scan still catches is a head released by someone other than its owner, which nothing in
+     * this shell does: deleting an index gives its heads back, and the descriptor refresh of open indices,
+     * which runs on its own interval, closes those shards. An hour bounds how long such a head would go
+     * unnoticed. It was five minutes, which made the scan an idle open writer's largest cost: twelve head reads
+     * an hour, now one.
      */
     public static final String HEAD_VERIFY_INTERVAL = "serverless.heads.verify_interval_millis";
 
     /** The production head-verification interval; see {@link #HEAD_VERIFY_INTERVAL}. */
-    public static final long DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS = 300_000L;
+    public static final long DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS = 3_600_000L;
 
     /**
      * How long a node goes between re-reading the descriptors of the indices it holds open, where nothing
