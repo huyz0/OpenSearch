@@ -89,6 +89,14 @@ public final class NodeStartup {
                         node.threadPool().generic()
                     );
                 writer.committer()
+                    .admitConcurrently(
+                        node.settings.getAsInt(
+                            org.opensearch.serverless.store.NodeLogCommitter.ADMISSION_CONCURRENCY_SETTING,
+                            org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_ADMISSION_CONCURRENCY
+                        ),
+                        node.threadPool().generic()
+                    );
+                writer.committer()
                     .flushWhenIdle(node.settings.getAsBoolean(org.opensearch.serverless.store.NodeLogCommitter.IDLE_FLUSH_SETTING, false));
                 node.nodeLogWriter = writer;
             }
