@@ -18,9 +18,36 @@ import java.util.Map;
 final class NodeStorage {
 
     private final ServerlessNode node;
+    private volatile org.opensearch.serverless.store.LocalSegmentTier localSegments;
 
     NodeStorage(ServerlessNode node) {
         this.node = node;
+    }
+
+    /** A shard's local directory, with the node's memory tier for freshly written files in front of it. */
+    org.apache.lucene.store.Directory localDirectory(org.apache.lucene.store.Directory local) {
+        return new org.opensearch.serverless.store.TieredSegmentDirectory(local, localSegments());
+    }
+
+    /**
+     * The node's memory tier for freshly written segment files, built from its settings on first use (this object is
+     * built before the node's settings are settled). Eviction runs on GENERIC.
+     */
+    org.opensearch.serverless.store.LocalSegmentTier localSegments() {
+        org.opensearch.serverless.store.LocalSegmentTier tier = localSegments;
+        if (tier == null) {
+            synchronized (this) {
+                tier = localSegments;
+                if (tier == null) {
+                    tier = org.opensearch.serverless.store.LocalSegmentTier.fromSettings(node.settings(), () -> {
+                        final org.opensearch.threadpool.ThreadPool pool = node.threadPool();
+                        return pool == null ? null : pool.generic();
+                    });
+                    localSegments = tier;
+                }
+            }
+        }
+        return tier;
     }
 
     /**
@@ -118,7 +145,7 @@ final class NodeStorage {
                     org.opensearch.index.shard.ShardPath shardPath
                 ) throws java.io.IOException {
                     return open(
-                        org.apache.lucene.store.FSDirectory.open(shardPath.resolveIndex()),
+                        localDirectory(org.apache.lucene.store.FSDirectory.open(shardPath.resolveIndex())),
                         indexSettings,
                         shardPath.getShardId().id()
                     );
@@ -133,7 +160,9 @@ final class NodeStorage {
                     // This hands over a location rather than a ShardPath, so the shard number has to be
                     // recovered from the directory the location sits in
                     // ({data}/indices/{uuid}/{shard}/index).
-                    final org.apache.lucene.store.Directory local = org.apache.lucene.store.FSDirectory.open(location, lockFactory);
+                    final org.apache.lucene.store.Directory local = localDirectory(
+                        org.apache.lucene.store.FSDirectory.open(location, lockFactory)
+                    );
                     final int shardNumber;
                     try {
                         shardNumber = Integer.parseInt(location.getParent().getFileName().toString());

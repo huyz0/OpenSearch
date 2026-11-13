@@ -170,6 +170,58 @@ public class WriteThroughputMeterTests extends OpenSearchTestCase {
         return out;
     }
 
+    /** This process's {@code write_bytes} and {@code cancelled_write_bytes} from /proc: bytes sent to the disk, and bytes dirtied then deleted before they were. */
+    private static long[] processDiskWrites() {
+        final long[] out = { -1, -1 };
+        try {
+            for (String line : java.nio.file.Files.readAllLines(org.opensearch.common.io.PathUtils.get("/proc/self/io"))) {
+                if (line.startsWith("write_bytes:")) {
+                    out[0] = Long.parseLong(line.substring(12).trim());
+                } else if (line.startsWith("cancelled_write_bytes:")) {
+                    out[1] = Long.parseLong(line.substring(22).trim());
+                }
+            }
+        } catch (java.io.IOException | RuntimeException e) {
+            // not Linux
+        }
+        return out;
+    }
+
+    /** What the writers put on local disk and in the memory tier over a step, per acknowledged document. */
+    private static String localWrites(
+        org.opensearch.serverless.store.LocalSegmentTier tier,
+        org.opensearch.serverless.store.LocalSegmentTier.Stats before,
+        long[] ioBefore,
+        long docs
+    ) {
+        final var d = tier.stats().since(before);
+        final long[] io = processDiskWrites();
+        final double per = Math.max(1, docs);
+        return String.format(
+            Locale.ROOT,
+            "memory tier %s (budget %d MB): disk %.0f B/doc (flush %.0f, merge %.0f, other %.0f), memory %.0f B/doc flushed;"
+                + " spilled while writing %d KB, evicted %d KB in %d files, deleted in memory %d KB; held now %d KB in %d files,"
+                + " peak %d KB, opens from memory %d; process write_bytes %d KB, cancelled %d KB",
+            tier.enabled() ? "on" : "off",
+            tier.maxBytes() >> 20,
+            d.diskTotal() / per,
+            d.diskFlush() / per,
+            d.diskMerge() / per,
+            d.diskOther() / per,
+            d.memoryFlush() / per,
+            d.spilledWhileWriting() >> 10,
+            d.evicted() >> 10,
+            d.evictedFiles(),
+            d.deletedInMemory() >> 10,
+            d.heldBytes() >> 10,
+            d.heldFiles(),
+            d.peakBytes() >> 10,
+            d.memoryOpens(),
+            io[0] < 0 ? -1 : (io[0] - ioBefore[0]) >> 10,
+            io[1] < 0 ? -1 : (io[1] - ioBefore[1]) >> 10
+        );
+    }
+
     @org.opensearch.common.SuppressForbidden(reason = "the process's CPU time, which only the JDK's own bean reports")
     private static long processCpuNanos() {
         final java.lang.management.OperatingSystemMXBean os = ManagementFactory.getOperatingSystemMXBean();
@@ -289,6 +341,9 @@ public class WriteThroughputMeterTests extends OpenSearchTestCase {
         final AtomicLong inFlight = new AtomicLong();
         final Map<String, Long> cpuBefore = cpuByGroup();
         final long cpuStarted = processCpuNanos();
+        node.localSegments().resetPeak();
+        final var localBefore = node.localSegments().stats();
+        final long[] ioBefore = processDiskWrites();
         final long started = System.nanoTime();
         final long end = started + TimeUnit.SECONDS.toNanos(seconds);
         final Random arrivals = new Random(random().nextLong());
@@ -427,9 +482,10 @@ public class WriteThroughputMeterTests extends OpenSearchTestCase {
             "offered %.0f docs/s (batch %d, over %d shards) -> acked %.0f/s (%d docs, %d failed, %d dropped, %d still in flight)"
                 + "|p50 %.0f p90 %.0f p99 %.0f max %.0f ms from arrival"
                 + "|CPU %.2f cores of %d, %.3f ms per doc; by thread: %s"
-                + "|heap used %d MB of %d MB, fds %d %s, threads %d"
+                + "|heap used %d MB of %d MB (%d MB live after GC), fds %d %s, threads %d"
                 + "|log PUTs %.1f/s, %.0f docs per log PUT; store PUT %.1f/s GET %.1f/s LIST %.1f/s; publishes %.1f/s"
                 + " (publish passes busy %.0f%% of the time); arrivals at most %.0f ms late"
+                + "|local writes: %s"
                 + "|requests %s|steps %s|log %s%s%s",
             offered,
             batch,
@@ -449,6 +505,7 @@ public class WriteThroughputMeterTests extends OpenSearchTestCase {
             cpu,
             (runtime.totalMemory() - runtime.freeMemory()) >> 20,
             runtime.maxMemory() >> 20,
+            usedHeapBytes() >> 20,
             openFileDescriptors(),
             descriptorsByKind(),
             ManagementFactory.getThreadMXBean().getThreadCount(),
@@ -460,6 +517,7 @@ public class WriteThroughputMeterTests extends OpenSearchTestCase {
             published.get() / secondsRun,
             100.0 * publishNanos.get() / 1e9 / secondsRun,
             late / 1e6,
+            localWrites(node.localSegments(), localBefore, ioBefore, acked),
             byOp,
             node.writes().ackTimings().describe(),
             node.nodeLogWriter().committer().timings().describe(),

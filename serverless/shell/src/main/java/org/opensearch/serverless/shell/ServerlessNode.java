@@ -542,6 +542,15 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * The memory tier writers put freshly flushed segment files in, and the count of what they write to local disk.
+     *
+     * @return the tier
+     */
+    public org.opensearch.serverless.store.LocalSegmentTier localSegments() {
+        return storage.localSegments();
+    }
+
+    /**
      * Registers who hears about writes and about ownership going wrong.
      *
      * <p>Optional. A node with no signals set still converges through the backstop pass; it just does so

@@ -709,7 +709,8 @@ then 99.4/s with 4 KB pages at p50 156 / p99 304 ms. See `large-document-results
 
 Each open writer shard holds one file descriptor, Lucene's `write.lock`: a writer keeps no local translog, since an
 acknowledged write is durable in the node log (`serverless.translog.local: true` brings core's disk translog back, and
-two more descriptors per writer). Segment files hold none, since reads go through the block cache. A hibernated or released writer
+two more descriptors per writer). Segment files hold none: published ones are read through the block cache and fresh
+ones from memory (see "Fresh segments in memory"; with it off, a filling segment holds four). A hibernated or released writer
 holds none. Sockets, the node's own files and the JVM come on top, a few hundred in all.
 
 Deploy with the open-file limit at 1,048,576 (`nofile`, soft and hard). It is the most Linux allows a process by
@@ -726,6 +727,20 @@ default (`fs.nr_open`), each descriptor costs the kernel about a kilobyte, and e
   starts (`ulimit -n`, then `./gradlew --stop`). Lucene's test filesystem caps a test JVM at 2,048 open handles
   regardless (`HandleLimitFS`); a test that opens more than about 600 writers suppresses it, as
   `WriterHibernationMeterTests` does.
+
+## Fresh segments in memory
+
+A writer's local disk holds nothing durable, so flushed segment files, commit points and the temporary files a segment
+keeps open while it fills are held in memory (`serverless.local_segments.memory.enabled`, on by default) and uploaded,
+searched, merged and pushed from there. One budget per node, `serverless.local_segments.memory.max_bytes` (5% of the
+heap): a file that finds it spent, or grows past `serverless.local_segments.memory.max_file_bytes` (16 MB), moves to
+disk while being written, and the oldest held files are written out at 90% of it. Merges write to disk. A commit point
+never moves to disk on its own, so a local commit cannot name a file that went with the memory; a shard opens from its
+published commit anyway. Node stats report bytes written to disk by source under `local_segments`.
+
+At 2,000 shards and 2,000 docs/s on 4 cores: local disk writes 410-541 -> 0 bytes per document before merges, CPU a
+third less per document, p99 unchanged or lower, the same store requests, live heap +25-40 MB, and about 7,500 fewer
+open files and memory maps. See `local-segment-memory-results.md`.
 
 ## Hibernating idle writers
 
