@@ -705,6 +705,17 @@ then on: 1 KB documents at 40/s offered, 15.6/s acked at p50 24 s, then 39.6/s a
 15.9/s with most refused or failed, then 600/s at p50 144 / p99 276 ms; the page mix at 100/s, 14.8/s at p50 60 s,
 then 99.4/s with 4 KB pages at p50 156 / p99 304 ms. See `large-document-results.md`.
 
+## Big bulk requests
+
+A `_bulk` taken whole holds its body several times over while it is parsed and applied, so many 100 MB batches at once
+can exhaust the heap. `serverless.http.streaming` (off by default) reads a batch's body as it arrives instead, a slice at
+a time, so each connection holds at most two 8 MB slices whatever the batch's size, and slices wait their turn for the
+node's batch memory (`serverless.write.bulk.memory_budget`, 10% of the heap) and cores rather than being refused; a
+client sending faster than the node indexes is slowed by TCP. The response is the ordinary bulk response. It serves HTTP
+through the Reactor Netty transport, with one plugin change behind `http.reactor.netty4.streaming.demand_driven` so the
+body is read only as the handler asks. On 4 cores and a 4 GB heap, 24 batches of 95 MB at once ran the node out of memory
+without it and were all accepted with it, at about 1 GB of live heap. See `big-bulk-results.md`.
+
 ## Open files per node
 
 Each open writer shard holds one file descriptor, Lucene's `write.lock`: a writer keeps no local translog, since an

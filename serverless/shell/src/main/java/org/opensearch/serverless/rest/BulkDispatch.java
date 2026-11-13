@@ -173,6 +173,9 @@ final class BulkDispatch {
      *
      * @return true if a refresh was asked for and every group that applied is visible as far as it promises
      */
+    /** The error type of a group refused for back-pressure before anything was applied, so safe to send again. */
+    static final String THROTTLED = "throttled";
+
     boolean dispatch(ServerlessNode serving, List<BulkHandler.Item> items, boolean refresh) throws IOException {
         final Map<String, List<BulkHandler.Item>> groups = new LinkedHashMap<>();
         for (BulkHandler.Item item : items) {
@@ -240,6 +243,16 @@ final class BulkDispatch {
                     return serving.writes().refreshWritten(local, outcomes, "serverless-bulk-refresh");
                 }
             } catch (Exception e) {
+                final var throttled = org.opensearch.ExceptionsHelper.unwrap(
+                    e,
+                    org.opensearch.serverless.store.WriteBackpressure.ThrottledException.class
+                );
+                if (throttled != null) {
+                    // Refused before anything was applied, because the store is slow, not because the shard moved: a
+                    // 429 the client (or a streamed batch, which waits) can retry, and no doubt cast on who owns it.
+                    failGroup(group, RestStatus.TOO_MANY_REQUESTS, THROTTLED, throttled.getMessage());
+                    return true;
+                }
                 // A batch that could not be applied here -- the log append failed and the shard was
                 // released, the shard turned out to be a reader, this node's own lease had lapsed -- used
                 // to escape into the fan-out, which swallowed it, and every item answered 500 "the writer

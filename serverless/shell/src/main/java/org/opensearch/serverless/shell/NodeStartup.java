@@ -97,6 +97,11 @@ public final class NodeStartup {
                         node.threadPool().generic()
                     );
                 writer.committer()
+                    .boundBlobs(
+                        node.settings.getAsBoolean(org.opensearch.serverless.store.NodeLogCommitter.SPLIT_SETTING, true),
+                        node.settings.getAsBoolean(org.opensearch.serverless.store.NodeLogCommitter.HEDGE_BY_SIZE_SETTING, true)
+                    );
+                writer.committer()
                     .flushWhenIdle(node.settings.getAsBoolean(org.opensearch.serverless.store.NodeLogCommitter.IDLE_FLUSH_SETTING, false));
                 node.nodeLogWriter = writer;
             }
