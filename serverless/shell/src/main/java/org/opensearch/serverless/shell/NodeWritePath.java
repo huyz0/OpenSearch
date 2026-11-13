@@ -242,21 +242,26 @@ public final class NodeWritePath {
         // the record is in the log before the write is acknowledged, and acknowledgement is this method
         // returning. It is also the order classic OpenSearch uses internally: Lucene, then the translog,
         // then fsync.
-        final var result = shard.applyIndexOperationOnPrimary(
-            requireAbsent ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-            org.opensearch.index.VersionType.INTERNAL,
-            new org.opensearch.index.mapper.SourceToParse(
-                shardId.getIndexName(),
-                id,
-                new org.opensearch.core.common.bytes.BytesArray(source),
-                org.opensearch.common.xcontent.XContentType.JSON,
-                routing
-            ),
-            ifSeqNo,
-            ifPrimaryTerm,
-            org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
-            false
-        );
+        final org.opensearch.index.engine.Engine.IndexResult result;
+        try (org.opensearch.common.lease.Releasable gate = node.writePools.enterApply()) {
+            result = shard.applyIndexOperationOnPrimary(
+                requireAbsent
+                    ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
+                    : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                org.opensearch.index.VersionType.INTERNAL,
+                new org.opensearch.index.mapper.SourceToParse(
+                    shardId.getIndexName(),
+                    id,
+                    new org.opensearch.core.common.bytes.BytesArray(source),
+                    org.opensearch.common.xcontent.XContentType.JSON,
+                    routing
+                ),
+                ifSeqNo,
+                ifPrimaryTerm,
+                org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
+                false
+            );
+        }
         if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.FAILURE) {
             // Core returns parsing and conditional-write failures as values. Preserve their native
             // exceptions so a client error keeps its status instead of becoming a generic I/O error.
@@ -518,13 +523,16 @@ public final class NodeWritePath {
         node.fences().ensureIncarnationLive(shardId);
         node.shards().markUsed(shardId);
         // Apply, then log -- the same reordering, for the same reason, as the index path above.
-        final var result = shard.applyDeleteOperationOnPrimary(
-            org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-            id,
-            org.opensearch.index.VersionType.INTERNAL,
-            ifSeqNo,
-            ifPrimaryTerm
-        );
+        final org.opensearch.index.engine.Engine.DeleteResult result;
+        try (org.opensearch.common.lease.Releasable gate = node.writePools.enterApply()) {
+            result = shard.applyDeleteOperationOnPrimary(
+                org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                id,
+                org.opensearch.index.VersionType.INTERNAL,
+                ifSeqNo,
+                ifPrimaryTerm
+            );
+        }
         if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.FAILURE
             && result.getFailure() instanceof org.opensearch.index.engine.VersionConflictEngineException conflict) {
             throw conflict;
@@ -765,13 +773,16 @@ public final class NodeWritePath {
                 final org.opensearch.serverless.store.WalRecord operation = item.record();
                 try {
                     if (operation.isDeletion()) {
-                        final var result = shard.applyDeleteOperationOnPrimary(
-                            org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                            operation.id(),
-                            org.opensearch.index.VersionType.INTERNAL,
-                            item.ifSeqNo(),
-                            item.ifPrimaryTerm()
-                        );
+                        final org.opensearch.index.engine.Engine.DeleteResult result;
+                        try (org.opensearch.common.lease.Releasable gate = node.writePools.enterApply()) {
+                            result = shard.applyDeleteOperationOnPrimary(
+                                org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                                operation.id(),
+                                org.opensearch.index.VersionType.INTERNAL,
+                                item.ifSeqNo(),
+                                item.ifPrimaryTerm()
+                            );
+                        }
                         if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {
                             // A failure here is a value, and a caller that reads
                             // only the exception channel reports success for an operation that did nothing.
@@ -796,23 +807,26 @@ public final class NodeWritePath {
                             result.getVersion()
                         );
                     } else {
-                        final var result = shard.applyIndexOperationOnPrimary(
-                            item.requireAbsent()
-                                ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
-                                : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
-                            org.opensearch.index.VersionType.INTERNAL,
-                            new org.opensearch.index.mapper.SourceToParse(
-                                shardId.getIndexName(),
-                                operation.id(),
-                                new org.opensearch.core.common.bytes.BytesArray(operation.source()),
-                                org.opensearch.common.xcontent.XContentType.JSON,
-                                operation.routing()
-                            ),
-                            item.ifSeqNo(),
-                            item.ifPrimaryTerm(),
-                            org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
-                            false
-                        );
+                        final org.opensearch.index.engine.Engine.IndexResult result;
+                        try (org.opensearch.common.lease.Releasable gate = node.writePools.enterApply()) {
+                            result = shard.applyIndexOperationOnPrimary(
+                                item.requireAbsent()
+                                    ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
+                                    : org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
+                                org.opensearch.index.VersionType.INTERNAL,
+                                new org.opensearch.index.mapper.SourceToParse(
+                                    shardId.getIndexName(),
+                                    operation.id(),
+                                    new org.opensearch.core.common.bytes.BytesArray(operation.source()),
+                                    org.opensearch.common.xcontent.XContentType.JSON,
+                                    operation.routing()
+                                ),
+                                item.ifSeqNo(),
+                                item.ifPrimaryTerm(),
+                                org.opensearch.action.index.IndexRequest.UNSET_AUTO_GENERATED_TIMESTAMP,
+                                false
+                            );
+                        }
                         if (result.getResultType() == org.opensearch.index.engine.Engine.Result.Type.MAPPING_UPDATE_REQUIRED) {
                             if (grewFor[i]) {
                                 // The mapping was grown for this item once already, and it still does

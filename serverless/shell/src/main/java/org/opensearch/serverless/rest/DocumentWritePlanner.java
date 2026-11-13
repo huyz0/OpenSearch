@@ -242,7 +242,7 @@ final class DocumentWritePlanner {
                 // Forward rather than refuse. The client should not have to know which node owns which
                 // shard; that is exactly the knowledge the shard-head exists to hold.
                 final String indexUuid = descriptor.get().uuid();
-                serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
+                serving.threadPool().executor(org.opensearch.serverless.shell.WritePools.writePool(serving.settings())).execute(() -> {
                     // Accounted on this node for as long as the forward is in flight, exactly as a local
                     // write is: the bytes are held here until the owner answers, whichever node applies them.
                     try (
@@ -414,7 +414,7 @@ final class DocumentWritePlanner {
             // Anything that went wrong before the member could have applied it falls back to taking it here.
             final Optional<String> roomy = serving.nodeCapacity().writerForUnheld(metadata, descriptor.get(), shard);
             if (roomy.isPresent()) {
-                serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
+                serving.threadPool().executor(org.opensearch.serverless.shell.WritePools.writePool(serving.settings())).execute(() -> {
                     try (
                         org.opensearch.common.lease.Releasable forwarded = serving.services()
                             .indexingPressure()
@@ -479,7 +479,9 @@ final class DocumentWritePlanner {
 
         // Off the HTTP thread: a WAL append is an object-store write, and blocking the thread that
         // should be reading the next request on remote IO is how a node stops answering under load.
-        serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> writeHere.accept(answer, shardId));
+        serving.threadPool()
+            .executor(org.opensearch.serverless.shell.WritePools.writePool(serving.settings()))
+            .execute(() -> writeHere.accept(answer, shardId));
         return;
     }
 
