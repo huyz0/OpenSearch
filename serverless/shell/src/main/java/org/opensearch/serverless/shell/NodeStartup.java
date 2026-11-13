@@ -103,6 +103,13 @@ public final class NodeStartup {
                     );
                 writer.committer()
                     .flushWhenIdle(node.settings.getAsBoolean(org.opensearch.serverless.store.NodeLogCommitter.IDLE_FLUSH_SETTING, false));
+                writer.committer()
+                    .followUnlocked(
+                        node.settings.getAsBoolean(
+                            org.opensearch.serverless.store.NodeLogCommitter.FOLLOW_UNLOCKED_SETTING,
+                            org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_FOLLOW_UNLOCKED
+                        )
+                    );
                 node.nodeLogWriter = writer;
             }
             if (node.reconciler != null && node.nodeLogHooked == false) {
