@@ -244,6 +244,10 @@ public final class BlockCacheDirectory extends FilterDirectory {
      * @throws IOException if a local file cannot be read
      */
     public long warmFromLocal(org.opensearch.serverless.store.CommitManifest manifest, long maxBytes) throws IOException {
+        // Only into room the cache has free: a block put into a full cache pushes out one somebody may be searching,
+        // for a file that is read only if this shard opens again. Free room is the cache's own bound, so no more heap.
+        final long free = (long) cache.maxBlocks() * cache.blockSize() - cache.bytesResident();
+        maxBytes = Math.min(maxBytes, free);
         long cached = 0;
         for (Map.Entry<String, byte[]> block : localBlocks(manifest, manifest.files().keySet(), maxBytes).entrySet()) {
             cache.put(block.getKey(), block.getValue());
