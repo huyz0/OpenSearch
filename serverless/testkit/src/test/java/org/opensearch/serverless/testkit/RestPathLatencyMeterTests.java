@@ -64,7 +64,8 @@ public class RestPathLatencyMeterTests extends OpenSearchTestCase {
             HttpClient http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).connectTimeout(Duration.ofSeconds(10)).build()
         ) {
             final int port = boot.node().boundHttpAddress().publishAddress().getPort();
-            final String mapping = "{\"properties\":{\"title\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"},\"body\":{\"type\":\"text\"}}}";
+            final String mapping =
+                "{\"properties\":{\"title\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"},\"body\":{\"type\":\"text\"}}}";
             expectOk(http, port, "PUT", "/restlat", "{\"settings\":{\"number_of_shards\":1},\"mappings\":" + mapping + "}");
             expectOk(http, port, "PUT", "/restlat/_doc/warm?refresh=true", String.format(Locale.ROOT, DOC, 0, 0));
             for (int i = 0; i < 50; i++) {
