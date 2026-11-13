@@ -332,6 +332,39 @@ public final class NodeCapacity {
         return placement.handOffTarget(plane);
     }
 
+    /**
+     * Where this node should send a write for a shard nobody holds, if anywhere. A node that takes writers asks
+     * {@link #handOffTarget(org.opensearch.serverless.metadata.MetadataPlane, org.opensearch.serverless.cluster.IndexDescriptor)};
+     * one that does not, a search node or a node that only coordinates, always sends it to a writer member, since taking
+     * the shard here would only fail.
+     *
+     * @param plane the metadata plane
+     * @param descriptor the index written to
+     * @param shard the shard
+     * @return the member's id, or empty to take it here
+     */
+    public java.util.Optional<String> writerForUnheld(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        org.opensearch.serverless.cluster.IndexDescriptor descriptor,
+        int shard
+    ) {
+        if (node.roles.contains(ServerlessNode.ROLE_INGEST)) {
+            return handOffTarget(plane, descriptor);
+        }
+        if (descriptor.bucket() != null) {
+            final java.util.Optional<String> owner = handOffTarget(plane, descriptor);
+            if (owner.isPresent()) {
+                return owner;
+            }
+        }
+        return placement.writerFor(plane, descriptor.name(), shard);
+    }
+
+    /** Whether this node takes writers; one that does not sends every write on. */
+    public boolean takesWriters() {
+        return node.roles.contains(ServerlessNode.ROLE_INGEST);
+    }
+
     /** Where unheld buckets go: the same rendezvous ranking on every node. */
     final org.opensearch.serverless.bucket.BucketPlacement bucketPlacement = new org.opensearch.serverless.bucket.BucketPlacement();
 

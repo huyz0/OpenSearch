@@ -410,8 +410,9 @@ final class DocumentWritePlanner {
             // Unless this node is nearly full and a member has room, or holds far more than its share and a member is
             // below the mean: the write goes there, marked to be taken, so a node that has just joined takes new shards
             // rather than the full ones evicting to make room for them, and load evens out below the cap as well.
+            // A node that takes no writers always sends it on, to the writer member it ranks first for the shard.
             // Anything that went wrong before the member could have applied it falls back to taking it here.
-            final Optional<String> roomy = serving.nodeCapacity().handOffTarget(metadata, descriptor.get());
+            final Optional<String> roomy = serving.nodeCapacity().writerForUnheld(metadata, descriptor.get(), shard);
             if (roomy.isPresent()) {
                 serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
                     try (

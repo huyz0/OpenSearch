@@ -76,9 +76,14 @@ final class ForwardedWorkHandlers {
 
     /** Takes the shard a steered write is for, if nobody else has; null if it was not taken here. */
     ShardId takeForSteeredWrite(ForwardedIndexRequest request) {
+        return takeForSteeredWrite(request.index(), request.shard(), request.indexUuid());
+    }
+
+    /** Takes a shard a steered write or batch is for, if nobody else has; null if it was not taken here. */
+    ShardId takeForSteeredWrite(String index, int shard, String indexUuid) {
         try {
             router.node.signals()
-                .activate(request.index(), request.shard())
+                .activate(index, shard)
                 .get(ShardRouter.STEERED_ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -87,7 +92,7 @@ final class ForwardedWorkHandlers {
             // Refused below as not held here: the sender takes it itself.
             return null;
         }
-        return router.writerShard(request.index(), request.shard(), request.indexUuid());
+        return router.writerShard(index, shard, indexUuid);
     }
 
     void handleIndexAccounted(ForwardedIndexRequest request, TransportChannel channel, ShardId shardId) throws Exception {
@@ -142,7 +147,11 @@ final class ForwardedWorkHandlers {
     void handleBulk(ForwardedBulkRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         router.requireMac(ForwardedBulkRequest.ACTION, request);
         router.requirePluginOriginForSystemIndex(request.index());
-        final ShardId shardId = router.writerShard(request.index(), request.shard(), request.indexUuid());
+        ShardId shardId = router.writerShard(request.index(), request.shard(), request.indexUuid());
+        if (shardId == null && request.isSteered()) {
+            // Sent here to be taken, by a node that takes no writers: take it, as for a batch that arrived here.
+            shardId = takeForSteeredWrite(request.index(), request.shard(), request.indexUuid());
+        }
         // Counted by the request as it was built, not by re-encoding every record here to measure it.
         try (
             org.opensearch.common.lease.Releasable primary = router.node.services()

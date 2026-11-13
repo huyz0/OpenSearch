@@ -407,4 +407,38 @@ final class FleetPlacement {
         }
         return aboveFleetShare(plane) ? memberBelowMean(plane) : Optional.empty();
     }
+
+    /**
+     * The writer member a node that takes no writers sends a write for a shard nobody holds to, so it can take the shard.
+     *
+     * <p>Ranked by shard over the live writer members with room, or over every live writer member when none has room,
+     * so coordinators that reach different nodes agree on one writer for a cold shard instead of racing several onto it.
+     *
+     * @param plane the metadata plane
+     * @param index the index
+     * @param shard the shard
+     * @return the member's id, or empty when no writer member is live
+     */
+    public Optional<String> writerFor(MetadataPlane plane, String index, int shard) {
+        final long now = plane.clock().getAsLong();
+        final java.util.List<String> withRoom = new java.util.ArrayList<>();
+        final java.util.List<String> live = new java.util.ArrayList<>();
+        for (NodeLease lease : plane.membership().current()) {
+            if (lease.nodeId().equals(localNodeId.get())
+                || lease.revoked()
+                || lease.isExpiredAt(now)
+                || lease.roles().contains(ServerlessNode.ROLE_INGEST) == false) {
+                continue;
+            }
+            live.add(lease.nodeId());
+            if (lease.cap() <= 0 || lease.held() < 0 || lease.held() < lease.cap()) {
+                withRoom.add(lease.nodeId());
+            }
+        }
+        if (live.isEmpty()) {
+            return Optional.empty();
+        }
+        final String key = index + "/" + shard;
+        return Optional.of(org.opensearch.serverless.cluster.Rendezvous.owner(key, withRoom.isEmpty() ? live : withRoom));
+    }
 }

@@ -306,6 +306,109 @@ unpublished record of every shard is, so a successor reads it without a listing.
   on a shard searched less often than every 500 ms (p50 about 3 ms more). Set `serverless.refresh_visibility: serving`
   to skip that round trip and promise only the search nodes serving the shard when the write is answered.
 
+## Node roles and request routing
+
+Every node runs the same binary. `serverless.roles` says what it holds:
+
+| `serverless.roles` | Holds | Use |
+|---|---|---|
+| unset, or `ingest,search` | writers and readers | one small deployment, tests |
+| `ingest` | writers: it takes a shard's head, indexes, appends to its node's write log, publishes | the ingest pool |
+| `search` | readers: read-only copies opened from published commits | the search pool |
+| empty (`-Dserverless.roles=`) | nothing | a coordinating tier, if you want one |
+
+The roles are enforced, not only routed around. A node without `ingest` never takes a shard's head and only opens
+shards with the read-only engine, so it cannot write. Only `ingest` nodes are picked to take over a dead writer's
+shards. A node advertises its roles in its lease in the object store, which is how its peers find out, not through
+Kubernetes. Any other value is refused at startup, so a misspelled role cannot start a node that serves nothing.
+
+**Every node coordinates.** Whatever node a request reaches answers it:
+
+- A **write** (`_doc`, `_create`, `_update`, `_bulk`, `_delete_by_query`) is grouped by shard on the node that
+  received it. Each group goes over the transport to the shard's writer, named by the shard's head. A group the node
+  writes itself costs no hop. A shard nobody holds is taken by the node that received the write if it takes writers;
+  a search node or a coordinating node sends the group to the writer member it ranks first for that shard, and that
+  member takes it. Every node ranks members the same way, so two nodes do not race to take one cold shard.
+- A **search** goes to search nodes: to a reader already open on the receiving node, if it is a ready search node,
+  otherwise to readers picked by rendezvous hashing over the leases, spread over more readers for a hot shard and
+  kept in the receiving node's zone where it can be. The writer answers only when no search node can.
+- A **get** is answered by the shard's writer, so it sees every acknowledged write.
+- `refresh=true` and `refresh=wait_for` are settled between the writer and the search nodes serving the shard, so
+  they hold whichever node the write and the later search reached.
+
+So no proxy has to know where a shard is. What a front door can still do is keep write work off the search pool.
+Writes sent to a search node are parsed there, pressure-accounted there and forwarded, so they take CPU and heap
+from searches and add a hop for every write. A rule on the request path is enough to avoid that, with no knowledge
+of shards: a write that lands on the wrong ingest node is forwarded once, and a request the rule misses still works.
+
+### Two pools behind one ingress
+
+Run the pools as two Deployments that differ in `serverless.roles`, each with its own Service. Send write paths to
+the ingest Service and everything else to the search Service. The search Deployment is the one in
+[Scaling search nodes without a cold cache](#scaling-search-nodes-without-a-cold-cache); the ingest Deployment is the
+same without the warm-on-join and drain settings, with `-Dserverless.roles=ingest`.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata: { name: ingest }
+spec:
+  selector: { app: ingest }
+  ports: [ { name: http, port: 9200, targetPort: http } ]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: search }
+spec:
+  selector: { app: search }
+  ports: [ { name: http, port: 9200, targetPort: http } ]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: opensearch
+  annotations:
+    # ingress-nginx: regular-expression paths. Other controllers have their own way to match a path by pattern.
+    nginx.ingress.kubernetes.io/use-regex: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          # Writes. A pattern for each write API; index names cannot contain '/', so [^/]+ is one index or a list.
+          - path: /(_bulk|[^/]+/_bulk)$
+            pathType: ImplementationSpecific
+            backend: { service: { name: ingest, port: { name: http } } }
+          - path: /[^/]+/(_doc|_create|_update)(/.*)?$
+            pathType: ImplementationSpecific
+            backend: { service: { name: ingest, port: { name: http } } }
+          - path: /[^/]+/_delete_by_query$
+            pathType: ImplementationSpecific
+            backend: { service: { name: ingest, port: { name: http } } }
+          # Everything else: searches, gets, index and cluster APIs.
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: search, port: { name: http } } }
+```
+
+Some points about the split:
+
+- A path rule cannot tell `GET /idx/_doc/1`, a get, from `PUT /idx/_doc/1`, a write, and does not need to: a get
+  sent to the ingest pool is forwarded to the shard's writer like any other. If your proxy can match the method too
+  (an ALB listener rule, an Envoy route, an HAProxy ACL), send only `PUT`, `POST` and `DELETE` on those paths to
+  ingest.
+- `POST /_search` and the other read APIs use `POST` too, so never route on the method alone.
+- Index creation, mappings and settings are written to the object store by whichever node receives them, so they
+  can go to either pool.
+- A coordinating tier (`serverless.roles` empty) is only worth running when the parsing and merging that coordinating
+  costs should scale apart from both pools, for example many small searches over many shards each. It holds no
+  shard, so it needs no cache and no drain. Put it behind the default route and keep the write rules pointing at
+  ingest.
+- On a node with both roles, a search can be answered by the writer's own copy when the receiving node holds it.
+  That is fine for a small deployment and one more reason to split the pools when search load matters.
+- Writes cross zones whenever the writer is in another zone than the client, because each shard has one writer. Only
+  the compression of [Keeping traffic inside a zone](#keeping-traffic-inside-a-zone) helps there.
+
 ## Scaling search nodes without a cold cache
 
 A search node that joins cold reads every block its first searches touch from the object store. If you set
