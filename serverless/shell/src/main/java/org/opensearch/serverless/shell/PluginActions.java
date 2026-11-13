@@ -92,8 +92,9 @@ public final class PluginActions {
      */
     public static PluginActions build(List<ActionPlugin> plugins, java.util.function.Function<ActionPlugin, List<Object>> availableFor) {
         final Map<String, TransportAction<? extends ActionRequest, ? extends ActionResponse>> built = new LinkedHashMap<>();
+        final List<String> failures = new ArrayList<>();
         for (ActionPlugin plugin : plugins) {
-            final List<Object> available = availableFor.apply(plugin);
+            final List<Object> available = new ArrayList<>(availableFor.apply(plugin));
             for (ActionPlugin.ActionHandler<? extends ActionRequest, ? extends ActionResponse> handler : plugin.getActions()) {
                 final String name = handler.getAction().name();
                 if (built.containsKey(name)) {
@@ -103,8 +104,17 @@ public final class PluginActions {
                         "two plugins provide the action [" + name + "]; which one answered would depend on load order"
                     );
                 }
-                built.put(name, construct(handler.getTransportAction(), available));
+                try {
+                    built.put(name, construct(handler.getTransportAction(), available));
+                } catch (IllegalStateException e) {
+                    failures.add(e.getMessage());
+                }
             }
+        }
+        // Every action that cannot be built, in one refusal: a plugin with several gaps would otherwise be
+        // discovered one restart at a time.
+        if (failures.isEmpty() == false) {
+            throw new IllegalStateException(failures.size() + " plugin action(s) cannot be built:\n" + String.join("\n", failures));
         }
         return new PluginActions(built);
     }
@@ -123,8 +133,8 @@ public final class PluginActions {
                     + type.getName()
                     + "]: no public constructor could be satisfied. Its parameters are "
                     + parametersOf(type)
-                    + " and this node can supply "
-                    + available.stream().map(o -> o.getClass().getSimpleName()).sorted().distinct().toList()
+                    + "; this node has nothing for "
+                    + missing(type, available)
             );
         }
         candidates.sort((a, b) -> Integer.compare(b.getParameterCount(), a.getParameterCount()));
@@ -147,22 +157,87 @@ public final class PluginActions {
 
     /** The arguments for a constructor, or null if any parameter cannot be supplied. */
     private static Object[] arguments(Constructor<?> constructor, List<Object> available) {
+        return arguments(constructor, available, 0);
+    }
+
+    private static Object[] arguments(Constructor<?> constructor, List<Object> available, int depth) {
         final Class<?>[] parameters = constructor.getParameterTypes();
         final Object[] arguments = new Object[parameters.length];
         for (int i = 0; i < parameters.length; i++) {
-            Object match = null;
-            for (Object candidate : available) {
-                if (parameters[i].isInstance(candidate)) {
-                    match = candidate;
-                    break;
-                }
-            }
+            final Object match = resolve(parameters[i], available, depth);
             if (match == null) {
                 return null;
             }
             arguments[i] = match;
         }
         return arguments;
+    }
+
+    /** How deep a chain of injectable helpers may go before resolution gives up; Guice has no limit, a cycle would. */
+    private static final int MAX_DEPTH = 8;
+
+    /**
+     * Finds an argument of a type: something the node or the plugin supplied, or else a helper built for it.
+     *
+     * <p><b>The helper is Guice's just-in-time binding, and only that.</b> A classic node constructs on demand any
+     * concrete class whose constructor carries {@code @Inject}, from what it can already supply. Plugins lean on
+     * it: cross-cluster replication's actions take services it never returns from {@code createComponents}, which
+     * exist only because Guice builds them. Doing the same here, for a class that asked for it with the
+     * annotation, is not inventing a container -- a class without the annotation is never constructed, so
+     * nothing is built that its author did not mark as buildable. One instance per type per plugin, kept in
+     * the list so later actions of the same plugin share it, as they would share Guice's singleton.
+     */
+    private static Object resolve(Class<?> type, List<Object> available, int depth) {
+        for (Object candidate : available) {
+            if (type.isInstance(candidate)) {
+                return candidate;
+            }
+        }
+        if (depth >= MAX_DEPTH || type.isInterface() || java.lang.reflect.Modifier.isAbstract(type.getModifiers())) {
+            return null;
+        }
+        for (Constructor<?> constructor : type.getConstructors()) {
+            if (injectable(constructor) == false) {
+                continue;
+            }
+            final Object[] arguments = arguments(constructor, available, depth + 1);
+            if (arguments == null) {
+                continue;
+            }
+            try {
+                final Object built = constructor.newInstance(arguments);
+                available.add(built);
+                return built;
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException("the injectable [" + type.getName() + "] threw while being built", e);
+            }
+        }
+        return null;
+    }
+
+    private static boolean injectable(Constructor<?> constructor) {
+        for (java.lang.annotation.Annotation annotation : constructor.getAnnotations()) {
+            final String name = annotation.annotationType().getName();
+            if (name.equals("org.opensearch.common.inject.Inject")
+                || name.equals("javax.inject.Inject")
+                || name.equals("jakarta.inject.Inject")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The parameter types, across every public constructor, that nothing can supply. */
+    private static List<String> missing(Class<?> type, List<Object> available) {
+        final java.util.Set<String> names = new java.util.TreeSet<>();
+        for (Constructor<?> constructor : type.getConstructors()) {
+            for (Class<?> parameter : constructor.getParameterTypes()) {
+                if (resolve(parameter, available, 0) == null) {
+                    names.add(parameter.getSimpleName());
+                }
+            }
+        }
+        return List.copyOf(names);
     }
 
     private static List<String> parametersOf(Class<?> type) {

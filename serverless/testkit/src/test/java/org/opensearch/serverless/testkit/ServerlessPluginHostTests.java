@@ -349,18 +349,19 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
      * is loud, and loud is recoverable.
      */
     public void testAPluginThatFailsToStartStopsTheNode() throws Exception {
-        try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-broken"), List.of(new BrokenPlugin()))) {
-            final var failure = expectThrows(IllegalStateException.class, node.startup()::start);
-            assertTrue(
-                "the node must say a plugin stopped it: " + failure.getMessage(),
-                failure.getMessage().contains("plugin failed to start")
-            );
-            assertTrue(
-                "and name the cause: " + failure.getCause().getMessage(),
-                failure.getCause().getMessage().contains("cannot load its configuration")
-            );
-            // And it must not be left half-serving.
-            assertFalse("a node whose plugin failed must not report itself started", node.isStarted());
-        }
+        // At construction now, where a classic node builds plugin components too: before the REST layer and
+        // the transport ask the plugin for anything, so nothing is ever served without it.
+        final var failure = expectThrows(
+            IllegalStateException.class,
+            () -> new ServerlessNode(nodeSettings("plugin-broken"), List.of(new BrokenPlugin())).close()
+        );
+        assertTrue(
+            "the node must say a plugin stopped it: " + failure.getMessage(),
+            failure.getMessage().contains("plugin failed to start")
+        );
+        assertTrue(
+            "and name the cause: " + failure.getCause().getMessage(),
+            failure.getCause().getMessage().contains("cannot load its configuration")
+        );
     }
 }

@@ -348,6 +348,13 @@ public final class ServerlessNode implements Closeable {
      * @throws Exception if the node cannot be built
      */
     public ServerlessNode(Settings settings, java.util.List<org.opensearch.plugins.Plugin> plugins) throws Exception {
+        // A node says it is one, before any plugin is constructed, exactly as core's Node does. Plugins read
+        // client.type in their constructors to tell a node from a transport client, and with it unset the
+        // security plugin decides it is a client and turns off its REST filter and its HTTP transport.
+        settings = Settings.builder()
+            .put(settings)
+            .put(org.opensearch.transport.client.Client.CLIENT_TYPE_SETTING_S.getKey(), "node")
+            .build();
         // Plugins first, before the settings are settled, because a plugin gets to contribute to them.
         //
         // The order is load-bearing. PluginsService is built from what the caller supplied, so a plugin is
@@ -399,14 +406,14 @@ public final class ServerlessNode implements Closeable {
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
         final Environment environment = new Environment(settings, null);
-        final ClusterSettings clusterSettings = new ClusterSettings(settings, ClusterSettings.BUILT_IN_CLUSTER_SETTINGS);
+        final ClusterSettings clusterSettings = new ClusterSettings(settings, this.plugins.clusterSettings(settings));
 
         // A pool of its own for fanned-out shard work. The coordinator of a search waits on GENERIC for
         // its shard tasks; when those tasks also ran on GENERIC, enough concurrent searches parked every
         // thread waiting for tasks no thread was free to run. A forwarded search handler ran on SEARCH and
         // blocked on the query phase forked to SEARCH, with the same shape. Both now run here, and this
         // pool waits on nothing that runs on it.
-        this.threadPool = NodeThreadPools.build(settings);
+        this.threadPool = NodeThreadPools.build(settings, this.plugins.executorBuilders(settings));
         this.services = new NodeServices(settings, this.plugins, threadPool, () -> metadataPlane, () -> this, this::indicesService);
         this.readerValidation = new ReaderValidation(
             () -> localNode.getId(),
@@ -450,6 +457,18 @@ public final class ServerlessNode implements Closeable {
             this.searchService = services.buildSearchService(clusterSettings, clusterService, indicesService);
 
             this.nodeClient = NodeComponents.nodeClient(settings, threadPool, services);
+            // The plugins build their components here, before the REST controller, the network module and the
+            // transport exist -- the order a classic node uses, and the one plugins are written for. Each of
+            // those asks the plugins for something (a request wrapper, REST handlers, transport interceptors),
+            // and a plugin commonly answers from a field its createComponents sets: the security plugin's
+            // request wrapper, index management's rollup interceptor and cross-cluster replication's REST
+            // handlers all dereference one, and failed with the old order of components last. What a plugin
+            // reaches through its client still waits for the node to start: the client refuses until then.
+            try {
+                this.plugins.createComponents(this, environment);
+            } catch (Exception e) {
+                throw new IllegalStateException("a plugin failed to start; the node will not serve", e);
+            }
             // Before the controller, because every handler it registers is wrapped in this.
             this.systemIndices = new org.opensearch.serverless.rest.SystemIndices(this.plugins.systemIndexPatterns(settings));
             this.restController = wiring.buildRestController(clusterSettings);
