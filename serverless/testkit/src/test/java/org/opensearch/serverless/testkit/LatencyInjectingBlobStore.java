@@ -180,6 +180,100 @@ final class LatencyInjectingBlobStore implements BlobStore {
         }
     }
 
+    private volatile long bytesPerSecond;
+    private final Map<String, java.util.concurrent.atomic.LongAdder[]> putBytes = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Adds transfer time to every PUT and GET in proportion to its body, as a single connection to an object store has: a
+     * request of {@code n} bytes takes {@code n / bytesPerSecond} on top of its first-byte latency. Zero turns it off, which
+     * is what every meter but the large-document one wants: their bodies are small enough for it not to matter.
+     *
+     * @param bytesPerSecond the per-request transfer rate, or zero for none
+     */
+    void setBytesPerSecond(long bytesPerSecond) {
+        this.bytesPerSecond = Math.max(0L, bytesPerSecond);
+    }
+
+    /**
+     * What has been PUT, by where: for each place, the PUT count, total bytes and the largest body.
+     *
+     * @return place to {count, bytes, largest}
+     */
+    Map<String, long[]> putBytesByPlace() {
+        final Map<String, long[]> out = new java.util.TreeMap<>();
+        putBytes.forEach((place, adders) -> out.put(place, new long[] { adders[0].sum(), adders[1].sum(), adders[2].sum() }));
+        return out;
+    }
+
+    /** Forgets what {@link #putBytesByPlace} has counted. */
+    void resetPutBytes() {
+        putBytes.clear();
+    }
+
+    private static String placeOf(BlobPath path, String blobName) {
+        final String full = path.buildAsString();
+        if (full.contains("nodelog/")) {
+            return "node log";
+        }
+        final int dot = blobName.lastIndexOf('.');
+        final String kind = dot < 0 ? "(no extension)" : blobName.substring(dot);
+        final int slash = full.indexOf('/');
+        return (slash < 0 ? full : full.substring(0, slash)) + " " + kind;
+    }
+
+    private void transfer(long bytes) {
+        final long rate = bytesPerSecond;
+        if (rate <= 0 || bytes <= 0) {
+            return;
+        }
+        final long delay = bytes * 1_000_000_000L / rate;
+        final long until = System.nanoTime() + delay;
+        for (long left = delay; left > 0; left = until - System.nanoTime()) {
+            LockSupport.parkNanos(left);
+        }
+    }
+
+    private void notePut(BlobPath path, String blobName, long size) {
+        final java.util.concurrent.atomic.LongAdder[] adders = putBytes.computeIfAbsent(
+            placeOf(path, blobName),
+            ignored -> new java.util.concurrent.atomic.LongAdder[] {
+                new java.util.concurrent.atomic.LongAdder(),
+                new java.util.concurrent.atomic.LongAdder(),
+                new java.util.concurrent.atomic.LongAdder() }
+        );
+        adders[0].increment();
+        adders[1].add(size);
+        synchronized (adders) {
+            if (size > adders[2].sum()) {
+                adders[2].add(size - adders[2].sum());
+            }
+        }
+        transfer(size);
+    }
+
+    private InputStream throttled(InputStream in) {
+        if (bytesPerSecond <= 0) {
+            return in;
+        }
+        return new java.io.FilterInputStream(in) {
+            @Override
+            public int read() throws IOException {
+                final int b = super.read();
+                if (b >= 0) {
+                    transfer(1);
+                }
+                return b;
+            }
+
+            @Override
+            public int read(byte[] buf, int off, int len) throws IOException {
+                final int n = super.read(buf, off, len);
+                transfer(n);
+                return n;
+            }
+        };
+    }
+
     private volatile Profile profile;
     private final java.util.Random jitter = new java.util.Random(0x5EED);
 
@@ -282,18 +376,19 @@ final class LatencyInjectingBlobStore implements BlobStore {
         @Override
         public InputStream readBlob(String blobName) throws IOException {
             pay("GET", path(), blobName);
-            return delegate.readBlob(blobName);
+            return throttled(delegate.readBlob(blobName));
         }
 
         @Override
         public InputStream readBlob(String blobName, long position, long length) throws IOException {
             pay("GET-range", path(), blobName);
-            return delegate.readBlob(blobName, position, length);
+            return throttled(delegate.readBlob(blobName, position, length));
         }
 
         @Override
         public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
             pay("PUT", path(), blobName);
+            notePut(path(), blobName, blobSize);
             delegate.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
         }
 
@@ -301,6 +396,7 @@ final class LatencyInjectingBlobStore implements BlobStore {
         public void writeBlobAtomic(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
             throws IOException {
             pay("PUT", path(), blobName);
+            notePut(path(), blobName, blobSize);
             delegate.writeBlobAtomic(blobName, inputStream, blobSize, failIfAlreadyExists);
         }
 
