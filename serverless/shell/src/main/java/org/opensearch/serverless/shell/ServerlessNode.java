@@ -634,6 +634,24 @@ public final class ServerlessNode implements Closeable {
                 logger.warn("could not publish this node's lease; peers will not be able to route to it", e);
             }
         }
+        notifyPluginsStarted();
+    }
+
+    private final java.util.concurrent.atomic.AtomicBoolean pluginsNotified = new java.util.concurrent.atomic.AtomicBoolean();
+
+    /**
+     * Tells the plugins the node is up, once it is started <em>and</em> has its metadata plane, whichever comes
+     * last.
+     *
+     * <p>A plugin answers {@code onNodeStarted} by reading or creating its own index -- the security plugin
+     * creates its configuration index there -- and without the plane every such call is refused. A deployed
+     * node starts first and is given its plane straight after, so telling the plugins at start told them too
+     * early, and the security plugin gave up on its configuration.
+     */
+    void notifyPluginsStarted() {
+        if (started && metadataPlane != null && pluginsNotified.compareAndSet(false, true)) {
+            plugins.onNodeStarted(localNode);
+        }
     }
 
     /**
@@ -805,6 +823,9 @@ public final class ServerlessNode implements Closeable {
     }
 
     PluginActions pluginActions = PluginActions.none();
+
+    /** Core's injector for plugin objects, once the node has started with plugins installed; null otherwise. */
+    PluginInjector pluginInjector;
 
     /**
      * The names of every action the installed plugins declare, known before any of them is built.
@@ -1110,6 +1131,17 @@ public final class ServerlessNode implements Closeable {
         // ServerlessPlugins#closeAll must be invoked here. Skipping it is invisible while every plugin is a
         // test plugin holding nothing; a plugin that owns a thread pool leaks it out of every node.
         IOUtils.closeWhileHandlingException(httpServerTransport);
+        // The plugins' lifecycle services before the plugins, the order a classic node stops them in.
+        if (pluginInjector != null) {
+            for (org.opensearch.common.lifecycle.LifecycleComponent service : pluginInjector.services()) {
+                try {
+                    service.stop();
+                } catch (RuntimeException e) {
+                    logger.warn("a plugin service failed to stop: " + service.getClass().getName(), e);
+                }
+                IOUtils.closeWhileHandlingException(service);
+            }
+        }
         ServerlessPlugins.closeAll(plugins.plugins());
         // After the plugins, because they were given these and may use them on the way out.
         IOUtils.closeWhileHandlingException(services);
