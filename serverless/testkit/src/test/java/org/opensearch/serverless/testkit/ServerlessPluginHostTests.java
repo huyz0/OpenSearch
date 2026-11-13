@@ -271,7 +271,8 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
     }
 
     /**
-     * A plugin is told when the node is serving, with the node's identity.
+     * A plugin is told when the node is serving, with the node's identity: once it has started and has its
+     * metadata plane.
      *
      * <p>A separate event from {@code createComponents} and plugins depend on the separation: work that
      * needs a running node — the OpenSearch security plugin reads its own configuration index here — cannot
@@ -282,6 +283,17 @@ public class ServerlessPluginHostTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-started"), List.of(new TestPlugin()))) {
             assertNull("not before start", STARTED_NODE.get());
             node.startup().start();
+            // Not before the metadata plane either: the security plugin creates its index on this event, and every
+            // index operation is refused until the node has a plane.
+            assertNull("not before the node has its metadata plane", STARTED_NODE.get());
+            node.setMetadataPlane(
+                new org.opensearch.serverless.metadata.MetadataPlane(
+                    new org.opensearch.common.blobstore.fs.FsBlobStore(1024, createTempDir(), false),
+                    org.opensearch.common.blobstore.BlobPath.cleanPath(),
+                    System::currentTimeMillis,
+                    30_000L
+                )
+            );
             assertEquals("a plugin must be told the node is serving, and which node it is", node.localNode().getId(), STARTED_NODE.get());
         }
     }

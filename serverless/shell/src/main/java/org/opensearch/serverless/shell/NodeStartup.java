@@ -222,10 +222,14 @@ public final class NodeStartup {
         // and before onNodeStarted, because a plugin told the node is up may immediately call its own
         // action.
         node.pluginActions = node.wiring.buildPluginActions();
+        if (node.pluginInjector != null) {
+            node.pluginInjector.services().forEach(org.opensearch.common.lifecycle.LifecycleComponent::start);
+        }
 
         // And then tell them the node is up. A plugin that has to read its own index cannot do it while
-        // components are being built; this is the event it waits for.
-        node.plugins.onNodeStarted(node.localNode);
+        // components are being built; this is the event it waits for. Deferred until the node also has its
+        // metadata plane, if it has none yet.
+        node.notifyPluginsStarted();
     }
 
     /**

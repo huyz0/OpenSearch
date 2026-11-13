@@ -34,8 +34,9 @@ import java.util.Optional;
  * of index or search. This holds only what plugins brought, and the shell's client asks it after its own
  * allowlist has not matched.
  *
- * <p><b>Constructor resolution, not injection.</b> Core binds these with Guice; plugins run here
- * without it. So each action is built by picking the constructor whose parameters can all be supplied from
+ * <p><b>Constructor resolution, and core's injector where it applies.</b> An action whose constructor
+ * carries core's {@code @Inject} is built by {@link PluginInjector}, exactly as a classic node builds it. Any
+ * other action, and every action when that injector is switched off, is built by picking the constructor whose parameters can all be supplied from
  * what this node has — its services, and whatever <em>that</em> plugin itself returned from
  * {@code createComponents}. Never another plugin's components: the aggregate list was once offered to every
  * action, and a constructor parameter typed to some other plugin's private class would have been handed
@@ -91,6 +92,24 @@ public final class PluginActions {
      * @throws IllegalStateException if an action cannot be built, naming what was missing
      */
     public static PluginActions build(List<ActionPlugin> plugins, java.util.function.Function<ActionPlugin, List<Object>> availableFor) {
+        return build(plugins, availableFor, null);
+    }
+
+    /**
+     * Builds every action the plugins declared: those core's injector bound are taken from it, the rest are
+     * resolved against what their own plugin may be given.
+     *
+     * @param plugins the action plugins
+     * @param availableFor what a constructor of the given plugin's actions may be given
+     * @param injector the plugins' injector, or null to resolve every action by constructor
+     * @return the registry
+     * @throws IllegalStateException if an action cannot be built, naming what was missing
+     */
+    static PluginActions build(
+        List<ActionPlugin> plugins,
+        java.util.function.Function<ActionPlugin, List<Object>> availableFor,
+        PluginInjector injector
+    ) {
         final Map<String, TransportAction<? extends ActionRequest, ? extends ActionResponse>> built = new LinkedHashMap<>();
         final List<String> failures = new ArrayList<>();
         for (ActionPlugin plugin : plugins) {
@@ -105,6 +124,10 @@ public final class PluginActions {
                     );
                 }
                 try {
+                    if (injector != null && injector.has(handler.getTransportAction())) {
+                        built.put(name, injector.instance(handler.getTransportAction()));
+                        continue;
+                    }
                     built.put(name, construct(handler.getTransportAction(), available));
                 } catch (IllegalStateException e) {
                     failures.add(e.getMessage());
