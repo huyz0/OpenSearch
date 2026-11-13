@@ -117,8 +117,18 @@ Same run both ways, 2,000 shards, flat 20 ms, C2 JIT:
 | refused at 2,000 docs/s | 0.5% | 0 |
 | store requests | same | same |
 
-Heap used is a sample of a live heap, not a post-GC floor, but the gap held at both rates. The disk run's refusals were
-the limiter shedding when an append passed ~0.9 s.
+Heap used is a sample of the live heap, garbage included, not a post-GC floor. The disk run's refusals were the limiter
+shedding when an append passed ~0.9 s. Rerun with assertions off (`-Dtests.asserts=false`, `-da`), as production runs:
+
+| | disk translog | none (default) |
+| --- | --- | --- |
+| heap used, 1,000 / 2,000 docs/s | 2,020 / 3,110 MB | 1,354 / 2,222 MB |
+| p99, 1,000 / 2,000 docs/s | 407 / 487 ms | 336 / 430 ms |
+| ms CPU per doc, 1,000 / 2,000 docs/s | 2.0 / 1.29 | 1.7 / 1.11 |
+
+What is retained is small: ~14 KB per writer (the translog writer and reader, two file channels, checkpoint state). The
+larger gap under load is most likely garbage between collections: every write copied its operation into the translog's
+paged buffer and wrote a checkpoint on sync. That reading is inferred; the meter does not take a post-GC floor.
 
 ## Fixed: checking new shards one at a time stalled the whole node
 
