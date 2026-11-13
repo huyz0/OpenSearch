@@ -264,6 +264,11 @@ final class BulkDispatch {
 
         final var head = plane.get().heads().read(index, shard);
         final String owner = head.map(h -> h.ownerNodeId()).orElse(null);
+        if (owner == null && serving.nodeCapacity().takesWriters() == false) {
+            // Nobody owns it and this node cannot take it: a search node, or one that only coordinates. The batch goes
+            // to the writer member every such node ranks first for the shard, marked to be taken there.
+            return steerGroup(serving, group, index, uuid, shard, operations, refresh);
+        }
         if (owner == null) {
             // Nobody owns it, and the only reason anyone would activate it is that a write arrived --
             // which just did. Same conclusion the single-document path reaches.
@@ -307,6 +312,68 @@ final class BulkDispatch {
             return refresh == false || response.refreshed();
         } catch (Exception e) {
             failForwarded(serving, group, index, shard, owner, e);
+        }
+        return true;
+    }
+
+    /**
+     * Sends a group for a shard nobody holds to a writer member to take, from a node that takes no writers.
+     *
+     * @return as {@link #applyGroup}
+     */
+    boolean steerGroup(
+        ServerlessNode serving,
+        List<BulkHandler.Item> group,
+        String index,
+        String uuid,
+        int shard,
+        List<BulkOperation> operations,
+        boolean refresh
+    ) {
+        final MetadataPlane metadata = plane.get();
+        final Optional<String> target;
+        try {
+            final Optional<org.opensearch.serverless.cluster.IndexDescriptor> descriptor = metadata.describeForRouting(index);
+            target = descriptor.isPresent() ? serving.nodeCapacity().writerForUnheld(metadata, descriptor.get(), shard) : Optional.empty();
+        } catch (IOException e) {
+            failGroup(
+                group,
+                RestStatus.SERVICE_UNAVAILABLE,
+                "no_writer",
+                "could not read " + index + " to route shard " + shard + "; retry"
+            );
+            return true;
+        }
+        if (target.isEmpty()) {
+            failGroup(
+                group,
+                RestStatus.SERVICE_UNAVAILABLE,
+                "no_writer",
+                "no node that takes writers is live to take shard " + shard + " of " + index + "; retry"
+            );
+            return true;
+        }
+        try {
+            final var peer = serving.router().peer(target.get());
+            if (peer.isEmpty()) {
+                failGroup(
+                    group,
+                    RestStatus.SERVICE_UNAVAILABLE,
+                    "owner_unreachable",
+                    "shard " + shard + " of " + index + " was to be taken by " + target.get() + ", which has no reachable lease"
+                );
+                return true;
+            }
+            final var response = serving.router()
+                .forwardBulk(
+                    peer.get(),
+                    org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh).steered()
+                );
+            serving.nodeCapacity().noteWriteSteered();
+            record(group, response.outcomes(), response.ownerNodeId());
+            return refresh == false || response.refreshed();
+        } catch (Exception e) {
+            failForwarded(serving, group, index, shard, target.get(), e);
         }
         return true;
     }

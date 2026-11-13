@@ -66,6 +66,43 @@ public final class ServerlessNode implements Closeable {
     /** Accepts reader activation: serves search from object-store-backed segments. */
     public static final String ROLE_SEARCH = "search";
 
+    /** The node's roles: any of {@link #ROLE_INGEST} and {@link #ROLE_SEARCH}, both when unset, neither when set empty. */
+    public static final String ROLES = "serverless.roles";
+
+    /**
+     * Reads a node's roles from its settings.
+     *
+     * <p>Unset means both roles, as one node of a small deployment runs. Set but empty means neither: a node that only
+     * coordinates, taking requests and sending each write to a shard's writer and each search to search nodes, while
+     * holding no shard itself. {@code Settings.getAsList} answers its default for an empty value, which made an empty
+     * setting mean both roles, so the value is split here instead. An unknown role is refused, since a misspelled
+     * {@code search} would otherwise start a node that silently serves nothing.
+     *
+     * @param settings the node settings
+     * @return the roles, possibly empty
+     * @throws IllegalArgumentException if a role is not one this node knows
+     */
+    public static Set<String> rolesFrom(Settings settings) {
+        final String raw = settings.get(ROLES);
+        if (raw == null) {
+            return Set.of(ROLE_INGEST, ROLE_SEARCH);
+        }
+        final Set<String> roles = new java.util.TreeSet<>();
+        for (String role : org.opensearch.core.common.Strings.splitStringByCommaToArray(raw)) {
+            final String trimmed = role.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            if (trimmed.equals(ROLE_INGEST) == false && trimmed.equals(ROLE_SEARCH) == false) {
+                throw new IllegalArgumentException(
+                    "unknown role [" + trimmed + "] in [" + ROLES + "]; use ingest, search, both, or an empty value to only coordinate"
+                );
+            }
+            roles.add(trimmed);
+        }
+        return Set.copyOf(roles);
+    }
+
     /** The store type that reads published segments lazily, a block at a time. */
     public static final String BLOCK_CACHE_STORE_TYPE = "serverless_block_cache";
 
@@ -341,7 +378,7 @@ public final class ServerlessNode implements Closeable {
         // Role is a runtime attribute a node advertises, not a topology decision baked into a
         // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
         // environment variable, and role switching under load stays a policy question.
-        this.roles = Set.copyOf(settings.getAsList("serverless.roles", java.util.List.of(ROLE_INGEST, ROLE_SEARCH)));
+        this.roles = rolesFrom(settings);
         this.blockCache = NodeComponents.blockCache(settings);
         this.writeBackpressureMax = settings.getAsInt("serverless.write.backpressure.max_in_flight", 1_024);
         this.writeBackpressure = NodeComponents.writeBackpressure(settings, writeBackpressureMax);
