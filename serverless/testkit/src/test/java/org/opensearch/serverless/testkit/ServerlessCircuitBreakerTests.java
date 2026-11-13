@@ -246,8 +246,8 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
             .put(nodeSettings("pressure-release", null))
             // Room for a few of these at once and nothing like the total, so a leak runs out well before
             // the end and a working release never does: forty writes of about 35 bytes and ten batches of
-            // about 200 are several times this, and every one of them has to succeed.
-            .put("indexing_pressure.memory.limit", "400b")
+            // about 200 (charged four times that up front) are several times this, and every one has to succeed.
+            .put("indexing_pressure.memory.limit", "1000b")
             .build();
 
         try (ServerlessNode node = new ServerlessNode(settings)) {
@@ -276,6 +276,47 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
                 final Response bulk = send(node, "POST", "/_bulk", batch.toString());
                 assertEquals("batch " + round + " must succeed for the same reason: " + bulk.body(), 200, bulk.status());
                 assertFalse("and none of its items rejected: " + bulk.body(), bulk.body().contains("\"error\""));
+            }
+        }
+    }
+
+    /**
+     * A batch is charged what it will hold before its body is parsed: refused while unparsed, even when its body would
+     * not parse, and charged its length alone once the switch is off.
+     */
+    public void testABatchIsChargedWhatItWillHoldBeforeItIsParsed() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        plane.createIndex(new IndexDescriptor("charged", "uuid-charged-000000", 1, MAPPING, null));
+        final StringBuilder batch = new StringBuilder();
+        for (int i = 0; i < 5; i++) {
+            batch.append("{\"index\":{\"_index\":\"charged\",\"_id\":\"c").append(i).append("\"}}\n{\"msg\":\"m\",\"colour\":\"c\"}\n");
+        }
+        // About 300 bytes: within a 1,000-byte budget once, past it four times over.
+        assertTrue(batch.length() > 250 && batch.length() < 1000 / 2);
+        for (boolean charged : new boolean[] { true, false }) {
+            final Settings settings = Settings.builder()
+                .put(nodeSettings("charged-" + charged, null))
+                .put("indexing_pressure.memory.limit", "1000b")
+                .put(org.opensearch.serverless.rest.BulkHandler.CHARGE_BEFORE_PARSE_SETTING, charged)
+                .build();
+            try (ServerlessNode node = new ServerlessNode(settings)) {
+                node.startup().start();
+                node.setMetadataPlane(plane);
+                final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+                loop.want("charged", 0);
+                loop.tick(clock.get());
+
+                final Response bulk = send(node, "POST", "/_bulk?refresh=true", batch.toString());
+                final Response garbage = send(node, "POST", "/_bulk", "x".repeat(batch.length()));
+                if (charged) {
+                    assertEquals("four times its length is past the budget: " + bulk.body(), 429, bulk.status());
+                    assertEquals("refused before it is parsed: " + garbage.body(), 429, garbage.status());
+                } else {
+                    assertEquals("its length alone fits: " + bulk.body(), 200, bulk.status());
+                    assertEquals("parsed first, so a bad body is a 400: " + garbage.body(), 400, garbage.status());
+                }
+                assertEquals("nothing is left charged", 0L, node.services().indexingPressure().stats().getCurrentCoordinatingBytes());
             }
         }
     }

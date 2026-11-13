@@ -49,6 +49,7 @@ tasks.named('forbiddenApisMain').configure {
 tasks.named('test').configure {
   exclude '**/ServerlessContentionTests.class'
   exclude '**/WriteThroughputMeterTests.class'
+  exclude '**/BigBulkMeterTests.class'
   exclude '**/ServerlessFleetTests.class'
   exclude '**/MinioBlobContainerConformanceTests.class'
   exclude '**/SeaweedBlobContainerConformanceTests.class'
@@ -288,6 +289,31 @@ tasks.register('throughputTest', Test) {
   systemProperty 'tests.timeout', '86400000!'
   System.getProperties().each { key, value ->
     if (key.toString().startsWith('tests.tput.') || key.toString().startsWith('tests.serverless.')) {
+      systemProperty key.toString(), value.toString()
+    }
+  }
+  outputs.upToDateWhen { false }
+}
+
+/*
+ * What batches of about 100 MB, several at once, do to a writer's heap and its node-log blobs (BigBulkMeterTests). A
+ * measurement, not part of check:
+ *
+ *   ./gradlew :serverless:testkit:bigBulkTest [-Dtests.bigbulk.mb=95] [-Dtests.bigbulk.concurrent=6] \
+ *       [-Dtests.bigbulk.rounds=3] [-Dtests.bigbulk.shards=1] [-Dtests.bigbulk.heap=4g] [-Dtests.bigbulk.settings=k=v,...]
+ */
+tasks.register('bigBulkTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/BigBulkMeterTests.class'
+  systemProperty 'opensearch.path.conf', 'config'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'opensearch.set.netty.runtime.available.processors', 'false'
+  jvmArgumentProviders.add({ ['-Xmx' + System.getProperty('tests.bigbulk.heap', '4g'), '-Xms1g'] } as CommandLineArgumentProvider)
+  systemProperty 'tests.timeoutSuite', '86400000!'
+  systemProperty 'tests.timeout', '86400000!'
+  System.getProperties().each { key, value ->
+    if (key.toString().startsWith('tests.bigbulk.') || key.toString().startsWith('tests.serverless.')) {
       systemProperty key.toString(), value.toString()
     }
   }
