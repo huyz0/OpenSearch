@@ -520,30 +520,27 @@ public final class NodeLogCommitter {
         }
         final java.util.concurrent.ConcurrentLinkedQueue<Window.Key> queue = new java.util.concurrent.ConcurrentLinkedQueue<>(keys);
         final java.util.concurrent.ConcurrentHashMap<ShardKey, IOException> failed = new java.util.concurrent.ConcurrentHashMap<>();
-        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(parallelism);
+        // Counted by checks, not by helpers: a helper the pool runs late finds the queue empty and the flusher has not
+        // waited for it, so a busy pool slows the checks down to the flusher's own pace and never holds the window longer.
+        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(keys.size());
         final Runnable drain = () -> {
-            try {
-                for (Window.Key key = queue.poll(); key != null; key = queue.poll()) {
+            for (Window.Key key = queue.poll(); key != null; key = queue.poll()) {
+                try {
                     final IOException failure = check(epoch, key);
                     if (failure != null) {
                         failed.put(key.shard, failure);
                     }
+                } finally {
+                    done.countDown();
                 }
-            } finally {
-                done.countDown();
             }
         };
-        int started = 0;
         for (int i = 0; i < parallelism - 1; i++) {
             try {
                 executor.execute(drain);
-                started++;
             } catch (RuntimeException rejected) {
                 break;
             }
-        }
-        for (int i = started; i < parallelism - 1; i++) {
-            done.countDown();
         }
         // This thread drains too, so the checks finish even when the executor runs none of them.
         drain.run();
