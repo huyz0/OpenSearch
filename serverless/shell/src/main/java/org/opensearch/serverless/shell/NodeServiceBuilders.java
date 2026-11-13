@@ -282,6 +282,7 @@ final class NodeServiceBuilders {
                 org.opensearch.common.settings.Setting.Property.PrivateIndex
             )
         );
+        known.addAll(services.plugins.indexSettings(services.settings));
         known.add(SegmentPlacement.INDEX);
         known.add(org.opensearch.serverless.transport.TailOverlays.INDEX);
         known.add(org.opensearch.serverless.bucket.BucketPolicy.INDEX);

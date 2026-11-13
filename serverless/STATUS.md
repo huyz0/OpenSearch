@@ -171,6 +171,15 @@ search plugins, network plugins and their transport interceptors, system-index d
 `ActionFilter`s all work. A plugin's **own transport actions** run too — built by resolving each
 constructor against what the node can supply, since Guice is not on offer here — so an action is reachable
 from the plugin's REST handler, from its own code through the client, and from another node. The `Client` and the `NodeClient` a handler receives are the same allowlist.
+Plugins are hosted in core's order: `createComponents` (all three overloads core calls, with a component registry and
+no-op telemetry) runs while the node is constructed, before the REST layer and the transport ask them for handlers, a
+request wrapper or interceptors; their node and index settings are registered and their thread pools built
+(`serverless.plugin_extensions.enabled`, on); `client.type` is `node`; and an action's constructor may take the
+`NodeClient`, core services such as `PluginsService` or `AnalysisRegistry`, and any class whose constructor is marked
+`@Inject`, built on demand as Guice would. Checked against the released 3.9 plugins: Job Scheduler, Index State
+Management (policy create/get on its own system index), Query Insights, custom codecs, system templates and Flow
+Framework start. Most of the rest stop on jar hell, because the shell's classpath carries the module and S3 jars a
+classic node keeps in their own class loaders; see the plugin compatibility work.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,
