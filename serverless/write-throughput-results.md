@@ -1,0 +1,119 @@
+# Write throughput per node: thousands of shards on one writer
+
+How many writes one writer node sustains while it holds 2,000-3,000 shards, and what stops it. The meter is
+`WriteThroughputMeterTests`, run by its own task:
+
+```
+./gradlew :serverless:testkit:throughputTest -Dtests.tput.step_seconds=60 -Dtests.tput.shards=3000 \
+    -Dtests.tput.active=2000 -Dtests.tput.rates=1000,2000,3000 [-Dtests.tput.batch=10] \
+    [-Dtests.tput.settings=serverless.write.backpressure.max_in_flight=8192]
+```
+
+Every `tests.tput.*` property is in the class javadoc. Three thousand shards need `ulimit -n` well above 20,000
+before the Gradle daemon starts (`./gradlew --stop` first); see "File descriptors" below.
+
+## Method
+
+- One ingest node takes every shard (timed), then each shard gets one write so it is in the node log's epoch.
+- An **open** load: writes arrive at random times at a fixed rate, whatever is acknowledged, spread uniformly over
+  the active shards. Latency is counted from arrival, so waiting for a free client counts. The old soak
+  (`NodeLogSoakMeterTests`) is closed-loop with 16 writers, so it measured latency and request cost, never throughput.
+- A ladder of rates, 60 s each. A step "keeps up" if it acknowledges at least 95% of what was offered with p99
+  under 5 s and nothing refused. The ladder stops at the first step that does not.
+- The node runs on its own cadence, as `ServerlessBootstrap` wires it: lazy publish at 1 s on the 250 ms log window,
+  edge publishes spaced 5 s, renewals and the backstop on their timers, head and descriptor checks every 5 min.
+  Defaults otherwise: node log on, `node_pack` placement, log commits on.
+- Store: the filesystem with 20 ms per request and one in fifty at 200 ms (`MeterStores` default).
+- Machine: 4 vCPU, 15 GB, test JVM with an 8 GB heap. Clients, arrivals and the node share the 4 cores.
+- CPU is reported per doc and by thread group; any write held over a second is sampled for where its thread is.
+
+## Results (2026-11-12)
+
+### Holding shards
+
+| | per open writer |
+| --- | --- |
+| open (take), 3,000 shards | 90 s in one pass, 30 ms and 9 requests per shard, 0.7 cores |
+| file descriptors, idle | 3 (`tlog`, `ckp`, `write.lock`) |
+| file descriptors, being written | about 6.7: plus `fdt`, `fdm` and two `tmp` of the segment being built |
+| heap, idle | 120-130 KB (3,000 shards: ~400 MB) |
+| threads | about 1 per open writer (3,000 shards: ~3,060 threads) |
+
+### Single-document requests
+
+3,000 shards held, writes over 2,000 of them (all 3,000 would need more descriptors than this sandbox allows):
+
+| offered docs/s | acked/s | p50 | p99 | refused | CPU (of 4) | ms CPU per doc |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1,000 | 999 | 197 ms | 352 ms | 0 | 1.8 | 1.8 |
+| 2,000 | 1,996 | 263 ms | 551 ms | 0.25% | 2.6 | 1.3 |
+
+The 2,000 step's refusals are the node's in-flight cap (`serverless.write.backpressure.max_in_flight`, 1,024): every
+write waits out part of a 250 ms window, so 2,000 docs/s keeps ~600 in flight on average and bursts pass 1,024.
+
+2,000 shards with the cap at 8,192:
+
+| offered docs/s | acked/s | p50 | p99 | refused | CPU (of 4) | ms CPU per doc |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2,000 | 1,993 | 245 ms | 490 ms | 0 | 2.4 | 1.2 |
+| 3,000 | 2,985 | 428 ms | 1,295 ms | 0.4% | 3.0 | 1.0 |
+
+At 3,000 the box is CPU-bound and the oldest write passes the limiter's 1 s target, so it starts refusing.
+
+### Bulk requests of 10 documents (2,000 shards, cap 8,192)
+
+| offered docs/s | acked/s | p50 | p99 | refused | CPU (of 4) | ms CPU per doc |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5,000 | 4,989 | 187 ms | 339 ms | 0 | 1.9 | 0.38 |
+| 10,000 | 10,013 | 283 ms | 636 ms | 0 | 3.0 | 0.31 |
+| 20,000 | 14,207 | 1,221 ms | 2,478 ms | 29% | 3.3 | 0.24 |
+
+### Store requests
+
+- Node-log PUTs stay at ~3.9/s whatever the rate: one blob per 250 ms window, 250 to 2,500 docs each.
+- All PUTs (log, segment packs, logged commits, manifests): 15-50/s at 1,000-10,000 docs/s.
+- GETs: 60-100/s, nearly all register reads (change-stripe confirmations and head checks); no LISTs on the write path.
+
+## What limits a node
+
+1. **CPU: about 1,000 single-document writes or ~3,300 documents in bulks of 10 per core.** Most of it is the write
+   path itself (parse, Lucene, log record); the node's background work is a steady ~0.6-0.8 cores here. A 16-core
+   node would sustain roughly 12-16K single-document writes/s, more in bulks.
+2. **The in-flight cap, for single-document writes.** With a 250 ms window, a node needs `max_in_flight` of about
+   0.35 s x its write rate. The default 1,024 tops out near 3,000 single-document writes/s whatever the cores; bulks
+   count once per request, so they are not affected. Raise it with the core count.
+3. **The node-log flusher, for bulk at high rates.** One blob is in flight at a time and the flusher encodes it
+   before the PUT. At 20,000 docs/s offered a blob held ~6,000 docs and took 263 ms against a 31 ms PUT, so log PUTs
+   fell to 2.4/s and writes queued behind it. On 4 cores CPU binds first; on a bigger node this is the next ceiling
+   (roughly 20-25K docs/s), and encoding the next blob while the previous PUT is in flight would lift it.
+4. **File descriptors.** 3 per open writer plus ~3.7 per writer being written: 3,000 shards all taking writes need
+   ~21,000. Set `nofile` to 65,536 or more on a node meant to hold thousands of shards. Heap is not the limit: ~400 MB
+   for 3,000 idle writers.
+5. **Open time.** 30 ms a shard at 20 ms a request: a node taking 3,000 shards takes 1.5 min, and one pass of that
+   is longer than a lease TTL, so a pass that opens thousands of shards must not hold back renewals.
+
+## Fixed: checking new shards one at a time stalled the whole node
+
+Before a shard's first records go into a log epoch the flusher checks that the shard's head still names this node:
+one register read. Those checks ran one after another inside the flusher, before the window's PUT. A window carrying
+the first records of thousands of shards (a node's first writes after taking them, or after its epoch changed)
+waited one read per shard, with every write on the node behind it. In the first 3,000-shard run the window took
+24 s, the write limiter cut its limit to 89 and refused 80% of writes at 500 docs/s.
+
+`NodeLogCommitter` now runs those checks side by side on the generic pool and on the flusher itself, up to
+`serverless.wal.node_log.admission_concurrency` at once (default 32; 1 restores the old order). All of them still
+finish before the PUT, and a refused shard fails only its own records. The scan of which shards need a check now
+takes the committer's lock once per window instead of once per shard.
+
+Same run, 3,000 shards, writes over 2,000, 1,000 docs/s:
+
+| | first write to every shard | refused at 1,000 docs/s | p99 |
+| --- | --- | --- | --- |
+| one at a time (`admission_concurrency=1`) | 109 s | 9% | 1,747 ms |
+| 32 at a time (default) | 7.9 s | 0 | 352 ms |
+
+## Not measured here
+
+- All 3,000 shards written at once (the sandbox's descriptor limit is 20,000).
+- Takeover of a 3,000-shard node (two nodes in one JVM double the descriptors). The 1,000-shard soak's takeover
+  numbers are in `NodeLogSoakMeterTests`' notes: about a minute per 1,000 shards for one successor.

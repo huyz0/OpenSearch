@@ -48,6 +48,7 @@ tasks.named('forbiddenApisMain').configure {
 // module losing it, so everything that does not need to fork keeps the guard.
 tasks.named('test').configure {
   exclude '**/ServerlessContentionTests.class'
+  exclude '**/WriteThroughputMeterTests.class'
   exclude '**/ServerlessFleetTests.class'
   exclude '**/MinioBlobContainerConformanceTests.class'
   exclude '**/SeaweedBlobContainerConformanceTests.class'
@@ -259,6 +260,34 @@ tasks.register('schemaHeapTest', Test) {
   systemProperty 'tests.timeout', '86400000!'
   System.getProperties().each { key, value ->
     if (key.toString().startsWith('tests.schema.') || key.toString().startsWith('tests.writeheap.')) {
+      systemProperty key.toString(), value.toString()
+    }
+  }
+  outputs.upToDateWhen { false }
+}
+
+/*
+ * Writes per second one writer node sustains across thousands of shards (WriteThroughputMeterTests): an open load climbing a
+ * ladder of rates, with fds, heap, threads and open time per writer and CPU by thread group. A measurement, not part of check:
+ *
+ *   ./gradlew :serverless:testkit:throughputTest -Dtests.tput.step_seconds=60 -Dtests.tput.shards=3000 \
+ *       -Dtests.tput.rates=500,1000,2000,4000,8000 [-Dtests.tput.batch=10] [-Dtests.tput.takeover=true]
+ *
+ * Three thousand shards need `ulimit -n 65536` before the Gradle daemon starts (`./gradlew --stop` first).
+ */
+tasks.register('throughputTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/WriteThroughputMeterTests.class'
+  systemProperty 'opensearch.path.conf', 'config'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'opensearch.set.netty.runtime.available.processors', 'false'
+  // Last on the command line, so it wins over the build's own default heap.
+  jvmArgumentProviders.add({ ['-Xmx' + System.getProperty('tests.tput.heap', '8g'), '-Xms1g'] } as CommandLineArgumentProvider)
+  systemProperty 'tests.timeoutSuite', '86400000!'
+  systemProperty 'tests.timeout', '86400000!'
+  System.getProperties().each { key, value ->
+    if (key.toString().startsWith('tests.tput.') || key.toString().startsWith('tests.serverless.')) {
       systemProperty key.toString(), value.toString()
     }
   }
