@@ -24,7 +24,7 @@ the whole body per request: twenty-four 100 MB requests are 2.4 GB wherever they
 
 ## Streaming
 
-`serverless.http.streaming` (off by default) serves HTTP through the Reactor Netty transport, and `_bulk` reads its body
+`serverless.http.streaming` (on by default) serves HTTP through the Reactor Netty transport, and `_bulk` reads its body
 as it arrives:
 
 - **Bounded per connection.** Chunks are read only as the batch asks for them. Once a slice has arrived
@@ -69,5 +69,19 @@ change explains on its own and has not been pinned down, so read the latency col
 
 ## Default
 
-Streaming stays off by default: it changes the HTTP transport for every request, and the REST compatibility suite has
-not yet been run on it.
+Streaming is on by default. It changes the HTTP transport for every request, so it was measured on small requests too
+(`RestPathLatencyMeterTests`, `-Dtests.restlat.requests=300`: one node, one shard, closed loop, each mode twice in
+alternation, filesystem store):
+
+| Mode | Single document p50 / p99 | Bulk of 10 p50 / p99 | Search p50 / p99 | Store requests |
+| --- | --- | --- | --- | --- |
+| Off, run 1 | 258.0 / 262.2 ms | 260.0 / 273.6 ms | 6.5 / 13.5 ms | 1,210 |
+| On, run 1 | 256.8 / 260.2 ms | 258.5 / 263.0 ms | 5.0 / 8.8 ms | 1,202 |
+| Off, run 2 | 255.5 / 259.4 ms | 256.4 / 260.4 ms | 3.9 / 7.6 ms | 1,202 |
+| On, run 2 | 255.7 / 258.5 ms | 257.1 / 260.4 ms | 4.1 / 6.6 ms | 1,203 |
+
+Writes are the 250 ms log window either way, searches are within noise, and the store requests are the same. The full
+shell, testkit (including the REST spec coverage and compatibility tests and the multi-process tests) and auth suites
+pass with it on. Two breaker tests that check a whole batch is refused at the indexing budget pin it off, since a
+streamed batch waits instead. A handler wrapper that does not pass on `supportsStreaming`, as an auth plugin's may not,
+gets the body whole and the batch is applied whole.
