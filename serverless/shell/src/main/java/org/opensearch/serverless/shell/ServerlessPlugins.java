@@ -23,6 +23,7 @@ import org.opensearch.rest.RestHeaderDefinition;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.UnaryOperator;
 
@@ -60,7 +61,7 @@ public final class ServerlessPlugins {
     private final List<Plugin> plugins;
     private final List<Object> components = new ArrayList<>();
     /** What each plugin built, by plugin: an action's constructor is resolved against its own plugin's only. */
-    private final java.util.Map<Plugin, List<Object>> componentsByPlugin = new java.util.LinkedHashMap<>();
+    private final Map<Plugin, List<Object>> componentsByPlugin = new java.util.LinkedHashMap<>();
 
     /**
      * Holds the plugins a node was given.
@@ -91,7 +92,7 @@ public final class ServerlessPlugins {
      * @return the components
      */
     public List<Object> components() {
-        return List.copyOf(components);
+        return java.util.Collections.unmodifiableList(new ArrayList<>(components));
     }
 
     /**
@@ -117,23 +118,62 @@ public final class ServerlessPlugins {
      * @throws Exception if any plugin fails to start
      */
     public void createComponents(ServerlessNode node, org.opensearch.env.Environment environment) throws Exception {
+        // The registry core passes since plugins began looking up each other's components, so a plugin that
+        // overrides only that overload -- index management does -- is called at all. The plain overload is its
+        // default, so a plugin overriding that one is reached through it.
+        final org.opensearch.plugins.DefaultPluginComponentRegistry registry = new org.opensearch.plugins.DefaultPluginComponentRegistry();
         for (Plugin plugin : plugins) {
-            final java.util.Collection<Object> built = plugin.createComponents(
-                node.services().client(),
-                node.clusterService(),
-                node.threadPool(),
-                node.services().resourceWatcherService(),
-                node.services().scriptService(),
-                node.services().searchXContentRegistry(),
-                environment,
-                node.nodeEnvironment(),
-                node.services().namedWriteableRegistry(),
-                node.services().indexNameExpressionResolver(),
-                () -> null                              // RepositoriesService: snapshots use the shell's own store
+            final List<Object> built = new ArrayList<>(
+                plugin.createComponents(
+                    node.nodeClient,
+                    node.clusterService(),
+                    node.threadPool(),
+                    node.services().resourceWatcherService(),
+                    node.services().scriptService(),
+                    node.services().searchXContentRegistry(),
+                    environment,
+                    node.nodeEnvironment(),
+                    node.services().namedWriteableRegistry(),
+                    node.services().indexNameExpressionResolver(),
+                    () -> null,                         // RepositoriesService: snapshots use the shell's own store
+                    registry
+                )
             );
-            components.addAll(built);
-            componentsByPlugin.put(plugin, List.copyOf(built));
-            logger.info("started plugin {}", plugin.getClass().getName());
+            for (Object component : built) {
+                if (component != null) {
+                    registry.register(component);
+                }
+            }
+            componentsByPlugin.put(plugin, built);
+        }
+        registry.seal();
+        // Then the telemetry-aware overload, as core calls it: a second pass over the plugins implementing it,
+        // with no-op telemetry, which is what a classic node without a telemetry plugin hands them too.
+        for (Plugin plugin : plugins) {
+            if (plugin instanceof org.opensearch.plugins.TelemetryAwarePlugin telemetryAware) {
+                final java.util.Collection<Object> built = telemetryAware.createComponents(
+                    node.nodeClient,
+                    node.clusterService(),
+                    node.threadPool(),
+                    node.services().resourceWatcherService(),
+                    node.services().scriptService(),
+                    node.services().searchXContentRegistry(),
+                    environment,
+                    node.nodeEnvironment(),
+                    node.services().namedWriteableRegistry(),
+                    node.services().indexNameExpressionResolver(),
+                    () -> null,
+                    org.opensearch.telemetry.tracing.noop.NoopTracer.INSTANCE,
+                    org.opensearch.telemetry.metrics.noop.NoopMetricsRegistry.INSTANCE
+                );
+                componentsByPlugin.computeIfAbsent(plugin, p -> new ArrayList<>()).addAll(built);
+            }
+        }
+        for (Map.Entry<Plugin, List<Object>> entry : componentsByPlugin.entrySet()) {
+            components.addAll(entry.getValue());
+            // Not List.copyOf: some plugins return a null among their components, which core's node tolerates.
+            entry.setValue(java.util.Collections.unmodifiableList(entry.getValue()));
+            logger.info("started plugin {}", entry.getKey().getClass().getName());
         }
     }
 
@@ -162,9 +202,20 @@ public final class ServerlessPlugins {
      * @param settings the node settings
      * @param controller the REST controller
      * @param clusterSettings the cluster settings
+     * @param indexScopedSettings the index settings this node validates against, plugins' own included
+     * @param resolver the resolver plugins are given, which refuses rather than answering from a partial view;
+     *     a plugin that only stores it to call later starts, which is what a null here prevented
+     * @param nodesInCluster the members this node currently knows
      * @return the handlers to register
      */
-    public List<RestHandler> restHandlers(Settings settings, RestController controller, ClusterSettings clusterSettings) {
+    public List<RestHandler> restHandlers(
+        Settings settings,
+        RestController controller,
+        ClusterSettings clusterSettings,
+        IndexScopedSettings indexScopedSettings,
+        org.opensearch.cluster.metadata.IndexNameExpressionResolver resolver,
+        java.util.function.Supplier<org.opensearch.cluster.node.DiscoveryNodes> nodesInCluster
+    ) {
         final List<RestHandler> handlers = new ArrayList<>();
         for (Plugin plugin : plugins) {
             if (plugin instanceof ActionPlugin actionPlugin) {
@@ -173,10 +224,10 @@ public final class ServerlessPlugins {
                         settings,
                         controller,
                         clusterSettings,
-                        IndexScopedSettings.DEFAULT_SCOPED_SETTINGS,
+                        indexScopedSettings,
                         new SettingsFilter(List.of()),
-                        null,
-                        () -> null
+                        resolver,
+                        nodesInCluster
                     )
                 );
             }
@@ -369,6 +420,90 @@ public final class ServerlessPlugins {
             }
         }
         return patterns;
+    }
+
+    /**
+     * Whether the settings and thread pools plugins declare are registered: on by default.
+     *
+     * <p>Off is the old behaviour, kept as a switch for one release: a plugin that declares a setting it
+     * listens to, or a pool it submits to, fails to start with it off -- Job Scheduler on its sweeper
+     * period, k-NN and ML Commons on their pools. With no plugin installed the two are identical.
+     */
+    public static final String EXTENSIONS = "serverless.plugin_extensions.enabled";
+
+    private static boolean extensions(Settings settings) {
+        return settings.getAsBoolean(EXTENSIONS, true);
+    }
+
+    /**
+     * Core's cluster-scoped settings plus every node-scoped setting a plugin declares.
+     *
+     * <p>Core's {@code SettingsModule} does this on a classic node. Without it a plugin that registers an
+     * update consumer for its own setting -- which is how most of them read a dynamic setting -- fails in
+     * {@code createComponents} with "Setting is not registered", and a value for it in the node's settings
+     * or in {@code PUT /_cluster/settings} is refused as unknown.
+     *
+     * @param settings the node settings, which carry {@link #EXTENSIONS}
+     * @return the settings a node's {@code ClusterSettings} knows
+     */
+    public java.util.Set<org.opensearch.common.settings.Setting<?>> clusterSettings(Settings settings) {
+        final java.util.Set<org.opensearch.common.settings.Setting<?>> known = new java.util.HashSet<>(
+            ClusterSettings.BUILT_IN_CLUSTER_SETTINGS
+        );
+        if (extensions(settings) == false) {
+            return known;
+        }
+        for (Plugin plugin : plugins) {
+            for (org.opensearch.common.settings.Setting<?> setting : plugin.getSettings()) {
+                if (setting.hasNodeScope()) {
+                    known.add(setting);
+                }
+            }
+        }
+        return known;
+    }
+
+    /**
+     * Every index-scoped setting a plugin declares, such as k-NN's {@code index.knn}.
+     *
+     * @param settings the node settings, which carry {@link #EXTENSIONS}
+     * @return the settings
+     */
+    public List<org.opensearch.common.settings.Setting<?>> indexSettings(Settings settings) {
+        final List<org.opensearch.common.settings.Setting<?>> known = new ArrayList<>();
+        if (extensions(settings) == false) {
+            return known;
+        }
+        for (Plugin plugin : plugins) {
+            for (org.opensearch.common.settings.Setting<?> setting : plugin.getSettings()) {
+                if (setting.hasIndexScope()) {
+                    known.add(setting);
+                }
+            }
+        }
+        return known;
+    }
+
+    /**
+     * The thread pools the plugins ask for.
+     *
+     * <p>A plugin looks its pool up by name with {@code ThreadPool#executor}, which throws for a name the
+     * pool was not built with. Core builds them from {@code getExecutorBuilders} on a classic node; the shell
+     * built only its own. A pool's threads start on first use, so a declared pool nobody submits to costs
+     * nothing.
+     *
+     * @param settings the node settings, which carry {@link #EXTENSIONS}
+     * @return their executor builders, in load order
+     */
+    public List<org.opensearch.threadpool.ExecutorBuilder<?>> executorBuilders(Settings settings) {
+        final List<org.opensearch.threadpool.ExecutorBuilder<?>> builders = new ArrayList<>();
+        if (extensions(settings) == false) {
+            return builders;
+        }
+        for (Plugin plugin : plugins) {
+            builders.addAll(plugin.getExecutorBuilders(settings));
+        }
+        return builders;
     }
 
     /**

@@ -73,63 +73,68 @@ public final class NodeThreadPools {
     public static final String FORWARDED_READ_POOL = "serverless_forwarded_read";
 
     /**
-     * Builds a node's thread pool: core's pools and this node's own.
+     * Builds a node's thread pool: core's pools, this node's own, and the ones its plugins declare.
      *
      * @param settings the node settings
+     * @param fromPlugins the executor builders the plugins declare; a name clashing with a pool already
+     *     built is refused by {@code ThreadPool} itself, as on a classic node
      * @return the thread pool
      */
-    static ThreadPool build(Settings settings) {
+    static ThreadPool build(Settings settings, java.util.List<org.opensearch.threadpool.ExecutorBuilder<?>> fromPlugins) {
         final int processors = org.opensearch.common.util.concurrent.OpenSearchExecutors.allocatedProcessors(settings);
-        return new ThreadPool(
-            settings,
-            new org.opensearch.threadpool.ScalingExecutorBuilder(
-                FANOUT_POOL,
-                1,
-                Math.max(8, 4 * processors),
-                org.opensearch.common.unit.TimeValue.timeValueSeconds(30)
-            ),
-            // Queued like WRITE, whose work it takes over for requests that were forwarded; sized for waiting on the log
-            // rather than for CPU, as the pool below is, unless that is switched off (see WritePools).
-            new org.opensearch.threadpool.FixedExecutorBuilder(
-                settings,
-                FORWARDED_WRITE_POOL,
-                WritePools.threads(settings),
-                10_000,
-                "thread_pool." + FORWARDED_WRITE_POOL
-            ),
-            new org.opensearch.threadpool.FixedExecutorBuilder(
-                settings,
-                WritePools.POOL,
-                WritePools.threads(settings),
-                10_000,
-                "thread_pool." + WritePools.POOL
-            ),
-            new org.opensearch.threadpool.FixedExecutorBuilder(settings, LEASE_POOL, 1, 16, "thread_pool." + LEASE_POOL),
-            // Sized past the default activation concurrency, which is what bounds how many are submitted at once;
-            // the queue only absorbs a concurrency raised beyond the pool.
-            // Twice the activations allowed at once, and never fewer than sixteen: an activation can wait on another's
-            // single-flight while holding a thread.
-            new org.opensearch.threadpool.FixedExecutorBuilder(settings, PUBLISH_POOL, 8, 100_000, "thread_pool." + PUBLISH_POOL),
-            new org.opensearch.threadpool.FixedExecutorBuilder(
-                settings,
-                ACTIVATION_POOL,
-                Math.max(
-                    16,
-                    2 * settings.getAsInt(
-                        ACTIVATION_CONCURRENCY_SETTING,
-                        org.opensearch.serverless.reconcile.BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY
-                    )
+        final java.util.List<org.opensearch.threadpool.ExecutorBuilder<?>> builders = new java.util.ArrayList<>(fromPlugins);
+        builders.addAll(
+            java.util.List.of(
+                new org.opensearch.threadpool.ScalingExecutorBuilder(
+                    FANOUT_POOL,
+                    1,
+                    Math.max(8, 4 * processors),
+                    org.opensearch.common.unit.TimeValue.timeValueSeconds(30)
                 ),
-                1000,
-                "thread_pool." + ACTIVATION_POOL
-            ),
-            new org.opensearch.threadpool.FixedExecutorBuilder(
-                settings,
-                FORWARDED_READ_POOL,
-                Math.max(4, processors),
-                1_000,
-                "thread_pool." + FORWARDED_READ_POOL
+                // Queued like WRITE, whose work it takes over for requests that were forwarded; sized for waiting on the log
+                // rather than for CPU, as the pool below is, unless that is switched off (see WritePools).
+                new org.opensearch.threadpool.FixedExecutorBuilder(
+                    settings,
+                    FORWARDED_WRITE_POOL,
+                    WritePools.threads(settings),
+                    10_000,
+                    "thread_pool." + FORWARDED_WRITE_POOL
+                ),
+                new org.opensearch.threadpool.FixedExecutorBuilder(
+                    settings,
+                    WritePools.POOL,
+                    WritePools.threads(settings),
+                    10_000,
+                    "thread_pool." + WritePools.POOL
+                ),
+                new org.opensearch.threadpool.FixedExecutorBuilder(settings, LEASE_POOL, 1, 16, "thread_pool." + LEASE_POOL),
+                // Sized past the default activation concurrency, which is what bounds how many are submitted at once;
+                // the queue only absorbs a concurrency raised beyond the pool.
+                // Twice the activations allowed at once, and never fewer than sixteen: an activation can wait on another's
+                // single-flight while holding a thread.
+                new org.opensearch.threadpool.FixedExecutorBuilder(settings, PUBLISH_POOL, 8, 100_000, "thread_pool." + PUBLISH_POOL),
+                new org.opensearch.threadpool.FixedExecutorBuilder(
+                    settings,
+                    ACTIVATION_POOL,
+                    Math.max(
+                        16,
+                        2 * settings.getAsInt(
+                            ACTIVATION_CONCURRENCY_SETTING,
+                            org.opensearch.serverless.reconcile.BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY
+                        )
+                    ),
+                    1000,
+                    "thread_pool." + ACTIVATION_POOL
+                ),
+                new org.opensearch.threadpool.FixedExecutorBuilder(
+                    settings,
+                    FORWARDED_READ_POOL,
+                    Math.max(4, processors),
+                    1_000,
+                    "thread_pool." + FORWARDED_READ_POOL
+                )
             )
         );
+        return new ThreadPool(settings, builders.toArray(new org.opensearch.threadpool.ExecutorBuilder<?>[0]));
     }
 }

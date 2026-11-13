@@ -68,7 +68,14 @@ final class NodeWiring {
         // RestController refuses a duplicate path rather than replacing it, and refusing loudly at boot
         // is the right answer -- a plugin that silently replaced the write path would be a system whose
         // behaviour depends on registration order.
-        for (org.opensearch.rest.RestHandler handler : node.plugins.restHandlers(node.settings, controller, clusterSettings)) {
+        for (org.opensearch.rest.RestHandler handler : node.plugins.restHandlers(
+            node.settings,
+            controller,
+            clusterSettings,
+            node.services.indexScopedSettings(),
+            node.services.indexNameExpressionResolver(),
+            () -> node.clusterService().state().nodes()
+        )) {
             controller.registerHandler(handler);
         }
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SearchHandler(() -> node, () -> node.metadataPlane)));
@@ -246,7 +253,25 @@ final class NodeWiring {
             node.services().namedWriteableRegistry(),
             node.services().indexNameExpressionResolver(),
             node.services().circuitBreakerService(),
-            node.indicesService
+            node.indicesService,
+            // What a classic node's injector also hands a transport action and plugins ask for by type: index
+            // management takes the NodeClient, query insights and others the services below.
+            node.nodeClient,
+            node.searchService,
+            node.services().scriptService(),
+            node.services().searchXContentRegistry(),
+            node.services().resourceWatcherService(),
+            node.services().bigArrays(),
+            node.services().identityService(),
+            node.clusterService.getClusterSettings(),
+            node.services.indexScopedSettings(),
+            node.nodeEnvironment,
+            node.pluginsService,
+            node.indicesService.getAnalysis(),
+            // Index management validates replica counts against zone awareness with it; core builds it from
+            // the same two arguments in ClusterModule.
+            new org.opensearch.cluster.routing.allocation.AwarenessReplicaBalance(node.settings, node.clusterService.getClusterSettings()),
+            new org.opensearch.env.Environment(node.settings, null)
         );
         // Each action's constructor is resolved against the node's services and the components *its own*
         // plugin built -- never another plugin's. The aggregate list used to be offered to every action,

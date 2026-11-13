@@ -218,15 +218,6 @@ public final class NodeStartup {
         });
         node.started = true;
 
-        // Last, and after `started`, because a plugin's createComponents may use the client -- which
-        // refuses to work on a node that has not started. Everything a plugin can reach now exists.
-        try {
-            node.plugins.createComponents(node, new org.opensearch.env.Environment(node.settings, null));
-        } catch (Exception e) {
-            node.started = false;
-            throw new IllegalStateException("a plugin failed to start; the node will not serve", e);
-        }
-
         // After createComponents, because a plugin's action almost always takes one of its own components,
         // and before onNodeStarted, because a plugin told the node is up may immediately call its own
         // action.

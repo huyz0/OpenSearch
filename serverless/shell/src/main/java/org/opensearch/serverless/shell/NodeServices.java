@@ -166,6 +166,15 @@ public final class NodeServices implements Closeable {
         return builders.buildNetworkModule(clusterSettings, restController);
     }
 
+    /**
+     * The index settings this node validates against, including those its plugins declare.
+     *
+     * @return the settings
+     */
+    org.opensearch.common.settings.IndexScopedSettings indexScopedSettings() {
+        return builders.indexScopedSettings();
+    }
+
     volatile org.opensearch.search.SearchModule searchModule;
 
     /**
