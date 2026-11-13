@@ -293,3 +293,29 @@ tasks.register('throughputTest', Test) {
   }
   outputs.upToDateWhen { false }
 }
+
+/*
+ * What large documents (wiki pages, text from PDF and Word files) do to the write path next to small ones
+ * (LargeDocumentMeterTests): acknowledgement latency by size, node-log blob sizes and PUTs, publishes, heap and
+ * allocation per byte, translog on disk. A measurement, not part of check:
+ *
+ *   ./gradlew :serverless:testkit:largeDocTest -Dtests.bigdoc.seconds=60 -Dtests.bigdoc.mixes=1k,64k,1m,4m,pages \
+ *       -Dtests.bigdoc.rates=200,50,10,3,100 [-Dtests.bigdoc.mbps=80] [-Dtests.bigdoc.settings=k=v,...]
+ */
+tasks.register('largeDocTest', Test) {
+  testClassesDirs = sourceSets.test.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath
+  include '**/LargeDocumentMeterTests.class'
+  systemProperty 'opensearch.path.conf', 'config'
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'opensearch.set.netty.runtime.available.processors', 'false'
+  jvmArgumentProviders.add({ ['-Xmx' + System.getProperty('tests.bigdoc.heap', '4g'), '-Xms1g'] } as CommandLineArgumentProvider)
+  systemProperty 'tests.timeoutSuite', '86400000!'
+  systemProperty 'tests.timeout', '86400000!'
+  System.getProperties().each { key, value ->
+    if (key.toString().startsWith('tests.bigdoc.') || key.toString().startsWith('tests.serverless.')) {
+      systemProperty key.toString(), value.toString()
+    }
+  }
+  outputs.upToDateWhen { false }
+}
