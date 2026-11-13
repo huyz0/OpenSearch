@@ -36,7 +36,12 @@ public class CommitPushTests extends OpenSearchTestCase {
     }
 
     private Settings nodeSettings(String name, String roles, boolean push, long inlineBytes) {
+        return nodeSettings(name, roles, push, inlineBytes, "zone-a");
+    }
+
+    private Settings nodeSettings(String name, String roles, boolean push, long inlineBytes, String zone) {
         return Settings.builder()
+            .put("node.attr.zone", zone)
             .put("node.name", name)
             .put("cluster.name", "serverless-commit-push")
             .put("path.home", createTempDir())
@@ -63,13 +68,20 @@ public class CommitPushTests extends OpenSearchTestCase {
     }
 
     private void run(boolean push, long inlineBytes) throws Exception {
+        run(push, inlineBytes, false);
+    }
+
+    private void run(boolean push, long inlineBytes, boolean readerInAnotherZone) throws Exception {
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("pushed", "uuid-pushed-00000000", 1, MAPPING, null));
             try (
                 ServerlessNode writer = joined(new ServerlessNode(nodeSettings("push-writer", "ingest", push, inlineBytes)), plane);
-                ServerlessNode reader = joined(new ServerlessNode(nodeSettings("push-reader", "search", push, inlineBytes)), plane)
+                ServerlessNode reader = joined(
+                    new ServerlessNode(nodeSettings("push-reader", "search", push, inlineBytes, readerInAnotherZone ? "zone-b" : "zone-a")),
+                    plane
+                )
             ) {
                 // The writer ranks readers from its membership snapshot, which a running node refreshes every renewal.
                 plane.membership().refresh();
@@ -79,6 +91,19 @@ public class CommitPushTests extends OpenSearchTestCase {
                 writer.shards().publishShard(shardId, term);
                 final ShardId onReader = reader.readers().serveAsReader(plane, "pushed", 0);
                 assertEquals(1L, ShardOps.hits(reader.searchService(), onReader, "msg", "first"));
+                if (push) {
+                    // One push for the reader to say it has the shard open: blocks go only to readers that did.
+                    final CommitManifest opened = reader.reconciler().readerCommit(onReader).orElseThrow();
+                    final long sentBefore = writer.router().commitPush().counts()[0];
+                    writer.writes().index(shardId, "a2", "{\"msg\":\"warm\"}");
+                    writer.shards().publishShard(shardId, term);
+                    assertBusy(() -> {
+                        assertEquals(sentBefore + 1, writer.router().commitPush().counts()[0]);
+                        final var now = reader.reconciler().readerCommit(onReader);
+                        assertTrue("the reader is open again", now.isPresent());
+                        assertNotEquals(opened.files(), now.get().files());
+                    }, 10, TimeUnit.SECONDS);
+                }
                 final CommitManifest before = reader.reconciler().readerCommit(onReader).orElseThrow();
 
                 writer.writes().index(shardId, "b", "{\"msg\":\"second\"}");
@@ -108,14 +133,14 @@ public class CommitPushTests extends OpenSearchTestCase {
                     }
                     assertBusy(() -> assertEquals(1L, writer.router().commitPush().counts()[0] - writerBefore[0]));
                     final long taken = reader.router().commitPush().counts()[5] - readerBefore[5];
-                    if (inlineBytes > 0) {
+                    if (inlineBytes > 0 && readerInAnotherZone == false) {
                         // The new segment came with the push: the reopen and the search read no segment block from the store.
                         assertTrue("the push carried the new segment's blocks", taken > 0);
                         assertEquals("no segment block read from the store: " + store.byPlace(), 0L, store.blobReads());
                         // The writer's mapping is the one the reader already serves with: no descriptor read either.
-                        assertEquals("the reopen reused the served descriptor", 1L, reader.readers().descriptorReadsSkipped());
+                        assertEquals("the reopens reused the served descriptor", 2L, reader.readers().descriptorReadsSkipped());
                     } else {
-                        assertEquals("nothing carried with inlining off", 0L, taken);
+                        assertEquals("nothing carried with inlining off or across zones", 0L, taken);
                         assertTrue("the reopen read the new segment from the store", store.blobReads() > 0);
                     }
                 } else {
@@ -142,6 +167,10 @@ public class CommitPushTests extends OpenSearchTestCase {
 
     public void testWithInliningOffTheReaderReadsTheNewSegmentFromTheStore() throws Exception {
         run(true, 0);
+    }
+
+    public void testAReaderInAnotherZoneIsSentTheCommitAlone() throws Exception {
+        run(true, CommitPush.DEFAULT_INLINE_BYTES, true);
     }
 
     public void testWithoutPushTheReaderStaysUntilItsRegisterLook() throws Exception {
