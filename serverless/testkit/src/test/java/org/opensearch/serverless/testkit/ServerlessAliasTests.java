@@ -211,7 +211,6 @@ public class ServerlessAliasTests extends OpenSearchTestCase {
                 { "routing", "{\"routing\":\"7\"}" },
                 { "index_routing", "{\"index_routing\":\"7\"}" },
                 { "search_routing", "{\"search_routing\":\"7\"}" },
-                { "is_write_index", "{\"is_write_index\":true}" },
                 { "is_hidden", "{\"is_hidden\":true}" }, };
 
             for (String[] each : refused) {

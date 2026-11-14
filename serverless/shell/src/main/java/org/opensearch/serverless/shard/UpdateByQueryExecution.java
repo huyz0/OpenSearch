@@ -19,12 +19,12 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Update-by-query over the same frozen walk delete-by-query uses: each matched document is updated in place, by the request's
- * script or unchanged when it has none, conditional on the sequence identity the view saw.
+ * Update-by-query over the same walk delete-by-query uses: each matched document is updated in place, by the request's
+ * script or unchanged when it has none, conditional on the sequence identity the page saw.
  *
  * <p>Plugins use it on their own indices -- the anomaly-detection plugin marks its old tasks as no longer the latest before
  * starting a detector. The script runs as an update's script does (core's update-by-query uses the same script context), so
- * {@code ctx._source} is the document and {@code ctx.op = "noop"} leaves it alone. A document changed after the view was taken
+ * {@code ctx._source} is the document and {@code ctx.op = "noop"} leaves it alone. A document changed after its page was read
  * is a version conflict, counted, and stops the operation unless conflicts are to proceed, as in core.
  */
 final class UpdateByQueryExecution {

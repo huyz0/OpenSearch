@@ -265,9 +265,12 @@ public final class AliasHandler extends BaseRestHandler {
         // write-index flag used to be read into the body map and never looked at again, so a filtered
         // alias was created unfiltered with {"acknowledged": true} -- and the index-scoped spelling never
         // parsed its body at all.
+        Boolean writeFlag = null;
         if ((method == RestRequest.Method.PUT || method == RestRequest.Method.POST) && bulk == false && request.hasContentOrSourceParam()) {
             try (XContentParser parser = request.contentOrSourceParamParser()) {
-                final String option = unsupportedAliasOption(parser.map());
+                final var body = parser.map();
+                writeFlag = writeIndexFlag(body);
+                final String option = unsupportedAliasOption(body);
                 if (option != null) {
                     return channel -> channel.sendResponse(
                         IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_alias_option", option)
@@ -275,6 +278,7 @@ public final class AliasHandler extends BaseRestHandler {
                 }
             }
         }
+        final Boolean isWriteIndex = writeFlag;
         if ((method == RestRequest.Method.PUT || method == RestRequest.Method.POST) && indexParam == null && bulk == false) {
             if (request.hasContentOrSourceParam() == false) {
                 return channel -> channel.sendResponse(
@@ -344,10 +348,11 @@ public final class AliasHandler extends BaseRestHandler {
                     method,
                     selectedIndices.isEmpty() ? null : String.join(",", selectedIndices),
                     selected.aliases()[0],
-                    selectedIndices
+                    selectedIndices,
+                    null
                 );
             } else {
-                updates.dispatch(buffered, metadata, method, indexParam, aliasName, indices);
+                updates.dispatch(buffered, metadata, method, indexParam, aliasName, indices, isWriteIndex);
             }
         });
     }
@@ -386,18 +391,24 @@ public final class AliasHandler extends BaseRestHandler {
      *
      * <p>An alias here is a name for a set of indices and nothing else. A filter would make a search
      * through the alias narrower than a search of its indices, routing would place documents by a value
-     * this system does not route on, and is_write_index would make one of several indices the target of a
-     * write through the alias -- each a promise that would be accepted and not kept.
+     * this system does not route on -- each a promise that would be accepted and not kept. {@code is_write_index} is
+     * honoured: it marks the member writes through the alias go to.
      */
+    /**
+     * The {@code is_write_index} a body carries: true marks the index as the one writes through the alias go to, false
+     * unmarks it, absent leaves the alias as it is.
+     */
+    static Boolean writeIndexFlag(java.util.Map<?, ?> body) {
+        final Object flag = body.get("is_write_index");
+        return flag == null ? null : Boolean.valueOf(String.valueOf(flag));
+    }
+
     static String unsupportedAliasOption(java.util.Map<?, ?> body) {
         if (body.get("filter") != null) {
             return "filter is not supported: an alias here names indices and does not narrow them";
         }
         if (body.get("routing") != null || body.get("index_routing") != null || body.get("search_routing") != null) {
             return "routing on an alias is not supported: a document is placed by its id alone";
-        }
-        if (Boolean.TRUE.equals(body.get("is_write_index"))) {
-            return "is_write_index is not supported: writes here name an index, and an alias resolves on read";
         }
         if (Boolean.TRUE.equals(body.get("is_hidden"))) {
             return "is_hidden is not supported: aliases are found by name and never listed, so there is nothing to hide from";

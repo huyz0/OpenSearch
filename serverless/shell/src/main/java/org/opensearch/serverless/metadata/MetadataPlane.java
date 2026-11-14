@@ -280,11 +280,11 @@ public final class MetadataPlane {
     }
 
     /**
-     * Resolves the name a write is addressed to: an index by name, or a data stream's newest backing index.
+     * Resolves the name a write is addressed to: an index by name, a data stream's newest backing index, or the index a
+     * plain alias writes to -- its {@code is_write_index} member, or its only index -- as core resolves it.
      *
-     * <p>A plain alias is not written through: an alias here names indices for reading, and which of
-     * several a write should land in is the question a data stream's generation answers and an alias does
-     * not.
+     * <p>An alias naming several indices and marking none is not written through, as in core: which of them a write
+     * should land in is not something the alias says.
      *
      * @param name the name
      * @return the target, or empty when the name is neither an index nor a data stream
@@ -299,6 +299,11 @@ public final class MetadataPlane {
             // The backing index through the same cache: it was a second descriptor read on every write to
             // a data stream, and the uuid check where the write lands covers it exactly as it covers a name.
             return describeForRouting(resolved.alias().writeIndex()).map(backing -> new WriteTarget(backing, resolved.alias()));
+        }
+        if (resolved.alias() != null && resolved.alias().writesTo() != null) {
+            // The member through the same cache a data stream's backing index is read through: one more descriptor
+            // read the first time, none after, and the uuid check where the write lands covers it as it covers a name.
+            return describeForRouting(resolved.alias().writesTo()).map(member -> new WriteTarget(member, null));
         }
         return Optional.empty();
     }

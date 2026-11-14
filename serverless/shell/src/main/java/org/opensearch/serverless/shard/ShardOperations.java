@@ -417,23 +417,14 @@ public final class ShardOperations {
     /**
      * Deletes every document a query matches.
      *
-     * <p><b>Evaluated against a frozen view, not live state.</b> The set of documents to delete is decided
-     * once, against the last published commit as of when the operation starts — the same point-in-time
-     * mechanism {@code search_after} paging uses, and for the same reason: a query re-evaluated against a
-     * moving index could match a document twice, or never, depending on when a write happened to land
-     * relative to which page was being read. A write acknowledged after the operation starts, published or
-     * not, is not touched by it — the same boundary a plain search_after export of matching ids would have.
+     * <p><b>Matched as a search sees the index when it starts.</b> As core matches against what each shard had refreshed
+     * when the operation began, each shard's highest visible sequence number is read first and the shard is paged in
+     * sequence-number order up to it: a document refreshed by then is matched whether or not it was published, a document
+     * written or changed after it is not, and a page never sees a document twice or skips one while the shard changes. Each
+     * page is one shard's search, answered where the shard is written, so this needs no point in time and no register writes.
      *
-     * <p><b>Walked one shard at a time, sorted by {@code _doc}</b> — native Lucene document order, always
-     * available with no fielddata, and exhaustive within one shard's frozen reader — rather than through
-     * the cross-shard {@code search_after} merge a multi-index search uses. That merge exists to produce
-     * one globally ordered page across shards, which needs a sort whose values are comparable across
-     * shards; this needs only that every match is visited exactly once, which a per-shard order already
-     * gives without needing to be meaningful across shards at all.
-     *
-     * <p><b>Deletes go to live state, not the frozen view.</b> Matching is frozen; deleting is not — each
-     * matched id is removed through the ordinary write path, conditional on the sequence identity the
-     * frozen view saw. A document rewritten since that view is a version conflict and is left alone.
+     * <p><b>Deletes go through the ordinary write path</b>, each conditional on the sequence identity its page saw. A
+     * document rewritten since is a version conflict and is left alone.
      *
      * <p><b>Gated once, under {@code indices:data/write/delete/byquery}</b>, not once per document under
      * {@code indices:data/write/delete} — the same reasoning {@code BulkHandler} gives for gating a whole
@@ -446,7 +437,7 @@ public final class ShardOperations {
      * @param refresh whether to make the deletions visible to search before returning
      * @return how many matched and how many were removed
      * @throws NoSuchIndexException if the index does not exist
-     * @throws IOException if the query, a delete, or the point-in-time machinery fails
+     * @throws IOException if the query or a delete fails
      */
     public DeleteByQueryOutcome deleteByQuery(String index, org.opensearch.index.query.QueryBuilder query, long maxDocs, boolean refresh)
         throws IOException {
@@ -454,10 +445,10 @@ public final class ShardOperations {
     }
 
     /**
-     * Deletes every document a query matches, leaving alone any that changed after the query was frozen.
+     * Deletes every document a query matches, leaving alone any that changed after it was read.
      *
-     * <p>Each delete is conditional on the sequence number the frozen view saw, so a document rewritten
-     * between the view and the delete is a version conflict rather than a silent loss of the rewrite --
+     * <p>Each delete is conditional on the sequence number its page saw, so a document rewritten
+     * between the read and the delete is a version conflict rather than a silent loss of the rewrite --
      * which is what core's {@code conflicts=abort} and {@code conflicts=proceed} are about.
      *
      * @param index the index
@@ -467,7 +458,7 @@ public final class ShardOperations {
      * @param abortOnConflict whether the first conflict stops the operation, as core does by default
      * @return the outcome
      * @throws NoSuchIndexException if the index does not exist
-     * @throws IOException if the query, a delete, or the point-in-time machinery fails
+     * @throws IOException if the query or a delete fails
      */
     public DeleteByQueryOutcome deleteByQuery(
         String index,

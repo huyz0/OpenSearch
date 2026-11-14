@@ -51,6 +51,7 @@ public final class AliasRecord {
     private final long mutationUntil;
     private final boolean creating;
     private final List<String> additions;
+    private final String writeMember;
 
     /**
      * Creates an alias.
@@ -76,7 +77,7 @@ public final class AliasRecord {
      * @param timestampField the data stream's timestamp field, null for an alias
      */
     public AliasRecord(String name, List<String> indices, boolean dataStream, long generation, String timestampField) {
-        this(name, indices, dataStream, generation, timestampField, 0L, false, List.of());
+        this(name, indices, dataStream, generation, timestampField, 0L, false, List.of(), null);
     }
 
     private AliasRecord(
@@ -87,7 +88,8 @@ public final class AliasRecord {
         String timestampField,
         long mutationUntil,
         boolean creating,
-        List<String> additions
+        List<String> additions,
+        String writeMember
     ) {
         this.name = name;
         this.indices = List.copyOf(indices);
@@ -97,6 +99,40 @@ public final class AliasRecord {
         this.mutationUntil = mutationUntil;
         this.creating = creating;
         this.additions = List.copyOf(additions);
+        this.writeMember = dataStream || writeMember == null || indices.contains(writeMember) == false ? null : writeMember;
+    }
+
+    /**
+     * Returns the same alias with a member marked as the index writes through it go to, as core's {@code is_write_index}.
+     *
+     * @param member a member of the alias, or null for none
+     * @return the record
+     * @throws IllegalArgumentException if the member is not one of the alias's indices, or this is a data stream
+     */
+    public AliasRecord withWriteMember(String member) {
+        if (member != null && (dataStream || indices.contains(member) == false)) {
+            throw new IllegalArgumentException("[" + member + "] is not an index of alias [" + name + "]");
+        }
+        return new AliasRecord(name, indices, dataStream, generation, timestampField, mutationUntil, creating, additions, member);
+    }
+
+    /**
+     * Returns the same record naming different indices, keeping a data stream's fields and the write member while it remains.
+     *
+     * @param members the indices it should name
+     * @return the record
+     */
+    public AliasRecord withMembers(List<String> members) {
+        return new AliasRecord(name, members, dataStream, generation, timestampField, 0L, false, List.of(), writeMember);
+    }
+
+    /**
+     * Returns the member explicitly marked as the write index of a plain alias.
+     *
+     * @return the member, or null when none is marked
+     */
+    public String writeMember() {
+        return writeMember;
     }
 
     /** Whether a mutation is preparing reverse hints before publishing membership. */
@@ -136,12 +172,12 @@ public final class AliasRecord {
         if (until <= 0L || mutationPending()) {
             throw new IllegalArgumentException("invalid alias mutation reservation");
         }
-        return new AliasRecord(name, indices, dataStream, generation, timestampField, until, creating, additions);
+        return new AliasRecord(name, indices, dataStream, generation, timestampField, until, creating, additions, writeMember);
     }
 
     /** Returns the last published fields without their temporary mutation reservation. */
     public AliasRecord published() {
-        return new AliasRecord(name, indices, dataStream, generation, timestampField);
+        return new AliasRecord(name, indices, dataStream, generation, timestampField, 0L, false, List.of(), writeMember);
     }
 
     /**
@@ -172,12 +208,27 @@ public final class AliasRecord {
     }
 
     /**
-     * Returns the index a write through this name goes to: the newest backing index of a data stream.
+     * Returns the index this name marks as its write index: the newest backing index of a data stream, or the member a plain
+     * alias marks with {@code is_write_index}.
      *
-     * @return the write index, or null for a plain alias, which is not written through
+     * @return the write index, or null for a plain alias that marks none
      */
     public String writeIndex() {
-        return dataStream ? indices.get(indices.size() - 1) : null;
+        return dataStream ? indices.get(indices.size() - 1) : writeMember;
+    }
+
+    /**
+     * Returns the index a write through this name goes to, as core sends it: the write index, or the only index of an alias
+     * that marks none.
+     *
+     * @return the index, or null when the alias names several indices and marks none, so a write through it is refused
+     */
+    public String writesTo() {
+        final String marked = writeIndex();
+        if (marked != null) {
+            return marked;
+        }
+        return indices.size() == 1 ? indices.get(0) : null;
     }
 
     /**
@@ -220,6 +271,10 @@ public final class AliasRecord {
                 builder.field("generation", generation);
                 builder.field("timestamp_field", timestampField);
             }
+            // Written only when a member is marked, so other alias records keep their bytes.
+            if (writeMember != null) {
+                builder.field("write_index", writeMember);
+            }
             if (mutationPending()) {
                 builder.startObject("mutation");
                 builder.field("until", mutationUntil);
@@ -261,7 +316,18 @@ public final class AliasRecord {
             final boolean dataStream = Boolean.TRUE.equals(body.get("data_stream"));
             final long generation = body.get("generation") instanceof Number n ? n.longValue() : 0L;
             final String timestampField = body.get("timestamp_field") == null ? null : String.valueOf(body.get("timestamp_field"));
-            final AliasRecord result = new AliasRecord(name.toString(), indices, dataStream, generation, timestampField);
+            final String writeMember = body.get("write_index") instanceof String marked ? marked : null;
+            final AliasRecord result = new AliasRecord(
+                name.toString(),
+                indices,
+                dataStream,
+                generation,
+                timestampField,
+                0L,
+                false,
+                List.of(),
+                writeMember
+            );
             if (body.containsKey("mutation") == false) {
                 return result;
             }
@@ -289,6 +355,6 @@ public final class AliasRecord {
 
     @Override
     public String toString() {
-        return "AliasRecord[" + name + " -> " + indices + "]";
+        return "AliasRecord[" + name + " -> " + indices + (writeMember == null ? "" : ", writes to " + writeMember) + "]";
     }
 }

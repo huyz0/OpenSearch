@@ -42,10 +42,19 @@ final class AliasSwap {
      * @param name the alias
      * @param indices the indices to add or remove
      * @param adding whether to add or remove
+     * @param isWriteIndex for an add, true to mark the index added as the write index, false to unmark it, null to leave it
      * @return a refusal to report, or null on success
      * @throws IOException if the store cannot be read or written
      */
-    static Refusal swap(MetadataPlane metadata, String name, List<String> indices, boolean adding) throws IOException {
+    static Refusal swap(MetadataPlane metadata, String name, List<String> indices, boolean adding, Boolean isWriteIndex)
+        throws IOException {
+        if (adding && Boolean.TRUE.equals(isWriteIndex) && indices.size() != 1) {
+            return new Refusal(
+                RestStatus.BAD_REQUEST,
+                "illegal_argument_exception",
+                "is_write_index marks one index; this request names " + indices.size()
+            );
+        }
         for (int attempt = 0; attempt < 4; attempt++) {
             final var resolved = metadata.resolveForAliasMutation(name);
             if (resolved.index() != null) {
@@ -69,18 +78,27 @@ final class AliasSwap {
                     now.remove(index);
                 }
             }
+            String writeMember = before == null ? null : before.writeMember();
+            if (adding && Boolean.TRUE.equals(isWriteIndex)) {
+                writeMember = indices.get(0);
+            } else if (adding && Boolean.FALSE.equals(isWriteIndex) && indices.contains(writeMember)) {
+                writeMember = null;
+            }
+            if (writeMember != null && now.contains(writeMember) == false) {
+                writeMember = null;
+            }
             if (before == null) {
                 if (adding == false) {
                     return new Refusal(RestStatus.NOT_FOUND, "aliases_not_found_exception", "aliases [" + name + "] missing");
                 }
                 try {
-                    metadata.createAlias(new AliasRecord(name, now));
+                    metadata.createAlias(new AliasRecord(name, now).withWriteMember(writeMember));
                     return null;
                 } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
                     continue; // somebody created it between the read and the write; re-read and merge
                 }
             }
-            if (now.equals(before.indices())) {
+            if (now.equals(before.indices()) && java.util.Objects.equals(writeMember, before.writeMember())) {
                 if (adding) {
                     return null; // already named; nothing to swap
                 }
@@ -95,7 +113,8 @@ final class AliasSwap {
                 }
                 continue;
             }
-            if (metadata.updateAlias(before, MetadataPlane.withIndices(before, now), resolved.generation()).isPresent()) {
+            if (metadata.updateAlias(before, MetadataPlane.withIndices(before, now).withWriteMember(writeMember), resolved.generation())
+                .isPresent()) {
                 return null;
             }
         }

@@ -21,6 +21,7 @@ import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
 
@@ -247,6 +248,24 @@ public final class IndexAdminHandler extends BaseRestHandler {
                                 return null;
                             }
                         );
+                        // The body's aliases once the index exists: two steps, since an alias is its own register. One
+                        // refused here is reported with the index named, so the caller knows the index was made.
+                        for (Map.Entry<String, Map<String, Object>> alias : create.aliases.entrySet()) {
+                            final AliasSwap.Refusal refused = AliasSwap.swap(
+                                metadata,
+                                alias.getKey(),
+                                List.of(index),
+                                true,
+                                AliasHandler.writeIndexFlag(alias.getValue())
+                            );
+                            if (refused != null) {
+                                throw new RefusedException(
+                                    refused.status(),
+                                    refused.type(),
+                                    "index [" + index + "] was created, and its alias [" + alias.getKey() + "] was not: " + refused.reason()
+                                );
+                            }
+                        }
                         try (XContentBuilder builder = channel.newBuilder()) {
                             builder.startObject();
                             builder.field("acknowledged", true);

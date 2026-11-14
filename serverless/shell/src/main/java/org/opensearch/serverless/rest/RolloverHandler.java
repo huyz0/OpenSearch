@@ -236,14 +236,15 @@ public final class RolloverHandler extends BaseRestHandler {
                     : "aliases, mappings, and index settings may not be specified when rolling over a data stream"
             );
         }
-        if (record.dataStream() == false && record.indices().size() != 1) {
+        if (record.writesTo() == null) {
+            // Core's refusal: several indices and none marked as the write index.
             throw new IndexAdminHandler.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "illegal_argument_exception",
-                "alias [" + ask.target() + "] names " + record.indices().size() + " indices, so there is no single index to roll over"
+                "rollover target [" + ask.target() + "] does not point to a write index"
             );
         }
-        final String oldName = record.dataStream() ? record.writeIndex() : record.indices().get(0);
+        final String oldName = record.writesTo();
         final Optional<IndexDescriptor> old = metadata.describe(oldName);
         if (old.isEmpty()) {
             throw new IndexAdminHandler.RefusedException(
@@ -324,6 +325,14 @@ public final class RolloverHandler extends BaseRestHandler {
         // template that declared the stream -- see DataStreamHandler.create for why it cannot be resolved
         // against the backing name.
         final IndexCreateRequest create = ask.create();
+        if (create.aliases.isEmpty() == false) {
+            // Refused rather than dropped: the new index would be created without the aliases the caller asked for.
+            throw new IndexAdminHandler.RefusedException(
+                RestStatus.NOT_IMPLEMENTED,
+                "unsupported_setting",
+                "'aliases' in a rollover body is not supported here; add them to the new index with POST /_aliases"
+            );
+        }
         long newGeneration = incrementCounter(record.generation(), "rollover generation");
         String createdUuid;
         try {
@@ -365,7 +374,14 @@ public final class RolloverHandler extends BaseRestHandler {
             final List<String> backing = new ArrayList<>(record.indices());
             backing.add(newName);
             moved = new AliasRecord(ask.target(), backing, true, newGeneration, record.timestampField());
+        } else if (record.writeMember() != null) {
+            // As core rolls an alias with a write index: the new index joins it as the write index, and the old ones stay
+            // in it for reads.
+            final List<String> members = new ArrayList<>(record.indices());
+            members.add(newName);
+            moved = record.published().withMembers(members).withWriteMember(newName);
         } else {
+            // An alias of one index and no write index moves to the new index, as in core.
             moved = new AliasRecord(ask.target(), List.of(newName));
         }
         if (metadata.updateAlias(record, moved, generation).isEmpty()) {

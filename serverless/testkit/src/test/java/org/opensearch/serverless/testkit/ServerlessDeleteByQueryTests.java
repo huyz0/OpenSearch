@@ -26,9 +26,8 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * {@code POST /{index}/_delete_by_query} — every document a query matches, removed.
  *
- * <p>See {@link org.opensearch.serverless.rest.DeleteByQueryHandler} for why matching is frozen and
- * deleting is not, and why it walks one shard at a time by {@code _doc} order rather than through the
- * cross-shard {@code search_after} merge {@code _search} uses.
+ * <p>See {@link org.opensearch.serverless.shard.ShardOperations#deleteByQuery} for how it matches what a search sees
+ * when it starts, one shard at a time in sequence-number order.
  *
  * <p>Runs against {@code FsBlobContainer} only.
  */
@@ -80,12 +79,8 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
     }
 
     /**
-     * Publishes every open shard of an index, so there is a commit for a point in time to freeze.
-     *
-     * <p>{@code refresh=true} on a write makes it searchable on the live shard; it does not publish it.
-     * A point in time — which is what delete_by_query freezes — can only be taken over what has been
-     * published, the same rule {@code _pit} itself enforces. Every test here has to publish explicitly for
-     * exactly that reason.
+     * Publishes every open shard of an index. Delete-by-query matches what a search finds, published or not; tests publish
+     * where they also check what survives a restart of the shard.
      */
     private void publish(ServerlessNode node, MetadataPlane plane, String index, int shardCount) throws Exception {
         for (int shard = 0; shard < shardCount; shard++) {
@@ -374,48 +369,31 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
     }
 
     /**
-     * A write acknowledged but not yet published is invisible to the frozen view, so it survives a
-     * delete_by_query that would have matched it.
-     *
-     * <p>This is the real, specific cost of freezing what has been published rather than what has been
-     * written, stated in the class javadoc and made concrete here: a document written and refreshed —
-     * searchable to a live query right now — is not touched by a delete_by_query running at that same
-     * moment if the writer has not yet published it. That is not a bug in the operation; it is the same
-     * boundary a plain {@code search_after} export of matching ids would have, and a caller relying on
-     * delete_by_query to remove everything a live search can currently find should know it is not that.
+     * A write refreshed but not yet published is matched: delete_by_query removes what a search finds now, as in core, not
+     * only what the writer has published.
      */
-    public void testAnUnpublishedWriteSurvivesEvenThoughItMatches() throws Exception {
+    public void testARefreshedUnpublishedWriteIsMatched() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 
-        try (ServerlessNode node = started(plane, "dbq-frozen")) {
+        try (ServerlessNode node = started(plane, "dbq-live")) {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
             send(http, "PUT", "/alpha?shards=1", MAPPING);
             node.activation().activateWriter(plane, "alpha", 0);
 
-            // Published: the frozen view will see this one.
             send(http, "PUT", "/alpha/_doc/published?refresh=true", "{\"msg\":\"x\",\"n\":1,\"keep\":false}");
             publish(node, plane, "alpha", 1);
-
-            // Written and refreshed after -- searchable right now, on the live shard -- but never
-            // published, so the point in time this call freezes never saw it.
+            // Refreshed, so a search finds it, and never published.
             send(http, "PUT", "/alpha/_doc/unpublished?refresh=true", "{\"msg\":\"x\",\"n\":2,\"keep\":false}");
-            final Response liveSearch = send(http, "POST", "/alpha/_search", "{\"query\":{\"term\":{\"keep\":false}}}");
-            assertTrue(
-                "this test is meaningless unless a live search can already find both: " + liveSearch.body(),
-                liveSearch.body().contains("\"value\":2")
-            );
+            // Written and not refreshed: core does not match such a document either.
+            send(http, "PUT", "/alpha/_doc/unrefreshed", "{\"msg\":\"x\",\"n\":3,\"keep\":false}");
 
             final Response result = send(http, "POST", "/alpha/_delete_by_query", "{\"query\":{\"term\":{\"keep\":false}}}");
             assertEquals(result.body(), 200, result.status());
-            assertTrue("only the published document was in the frozen view: " + result.body(), result.body().contains("\"matched\":1"));
-
-            assertEquals("the published match must be gone", 404, send(http, "GET", "/alpha/_doc/published", null).status());
-            assertEquals(
-                "the unpublished match must survive -- the view never saw it",
-                200,
-                send(http, "GET", "/alpha/_doc/unpublished", null).status()
-            );
+            assertTrue("both refreshed documents are matched: " + result.body(), result.body().contains("\"deleted\":2"));
+            assertEquals(404, send(http, "GET", "/alpha/_doc/published", null).status());
+            assertEquals(404, send(http, "GET", "/alpha/_doc/unpublished", null).status());
+            assertEquals("a write no search could see yet is left", 200, send(http, "GET", "/alpha/_doc/unrefreshed", null).status());
         }
     }
 
@@ -491,13 +469,8 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
         }
     }
 
-    /**
-     * The frozen shards are released once the operation finishes, not left open.
-     *
-     * <p>Every point-in-time this node opens for the operation must be closed by the end of it, win or
-     * lose -- the same discipline {@code PointInTimeHandler}'s own release path follows.
-     */
-    public void testTheFrozenViewIsReleasedWhenDone() throws Exception {
+    /** The operation opens no frozen view and records no point in time: nothing is left to release. */
+    public void testNoFrozenViewIsLeftBehind() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = planeOver(createTempDir(), clock);
 

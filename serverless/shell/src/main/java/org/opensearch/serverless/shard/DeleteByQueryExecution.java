@@ -13,8 +13,8 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
 
 /**
- * The walk behind {@link ShardOperations#deleteByQuery}: freeze a view, page through each shard's matches, and delete
- * each one through the ordinary write path, conditional on the sequence identity the view saw.
+ * The walk behind {@link ShardOperations#deleteByQuery}: page through each shard's matches as a search sees them, and delete
+ * each one through the ordinary write path, conditional on the sequence identity the page saw.
  */
 final class DeleteByQueryExecution {
 
@@ -38,11 +38,8 @@ final class DeleteByQueryExecution {
         this.writes = writes;
     }
 
-    /** How many matches are fetched per page, per shard, while walking a frozen view. */
+    /** How many matches are fetched per page, per shard. */
     static final int DELETE_BY_QUERY_BATCH_SIZE = 1000;
-
-    /** How long the frozen view a delete-by-query takes is held. Bounded, not indefinite. */
-    static final long DELETE_BY_QUERY_KEEP_ALIVE_MILLIS = 3_600_000L;
 
     /** What a walk does to one matched document: true if it changed it, false if it left it as it was. */
     @FunctionalInterface
@@ -82,8 +79,15 @@ final class DeleteByQueryExecution {
     }
 
     /**
-     * Freezes a view of the index, pages through each shard's matches, and applies a change to each one, conditional on the
-     * sequence identity the view saw: a document rewritten after the view was taken is a conflict, never overwritten.
+     * Pages through each shard's matches as a search sees them now, and applies a change to each one, conditional on the
+     * sequence identity the page saw: a document rewritten after it was read is a conflict, never overwritten.
+     *
+     * <p>Core's by-query works through a snapshot of what each shard had refreshed when it started. The walk here gets the
+     * same set without holding a reader open: each shard's highest visible sequence number is read first, and the shard is
+     * then paged in sequence-number order up to it. A document written or changed after that has a higher number and is not
+     * matched -- the documents this operation changes among them, so it never visits its own writes -- and pages after one
+     * another stay in order while the shard changes. Each page is an ordinary search of one shard, answered where the shard is
+     * written (or forwarded there), so a document refreshed but not yet published is matched, as in core.
      */
     Walk walk(
         String index,
@@ -97,113 +101,107 @@ final class DeleteByQueryExecution {
             throw new SystemIndexException(index);
         }
         final IndexDescriptor descriptor = routing.describeOnce(index).orElseThrow(() -> new NoSuchIndexException(index));
-
-        // A frozen view, exactly as _pit takes one -- see the class javadoc for why the query is decided
-        // once rather than re-evaluated as the walk goes.
-        // The capture marker before the first manifest read, so the commits this is about to freeze
-        // cannot be swept while it is reading them. See PointInTime#isCapturing.
-        final String pitId = org.opensearch.common.UUIDs.randomBase64UUID();
-        final long expiresAt = plane.clock().getAsLong() + DELETE_BY_QUERY_KEEP_ALIVE_MILLIS;
-        plane.beginPointInTime(
-            new org.opensearch.serverless.metadata.PointInTime(pitId, index, descriptor.uuid(), expiresAt, java.util.Map.of(), true)
-        );
-
-        final java.util.Map<Integer, org.opensearch.serverless.store.CommitManifest> shards = new java.util.LinkedHashMap<>();
+        final java.util.Map<String, IndexDescriptor> indices = java.util.Map.of(index, descriptor);
+        long visited = 0;
+        long deleted = 0;
+        long noops = 0;
+        long conflicts = 0;
+        int batches = 0;
         for (int shard : descriptor.unitIds()) {
-            final var manifest = plane.segmentPublisher(index, descriptor.uuid(), shard).readManifest();
-            if (manifest.isEmpty()) {
-                // Nothing published on this shard: nothing to match, and nothing silently skipped either
-                // -- an unpublished shard has no documents a search could have found.
+            if (visited >= maxDocs) {
+                break;
+            }
+            final var onlyThisShard = org.opensearch.serverless.rest.SearchFanout.Options.DEFAULT.withOnlyShards(java.util.Set.of(shard));
+            final var newest = searchOne(
+                indices,
+                new org.opensearch.search.builder.SearchSourceBuilder().query(query)
+                    .sort(new org.opensearch.search.sort.FieldSortBuilder(SEQ_NO).order(org.opensearch.search.sort.SortOrder.DESC))
+                    .size(1)
+                    .trackTotalHits(false)
+                    .fetchSource(false),
+                onlyThisShard
+            );
+            if (newest.isEmpty()) {
+                // Nothing on this shard matches now.
                 continue;
             }
-            shards.put(shard, manifest.get());
-        }
-        if (shards.isEmpty()) {
-            // Nothing to freeze, so the marker must not be left pinning the index's sweep.
-            plane.releasePointInTime(pitId);
-            return new Walk(0, 0, 0, 0, null, null, 0);
-        }
-
-        final var pit = new org.opensearch.serverless.metadata.PointInTime(pitId, index, descriptor.uuid(), expiresAt, shards);
-        plane.finishPointInTime(pit);
-        try {
-            long visited = 0;
-            long deleted = 0;
-            long noops = 0;
-            long conflicts = 0;
-            int batches = 0;
-            for (Integer shard : shards.keySet()) {
-                final var frozenShardId = node.activation().openFrozenView(plane, pit, shard);
-                Object[] cursor = null;
-                while (visited < maxDocs) {
-                    final var page = new org.opensearch.search.builder.SearchSourceBuilder().query(query)
-                        .sort(new org.opensearch.search.sort.FieldSortBuilder(org.opensearch.search.sort.FieldSortBuilder.DOC_FIELD_NAME))
-                        .size((int) Math.min(DELETE_BY_QUERY_BATCH_SIZE, maxDocs - visited))
-                        .trackTotalHits(false)
-                        // The sequence number each delete is conditional on.
-                        .seqNoAndPrimaryTerm(true)
-                        .fetchSource(false);
-                    if (cursor != null) {
-                        page.searchAfter(cursor);
-                    }
-                    final var result = org.opensearch.serverless.shard.ShardQuery.execute(node.searchService(), frozenShardId, page);
-                    final var hits = result.hits();
-                    if (hits.isEmpty()) {
-                        break;
-                    }
-                    batches = Math.incrementExact(batches);
-                    final boolean lastPageOfShard = hits.size() < page.size() || visited + hits.size() >= maxDocs;
-                    long pageBytes = 0L;
-                    for (var hit : hits) {
-                        pageBytes += 64L + (hit.getId() == null ? 0 : hit.getId().length());
-                    }
-                    // A page of deletes is a page of writes, and accounted as one: this operation used to
-                    // be the only writer on the node that indexing pressure could not see.
-                    try (
-                        org.opensearch.common.lease.Releasable inFlight = node.services()
-                            .indexingPressure()
-                            .markCoordinatingOperationStarted(pageBytes, false)
-                    ) {
-                        for (int i = 0; i < hits.size(); i++) {
-                            final var hit = hits.get(i);
-                            visited++;
-                            // The refresh -- when asked for -- rides the last delete of the shard, not every
-                            // one: refreshing per document would refresh the shard once per document instead
-                            // of once for the whole operation.
-                            final boolean isLastOfShard = refresh && lastPageOfShard && i == hits.size() - 1;
-                            try {
-                                if (change.apply(hit.getId(), hit.getSeqNo(), hit.getPrimaryTerm(), isLastOfShard)) {
-                                    deleted++;
-                                } else {
-                                    noops++;
-                                }
-                            } catch (org.opensearch.index.engine.VersionConflictEngineException e) {
-                                // Rewritten -- or already removed -- after the view was taken. Left alone,
-                                // and counted, rather than deleted regardless.
-                                conflicts++;
-                                if (abortOnConflict) {
-                                    return new Walk(visited, deleted, noops, conflicts, hit.getId(), e, batches);
-                                }
+            final long upTo = (Long) newest.get(0).getSortValues()[0];
+            final var bounded = org.opensearch.index.query.QueryBuilders.boolQuery()
+                .filter(query)
+                .filter(org.opensearch.index.query.QueryBuilders.rangeQuery(SEQ_NO).lte(upTo));
+            Object[] cursor = null;
+            while (visited < maxDocs) {
+                final var page = new org.opensearch.search.builder.SearchSourceBuilder().query(bounded)
+                    .sort(new org.opensearch.search.sort.FieldSortBuilder(SEQ_NO).order(org.opensearch.search.sort.SortOrder.ASC))
+                    .size((int) Math.min(DELETE_BY_QUERY_BATCH_SIZE, maxDocs - visited))
+                    .trackTotalHits(false)
+                    // The sequence number each change is conditional on.
+                    .seqNoAndPrimaryTerm(true)
+                    .fetchSource(false);
+                if (cursor != null) {
+                    page.searchAfter(cursor);
+                }
+                final var hits = searchOne(indices, page, onlyThisShard);
+                if (hits.isEmpty()) {
+                    break;
+                }
+                batches = Math.incrementExact(batches);
+                final boolean lastPageOfShard = hits.size() < page.size() || visited + hits.size() >= maxDocs;
+                long pageBytes = 0L;
+                for (var hit : hits) {
+                    pageBytes += 64L + (hit.getId() == null ? 0 : hit.getId().length());
+                }
+                // A page of changes is a page of writes, and accounted as one.
+                try (
+                    org.opensearch.common.lease.Releasable inFlight = node.services()
+                        .indexingPressure()
+                        .markCoordinatingOperationStarted(pageBytes, false)
+                ) {
+                    for (int i = 0; i < hits.size(); i++) {
+                        final var hit = hits.get(i);
+                        visited++;
+                        // The refresh -- when asked for -- rides the last change of the shard, not every one.
+                        final boolean isLastOfShard = refresh && lastPageOfShard && i == hits.size() - 1;
+                        try {
+                            if (change.apply(hit.getId(), hit.getSeqNo(), hit.getPrimaryTerm(), isLastOfShard)) {
+                                deleted++;
+                            } else {
+                                noops++;
+                            }
+                        } catch (org.opensearch.index.engine.VersionConflictEngineException e) {
+                            // Rewritten -- or already removed -- after the page was read. Left alone, and counted.
+                            conflicts++;
+                            if (abortOnConflict) {
+                                return new Walk(visited, deleted, noops, conflicts, hit.getId(), e, batches);
                             }
                         }
                     }
-                    cursor = hits.get(hits.size() - 1).getSortValues();
-                    if (lastPageOfShard) {
-                        // Fewer than a full page, or the cap was reached: this shard has nothing left to
-                        // give (or nothing more is wanted), and asking again would cost a round trip to
-                        // learn what this already knows.
-                        break;
-                    }
                 }
-                // A shard with no match never entered the loop above, so it never issued a delete and
-                // never needed a refresh -- correctly, since nothing changed on it to make visible.
+                cursor = hits.get(hits.size() - 1).getSortValues();
+                if (lastPageOfShard) {
+                    break;
+                }
             }
-            return new Walk(visited, deleted, noops, conflicts, null, null, batches);
-        } finally {
-            // Local shards first, then the record -- the same order _pit's own release does, so this node
-            // is never left holding open frozen shards for a view no longer recorded anywhere.
-            node.reconciler().closeFrozenReader(pit.id());
-            plane.releasePointInTime(pit.id());
         }
+        return new Walk(visited, deleted, noops, conflicts, null, null, batches);
+    }
+
+    private static final String SEQ_NO = org.opensearch.index.mapper.SeqNoFieldMapper.NAME;
+
+    /** One page from one shard, as a search sees it; a shard that cannot answer fails the operation rather than being skipped. */
+    private java.util.List<org.opensearch.search.SearchHit> searchOne(
+        java.util.Map<String, IndexDescriptor> indices,
+        org.opensearch.search.builder.SearchSourceBuilder page,
+        org.opensearch.serverless.rest.SearchFanout.Options options
+    ) throws Exception {
+        final var outcome = org.opensearch.serverless.rest.SearchFanout.run(node, plane, indices, page, options);
+        if (outcome.failures().isEmpty() == false) {
+            final Throwable cause = outcome.failures().get(0).getCause();
+            if (cause instanceof Exception failure) {
+                throw failure;
+            }
+            throw new java.io.IOException("a shard could not be searched", cause);
+        }
+        return outcome.hits();
     }
 }

@@ -31,10 +31,10 @@ nothing — read then written back, not a transaction on its own: nothing holds 
 the two, so an unconditional update can still lose a race. The caller can close that window itself now, by
 passing `if_seq_no`/`if_primary_term` and retrying on a 409 — which is the compare-and-swap classic
 OpenSearch's own `_update` performs internally. `_delete_by_query` removes every document a query
-matches — evaluated once, against a frozen point-in-time view, then walked one shard at a time in native
-Lucene `_doc` order (always available, no fielddata) and deleted through the ordinary write path. A write
-acknowledged but not yet published when the operation starts is not touched by it, the same boundary a
-plain `search_after` export of matching ids would have. Routing is resolved
+matches — walked one shard at a time over the shard's live searcher, as core does: the highest `_seq_no` matching
+when the shard's walk starts bounds it, and pages are read in `_seq_no` order with `search_after` and deleted through
+the ordinary write path. A write that was refreshed is matched whether or not it was published; one written after the
+shard's walk started is not, and one not yet refreshed is not, as in core. No point-in-time record is written. Routing is resolved
 once per request, so a multi-get's object-store cost is the shards it touches and not the documents it asks
 for: ten documents cost 4 requests and twenty cost 4, against 30 for the same ten fetched one at a time. A write is durable in a write-ahead log before it is
 acknowledged, and replayed by a successor. **A single write no longer costs an object-store PUT of its
@@ -77,7 +77,8 @@ the alias records it names; **stored scripts** live in a register with a change 
 one overridden `ScriptService` method; **search templates** (`lang-mustache`), **ranking evaluation**
 (`rank-eval`) and **search pipelines** (`search-pipeline-common`) are served through the modules chosen by
 name, the way painless and ingest-common were; **rollover** is one compare-and-swap of the alias after the
-index is created, with `max_age` and `max_docs` evaluated against what is recorded; **data streams** are
+index is created (an alias with an `is_write_index` member keeps the old index for reads and marks the new one as the
+write index; one without moves to the new index), with `max_age` and `max_docs` evaluated against what is recorded; **data streams** are
 aliases with a generation, written through to their newest `.ds-` backing index and rolled over in place.
 
 **Point in time.** `POST /{index}/_pit` freezes each shard's commit into a record and returns an id; a
@@ -231,15 +232,15 @@ empty when the request allows no indices; and an update that asks for its source
 alerting plugin's lock release asks, and was refused). With these the alerting plugin runs monitors, on demand and on schedule, and
 records their alerts.
 The plugin client also answers field mappings (leaf fields and multi-fields, from the descriptor), update-by-query
-and delete-by-query on one index (over the same frozen view of what is published that `_delete_by_query` walks, so a
-document written but not yet published is not matched), and a write to a plugin's own alias goes to the index the alias
-writes to, or its only index. Plugins that need the identity service's plugin subject (Job Scheduler) get it at start;
+and delete-by-query on one index (over the live, refreshed data, as `_delete_by_query` walks it), and a write to an
+alias goes to the index the alias writes to, or its only index. Plugins that need the identity service's plugin subject (Job Scheduler) get it at start;
 node info lists the installed plugins when asked; a plugin action asking for the stream transport gets none, as on a
 node with streaming off; a bulk to a shard nobody holds yet waits for this node to take it, as a single write does; and
 every index carries its creation date. With these the anomaly-detection plugin creates and starts detectors and runs
 their schedule (it cannot yet read the tenant index a detector watches: the plugin's name resolver answers only plugin
 indices), Index Management moves an index through its policy states (`min_index_age` transitions, read-only, delete;
-rollover still needs a write alias, which the shell refuses), and ML Commons trains, predicts, creates connectors, and
+and rollover through an `is_write_index` alias: the local view carries
+each served index's aliases), and ML Commons trains, predicts, creates connectors, and
 registers and deploys remote models. A plugin's dynamic setting changed through `/_cluster/settings` reaches the running
 plugin (`serverless.plugin_cluster_settings.enabled`, on): a value the setting refuses is refused at the write; the node
 that served the write applies it when the write returns, and every other node within
@@ -379,7 +380,7 @@ These are decisions, not gaps. Each answers 501 with a reason.
 
 | Refused | Because |
 | --- | --- |
-| Alias options: `filter`, `routing`, `index_routing`, `search_routing`, `is_write_index`, `is_hidden` | An alias here names indices and nothing else. Refused on all three doors -- the index-scoped spelling, the alias-scoped one, and an action inside `POST /_aliases` -- and pinned by a canaried test. This was once the last place something was accepted and not honoured: a filtered alias was created unfiltered and answered `{"acknowledged": true}`. |
+| Alias options: `filter`, `routing`, `index_routing`, `search_routing`, `is_hidden` | An alias here names indices and nothing else. Refused on all three doors -- the index-scoped spelling, the alias-scoped one, and an action inside `POST /_aliases` -- and pinned by a canaried test. This was once the last place something was accepted and not honoured: a filtered alias was created unfiltered and answered `{"acknowledged": true}`. |
 | `_cat/indices` past the pattern cap | `GET /_cat/indices` is served as the empty prefix under the same capped resolution every pattern takes, and refused past the cap rather than truncated: its contract is the whole answer, and a page that looks complete and is not is worse than a refusal. `GET /_list/indices` walks any number of indices by `next_token` instead. |
 | `POST /_data_stream/_modify` | A data stream here is an alias with a generation, so its backing indices are the alias's members and change by rolling it over, not by being reassigned underneath it. |
 | Patterns that are not a prefix (`*-2026`, `lo*s-a`, `logs-?`) | A prefix can be answered by one bounded listing; these cannot be answered by a listing at all, only by reading every index name in the deployment and matching each. Supporting a wildcard syntax whose cost depends on where the caller put the star would be worse than the split. |
