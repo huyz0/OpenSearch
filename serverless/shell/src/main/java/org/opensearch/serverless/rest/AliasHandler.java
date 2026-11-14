@@ -63,9 +63,31 @@ public final class AliasHandler extends BaseRestHandler {
      * @param node supplies the node, for its action gate and system-index list
      */
     public AliasHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+        this(plane, node, false);
+    }
+
+    private AliasHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node, boolean forPlugins) {
         this.plane = plane;
         this.node = node;
+        this.forPlugins = forPlugins;
     }
+
+    /**
+     * The handler a plugin's client requests are run through, which may alias the plugin's own indices.
+     *
+     * <p>A system index is refused here for requests from outside the node, because it belongs to a plugin and not
+     * to the caller. The plugin it belongs to is the one caller that must be able to alias it: the alerting plugin
+     * writes its alert history through a write alias it creates with each history index.
+     *
+     * @param plane supplies the metadata plane
+     * @param node supplies the node
+     * @return the handler
+     */
+    public static AliasHandler forPlugins(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+        return new AliasHandler(plane, node, true);
+    }
+
+    private final boolean forPlugins;
 
     final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
     /** Applies the alias changes this handler parsed. */
@@ -332,6 +354,9 @@ public final class AliasHandler extends BaseRestHandler {
 
     /** Whether an index is a plugin's, which no alias may name: an alias over one is a read of it by another name. */
     boolean isSystemIndex(String index) {
+        if (forPlugins) {
+            return false;
+        }
         final var serving = node.get();
         return serving != null && serving.isSystemIndex(index);
     }

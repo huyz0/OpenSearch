@@ -139,8 +139,14 @@ public class NativeCreateRequestExecutionTests extends OpenSearchTestCase {
         assertRefused(new CreateIndexRequest("refused").settings(Settings.builder().put("index.uuid", "forged")), RestStatus.BAD_REQUEST);
     }
 
-    public void testNativeCreateRefusesIgnoredAliases() throws Exception {
-        assertRefused(new CreateIndexRequest("refused").alias(new Alias("ignored")), RestStatus.NOT_IMPLEMENTED);
+    /** An alias in a native create is applied after the index is made, rather than ignored or refused. */
+    public void testNativeCreateAppliesAliases() throws Exception {
+        withNode(new org.opensearch.plugins.Plugin() {
+        }, (node, metadata) -> {
+            node.services().client().admin().indices().create(new CreateIndexRequest("aliased").alias(new Alias("applied"))).actionGet();
+            assertTrue(metadata.describe("aliased").isPresent());
+            assertEquals(java.util.List.of("aliased"), metadata.aliasWithGeneration("applied").orElseThrow().alias().indices());
+        });
     }
 
     public void testNativeCreateRefusesIgnoredContexts() throws Exception {
