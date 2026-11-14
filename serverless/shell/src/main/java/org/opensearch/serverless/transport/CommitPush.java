@@ -50,13 +50,13 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p><b>What it does not change.</b> The register look stays, as the backstop for a lost push, a reader that placement
  * did not name, and a writer that died. A pushed commit only ever moves a reader forward: one no newer than the commit
  * open is ignored, and a commit is trusted as far as a writer's answer to {@link NewestCommits} is, since it comes from
- * the same authenticated peer. On unless {@value #ENABLED} is set to false.
+ * the same authenticated peer. On unless {@code serverless.search.commit_push.enabled} is set to false.
  *
  * <p><b>New files ride along.</b> The reader's reopen used to fetch every block of the commit's new segment from the
  * object store, though the writer had just written those bytes and still holds them on disk: at one refresh every ten
  * seconds that was the largest share of a lightly used index's reads. So a push carries the blocks of the files that
  * are new since the previous push of the shard, read from the writer's own copies, smallest first and whole files only
- * up to {@value #INLINE_BYTES} (1 MB by default, 0 turns it off). The reader puts them in its block cache before it
+ * up to {@code serverless.search.commit_push.inline_bytes} (1 MB by default, 0 turns it off). The reader puts them in its block cache before it
  * reopens, under the keys its own reads use, so the reopen and the next search read memory. A larger segment, a merge's
  * say, is left to the reader's reads from the store as before. A block already held is not replaced. Blocks go only to
  * readers in the writer's zone that answered the previous push saying they have the shard open: a reader elsewhere
@@ -65,12 +65,6 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class CommitPush {
 
     private static final Logger LOG = LogManager.getLogger(CommitPush.class);
-
-    /** Whether this node, as a writer, pushes the commits it publishes to the shard's search nodes. */
-    public static final String ENABLED = "serverless.search.commit_push.enabled";
-
-    /** The most bytes of a commit's new files one push carries to each search node; 0 sends the commit alone. */
-    public static final String INLINE_BYTES = "serverless.search.commit_push.inline_bytes";
 
     /** The default: well above a refresh's segment, well below a merge's. */
     public static final long DEFAULT_INLINE_BYTES = 1L << 20;
@@ -91,9 +85,6 @@ public final class CommitPush {
     /** A pushed commit and when it came. */
     private record Pushed(CommitManifest commit, long atNanos, long mappingVersion, long settingsVersion) {
     }
-
-    /** Whether a reader moved onto a pushed commit reuses the descriptor it holds when the writer's is no newer. */
-    public static final String REUSE_DESCRIPTOR = "serverless.search.commit_push.reuse_descriptor";
 
     private final ShardRouter router;
     private final boolean enabled;
@@ -116,14 +107,9 @@ public final class CommitPush {
 
     CommitPush(ShardRouter router) {
         this.router = router;
-        this.enabled = router.node.settings().getAsBoolean(ENABLED, true);
-        this.reuseDescriptor = router.node.settings().getAsBoolean(REUSE_DESCRIPTOR, true);
-        this.inlineBytes = Math.max(
-            0L,
-            router.node.settings()
-                .getAsBytesSize(INLINE_BYTES, new org.opensearch.core.common.unit.ByteSizeValue(DEFAULT_INLINE_BYTES))
-                .getBytes()
-        );
+        this.enabled = ReaderPushSettings.COMMIT_PUSH_ENABLED.get(router.node.settings());
+        this.reuseDescriptor = ReaderPushSettings.COMMIT_PUSH_REUSE_DESCRIPTOR.get(router.node.settings());
+        this.inlineBytes = Math.max(0L, ReaderPushSettings.COMMIT_PUSH_INLINE_BYTES.get(router.node.settings()).getBytes());
         this.registerLooks = new ReaderRegisterLooks(router.node, router.plane, router.node.settings());
     }
 

@@ -205,7 +205,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             RestStatus.NOT_IMPLEMENTED
                         );
                     }
-                    final Object bucketPolicy = flat.get(org.opensearch.serverless.bucket.BucketPolicy.CLUSTER_SETTING);
+                    final Object bucketPolicy = flat.get(org.opensearch.serverless.bucket.BucketSettings.CLUSTER_POLICY.getKey());
                     if (bucketPolicy != null) {
                         try {
                             org.opensearch.serverless.bucket.BucketPolicy.check(String.valueOf(bucketPolicy));
@@ -213,7 +213,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
                     }
-                    final Object placement = flat.get(org.opensearch.serverless.shell.SegmentPlacement.CLUSTER_SETTING);
+                    final Object placement = flat.get(org.opensearch.serverless.shell.NodeSettings.SEGMENT_PLACEMENT_CLUSTER.getKey());
                     if (placement != null) {
                         try {
                             org.opensearch.serverless.shell.SegmentPlacement.check(String.valueOf(placement));
@@ -221,7 +221,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
                     }
-                    final Object overlay = flat.get(org.opensearch.serverless.transport.TailOverlays.CLUSTER_SETTING);
+                    final Object overlay = flat.get(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_CLUSTER.getKey());
                     if (overlay != null) {
                         try {
                             org.opensearch.serverless.transport.TailOverlays.check(String.valueOf(overlay));
@@ -229,7 +229,9 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
                     }
-                    final Object visibility = flat.get(org.opensearch.serverless.transport.RefreshVisibility.CLUSTER_SETTING);
+                    final Object visibility = flat.get(
+                        org.opensearch.serverless.transport.ReaderPushSettings.REFRESH_VISIBILITY_CLUSTER.getKey()
+                    );
                     if (visibility != null) {
                         try {
                             org.opensearch.serverless.transport.RefreshVisibility.check(String.valueOf(visibility));
@@ -237,7 +239,9 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
                     }
-                    final Object checkpoint = flat.get(org.opensearch.serverless.shell.LogCommitCheckpoint.SETTING);
+                    final Object checkpoint = flat.get(
+                        org.opensearch.serverless.shell.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey()
+                    );
                     if (checkpoint != null) {
                         try {
                             org.opensearch.serverless.shell.LogCommitCheckpoint.check(node.get(), checkpoint);

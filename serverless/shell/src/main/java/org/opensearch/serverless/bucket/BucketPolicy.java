@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.bucket;
 
-import org.opensearch.common.settings.Setting;
 import org.opensearch.common.settings.Settings;
 
 import java.util.Locale;
@@ -18,33 +17,15 @@ import java.util.Locale;
  *
  * <p>{@code auto} groups an index while it is small: only a one-shard index with no unit layout is placed, and nothing
  * forces a big index into a bucket. {@code off} keeps an index on its own. Unset everywhere, the node's
- * {@link BucketSettings#ENABLED} decides. The setting only decides placement; which head owns an index follows its
+ * {@link org.opensearch.serverless.bucket.BucketSettings#ENABLED} decides. The setting only decides placement; which head owns an index follows its
  * descriptor on every node whatever this says, so changing it never splits ownership.
  */
 public final class BucketPolicy {
 
-    /** The index setting. */
-    public static final String INDEX_SETTING = "index.serverless.bucket";
-    /** The cluster setting, in the {@code cluster/config} register. */
-    public static final String CLUSTER_SETTING = "serverless.bucket";
-    /** The index setting naming the group an index is bucketed with, such as its tenant; the index name by default. */
-    public static final String GROUP_SETTING = "index.serverless.bucket_group";
     /** Group while small. */
     public static final String AUTO = "auto";
     /** Never group. */
     public static final String OFF = "off";
-
-    /** The index setting's definition: dynamic, {@code auto} or {@code off}. */
-    public static final Setting<String> INDEX = new Setting<>(
-        INDEX_SETTING,
-        "",
-        BucketPolicy::parse,
-        Setting.Property.IndexScope,
-        Setting.Property.Dynamic
-    );
-
-    /** The group setting's definition. */
-    public static final Setting<String> GROUP = Setting.simpleString(GROUP_SETTING, Setting.Property.IndexScope);
 
     private BucketPolicy() {}
 
@@ -78,18 +59,8 @@ public final class BucketPolicy {
      * @return true to group it
      */
     public static boolean wanted(Settings indexSettings, String cluster, boolean nodeDefault) {
-        final String index = indexSettings == null ? null : indexSettings.get(INDEX_SETTING);
-        for (String value : new String[] { index, cluster }) {
-            if (value == null || value.isEmpty()) {
-                continue;
-            }
-            try {
-                return AUTO.equals(parse(value));
-            } catch (IllegalArgumentException e) {
-                // Neither value: the next, less specific, setting decides.
-            }
-        }
-        return nodeDefault;
+        final String index = indexSettings == null ? null : indexSettings.get(BucketSettings.INDEX_POLICY.getKey());
+        return org.opensearch.serverless.settings.LayeredSetting.resolve(index, cluster, value -> AUTO.equals(parse(value)), nodeDefault);
     }
 
     /**
@@ -100,7 +71,7 @@ public final class BucketPolicy {
      * @return the group
      */
     public static String group(String indexName, Settings indexSettings) {
-        final String group = indexSettings == null ? null : indexSettings.get(GROUP_SETTING);
+        final String group = indexSettings == null ? null : indexSettings.get(BucketSettings.GROUP.getKey());
         return group == null || group.isEmpty() ? indexName : group;
     }
 }

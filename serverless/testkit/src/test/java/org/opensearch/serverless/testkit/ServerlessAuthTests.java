@@ -907,8 +907,8 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final java.nio.file.Path store = createTempDir();
         final Settings settings = Settings.builder()
             .put(nodeSettings("auth-daemon"))
-            .put(org.opensearch.serverless.shell.ServerlessBootstrap.STORE_PATH, store.toString())
-            .put(org.opensearch.serverless.shell.ServerlessBootstrap.PLUGINS, ServerlessAuthPlugin.class.getName())
+            .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), store.toString())
+            .put(org.opensearch.serverless.shell.NodeSettings.PLUGINS.getKey(), ServerlessAuthPlugin.class.getName())
             .build();
 
         try (var boot = org.opensearch.serverless.shell.ServerlessBootstrap.start(settings)) {
@@ -929,8 +929,8 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
     public void testADaemonRefusesAPluginItCannotFind() throws Exception {
         final Settings settings = Settings.builder()
             .put(nodeSettings("auth-daemon-missing"))
-            .put(org.opensearch.serverless.shell.ServerlessBootstrap.STORE_PATH, createTempDir().toString())
-            .put(org.opensearch.serverless.shell.ServerlessBootstrap.PLUGINS, "com.example.NotAPluginThatExists")
+            .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), createTempDir().toString())
+            .put(org.opensearch.serverless.shell.NodeSettings.PLUGINS.getKey(), "com.example.NotAPluginThatExists")
             .build();
         final var failure = expectThrows(
             IllegalArgumentException.class,

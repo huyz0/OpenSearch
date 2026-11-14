@@ -8,7 +8,6 @@
 
 package org.opensearch.serverless.testkit;
 
-import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.net.URI;
@@ -47,7 +46,7 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
     private static final String LOG_COMMITS = "serverless.wal.node_log.commits";
 
     private Map<String, String> settings() {
-        return Map.of(ServerlessBootstrap.LEASE_TTL, TTL);
+        return Map.of(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), TTL);
     }
 
     /**
@@ -318,9 +317,9 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
                 store,
                 createTempDir(),
                 Map.of(
-                    ServerlessBootstrap.LEASE_TTL,
+                    org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(),
                     TTL,
-                    ServerlessBootstrap.PUBLISH_DEBOUNCE,
+                    org.opensearch.serverless.shell.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(),
                     "10000",
                     PACKS,
                     "false",
@@ -332,7 +331,7 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
                 "zombie-b",
                 store,
                 createTempDir(),
-                Map.of(ServerlessBootstrap.LEASE_TTL, TTL, PACKS, "false", LOG_COMMITS, "false")
+                Map.of(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), TTL, PACKS, "false", LOG_COMMITS, "false")
             )
         ) {
             assertEquals(200, send(a, "PUT", "/alpha?shards=1", MAPPING).status());

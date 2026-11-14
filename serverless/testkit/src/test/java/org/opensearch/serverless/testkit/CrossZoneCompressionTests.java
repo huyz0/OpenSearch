@@ -15,7 +15,6 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.transport.ShardRouter;
 import org.opensearch.serverless.transport.ZoneTraffic;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -48,7 +47,13 @@ public class CrossZoneCompressionTests extends OpenSearchTestCase {
             ServerlessNode owner = new ServerlessNode(settings("cz-owner", "zone-a", Settings.EMPTY));
             ServerlessNode compressed = new ServerlessNode(settings("cz-compressed", "zone-b", Settings.EMPTY));
             ServerlessNode plain = new ServerlessNode(
-                settings("cz-plain", "zone-b", Settings.builder().put(ShardRouter.COMPRESS_CROSS_ZONE, false).build())
+                settings(
+                    "cz-plain",
+                    "zone-b",
+                    Settings.builder()
+                        .put(org.opensearch.serverless.transport.ShardRouterSettings.COMPRESS_CROSS_ZONE.getKey(), false)
+                        .build()
+                )
             )
         ) {
             owner.startup().start();

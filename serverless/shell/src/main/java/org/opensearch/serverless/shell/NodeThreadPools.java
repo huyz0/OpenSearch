@@ -66,9 +66,6 @@ public final class NodeThreadPools {
      */
     public static final String PUBLISH_POOL = "serverless_publish";
 
-    /** How many shards a node activates at once; see {@code ServerlessBootstrap#ACTIVATION_CONCURRENCY}. */
-    public static final String ACTIVATION_CONCURRENCY_SETTING = "serverless.activation.concurrency";
-
     /** The pool a forwarded get is answered on, at its owner: not GET, for the reason {@link #FORWARDED_WRITE_POOL} is not WRITE. */
     public static final String FORWARDED_READ_POOL = "serverless_forwarded_read";
 
@@ -116,13 +113,7 @@ public final class NodeThreadPools {
                 new org.opensearch.threadpool.FixedExecutorBuilder(
                     settings,
                     ACTIVATION_POOL,
-                    Math.max(
-                        16,
-                        2 * settings.getAsInt(
-                            ACTIVATION_CONCURRENCY_SETTING,
-                            org.opensearch.serverless.reconcile.BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY
-                        )
-                    ),
+                    Math.max(16, 2 * ActivationSettings.CONCURRENCY.get(settings)),
                     1000,
                     "thread_pool." + ACTIVATION_POOL
                 ),

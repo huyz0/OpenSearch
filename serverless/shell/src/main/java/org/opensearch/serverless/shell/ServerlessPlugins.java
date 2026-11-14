@@ -448,93 +448,32 @@ public final class ServerlessPlugins {
         return patterns;
     }
 
-    /**
-     * Whether the settings and thread pools plugins declare are registered: on by default.
-     *
-     * <p>Off is the old behaviour, kept as a switch for one release: a plugin that declares a setting it
-     * listens to, or a pool it submits to, fails to start with it off -- Job Scheduler on its sweeper
-     * period, k-NN and ML Commons on their pools. With no plugin installed the two are identical.
-     */
-    public static final String EXTENSIONS = "serverless.plugin_extensions.enabled";
-
-    /**
-     * Whether plugins see a cluster they can work with: on by default, and only on a node with plugins.
-     *
-     * <p>On, the node's view names a cluster manager and the plugin client answers cluster health and cluster
-     * state. Off, a plugin that waits for health (the security plugin does, before loading its configuration)
-     * or that reads the cluster state through its client never gets an answer.
-     */
-    public static final String CLUSTER_VIEW = "serverless.plugin_cluster_view.enabled";
-
     static boolean clusterView(Settings settings) {
-        return settings.getAsBoolean(CLUSTER_VIEW, true);
+        return PluginSettings.CLUSTER_VIEW.get(settings);
     }
-
-    /**
-     * Whether the plugin client runs multi-get, bulk and update: on by default.
-     *
-     * <p>Off, a plugin that loads its state with a multi-get or writes it with a bulk -- the security plugin does
-     * both -- is refused by name, as before.
-     */
-    public static final String DOCUMENT_BATCHES = "serverless.plugin_client.batches.enabled";
 
     static boolean documentBatches(Settings settings) {
-        return settings.getAsBoolean(DOCUMENT_BATCHES, true);
+        return PluginSettings.DOCUMENT_BATCHES.get(settings);
     }
-
-    /**
-     * Whether plugin components that are lifecycle components are started with the node and stopped with it: on by
-     * default.
-     *
-     * <p>Core starts every component a plugin's {@code createComponents} returns that is a lifecycle component. The
-     * alerting plugin's monitor runner builds its state in {@code doStart}; never started, every monitor run failed on
-     * an uninitialised field. Off, they are left as they were built, as before.
-     */
-    public static final String COMPONENT_LIFECYCLE = "serverless.plugin_components.lifecycle.enabled";
 
     static boolean componentLifecycle(Settings settings) {
-        return settings.getAsBoolean(COMPONENT_LIFECYCLE, true);
+        return PluginSettings.COMPONENT_LIFECYCLE.get(settings);
     }
-
-    /**
-     * Whether the plugin client answers index administration: existence, mappings, settings and aliases, read and
-     * changed, index deletion and rollover. On by default.
-     *
-     * <p>Off, a plugin that checks or upgrades its own indices -- alerting does before running a monitor -- is refused
-     * by name, as before.
-     */
-    public static final String INDEX_ADMIN = "serverless.plugin_client.index_admin.enabled";
 
     static boolean indexAdmin(Settings settings) {
-        return settings.getAsBoolean(INDEX_ADMIN, true);
+        return PluginSettings.INDEX_ADMIN.get(settings);
     }
-
-    /**
-     * Whether the plugin client answers node info, node stats, indices stats and refresh: on by default.
-     *
-     * <p>Off, a metrics exporter and a plugin that refreshes its own index are refused by name, as before.
-     */
-    public static final String NODE_ANSWERS = "serverless.plugin_client.node_answers.enabled";
 
     static boolean nodeAnswers(Settings settings) {
-        return settings.getAsBoolean(NODE_ANSWERS, true);
+        return PluginSettings.NODE_ANSWERS.get(settings);
     }
 
-    /**
-     * Whether the index-name resolver plugins are given answers for tenant names from the metadata plane: a concrete
-     * name, an alias or a trailing wildcard, one read each. On by default.
-     *
-     * <p>Off, a plugin resolving a tenant index -- the anomaly-detection plugin checks a detector's source index before
-     * each run -- is refused by name, as before.
-     */
-    public static final String NAME_RESOLUTION = "serverless.plugin_name_resolution.enabled";
-
     static boolean nameResolution(Settings settings) {
-        return settings.getAsBoolean(NAME_RESOLUTION, true);
+        return PluginSettings.NAME_RESOLUTION.get(settings);
     }
 
     static boolean extensions(Settings settings) {
-        return settings.getAsBoolean(EXTENSIONS, true);
+        return PluginSettings.EXTENSIONS.get(settings);
     }
 
     /**
@@ -545,7 +484,7 @@ public final class ServerlessPlugins {
      * {@code createComponents} with "Setting is not registered", and a value for it in the node's settings
      * or in {@code PUT /_cluster/settings} is refused as unknown.
      *
-     * @param settings the node settings, which carry {@link #EXTENSIONS}
+     * @param settings the node settings, which carry {@link org.opensearch.serverless.shell.PluginSettings#EXTENSIONS}
      * @return the settings a node's {@code ClusterSettings} knows
      */
     public java.util.Set<org.opensearch.common.settings.Setting<?>> clusterSettings(Settings settings) {
@@ -568,7 +507,7 @@ public final class ServerlessPlugins {
     /**
      * Every node-scoped setting a plugin declares.
      *
-     * @param settings the node settings, which carry {@link #EXTENSIONS}
+     * @param settings the node settings, which carry {@link org.opensearch.serverless.shell.PluginSettings#EXTENSIONS}
      * @return the settings, empty when plugin extensions are off
      */
     public List<org.opensearch.common.settings.Setting<?>> pluginNodeSettings(Settings settings) {
@@ -589,7 +528,7 @@ public final class ServerlessPlugins {
     /**
      * Every index-scoped setting a plugin declares, such as k-NN's {@code index.knn}.
      *
-     * @param settings the node settings, which carry {@link #EXTENSIONS}
+     * @param settings the node settings, which carry {@link org.opensearch.serverless.shell.PluginSettings#EXTENSIONS}
      * @return the settings
      */
     public List<org.opensearch.common.settings.Setting<?>> indexSettings(Settings settings) {
@@ -615,7 +554,7 @@ public final class ServerlessPlugins {
      * built only its own. A pool's threads start on first use, so a declared pool nobody submits to costs
      * nothing.
      *
-     * @param settings the node settings, which carry {@link #EXTENSIONS}
+     * @param settings the node settings, which carry {@link org.opensearch.serverless.shell.PluginSettings#EXTENSIONS}
      * @return their executor builders, in load order
      */
     public List<org.opensearch.threadpool.ExecutorBuilder<?>> executorBuilders(Settings settings) {

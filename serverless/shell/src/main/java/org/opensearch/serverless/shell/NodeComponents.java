@@ -38,20 +38,11 @@ public final class NodeComponents {
         // bytes, and the right value depends on the object store's per-request cost and the index's
         // access pattern. Exposed so that can be measured rather than guessed.
         return new org.opensearch.serverless.store.BlockCache(
-            settings.getAsInt("serverless.block_cache.block_size", org.opensearch.serverless.store.BlockCache.DEFAULT_BLOCK_SIZE),
+            org.opensearch.serverless.store.CacheSettings.BLOCK_SIZE.get(settings),
             // Sized from the heap when not configured: the cache lives outside the breakers (accounting it
             // there would trip every request check by its own size), so its bound has to come from what
             // the process actually has rather than from a constant that was right on one machine.
-            settings.getAsInt(
-                "serverless.block_cache.max_blocks",
-                (int) Math.max(
-                    256L,
-                    Runtime.getRuntime().maxMemory() / 10 / settings.getAsInt(
-                        "serverless.block_cache.block_size",
-                        org.opensearch.serverless.store.BlockCache.DEFAULT_BLOCK_SIZE
-                    )
-                )
-            )
+            org.opensearch.serverless.store.CacheSettings.MAX_BLOCKS.get(settings)
         );
     }
 
@@ -64,9 +55,9 @@ public final class NodeComponents {
      */
     static org.opensearch.serverless.store.WriteBackpressure writeBackpressure(Settings settings, int maxInFlight) {
         return new org.opensearch.serverless.store.WriteBackpressure(
-            settings.getAsLong("serverless.write.backpressure.target_millis", 1_000L),
-            settings.getAsLong("serverless.write.backpressure.budget_millis", 5_000L),
-            settings.getAsInt("serverless.write.backpressure.min_in_flight", 4),
+            WriteSettings.BACKPRESSURE_TARGET_MILLIS.get(settings),
+            WriteSettings.BACKPRESSURE_BUDGET_MILLIS.get(settings),
+            WriteSettings.BACKPRESSURE_MIN_IN_FLIGHT.get(settings),
             maxInFlight
         );
     }
@@ -82,11 +73,8 @@ public final class NodeComponents {
         // in flight, so these bound the size of a group rather than schedule one -- there is no window to
         // configure. Setting max_records to 1 restores one PUT per write, which is what this replaced.
         return new org.opensearch.serverless.store.WalGroupCommitter(
-            settings.getAsInt(
-                "serverless.wal.group_commit.max_records",
-                org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_RECORDS
-            ),
-            settings.getAsLong("serverless.wal.group_commit.max_bytes", org.opensearch.serverless.store.WalGroupCommitter.DEFAULT_MAX_BYTES)
+            org.opensearch.serverless.store.NodeLogSettings.GROUP_COMMIT_MAX_RECORDS.get(settings),
+            org.opensearch.serverless.store.NodeLogSettings.GROUP_COMMIT_MAX_BYTES.get(settings)
         );
     }
 
@@ -174,6 +162,6 @@ public final class NodeComponents {
      * @return the attributes to describe a node with
      */
     public static Map<String, String> discoveryAttributesFor(Set<String> leaseRoles) {
-        return Map.of("serverless.roles", String.join(",", new java.util.TreeSet<>(leaseRoles)));
+        return Map.of(NodeSettings.ROLES.getKey(), String.join(",", new java.util.TreeSet<>(leaseRoles)));
     }
 }

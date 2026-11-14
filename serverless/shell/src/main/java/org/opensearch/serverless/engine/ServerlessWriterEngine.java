@@ -90,14 +90,7 @@ public final class ServerlessWriterEngine extends InternalEngine {
         this.replayLog = replayLog;
     }
 
-    /**
-     * Whether a writer keeps core's translog on local disk. Off, the writer keeps none ({@link DiscardingTranslogManager}): an
-     * acknowledged write is durable in the node log, and nothing ever replays a local translog, which cost every open writer two
-     * file descriptors and every acknowledged write a local fsync.
-     */
-    public static final String LOCAL_TRANSLOG_SETTING = "serverless.translog.local";
-
-    /** The default {@link #LOCAL_TRANSLOG_SETTING}. */
+    /** The default {@link org.opensearch.serverless.engine.WriterEngineSettings#LOCAL_TRANSLOG}. */
     public static final boolean DEFAULT_LOCAL_TRANSLOG = false;
 
     /**
@@ -107,7 +100,7 @@ public final class ServerlessWriterEngine extends InternalEngine {
      * @return true to keep core's disk translog
      */
     public static boolean keepsLocalTranslog(org.opensearch.common.settings.Settings nodeSettings) {
-        return nodeSettings.getAsBoolean(LOCAL_TRANSLOG_SETTING, DEFAULT_LOCAL_TRANSLOG);
+        return WriterEngineSettings.LOCAL_TRANSLOG.get(nodeSettings);
     }
 
     @Override

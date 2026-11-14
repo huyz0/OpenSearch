@@ -14,7 +14,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
-import org.opensearch.serverless.rest.BulkHandler;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -50,8 +49,8 @@ public class StreamingBulkTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put(BulkHandler.STREAMING_SETTING, true)
-            .put(BulkHandler.SLICE_BYTES_SETTING, "64kb")
+            .put(org.opensearch.serverless.rest.BulkSettings.STREAMING.getKey(), true)
+            .put(org.opensearch.serverless.rest.BulkSettings.SLICE_BYTES.getKey(), "64kb")
             .put(extra)
             .build();
     }
@@ -132,7 +131,7 @@ public class StreamingBulkTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = plane(clock);
         // The budget fits one slice at a time: four batches at once take turns, and none is refused.
-        final Settings tight = Settings.builder().put(BulkHandler.BUDGET_SETTING, "256kb").build();
+        final Settings tight = Settings.builder().put(org.opensearch.serverless.rest.BulkSettings.MEMORY_BUDGET.getKey(), "256kb").build();
         try (ServerlessNode node = started(nodeSettings("streaming-wait", tight), plane, clock)) {
             final List<Response> responses = new CopyOnWriteArrayList<>();
             final List<Thread> clients = new ArrayList<>();

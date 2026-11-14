@@ -54,7 +54,7 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
             .put("cluster.name", "serverless-breaker")
             // Batches taken whole, which are refused at the indexing budget; a streamed batch waits for the node's batch
             // memory instead, as StreamingBulkTests checks.
-            .put(org.opensearch.serverless.rest.BulkHandler.STREAMING_SETTING, false)
+            .put(org.opensearch.serverless.rest.BulkSettings.STREAMING.getKey(), false)
             .put("path.home", createTempDir())
             .put("network.host", "127.0.0.1")
             .put("http.port", "0")
@@ -301,7 +301,7 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
             final Settings settings = Settings.builder()
                 .put(nodeSettings("charged-" + charged, null))
                 .put("indexing_pressure.memory.limit", "1000b")
-                .put(org.opensearch.serverless.rest.BulkHandler.CHARGE_BEFORE_PARSE_SETTING, charged)
+                .put(org.opensearch.serverless.rest.BulkSettings.CHARGE_BEFORE_PARSE.getKey(), charged)
                 .build();
             try (ServerlessNode node = new ServerlessNode(settings)) {
                 node.startup().start();

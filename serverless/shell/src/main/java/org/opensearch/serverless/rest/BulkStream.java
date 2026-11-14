@@ -30,14 +30,14 @@ import reactor.core.publisher.BaseSubscriber;
  * One {@code _bulk} request applied as its body arrives, a slice at a time, with an ordinary bulk response at the end.
  *
  * <p><b>Memory per request is bounded, whatever the body's size.</b> Bytes arrive in chunks the transport reads only as
- * this asks for them. Once a slice's worth has arrived ({@link BulkHandler#SLICE_BYTES_SETTING}, 8 MB by default), its
+ * this asks for them. Once a slice's worth has arrived ({@link org.opensearch.serverless.rest.BulkSettings#SLICE_BYTES}, 8 MB by default), its
  * complete operations are parsed and applied while the next slice arrives; a third is not read until the first is done, so
  * a connection holds at most two slices of body and one slice's working set, and one slice while it waits its turn. A client sending faster than its batch can
  * be applied is slowed by TCP, as an object store slows an upload, rather than refused or buffered.
  *
  * <p><b>Applying waits its turn for memory.</b> Each slice is applied holding a share of the node's
  * {@link BulkMemoryBudget}, granted first come, first served. Waiting holds no thread, and its connection is not read
- * meanwhile. A slice refused after waiting {@link BulkHandler#WAIT_SETTING} ends the request with a 429. A shard group the
+ * meanwhile. A slice refused after waiting {@link org.opensearch.serverless.rest.BulkSettings#MAX_WAIT} ends the request with a 429. A shard group the
  * object store is too slow to take is sent again, the slice waiting, for as long again; only then is it answered 429.
  *
  * <p><b>What differs from a body taken whole.</b> Operations apply in order, a slice at a time, so a body that turns out
@@ -270,7 +270,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
 
     /**
      * Writes a slice's operations. A shard group refused because the object store is slow applied nothing, so rather
-     * than answer it 429 the slice waits and sends it again, until {@link BulkHandler#WAIT_SETTING} has passed: the
+     * than answer it 429 the slice waits and sends it again, until {@link org.opensearch.serverless.rest.BulkSettings#MAX_WAIT} has passed: the
      * next slice is not cut meanwhile and the connection is not read, so the client is slowed instead of refused.
      */
     private void write(

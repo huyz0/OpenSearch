@@ -65,14 +65,6 @@ import java.util.Set;
  */
 final class PluginInjector {
 
-    /**
-     * Whether plugin objects are built by core's injector: on by default.
-     *
-     * <p>Off falls back to constructor resolution only, which cannot run a plugin that binds Guice modules,
-     * takes a {@code Provider}, or names lifecycle services. With no plugin installed the two are identical.
-     */
-    static final String ENABLED = "serverless.plugin_injector.enabled";
-
     private final Injector injector;
     private final Set<Class<?>> bound;
     private final List<LifecycleComponent> services;
@@ -84,7 +76,7 @@ final class PluginInjector {
     }
 
     static boolean enabled(Settings settings) {
-        return settings.getAsBoolean(ENABLED, true);
+        return PluginSettings.INJECTOR.get(settings);
     }
 
     /**

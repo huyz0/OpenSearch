@@ -53,7 +53,7 @@ public class BucketColdOpenMeterTests extends OpenSearchTestCase {
             .put("serverless.wal.node_log.commits", true)
             .put("serverless.segments.node_pack.enabled", true)
             .put("serverless.buckets.enabled", true)
-            .put(org.opensearch.serverless.bucket.BucketSettings.MANIFEST_CODEC, codec)
+            .put(org.opensearch.serverless.bucket.BucketSettings.MANIFEST_CODEC.getKey(), codec)
             .build();
     }
 

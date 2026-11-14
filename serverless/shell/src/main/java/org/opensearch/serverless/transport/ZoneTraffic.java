@@ -34,9 +34,6 @@ import java.util.concurrent.atomic.LongAdder;
  */
 public final class ZoneTraffic {
 
-    /** Whether the meter counts, {@code true} by default; the count costs less than the request's MAC already does. */
-    public static final String ENABLED = "serverless.network.zone_meter.enabled";
-
     /** Where an exchange went, relative to this node's zone. */
     public enum Path {
         /** Both sides in the same known zone. */

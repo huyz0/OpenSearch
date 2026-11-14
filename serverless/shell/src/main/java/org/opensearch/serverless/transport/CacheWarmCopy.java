@@ -37,8 +37,8 @@ import java.util.function.LongSupplier;
  * cache key names a shard's storage and a file, not the node. So a joiner asks each search peer which of the peer's
  * readers it will serve once ready ({@link CacheHotSet}), then pulls those blocks, hottest first, over the transport.
  *
- * <p>Bounded on both sides. The joiner paces itself to {@value #MAX_BYTES_PER_SECOND} and asks for
- * {@value #BATCH_BLOCKS} blocks at a time, so a peer serving searches gives up a little bandwidth and no more; the peer
+ * <p>Bounded on both sides. The joiner paces itself to {@code serverless.search.warm_copy.max_bytes_per_second} and asks for
+ * {@code serverless.search.warm_copy.batch_blocks} blocks at a time, so a peer serving searches gives up a little bandwidth and no more; the peer
  * answers the listing on its management pool, never the threads that serve searches. A block the peer has evicted by
  * the time it is asked for is skipped, and so is everything from a peer that cannot be reached: the copy is an
  * optimisation, and a block it did not bring is fetched on first read exactly as it would have been without it.
@@ -47,39 +47,17 @@ public final class CacheWarmCopy {
 
     private static final Logger LOG = LogManager.getLogger(CacheWarmCopy.class);
 
-    /** The most bytes a second a joiner copies, across all its peers. */
-    public static final String MAX_BYTES_PER_SECOND = "serverless.search.warm_copy.max_bytes_per_second";
-
-    /** How many blocks one transfer asks a peer for. */
-    public static final String BATCH_BLOCKS = "serverless.search.warm_copy.batch_blocks";
-
     /** The default pace: about a gigabit, a share of a node's network a peer serving searches can spare. */
     static final long DEFAULT_MAX_BYTES_PER_SECOND = 128L * 1024 * 1024;
 
     /** The default batch: 4 MB of 64 KB blocks. */
     static final int DEFAULT_BATCH_BLOCKS = 64;
 
-    /** The most bytes of warm blocks a joiner copies, across all its peers. Defaults to a quarter of its cache. */
-    public static final String MAX_BYTES = "serverless.search.warm_copy.max_bytes";
-
-    /** How recently a block must have been read on a peer to be copied. */
-    public static final String RECENT_WINDOW = "serverless.search.warm_copy.recent_window";
-
     /** The default window: a block no search has read for half an hour is not what the next searches want. */
     static final org.opensearch.common.unit.TimeValue DEFAULT_RECENT_WINDOW = org.opensearch.common.unit.TimeValue.timeValueMinutes(30);
 
-    /** How many peers a joiner copies from at once. */
-    public static final String PARALLEL_PEERS = "serverless.search.warm_copy.parallel_peers";
-
     /** The default: enough to keep a joiner's network busy without one peer's slowness setting the pace of all. */
     static final int DEFAULT_PARALLEL_PEERS = 8;
-
-    /**
-     * Whether a joiner copies blocks from peers in other zones; false by default. A block from a peer in another zone
-     * is billed by the byte both ways, about four hundred times what reading the same block from the object store in
-     * 8 MB ranges costs, so by default such a peer is asked only what it holds and the blocks are read from the store.
-     */
-    public static final String CROSS_ZONE = "serverless.search.warm_copy.cross_zone";
 
     /** The most blocks a peer hands over in one answer, whatever it is asked for. */
     static final int MAX_BATCH_BLOCKS = 1024;
@@ -134,13 +112,16 @@ public final class CacheWarmCopy {
 
     CacheWarmCopy(ShardRouter router) {
         this.router = router;
-        this.maxBytesPerSecond = Math.max(1L, router.node.settings().getAsLong(MAX_BYTES_PER_SECOND, DEFAULT_MAX_BYTES_PER_SECOND));
-        this.batchBlocks = Math.max(1, Math.min(MAX_BATCH_BLOCKS, router.node.settings().getAsInt(BATCH_BLOCKS, DEFAULT_BATCH_BLOCKS)));
-        this.parallelPeers = Math.max(1, router.node.settings().getAsInt(PARALLEL_PEERS, DEFAULT_PARALLEL_PEERS));
+        this.maxBytesPerSecond = Math.max(1L, WarmCopySettings.MAX_BYTES_PER_SECOND.get(router.node.settings()));
+        this.batchBlocks = Math.max(1, Math.min(MAX_BATCH_BLOCKS, WarmCopySettings.BATCH_BLOCKS.get(router.node.settings())));
+        this.parallelPeers = Math.max(1, WarmCopySettings.PARALLEL_PEERS.get(router.node.settings()));
         final BlockCache cache = router.node.blockCache();
-        this.maxBytes = Math.max(0L, router.node.settings().getAsLong(MAX_BYTES, (long) cache.maxBlocks() * cache.blockSize() / 4));
-        this.recentMillis = router.node.settings().getAsTime(RECENT_WINDOW, DEFAULT_RECENT_WINDOW).millis();
-        this.crossZone = router.node.settings().getAsBoolean(CROSS_ZONE, false);
+        this.maxBytes = Math.max(
+            0L,
+            router.node.settings().getAsLong(WarmCopySettings.MAX_BYTES.getKey(), (long) cache.maxBlocks() * cache.blockSize() / 4)
+        );
+        this.recentMillis = WarmCopySettings.RECENT_WINDOW.get(router.node.settings()).millis();
+        this.crossZone = WarmCopySettings.CROSS_ZONE.get(router.node.settings());
     }
 
     /**
@@ -319,7 +300,7 @@ public final class CacheWarmCopy {
      *
      * <p>Every peer is asked for its hot set together, and a block named by several (a hot shard is spread over
      * several readers) is fetched from only one of them. The blocks are then taken from every peer at once, up to
-     * {@value #PARALLEL_PEERS}, within one shared pace: a joiner's time is the slowest peer's, not their sum. Each
+     * {@code serverless.search.warm_copy.parallel_peers}, within one shared pace: a joiner's time is the slowest peer's, not their sum. Each
      * peer's blocks go hottest first across its shards, so the share that arrives first is the share searches want.
      *
      * @param peers the peers to copy from

@@ -65,8 +65,8 @@ public class ObjectStoreLifecycleTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put(ObjectStores.TYPE, "s3")
-            .put(ObjectStores.BUCKET, "lifecycle-test")
+            .put(ObjectStoreSettings.TYPE.getKey(), "s3")
+            .put(ObjectStoreSettings.BUCKET.getKey(), "lifecycle-test")
             .setSecureSettings(secure)
             .build();
         try (var node = new org.opensearch.serverless.shell.ServerlessNode(settings)) {

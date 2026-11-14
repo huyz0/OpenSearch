@@ -535,7 +535,7 @@ public class LargeDocumentMeterTests extends OpenSearchTestCase {
             final Settings.Builder settings = Settings.builder()
                 .put(nodeSettings(createTempDir(), extra))
                 .put("serverless.activation.max_shards", shards + 100)
-                .put(org.opensearch.serverless.shell.ServerlessBootstrap.STORE_PATH, createTempDir().toString());
+                .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), createTempDir().toString());
             final ExecutorService httpThreads = Executors.newFixedThreadPool(64);
             try (
                 org.opensearch.serverless.shell.ServerlessBootstrap boot = org.opensearch.serverless.shell.ServerlessBootstrap.start(

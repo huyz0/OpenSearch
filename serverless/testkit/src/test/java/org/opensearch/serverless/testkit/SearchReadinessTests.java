@@ -38,7 +38,7 @@ public class SearchReadinessTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "search")
-            .put(SearchReadiness.WARM_ON_JOIN, warmOnJoin)
+            .put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), warmOnJoin)
             .build();
     }
 

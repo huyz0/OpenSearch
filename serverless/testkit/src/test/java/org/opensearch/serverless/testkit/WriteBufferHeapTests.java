@@ -65,7 +65,7 @@ public class WriteBufferHeapTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
             .put("serverless.activation.max_shards", indices + 100)
-            .put(ServerlessBootstrap.STORE_PATH, createTempDir().toString());
+            .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), createTempDir().toString());
         for (String key : java.util.Collections.list(org.opensearch.bootstrap.BootstrapInfo.getSystemProperties().keys())
             .stream()
             .map(String::valueOf)

@@ -9,7 +9,6 @@
 package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.settings.Settings;
-import org.opensearch.serverless.rest.BulkHandler;
 import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.serverless.store.MeteredBlobStore;
 import org.opensearch.test.OpenSearchTestCase;
@@ -25,7 +24,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Small requests over HTTP with and without {@link BulkHandler#STREAMING_SETTING}: single-document writes, small bulks
+ * Small requests over HTTP with and without {@link org.opensearch.serverless.rest.BulkSettings#STREAMING}: single-document writes, small bulks
  * and searches, closed loop, each mode run twice in alternation, with the object-store requests each mode made. Off
  * unless {@code -Dtests.restlat.requests} is set:
  *
@@ -56,8 +55,8 @@ public class RestPathLatencyMeterTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put(BulkHandler.STREAMING_SETTING, streaming)
-            .put(ServerlessBootstrap.STORE_PATH, createTempDir().toString())
+            .put(org.opensearch.serverless.rest.BulkSettings.STREAMING.getKey(), streaming)
+            .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), createTempDir().toString())
             .build();
         try (
             ServerlessBootstrap boot = ServerlessBootstrap.start(settings);

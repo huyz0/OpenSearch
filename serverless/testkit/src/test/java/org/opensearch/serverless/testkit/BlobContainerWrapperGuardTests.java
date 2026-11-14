@@ -169,7 +169,10 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
         final Path dir = createTempDir();
         try (
             ObjectStoreHandle handle = ObjectStores.create(
-                Settings.builder().put(ObjectStores.TYPE, "fs").put("serverless.store.path", dir.toString()).build(),
+                Settings.builder()
+                    .put(org.opensearch.serverless.store.ObjectStoreSettings.TYPE.getKey(), "fs")
+                    .put("serverless.store.path", dir.toString())
+                    .build(),
                 null,
                 createTempDir()
             )
@@ -196,11 +199,11 @@ public class BlobContainerWrapperGuardTests extends OpenSearchTestCase {
             .put("network.host", "127.0.0.1")
             .put("http.port", "0")
             .put("transport.port", "0")
-            .put(ObjectStores.TYPE, "s3")
-            .put(ObjectStores.BUCKET, bucket)
-            .put(ObjectStores.ENDPOINT, endpoint)
-            .put(ObjectStores.PATH_STYLE, true)
-            .put(ObjectStores.REGION, "us-east-1")
+            .put(org.opensearch.serverless.store.ObjectStoreSettings.TYPE.getKey(), "s3")
+            .put(org.opensearch.serverless.store.ObjectStoreSettings.BUCKET.getKey(), bucket)
+            .put(org.opensearch.serverless.store.ObjectStoreSettings.ENDPOINT.getKey(), endpoint)
+            .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH_STYLE_ACCESS.getKey(), true)
+            .put(org.opensearch.serverless.store.ObjectStoreSettings.REGION.getKey(), "us-east-1")
             .setSecureSettings(secure)
             .build();
         final boolean honours = Boolean.parseBoolean(System.getProperty("tests.serverless.guard.conditional_delete", "true"));

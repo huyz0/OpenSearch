@@ -25,23 +25,16 @@ import java.util.List;
  * shard, so the answer stays inside the zone.
  *
  * <p><b>Only hot shards.</b> A reader per zone for every shard would hold up to one copy per zone of every index's
- * cache, for shards that are searched once an hour. A shard searched at least {@link #MIN_PER_SECOND} times a second by
+ * cache, for shards that are searched once an hour. A shard searched at least {@link org.opensearch.serverless.cluster.ReaderPlacementSettings#ZONE_LOCAL_MIN_PER_SECOND} times a second by
  * this coordinator moves enough bytes to be worth a reader in each zone; a colder one keeps the single reader placement
  * names, wherever it is, and its cache affinity is unchanged.
  *
  * <p><b>Never a requirement.</b> The zone's chosen reader goes first and the fleet-wide order follows it, so the next
  * attempt after a zone's reader fails is the reader placement would have used anyway. A zone's reader with
- * {@link #SPILL_IN_FLIGHT} more searches in flight than the fleet-wide choice gives way to it, so a zone with fewer
+ * {@link org.opensearch.serverless.cluster.ReaderPlacementSettings#ZONE_LOCAL_SPILL_IN_FLIGHT} more searches in flight than the fleet-wide choice gives way to it, so a zone with fewer
  * nodes than the others does not collect a queue for the money it saves.
  */
 public final class ZonePreference {
-
-    /** Whether hot shards prefer a reader in the coordinator's zone; true by default, and a no-op without zones. */
-    public static final String ENABLED = "serverless.search.zone_local.enabled";
-    /** Searches a second, from one coordinator, above which a shard gets a reader in the coordinator's zone. */
-    public static final String MIN_PER_SECOND = "serverless.search.zone_local.min_per_second";
-    /** How many more searches in flight a zone's reader may have than the fleet-wide choice before it gives way. */
-    public static final String SPILL_IN_FLIGHT = "serverless.search.zone_local.spill_in_flight";
 
     static final double DEFAULT_MIN_PER_SECOND = 1.0;
     static final int DEFAULT_SPILL_IN_FLIGHT = 8;
@@ -73,9 +66,9 @@ public final class ZonePreference {
      */
     public ZonePreference(Settings settings) {
         this(
-            settings.getAsBoolean(ENABLED, true),
-            settings.getAsDouble(MIN_PER_SECOND, DEFAULT_MIN_PER_SECOND),
-            settings.getAsInt(SPILL_IN_FLIGHT, DEFAULT_SPILL_IN_FLIGHT)
+            ReaderPlacementSettings.ZONE_LOCAL_ENABLED.get(settings),
+            ReaderPlacementSettings.ZONE_LOCAL_MIN_PER_SECOND.get(settings),
+            ReaderPlacementSettings.ZONE_LOCAL_SPILL_IN_FLIGHT.get(settings)
         );
     }
 

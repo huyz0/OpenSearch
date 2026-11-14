@@ -66,24 +66,21 @@ public final class ServerlessNode implements Closeable {
     /** Accepts reader activation: serves search from object-store-backed segments. */
     public static final String ROLE_SEARCH = "search";
 
-    /** The node's roles: any of {@link #ROLE_INGEST} and {@link #ROLE_SEARCH}, both when unset, neither when set empty. */
-    public static final String ROLES = "serverless.roles";
-
     /**
-     * Reads a node's roles from its settings.
-     *
-     * <p>Unset means both roles, as one node of a small deployment runs. Set but empty means neither: a node that only
-     * coordinates, taking requests and sending each write to a shard's writer and each search to search nodes, while
-     * holding no shard itself. {@code Settings.getAsList} answers its default for an empty value, which made an empty
-     * setting mean both roles, so the value is split here instead. An unknown role is refused, since a misspelled
-     * {@code search} would otherwise start a node that silently serves nothing.
-     *
-     * @param settings the node settings
-     * @return the roles, possibly empty
-     * @throws IllegalArgumentException if a role is not one this node knows
-     */
+    * Reads a node's roles from its settings.
+    *
+    * <p>Unset means both roles, as one node of a small deployment runs. Set but empty means neither: a node that only
+    * coordinates, taking requests and sending each write to a shard's writer and each search to search nodes, while
+    * holding no shard itself. {@code Settings.getAsList} answers its default for an empty value, which made an empty
+    * setting mean both roles, so the value is split here instead. An unknown role is refused, since a misspelled
+    * {@code search} would otherwise start a node that silently serves nothing.
+    *
+    * @param settings the node settings
+    * @return the roles, possibly empty
+    * @throws IllegalArgumentException if a role is not one this node knows
+    */
     public static Set<String> rolesFrom(Settings settings) {
-        final String raw = settings.get(ROLES);
+        final String raw = settings.get(NodeSettings.ROLES.getKey());
         if (raw == null) {
             return Set.of(ROLE_INGEST, ROLE_SEARCH);
         }
@@ -95,7 +92,11 @@ public final class ServerlessNode implements Closeable {
             }
             if (trimmed.equals(ROLE_INGEST) == false && trimmed.equals(ROLE_SEARCH) == false) {
                 throw new IllegalArgumentException(
-                    "unknown role [" + trimmed + "] in [" + ROLES + "]; use ingest, search, both, or an empty value to only coordinate"
+                    "unknown role ["
+                        + trimmed
+                        + "] in ["
+                        + NodeSettings.ROLES.getKey()
+                        + "]; use ingest, search, both, or an empty value to only coordinate"
                 );
             }
             roles.add(trimmed);
@@ -393,20 +394,17 @@ public final class ServerlessNode implements Closeable {
         // environment variable, and role switching under load stays a policy question.
         this.roles = rolesFrom(settings);
         this.blockCache = NodeComponents.blockCache(settings);
-        this.writeBackpressureMax = settings.getAsInt(
-            "serverless.write.backpressure.max_in_flight",
-            WritePools.defaultMaxInFlight(settings)
-        );
+        this.writeBackpressureMax = WriteSettings.BACKPRESSURE_MAX_IN_FLIGHT.get(settings);
         this.writePools = WritePools.of(settings);
         this.writeBackpressure = NodeComponents.writeBackpressure(settings, writeBackpressureMax);
         this.walCommitter = NodeComponents.walCommitter(settings);
-        this.nodeLogEnabled = settings.getAsBoolean("serverless.wal.node_log.enabled", true);
-        if (nodeLogEnabled && settings.getAsBoolean(NodePackWiring.LOG_COMMITS, NodePackWiring.LOG_COMMITS_DEFAULT)) {
+        this.nodeLogEnabled = org.opensearch.serverless.store.NodeLogSettings.ENABLED.get(settings);
+        if (nodeLogEnabled && WriteSettings.LOG_COMMITS.get(settings)) {
             // Refused here, at construction, rather than on the first shard it takes.
             this.nodeLogCommitCheckpointMillis = LogCommitCheckpoint.nodeValue(settings);
             this.logCommitCheckpointMillis = nodeLogCommitCheckpointMillis;
         }
-        this.packSegments = settings.getAsBoolean("serverless.segments.pack.enabled", true);
+        this.packSegments = WriteSettings.SEGMENTS_PACK.get(settings);
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
         final Environment environment = new Environment(settings, null);
@@ -426,12 +424,10 @@ public final class ServerlessNode implements Closeable {
             threadPool,
             readerServing::forgetReader
         );
-        this.readerValidation.setLiveOwnerCheckMillis(
-            settings.getAsLong(ReaderValidation.LIVE_OWNER_CHECK, ReaderValidation.LIVE_OWNER_CHECK_MILLIS)
-        );
+        this.readerValidation.setLiveOwnerCheckMillis(SearchSettings.READER_CHECK_LIVE_OWNER_MILLIS.get(settings));
         // An open fetches the blocks it will read concurrently rather than one round trip at a time, on GENERIC as
         // the log replay's reads do; the opening thread reads too, so a busy pool costs width only.
-        if (settings.getAsBoolean("serverless.block_cache.prefetch_on_open", true)) {
+        if (org.opensearch.serverless.store.CacheSettings.PREFETCH_ON_OPEN.get(settings)) {
             blockCache.prefetchingWith(threadPool.generic());
         }
         boolean success = false;
@@ -532,38 +528,19 @@ public final class ServerlessNode implements Closeable {
      * own uuid exactly as before.
      */
     static String storageUuidOf(org.opensearch.index.IndexSettings indexSettings) {
-        final String source = indexSettings.getSettings().get(STORAGE_UUID_SETTING);
+        final String source = indexSettings.getSettings().get(NodeSettings.STORAGE_UUID.getKey());
         return source == null ? indexSettings.getIndex().getUUID() : source;
     }
 
-    /** Names the index whose storage a shard should read, when that is not the index it belongs to. */
-    public static final String STORAGE_UUID_SETTING = "index.serverless.storage_uuid";
-
     /**
-     * Refuse to start on a plaintext transport.
-     *
-     * <p>Forwarded requests carry the deployment's transport secret; on a plaintext transport it crosses
-     * the wire in the clear, and anyone who can read the wire can forward writes as a member. Off by
-     * default because the filesystem-backed, loopback-only configuration every test runs is exactly the
-     * case where a plaintext transport is fine; a deployment whose transport port is on a reachable
-     * network sets it and gets a refusal instead of a warning.
-     */
-    public static final org.opensearch.common.settings.Setting<Boolean> REQUIRE_SECURE_TRANSPORT_SETTING =
-        org.opensearch.common.settings.Setting.boolSetting(
-            "serverless.transport.require_secure",
-            false,
-            org.opensearch.common.settings.Setting.Property.NodeScope
-        );
-
-    /**
-     * The frozen view a shard is serving, if it is serving one.
-     *
-     * <p>A view is opened as an index of its own whose uuid is the view's identifier, and it is the only
-     * kind of shard that carries {@link #STORAGE_UUID_SETTING} — so the presence of that setting is what
-     * distinguishes one, and its own uuid is the identifier.
-     */
+    * The frozen view a shard is serving, if it is serving one.
+    *
+    * <p>A view is opened as an index of its own whose uuid is the view's identifier, and it is the only
+    * kind of shard that carries {@link org.opensearch.serverless.shell.NodeSettings#STORAGE_UUID} — so the presence of that setting is what
+    * distinguishes one, and its own uuid is the identifier.
+    */
     static String frozenViewIdOf(org.opensearch.index.IndexSettings indexSettings) {
-        return indexSettings.getSettings().get(STORAGE_UUID_SETTING) == null ? null : indexSettings.getIndex().getUUID();
+        return indexSettings.getSettings().get(NodeSettings.STORAGE_UUID.getKey()) == null ? null : indexSettings.getIndex().getUUID();
     }
 
     /**
@@ -626,20 +603,14 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
-     * Whether the membership view reports a peer's renewal as that peer leaving and joining again, as it did before it
-     * compared members rather than whole leases. False by default; true only to compare with the old behaviour.
-     */
-    public static final String MEMBERSHIP_RENEWALS_AS_CHANGES = "serverless.membership.renewals_as_changes";
-
-    /**
-     * Gives this node's REST surface a metadata plane to read and write.
-     *
-     * <p>Set after construction because the plane is a deployment-level object and the REST routes are
-     * registered while the node is still being built. Until it is set, the admin endpoints answer 503
-     * saying exactly that, rather than answering as though nothing existed.
-     *
-     * @param plane the metadata plane, or null
-     */
+    * Gives this node's REST surface a metadata plane to read and write.
+    *
+    * <p>Set after construction because the plane is a deployment-level object and the REST routes are
+    * registered while the node is still being built. Until it is set, the admin endpoints answer 503
+    * saying exactly that, rather than answering as though nothing existed.
+    *
+    * @param plane the metadata plane, or null
+    */
     public void setMetadataPlane(org.opensearch.serverless.metadata.MetadataPlane plane) {
         this.metadataPlane = plane;
         if (plane != null) {
@@ -648,7 +619,7 @@ public final class ServerlessNode implements Closeable {
             // on which head owns an index could both take it.
             plane.bucketHeads().register(localNode.getId(), () -> reconciler().openShards());
             plane.buckets().configure(settings);
-            plane.membership().reportRenewalsAsChanges(settings.getAsBoolean(MEMBERSHIP_RENEWALS_AS_CHANGES, false));
+            plane.membership().reportRenewalsAsChanges(NodeSettings.MEMBERSHIP_RENEWALS_AS_CHANGES.get(settings));
             try {
                 // Publish the lease immediately. It is this node's entry in the address book that peers
                 // use to forward writes here, so a node that has not renewed yet is not merely invisible

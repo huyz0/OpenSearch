@@ -42,7 +42,7 @@ import java.util.concurrent.CountDownLatch;
  * provider's conditional writes -- the property every register here leans on -- has not been closed for
  * Amazon S3 itself, so a node runs on such a provider only behind a flag that says so. An
  * {@code s3} store boots, and boots with a warning naming the providers actually tested, unless
- * {@link #PROVIDER_ACK} records that the operator has read it. A process that accepted a bucket it has
+ * {@link org.opensearch.serverless.store.ObjectStoreSettings#PROVIDER_ACK} records that the operator has read it. A process that accepted a bucket it has
  * never been run against and said nothing would be worse than one that says what it is.
  */
 public final class ServerlessBootstrap implements Closeable {
@@ -85,173 +85,30 @@ public final class ServerlessBootstrap implements Closeable {
         }
     }
 
-    /** Where the stand-in object store lives. Required. */
-    public static final String STORE_PATH = "serverless.store.path";
-
-    /** How long a lease stays valid after a renewal. */
-    public static final String LEASE_TTL = "serverless.lease.ttl_millis";
-
-    /** Whether to take unowned shards that somebody asks for. */
-    public static final String ON_DEMAND = "serverless.activation.on_demand";
-
-    /** How many shards this node will take on demand before refusing. */
-    public static final String MAX_SHARDS = "serverless.activation.max_shards";
-
-    /**
-     * How long a shard may go unused before this node lets go of it. Zero never releases.
-     *
-     * <p>On here and off in the library, the same split {@link #ON_DEMAND} has. A node running unattended
-     * that only ever acquires shards is not serverless in any sense its users would recognise — it is a
-     * process that grows until it hits {@link #MAX_SHARDS} and then starts refusing.
-     */
-    public static final String IDLE_AFTER = "serverless.activation.idle_after_millis";
-
-    /** How long a shard must be unused before a node at its cap evicts it to take a new one. */
-    public static final String EVICT_AFTER = "serverless.activation.evict_after_millis";
-
-    /**
-     * How long a writer may go unused before it hibernates: it publishes, closes its engine and keeps its head, and the
-     * next request wakes it at the same term with one head read rather than a takeover. Zero never hibernates. Below
-     * {@link #IDLE_AFTER}, which still gives the head back once a writer has been unused that long.
-     */
-    public static final String HIBERNATE_AFTER = "serverless.activation.hibernate_after_millis";
-
-    /** The default for {@link #HIBERNATE_AFTER}: off until it is measured to cost nothing it saves. */
+    /** The default for {@link org.opensearch.serverless.shell.ActivationSettings#HIBERNATE_AFTER_MILLIS}: off until it is measured to cost nothing it saves. */
     public static final long DEFAULT_HIBERNATE_AFTER_MILLIS = 0L;
 
-    /**
-     * How many shards a node activates at once; the activation pool is sized from it. An activation spends most of its time
-     * waiting on the object store, so a node taking a dead node's shards, or a new node taking its share, is bounded by
-     * this times the store's latency rather than by its own work.
-     */
-    public static final String ACTIVATION_CONCURRENCY = NodeThreadPools.ACTIVATION_CONCURRENCY_SETTING;
-
-    /** Whether the activations at once follow the store, up to {@link #ACTIVATION_CONCURRENCY}; off by default. */
-    public static final String ACTIVATION_ADAPTIVE = "serverless.activation.adaptive";
-
-    /** Whether requests for a dead member's shard go to the one survivor named for it; on by default. */
-    public static final String ROUTE_TAKEOVERS = "serverless.takeover.route_to_winner";
-
-    /** Whether activations at once are cut while the write path's limiter is cutting writes; off until measured. */
-    public static final String ACTIVATION_PACED = "serverless.activation.paced_by_writes";
-
-    /** How far past its cap a node may take a dead member's shards, as a fraction of the cap; 0 turns it off. */
-    public static final String TAKEOVER_OVERCOMMIT = "serverless.takeover.overcommit";
-
-    /**
-     * Whether the local view reuses an unchanged index's last projection; on by default. Off only to measure what it saves.
-     */
-    public static final String VIEW_REUSE = "serverless.view.reuse_projections";
-
-    /** How long an activation should take before the adaptive limit falls. */
-    public static final String ACTIVATION_TARGET = "serverless.activation.target_millis";
-
-    /**
-     * How long a node goes between re-reading the head of every writer shard it holds. Zero reads them on
-     * every pass, which is the library default.
-     *
-     * <p>On here and at an hour, because a head cannot move away from a node whose renewals succeed
-     * without that node being told: a taker revokes the owner's lease before taking its shard, and the
-     * owner's next renewal fails on it (see {@code BlobLeaseMembership#revoke}), which re-reads every head at
-     * once. What the scan still catches is a head released by someone other than its owner, which nothing in
-     * this shell does: deleting an index gives its heads back, and the descriptor refresh of open indices,
-     * which runs on its own interval, closes those shards. An hour bounds how long such a head would go
-     * unnoticed. It was five minutes, which made the scan an idle open writer's largest cost: twelve head reads
-     * an hour, now one.
-     */
-    public static final String HEAD_VERIFY_INTERVAL = "serverless.heads.verify_interval_millis";
-
-    /** The production head-verification interval; see {@link #HEAD_VERIFY_INTERVAL}. */
+    /** The production head-verification interval; see {@link org.opensearch.serverless.shell.NodeSettings#HEAD_VERIFY_INTERVAL_MILLIS}. */
     public static final long DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS = 3_600_000L;
 
-    /**
-     * How long a node goes between re-reading the descriptors of the indices it holds open, where nothing
-     * else has read them meanwhile. Zero reads them on every pass, which is the library default.
-     *
-     * <p>A backstop, not the way changes arrive. Every operation on a shard -- write, get, search -- first passes
-     * the incarnation fence, which reads the descriptor unless one was read within the last second and applies
-     * what it read, so a mapping or settings change made on another node is in force for the first operation
-     * after it. A shard nobody uses answers nothing, so nothing can see it behind; this pass only bounds how long
-     * it stays so. At thirty seconds it was most of an idle node's store requests: 120 reads an hour per open
-     * index, for shards nobody was asking anything of.
-     */
-    public static final String DESCRIPTOR_REFRESH_INTERVAL = "serverless.descriptors.refresh_interval_millis";
-
-    /**
-     * How often each node cleans up after crashed nodes: a dead owner's fully published shards given back, the rollup
-     * marks and claims it left cleared, and shards it left behind its log taken to be replayed, a bounded number a
-     * pass. Zero runs no janitor.
-     */
-    public static final String JANITOR_INTERVAL = "serverless.janitor.interval_millis";
-
-    /** The production janitor interval; see {@link #JANITOR_INTERVAL}. */
+    /** The production janitor interval; see {@link org.opensearch.serverless.shell.NodeSettings#JANITOR_INTERVAL_MILLIS}. */
     public static final long DEFAULT_JANITOR_INTERVAL_MILLIS = 60_000L;
 
-    /** The production descriptor refresh interval; see {@link #DESCRIPTOR_REFRESH_INTERVAL}. */
+    /** The production descriptor refresh interval; see {@link org.opensearch.serverless.shell.NodeSettings#DESCRIPTOR_REFRESH_INTERVAL_MILLIS}. */
     public static final long DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS = 300_000L;
-    /**
-     * How long writes are gathered before one publish covers them all. Exposed because it is the knob
-     * that decides how much a crashed node leaves for its successor to replay from the log.
-     */
-    public static final String PUBLISH_DEBOUNCE = "serverless.publish.debounce_millis";
-
-    /**
-     * The least time between two write-triggered publishes of one shard. Each publish of a small commit costs five or
-     * more PUTs, so this is the knob that decides how much a busy shard spends on publishing; zero or less publishes
-     * every debounce window. See {@link ReconcileScheduler#DEFAULT_PUBLISH_MIN_INTERVAL}.
-     */
-    public static final String PUBLISH_MIN_INTERVAL = "serverless.publish.min_interval_millis";
-
-    /**
-     * How many operations beyond its last publish make a shard due for a publish inside the minimum interval; zero
-     * for never early. Bounds what a successor replays.
-     */
-    public static final String PUBLISH_MAX_UNPUBLISHED_OPERATIONS = "serverless.publish.max_unpublished_operations";
-
-    /**
-     * With one write log per node, how long a write may wait to be published: the longest a write takes to be
-     * searchable, and what bounds how much of the log is kept. Zero publishes as without the log. See
-     * {@link BackgroundReconciler#setLazyPublish}.
-     */
-    public static final String NODE_LOG_PUBLISH_MAX_AGE = "serverless.wal.node_log.publish_max_age_millis";
-
-    /** The default {@link #NODE_LOG_PUBLISH_MAX_AGE}: a second, as core refreshes an index that sets no interval. */
+    /** The default {@link org.opensearch.serverless.shell.WriteSettings#NODE_LOG_PUBLISH_MAX_AGE_MILLIS}: a second, as core refreshes an index that sets no interval. */
     public static final long DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS = 1_000L;
-
-    /** How long a node's write-log window stays open: one of {@link NodeLogCommitter#ALLOWED_WINDOW_MILLIS}. */
-    public static final String NODE_LOG_WINDOW = "serverless.wal.node_log.window_millis";
 
     /** The first token of the readiness line, so the file is self-describing. */
     public static final String READY_MARKER = "SERVERLESS_READY";
-
-    /** Where to write the readiness line once the node is serving. Optional. */
-    public static final String READY_FILE = "serverless.ready.file";
 
     /**
      * Where {@code opensearch.keystore} lives. Defaults to {@code path.home/config}, as for a real node.
      */
     public static final String CONFIG_PATH = "path.conf";
 
-    /**
-     * Plugin classes to run, by name.
-     *
-     * <p><b>Not the same thing as installing one.</b> An installed plugin lives in {@code plugins/} with a
-     * descriptor and its own jars, and {@link ServerlessNode} loads those through core's own loader. This
-     * setting is for a class that is already on the node's classpath — a plugin a distribution ships rather
-     * than one an operator installed — and it exists so that turning such a plugin on is configuration
-     * rather than a change to the shell.
-     */
-    public static final String PLUGINS = "serverless.plugins";
-
     /** The default lease TTL: long enough to survive a slow object store, short enough to fail over. */
     public static final long DEFAULT_LEASE_TTL_MILLIS = 30_000L;
-
-    /**
-     * Set to {@code true} to record that the operator knows an {@code s3} store's conditional writes have
-     * not been proven linearizable by the conformance suite against their provider. Silences the boot warning and
-     * nothing else: the node behaves the same either way.
-     */
-    public static final String PROVIDER_ACK = "serverless.store.provider_ack";
 
     /** The providers the blob-store conformance suite has actually been run against. */
     static final String TESTED_PROVIDERS = "the filesystem container, MinIO, SeaweedFS and RustFS";
@@ -300,12 +157,12 @@ public final class ServerlessBootstrap implements Closeable {
      * lease pointing at an address that refuses connections — and peers resolve forwarding targets from
      * exactly that lease.
      *
-     * @param settings the node's settings, including {@link #STORE_PATH}
+     * @param settings the node's settings, including {@link org.opensearch.serverless.store.ObjectStoreSettings#PATH}
      * @return the running node
      * @throws Exception if any part of startup fails
      */
     public static ServerlessBootstrap start(Settings settings) throws Exception {
-        final String storeType = settings.get(org.opensearch.serverless.store.ObjectStores.TYPE, "fs");
+        final String storeType = org.opensearch.serverless.store.ObjectStoreSettings.TYPE.get(settings);
         if ("s3".equals(storeType) && System.getProperty("opensearch.path.conf") == null) {
             // The AWS SDK v2 is told where the node's config lives so it does not go looking in the home
             // directory, and the s3 plugin passes that property straight into System.setProperty. Unset,
@@ -317,10 +174,15 @@ public final class ServerlessBootstrap implements Closeable {
                     + "start this process with -Dopensearch.path.conf=<config dir>"
             );
         }
-        if ("fs".equals(storeType) && (settings.get(STORE_PATH) == null || settings.get(STORE_PATH).isBlank())) {
-            throw new IllegalArgumentException(STORE_PATH + " is required: it is where the metadata plane and segments live");
+        if ("fs".equals(storeType)
+            && (settings.get(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey()) == null
+                || settings.get(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey()).isBlank())) {
+            throw new IllegalArgumentException(
+                org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey()
+                    + " is required: it is where the metadata plane and segments live"
+            );
         }
-        if ("s3".equals(storeType) && settings.getAsBoolean(PROVIDER_ACK, false) == false) {
+        if ("s3".equals(storeType) && org.opensearch.serverless.store.ObjectStoreSettings.PROVIDER_ACK.get(settings) == false) {
             // The provider flag, as a warning rather than a refusal: a deployment already on such a store must
             // not stop booting on upgrade, and an operator who has read this sets the setting once.
             logger.warn(
@@ -328,12 +190,12 @@ public final class ServerlessBootstrap implements Closeable {
                     + "provider's conditional writes -- which every register here depends on -- has not been closed for it. "
                     + "Set {}=true to record that this is understood.",
                 TESTED_PROVIDERS,
-                PROVIDER_ACK
+                org.opensearch.serverless.store.ObjectStoreSettings.PROVIDER_ACK.getKey()
             );
         }
-        final long ttl = settings.getAsLong(LEASE_TTL, DEFAULT_LEASE_TTL_MILLIS);
+        final long ttl = NodeSettings.LEASE_TTL_MILLIS.get(settings);
         if (ttl <= 0L) {
-            throw new IllegalArgumentException(LEASE_TTL + " must be positive, got " + ttl);
+            throw new IllegalArgumentException(NodeSettings.LEASE_TTL_MILLIS.getKey() + " must be positive, got " + ttl);
         }
 
         // Secure settings, before anything reads them. An object store's credentials are SecureSettings
@@ -341,6 +203,9 @@ public final class ServerlessBootstrap implements Closeable {
         // could talk to S3 in a test that supplied MockSecureSettings by hand, and not in production.
         final Path configPath = configPath(settings);
         final Settings complete = withSecureSettings(settings, configPath);
+        for (String unknown : org.opensearch.serverless.settings.ServerlessSettings.unknownNodeKeys(complete)) {
+            logger.warn("[{}] is not a serverless setting and is ignored; check its spelling", unknown);
+        }
 
         // The node comes first, and it has to: an s3 store is built through the repository plugin, which
         // wants a ClusterService, and the node is what owns one. The plane is attached immediately
@@ -356,8 +221,8 @@ public final class ServerlessBootstrap implements Closeable {
         ReconcileScheduler openedScheduler = null;
         try {
             node.startup().start();
-            node.projector().setReuseProjections(complete.getAsBoolean(VIEW_REUSE, true));
-            node.nodeCapacity().setRouteTakeovers(complete.getAsBoolean(ROUTE_TAKEOVERS, true));
+            node.projector().setReuseProjections(NodeSettings.VIEW_REUSE_PROJECTIONS.get(complete));
+            node.nodeCapacity().setRouteTakeovers(ActivationSettings.TAKEOVER_ROUTE_TO_WINNER.get(complete));
             logger.info("startup: node started at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
 
             final org.opensearch.serverless.store.ObjectStoreHandle store = org.opensearch.serverless.store.ObjectStores.create(
@@ -376,20 +241,18 @@ public final class ServerlessBootstrap implements Closeable {
             );
             // A search node that joined to warm copies its peers' cache and opens its shards, then turns ready.
             SearchWarmup.startInBackground(node, plane);
-            node.setHeadVerifyIntervalMillis(complete.getAsLong(HEAD_VERIFY_INTERVAL, DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS));
-            node.setDescriptorRefreshIntervalMillis(
-                complete.getAsLong(DESCRIPTOR_REFRESH_INTERVAL, DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS)
-            );
+            node.setHeadVerifyIntervalMillis(NodeSettings.HEAD_VERIFY_INTERVAL_MILLIS.get(complete));
+            node.setDescriptorRefreshIntervalMillis(NodeSettings.DESCRIPTOR_REFRESH_INTERVAL_MILLIS.get(complete));
 
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             openedLoop = loop;
-            final boolean nodeLog = complete.getAsBoolean("serverless.wal.node_log.enabled", true);
-            final long window = complete.getAsLong(NODE_LOG_WINDOW, NodeLogCommitter.DEFAULT_WINDOW_MILLIS);
+            final boolean nodeLog = org.opensearch.serverless.store.NodeLogSettings.ENABLED.get(complete);
+            final long window = org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.get(complete);
             if (nodeLog) {
                 if (NodeLogCommitter.ALLOWED_WINDOW_MILLIS.contains(window) == false) {
                     throw new IllegalArgumentException(
                         "["
-                            + NODE_LOG_WINDOW
+                            + org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.getKey()
                             + "] must be one of "
                             + new java.util.TreeSet<>(NodeLogCommitter.ALLOWED_WINDOW_MILLIS)
                             + ", got "
@@ -398,22 +261,22 @@ public final class ServerlessBootstrap implements Closeable {
                 }
                 // Due times line up with the window the log ships on, so shards that come due together go out together.
                 loop.setLazyPublish(
-                    complete.getAsLong(NODE_LOG_PUBLISH_MAX_AGE, DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS),
-                    complete.getAsLong(PUBLISH_MAX_UNPUBLISHED_OPERATIONS, ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS),
+                    WriteSettings.NODE_LOG_PUBLISH_MAX_AGE_MILLIS.get(complete),
+                    WriteSettings.PUBLISH_MAX_UNPUBLISHED_OPERATIONS.get(complete),
                     window
                 );
             }
-            warnIfTooFewOpenFiles(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD), complete);
-            loop.setDemandDrivenActivation(complete.getAsBoolean(ON_DEMAND, true))
-                .setMaxShardsHeld(complete.getAsInt(MAX_SHARDS, BackgroundReconciler.DEFAULT_MAX_SHARDS_HELD))
-                .setIdleAfterMillis(complete.getAsLong(IDLE_AFTER, BackgroundReconciler.DEFAULT_IDLE_AFTER_MILLIS))
-                .setHibernateAfterMillis(complete.getAsLong(HIBERNATE_AFTER, DEFAULT_HIBERNATE_AFTER_MILLIS))
-                .setEvictAfterMillis(complete.getAsLong(EVICT_AFTER, BackgroundReconciler.DEFAULT_EVICT_AFTER_MILLIS))
-                .setActivationConcurrency(complete.getAsInt(ACTIVATION_CONCURRENCY, BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY))
-                .setActivationTargetMillis(complete.getAsLong(ACTIVATION_TARGET, BackgroundReconciler.DEFAULT_ACTIVATION_TARGET_MILLIS))
-                .setAdaptiveActivation(complete.getAsBoolean(ACTIVATION_ADAPTIVE, false))
-                .setTakeoverOvercommit(complete.getAsDouble(TAKEOVER_OVERCOMMIT, BackgroundReconciler.DEFAULT_TAKEOVER_OVERCOMMIT))
-                .setActivationPacedByWrites(complete.getAsBoolean(ACTIVATION_PACED, false));
+            warnIfTooFewOpenFiles(ActivationSettings.MAX_SHARDS.get(complete), complete);
+            loop.setDemandDrivenActivation(ActivationSettings.ON_DEMAND.get(complete))
+                .setMaxShardsHeld(ActivationSettings.MAX_SHARDS.get(complete))
+                .setIdleAfterMillis(ActivationSettings.IDLE_AFTER_MILLIS.get(complete))
+                .setHibernateAfterMillis(ActivationSettings.HIBERNATE_AFTER_MILLIS.get(complete))
+                .setEvictAfterMillis(ActivationSettings.EVICT_AFTER_MILLIS.get(complete))
+                .setActivationConcurrency(ActivationSettings.CONCURRENCY.get(complete))
+                .setActivationTargetMillis(ActivationSettings.TARGET_MILLIS.get(complete))
+                .setAdaptiveActivation(ActivationSettings.ADAPTIVE.get(complete))
+                .setTakeoverOvercommit(ActivationSettings.TAKEOVER_OVERCOMMIT.get(complete))
+                .setActivationPacedByWrites(ActivationSettings.PACED_BY_WRITES.get(complete));
 
             final ReconcileScheduler scheduler = new ReconcileScheduler(
                 loop,
@@ -422,19 +285,20 @@ public final class ServerlessBootstrap implements Closeable {
                 org.opensearch.common.unit.TimeValue.timeValueMillis(Math.max(1L, ttl / ReconcileScheduler.RENEWALS_PER_TTL)),
                 // With the node log, a pass looks again every window, so a shard due at a tick is published at it.
                 org.opensearch.common.unit.TimeValue.timeValueMillis(
-                    complete.getAsLong(PUBLISH_DEBOUNCE, nodeLog ? window : ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis())
+                    complete.getAsLong(
+                        WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(),
+                        nodeLog ? window : ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis()
+                    )
                 ),
                 ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
             );
             scheduler.setPublishSpacing(
-                org.opensearch.common.unit.TimeValue.timeValueMillis(
-                    Math.max(0L, complete.getAsLong(PUBLISH_MIN_INTERVAL, ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL.millis()))
-                ),
-                complete.getAsLong(PUBLISH_MAX_UNPUBLISHED_OPERATIONS, ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS)
+                org.opensearch.common.unit.TimeValue.timeValueMillis(Math.max(0L, WriteSettings.PUBLISH_MIN_INTERVAL_MILLIS.get(complete))),
+                WriteSettings.PUBLISH_MAX_UNPUBLISHED_OPERATIONS.get(complete)
             );
             openedScheduler = scheduler;
             node.setSignals(scheduler);
-            final long janitorMillis = complete.getAsLong(JANITOR_INTERVAL, DEFAULT_JANITOR_INTERVAL_MILLIS);
+            final long janitorMillis = NodeSettings.JANITOR_INTERVAL_MILLIS.get(complete);
             if (janitorMillis > 0) {
                 scheduler.setJanitorInterval(org.opensearch.common.unit.TimeValue.timeValueMillis(janitorMillis));
             }
@@ -446,7 +310,7 @@ public final class ServerlessBootstrap implements Closeable {
                 storeType,
                 ttl,
                 node.boundHttpAddress().publishAddress(),
-                complete.getAsBoolean(ON_DEMAND, true)
+                ActivationSettings.ON_DEMAND.get(complete)
             );
             return new ServerlessBootstrap(node, plane, loop, scheduler, store);
         } catch (Exception | Error failure) {
@@ -615,7 +479,7 @@ public final class ServerlessBootstrap implements Closeable {
         // is actually serving, so its existence means something. A file rather than a line on stdout
         // because stdout is forbidden in production code here -- and it is the better mechanism anyway:
         // it does not race with log output and it survives whatever is or is not tailing the process.
-        final String readyFile = System.getProperty(READY_FILE);
+        final String readyFile = System.getProperty(NodeSettings.READY_FILE_PROPERTY);
         if (readyFile != null) {
             java.nio.file.Files.writeString(
                 Path.of(readyFile),

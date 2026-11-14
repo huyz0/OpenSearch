@@ -41,12 +41,6 @@ public final class PluginClusterSettings {
 
     private static final Logger logger = LogManager.getLogger(PluginClusterSettings.class);
 
-    /** Whether plugins' dynamic settings in the register are applied to the running plugins. On by default. */
-    static final String ENABLED = "serverless.plugin_cluster_settings.enabled";
-
-    /** How often a node reads the register for changes made on other nodes. */
-    static final String REFRESH_INTERVAL = "serverless.plugin_cluster_settings.refresh_interval";
-
     private final ServerlessNode node;
     private final List<Setting<?>> dynamic;
     private volatile Scheduler.Cancellable refresher;
@@ -64,7 +58,7 @@ public final class PluginClusterSettings {
     }
 
     private boolean active() {
-        return node.settings.getAsBoolean(ENABLED, true) && dynamic.isEmpty() == false;
+        return PluginSettings.CLUSTER_SETTINGS.get(node.settings) && dynamic.isEmpty() == false;
     }
 
     /** The register's values for settings a plugin declares as dynamic. */
@@ -136,7 +130,7 @@ public final class PluginClusterSettings {
             return;
         }
         refresh(plane);
-        final TimeValue every = node.settings.getAsTime(REFRESH_INTERVAL, TimeValue.timeValueSeconds(30));
+        final TimeValue every = PluginSettings.CLUSTER_SETTINGS_REFRESH_INTERVAL.get(node.settings);
         if (every.millis() > 0) {
             try {
                 refresher = node.threadPool().scheduleWithFixedDelay(() -> refresh(plane), every, ThreadPool.Names.GENERIC);

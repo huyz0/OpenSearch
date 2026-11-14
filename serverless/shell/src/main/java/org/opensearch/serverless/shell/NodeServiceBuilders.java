@@ -137,7 +137,7 @@ final class NodeServiceBuilders {
      */
     static java.util.Collection<org.opensearch.plugins.PluginInfo> classpathPlugins(Settings settings) {
         final java.util.List<org.opensearch.plugins.PluginInfo> described = new java.util.ArrayList<>();
-        for (String name : settings.getAsList(ServerlessBootstrap.PLUGINS)) {
+        for (String name : NodeSettings.PLUGINS.get(settings)) {
             final String className = name.trim();
             if (className.isEmpty()) {
                 continue;
@@ -146,19 +146,19 @@ final class NodeServiceBuilders {
                 final Class<?> type = ServerlessNode.class.getClassLoader().loadClass(className);
                 if (org.opensearch.plugins.Plugin.class.isAssignableFrom(type) == false) {
                     throw new IllegalArgumentException(
-                        "[" + ServerlessBootstrap.PLUGINS + "] names [" + className + "], which is not an OpenSearch plugin"
+                        "[" + NodeSettings.PLUGINS.getKey() + "] names [" + className + "], which is not an OpenSearch plugin"
                     );
                 }
             } catch (ClassNotFoundException e) {
                 throw new IllegalArgumentException(
-                    "[" + ServerlessBootstrap.PLUGINS + "] names [" + className + "], which is not on this node's classpath",
+                    "[" + NodeSettings.PLUGINS.getKey() + "] names [" + className + "], which is not on this node's classpath",
                     e
                 );
             }
             described.add(
                 new org.opensearch.plugins.PluginInfo(
                     className,
-                    "named by " + ServerlessBootstrap.PLUGINS,
+                    "named by " + NodeSettings.PLUGINS.getKey(),
                     Version.CURRENT.toString(),
                     Version.CURRENT,
                     System.getProperty("java.specification.version"),
@@ -264,11 +264,9 @@ final class NodeServiceBuilders {
      *
      * <p>Core validates every index setting against a registry and refuses one it has never heard of, which
      * is right — a typo in a setting name that was silently accepted would be a setting that silently did
-     * nothing. The shell has exactly one of its own, so it registers it rather than turning the validation
-     * off.
-     *
-     * <p>Private, because nothing outside this node should be setting it: it names where a shard reads its
-     * bytes, and a caller who could set it could point one index's shard at another's data.
+     * nothing. The shell registers its own -- every index-scoped setting a feature package defines -- rather than
+     * turning the validation off. The storage UUID among them is private: it names where a shard reads its bytes,
+     * and a caller who could set it could point one index's shard at another's data.
      *
      * @return the settings a shard is validated against
      */
@@ -276,18 +274,9 @@ final class NodeServiceBuilders {
         final java.util.Set<org.opensearch.common.settings.Setting<?>> known = new java.util.HashSet<>(
             IndexScopedSettings.BUILT_IN_INDEX_SETTINGS
         );
-        known.add(
-            org.opensearch.common.settings.Setting.simpleString(
-                ServerlessNode.STORAGE_UUID_SETTING,
-                org.opensearch.common.settings.Setting.Property.IndexScope,
-                org.opensearch.common.settings.Setting.Property.PrivateIndex
-            )
-        );
         known.addAll(services.plugins.indexSettings(services.settings));
-        known.add(SegmentPlacement.INDEX);
-        known.add(org.opensearch.serverless.transport.TailOverlays.INDEX);
-        known.add(org.opensearch.serverless.bucket.BucketPolicy.INDEX);
-        known.add(org.opensearch.serverless.bucket.BucketPolicy.GROUP);
+        // The shell's own index settings, each defined once by its feature package.
+        known.addAll(org.opensearch.serverless.settings.ServerlessSettings.indexScoped());
         return new IndexScopedSettings(services.settings, known);
     }
 
