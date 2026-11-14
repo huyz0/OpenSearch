@@ -137,15 +137,17 @@ public class UpdateRequestExecutionTests extends OpenSearchTestCase {
         });
     }
 
-    public void testUnsupportedAdmittedSourceFetchingIsRefused() throws Exception {
+    public void testAdmittedSourceFetchingReturnsTheUpdatedDocument() throws Exception {
         withNode(PolicyFilterPlugin.request(UpdateAction.NAME, request -> {
             ((UpdateRequest) request).fetchSource(true);
             return request;
         }), (node, metadata) -> {
             seed(node, "original", "original", "old");
             final var answer = send(node, "POST", "/original/_update/original", "{\"doc\":{\"value\":\"changed\"}}");
-            assertEquals(answer.body(), 501, answer.statusCode());
-            assertEquals("old", value(node, "original", "original"));
+            assertEquals(answer.body(), 200, answer.statusCode());
+            assertTrue("the document as the update left it: " + answer.body(), answer.body().contains("\"get\":{"));
+            assertTrue(answer.body(), answer.body().contains("\"_source\":{\"value\":\"changed\"}"));
+            assertEquals("changed", value(node, "original", "original"));
         });
     }
 
