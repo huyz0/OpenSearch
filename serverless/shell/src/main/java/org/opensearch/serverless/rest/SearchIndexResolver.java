@@ -153,7 +153,7 @@ final class SearchIndexResolver {
             final String prefix = name.substring(0, name.length() - 1);
             final java.util.List<String> matched;
             java.util.Map<String, org.opensearch.serverless.metadata.RollupEntry> groupEntries = null;
-            if (serving.searchSettings().resolveFromRollups() && org.opensearch.serverless.metadata.DigestRollups.coversGroup(prefix)) {
+            if (org.opensearch.serverless.metadata.DigestRollups.coversGroup(prefix)) {
                 // The group's entries are its name list: every index that can hold a document has one, so the
                 // names the listing would add are indices with nothing to find. See DigestRollups.
                 try {
@@ -381,7 +381,6 @@ final class SearchIndexResolver {
         java.util.Map<String, org.opensearch.serverless.metadata.RollupEntry> alreadyRead
     ) {
         if (source == null
-            || serving.searchSettings().searchPruning() == false
             || matched.size() < serving.searchSettings().rollupMinIndices()
             || org.opensearch.serverless.metadata.DigestRollups.coversGroup(prefix) == false
             || org.opensearch.serverless.store.PruningDigest.mayPrune(source.query()) == false

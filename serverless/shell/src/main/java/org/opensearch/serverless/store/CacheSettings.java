@@ -37,13 +37,6 @@ public final class CacheSettings implements SettingsProvider {
         Property.NodeScope
     );
 
-    /** The {@code serverless.block_cache.prefetch_on_open} setting. */
-    public static final Setting<Boolean> PREFETCH_ON_OPEN = Setting.boolSetting(
-        "serverless.block_cache.prefetch_on_open",
-        true,
-        Property.NodeScope
-    );
-
     /** Whether writers hold freshly written segment files in memory. */
     public static final Setting<Boolean> LOCAL_MEMORY_ENABLED = Setting.boolSetting(
         "serverless.local_segments.memory.enabled",
@@ -70,6 +63,6 @@ public final class CacheSettings implements SettingsProvider {
 
     @Override
     public List<Setting<?>> settings() {
-        return List.of(BLOCK_SIZE, MAX_BLOCKS, PREFETCH_ON_OPEN, LOCAL_MEMORY_ENABLED, LOCAL_MEMORY_MAX_BYTES, LOCAL_MEMORY_MAX_FILE_BYTES);
+        return List.of(BLOCK_SIZE, MAX_BLOCKS, LOCAL_MEMORY_ENABLED, LOCAL_MEMORY_MAX_BYTES, LOCAL_MEMORY_MAX_FILE_BYTES);
     }
 }

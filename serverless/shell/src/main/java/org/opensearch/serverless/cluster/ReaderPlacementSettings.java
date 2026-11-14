@@ -36,13 +36,6 @@ public final class ReaderPlacementSettings implements SettingsProvider {
         Property.NodeScope
     );
 
-    /** Whether hot shards prefer a reader in the coordinator's zone; true by default, and a no-op without zones. */
-    public static final Setting<Boolean> ZONE_LOCAL_ENABLED = Setting.boolSetting(
-        "serverless.search.zone_local.enabled",
-        true,
-        Property.NodeScope
-    );
-
     /** Searches a second, from one coordinator, above which a shard gets a reader in the coordinator's zone. */
     public static final Setting<Double> ZONE_LOCAL_MIN_PER_SECOND = Setting.doubleSetting(
         "serverless.search.zone_local.min_per_second",
@@ -63,12 +56,6 @@ public final class ReaderPlacementSettings implements SettingsProvider {
 
     @Override
     public List<Setting<?>> settings() {
-        return List.of(
-            SPREAD_TARGET_PER_SECOND,
-            SPREAD_MAX_READERS,
-            ZONE_LOCAL_ENABLED,
-            ZONE_LOCAL_MIN_PER_SECOND,
-            ZONE_LOCAL_SPILL_IN_FLIGHT
-        );
+        return List.of(SPREAD_TARGET_PER_SECOND, SPREAD_MAX_READERS, ZONE_LOCAL_MIN_PER_SECOND, ZONE_LOCAL_SPILL_IN_FLIGHT);
     }
 }

@@ -105,9 +105,6 @@ public final class BulkHandler extends BaseRestHandler {
         );
     }
 
-    /** The default {@link org.opensearch.serverless.rest.BulkSettings#CHARGE_BEFORE_PARSE}. */
-    public static final boolean DEFAULT_CHARGE_BEFORE_PARSE = true;
-
     /** The default {@link org.opensearch.serverless.rest.BulkSettings#MEMORY_FACTOR}. */
     public static final double DEFAULT_MEMORY_FACTOR = 4.0;
 
@@ -261,7 +258,7 @@ public final class BulkHandler extends BaseRestHandler {
 
     /** Takes the body whole: charged up front, then parsed and applied. */
     private RestChannelConsumer prepareWhole(RestRequest request, ServerlessNode serving) throws IOException {
-        if (serving == null || request.hasContent() == false || BulkSettings.CHARGE_BEFORE_PARSE.get(serving.settings()) == false) {
+        if (serving == null || request.hasContent() == false) {
             return prepareCharged(request, null);
         }
         // Charged before the body is copied or parsed, so a node at its limit refuses a large batch before holding any

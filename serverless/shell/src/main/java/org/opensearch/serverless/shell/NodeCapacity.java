@@ -216,24 +216,6 @@ public final class NodeCapacity {
     }
 
     /**
-     * Sets whether requests for a dead member's shard go to the one survivor named for it.
-     *
-     * @param route whether to
-     */
-    public void setRouteTakeovers(boolean route) {
-        placement.setRouteTakeovers(route);
-    }
-
-    /**
-     * Whether requests for a dead member's shard go to the one survivor named for it.
-     *
-     * @return true if they do
-     */
-    public boolean routesTakeovers() {
-        return placement.routesTakeovers();
-    }
-
-    /**
      * Sets how far past its cap a member may take a dead member's shards. See {@link FleetPlacement#setTakeoverOvercommit}.
      *
      * @param fraction of the cap

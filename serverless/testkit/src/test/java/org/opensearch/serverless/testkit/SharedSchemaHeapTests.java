@@ -95,10 +95,6 @@ public class SharedSchemaHeapTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
             .put("serverless.activation.max_shards", 100_000)
-            .put(
-                "serverless.schema.sharing.enabled",
-                org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.schema.sharing", "false"))
-            )
             .build();
     }
 
@@ -199,13 +195,7 @@ public class SharedSchemaHeapTests extends OpenSearchTestCase {
         final String mapping = trivial ? TRIVIAL_MAPPING : realisticMapping();
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
-        logger.info(
-            "schema heap: {} indices, mapping {} ({} bytes), sharing {}",
-            indices,
-            trivial ? "trivial" : "realistic",
-            mapping.length(),
-            org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.schema.sharing", "false"))
-        );
+        logger.info("schema heap: {} indices, mapping {} ({} bytes)", indices, trivial ? "trivial" : "realistic", mapping.length());
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("schema-heap"))) {
             node.startup().start();

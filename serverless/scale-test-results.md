@@ -664,8 +664,8 @@ test (`ServerlessActivationCostTests`, one-shard indices opened in batches of 10
 taken at 100 held and 44 ms at 600, and growing. In the fleet, with activations queued on the lock, it was a second.
 
 **The fix:** an index whose descriptor (the same object) and shard terms are unchanged reuses its last projection. In
-the single-node test projection is now 1-2.5 ms at any size, and taking a shard a flat ~170 ms. The setting
-`serverless.view.reuse_projections=false` turns it off, for measuring.
+the single-node test projection is now 1-2.5 ms at any size, and taking a shard a flat ~170 ms.
+(The setting that turned it off, for measuring, has since been retired.)
 
 **The fleet, both ways, twice each** (cap 1,000, the kill aimed at the node holding the median of held shards; on:
 `run1791369896819`, `run1791375826545`; off: `run1791372730518`, `run1791378899406`). All four clean.
@@ -712,7 +712,7 @@ second look reaching a survivor for an unheld shard asked for it there. Every me
 each such shard -- of the live writer members, in name order, the first from the shard's hash with room under its
 overcommit ceiling -- and the departure pass splits by it. A doubt about the shard elsewhere is left to that survivor,
 and a write for it is forwarded there once, marked to be taken; anything short of an answer from there takes it locally.
-Routing only: the head's compare-and-swap still decides. `serverless.takeover.route_to_winner=false` turns it off.
+Routing only: the head's compare-and-swap still decides. (Its switch has since been retired.)
 
 The first version covered writes and doubts. Twice each way (on: `run1791396248723`, `run1791402406554`; off:
 `run1791399438196`, `run1791405501132`), all clean:

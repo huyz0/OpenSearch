@@ -25,17 +25,7 @@ import java.util.List;
 public final class BulkSettings implements SettingsProvider {
 
     /**
-     * Whether a batch's memory is charged to indexing pressure before its body is copied and parsed, at
-     * {@link #MEMORY_FACTOR} times its length; off, it is charged its length once, after parsing, as before.
-     */
-    public static final Setting<Boolean> CHARGE_BEFORE_PARSE = Setting.boolSetting(
-        "serverless.write.bulk.charge_before_parse",
-        BulkHandler.DEFAULT_CHARGE_BEFORE_PARSE,
-        Property.NodeScope
-    );
-
-    /**
-     * How many times its length a batch is charged when {@link #CHARGE_BEFORE_PARSE} is on: what a node holds of
+     * How many times its length a batch is charged before it is parsed: what a node holds of
      * it at once, the body, each source as a string, the bytes the engine parses and the node-log blob carrying it.
      */
     public static final Setting<Double> MEMORY_FACTOR = Setting.doubleSetting(
@@ -89,6 +79,6 @@ public final class BulkSettings implements SettingsProvider {
 
     @Override
     public List<Setting<?>> settings() {
-        return List.of(CHARGE_BEFORE_PARSE, MEMORY_FACTOR, STREAMING, SLICE_BYTES, MEMORY_BUDGET, MAX_WAIT, MAX_APPLYING_SLICES);
+        return List.of(MEMORY_FACTOR, STREAMING, SLICE_BYTES, MEMORY_BUDGET, MAX_WAIT, MAX_APPLYING_SLICES);
     }
 }

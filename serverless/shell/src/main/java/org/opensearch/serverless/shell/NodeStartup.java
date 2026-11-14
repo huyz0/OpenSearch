@@ -78,13 +78,7 @@ public final class NodeStartup {
                         org.opensearch.serverless.store.NodeLogSettings.ADMISSION_CONCURRENCY.get(node.settings),
                         node.threadPool().generic()
                     );
-                writer.committer()
-                    .boundBlobs(
-                        org.opensearch.serverless.store.NodeLogSettings.SPLIT_LARGE_BATCHES.get(node.settings),
-                        org.opensearch.serverless.store.NodeLogSettings.HEDGE_BY_SIZE.get(node.settings)
-                    );
                 writer.committer().flushWhenIdle(org.opensearch.serverless.store.NodeLogSettings.IDLE_FLUSH.get(node.settings));
-                writer.committer().followUnlocked(org.opensearch.serverless.store.NodeLogSettings.FOLLOW_UNLOCKED.get(node.settings));
                 node.nodeLogWriter = writer;
             }
             if (node.reconciler != null && node.nodeLogHooked == false) {
@@ -197,11 +191,9 @@ public final class NodeStartup {
         // action.
         node.pluginActions = node.wiring.buildPluginActions();
         // The plugins' lifecycle components, then the services their injector built, as core starts them.
-        if (ServerlessPlugins.componentLifecycle(node.settings)) {
-            for (Object component : node.plugins.components()) {
-                if (component instanceof org.opensearch.common.lifecycle.LifecycleComponent lifecycle) {
-                    node.pluginLifecycle.add(lifecycle);
-                }
+        for (Object component : node.plugins.components()) {
+            if (component instanceof org.opensearch.common.lifecycle.LifecycleComponent lifecycle) {
+                node.pluginLifecycle.add(lifecycle);
             }
         }
         if (node.pluginInjector != null) {

@@ -126,21 +126,6 @@ public class ServerlessPluginNodeAnswersTests extends OpenSearchTestCase {
         }
     }
 
-    /** With the switch off, the client refuses them by name, as before. */
-    public void testTheSwitchRefusesThem() throws Exception {
-        try (
-            ServerlessBootstrap boot = ServerlessBootstrap.start(
-                nodeSettings("answers-off", Settings.builder().put("serverless.plugin_client.node_answers.enabled", false).build())
-            )
-        ) {
-            final Exception refused = expectThrows(
-                Exception.class,
-                () -> boot.node().services().client().admin().cluster().nodesStats(new NodesStatsRequest("_local")).actionGet()
-            );
-            assertTrue(refused.toString(), org.opensearch.ExceptionsHelper.stackTrace(refused).contains("does not implement action"));
-        }
-    }
-
     /** The exporter's per-index series are off unless an operator turns them on. */
     public void testPerIndexExportIsOffByDefault() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("exporter", Settings.EMPTY), List.of(new ExporterLikePlugin()))) {

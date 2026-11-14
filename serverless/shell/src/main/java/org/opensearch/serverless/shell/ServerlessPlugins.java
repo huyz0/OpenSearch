@@ -448,34 +448,6 @@ public final class ServerlessPlugins {
         return patterns;
     }
 
-    static boolean clusterView(Settings settings) {
-        return PluginSettings.CLUSTER_VIEW.get(settings);
-    }
-
-    static boolean documentBatches(Settings settings) {
-        return PluginSettings.DOCUMENT_BATCHES.get(settings);
-    }
-
-    static boolean componentLifecycle(Settings settings) {
-        return PluginSettings.COMPONENT_LIFECYCLE.get(settings);
-    }
-
-    static boolean indexAdmin(Settings settings) {
-        return PluginSettings.INDEX_ADMIN.get(settings);
-    }
-
-    static boolean nodeAnswers(Settings settings) {
-        return PluginSettings.NODE_ANSWERS.get(settings);
-    }
-
-    static boolean nameResolution(Settings settings) {
-        return PluginSettings.NAME_RESOLUTION.get(settings);
-    }
-
-    static boolean extensions(Settings settings) {
-        return PluginSettings.EXTENSIONS.get(settings);
-    }
-
     /**
      * Core's cluster-scoped settings plus every node-scoped setting a plugin declares.
      *
@@ -484,16 +456,12 @@ public final class ServerlessPlugins {
      * {@code createComponents} with "Setting is not registered", and a value for it in the node's settings
      * or in {@code PUT /_cluster/settings} is refused as unknown.
      *
-     * @param settings the node settings, which carry {@link org.opensearch.serverless.shell.PluginSettings#EXTENSIONS}
      * @return the settings a node's {@code ClusterSettings} knows
      */
-    public java.util.Set<org.opensearch.common.settings.Setting<?>> clusterSettings(Settings settings) {
+    public java.util.Set<org.opensearch.common.settings.Setting<?>> clusterSettings() {
         final java.util.Set<org.opensearch.common.settings.Setting<?>> known = new java.util.HashSet<>(
             ClusterSettings.BUILT_IN_CLUSTER_SETTINGS
         );
-        if (extensions(settings) == false) {
-            return known;
-        }
         for (Plugin plugin : plugins) {
             for (org.opensearch.common.settings.Setting<?> setting : plugin.getSettings()) {
                 if (setting.hasNodeScope()) {
@@ -507,14 +475,10 @@ public final class ServerlessPlugins {
     /**
      * Every node-scoped setting a plugin declares.
      *
-     * @param settings the node settings, which carry {@link org.opensearch.serverless.shell.PluginSettings#EXTENSIONS}
-     * @return the settings, empty when plugin extensions are off
+     * @return the settings
      */
-    public List<org.opensearch.common.settings.Setting<?>> pluginNodeSettings(Settings settings) {
+    public List<org.opensearch.common.settings.Setting<?>> pluginNodeSettings() {
         final List<org.opensearch.common.settings.Setting<?>> known = new ArrayList<>();
-        if (extensions(settings) == false) {
-            return known;
-        }
         for (Plugin plugin : plugins) {
             for (org.opensearch.common.settings.Setting<?> setting : plugin.getSettings()) {
                 if (setting.hasNodeScope()) {
@@ -528,14 +492,10 @@ public final class ServerlessPlugins {
     /**
      * Every index-scoped setting a plugin declares, such as k-NN's {@code index.knn}.
      *
-     * @param settings the node settings, which carry {@link org.opensearch.serverless.shell.PluginSettings#EXTENSIONS}
      * @return the settings
      */
-    public List<org.opensearch.common.settings.Setting<?>> indexSettings(Settings settings) {
+    public List<org.opensearch.common.settings.Setting<?>> indexSettings() {
         final List<org.opensearch.common.settings.Setting<?>> known = new ArrayList<>();
-        if (extensions(settings) == false) {
-            return known;
-        }
         for (Plugin plugin : plugins) {
             for (org.opensearch.common.settings.Setting<?> setting : plugin.getSettings()) {
                 if (setting.hasIndexScope()) {
@@ -554,14 +514,11 @@ public final class ServerlessPlugins {
      * built only its own. A pool's threads start on first use, so a declared pool nobody submits to costs
      * nothing.
      *
-     * @param settings the node settings, which carry {@link org.opensearch.serverless.shell.PluginSettings#EXTENSIONS}
+     * @param settings the node settings
      * @return their executor builders, in load order
      */
     public List<org.opensearch.threadpool.ExecutorBuilder<?>> executorBuilders(Settings settings) {
         final List<org.opensearch.threadpool.ExecutorBuilder<?>> builders = new ArrayList<>();
-        if (extensions(settings) == false) {
-            return builders;
-        }
         for (Plugin plugin : plugins) {
             builders.addAll(plugin.getExecutorBuilders(settings));
         }

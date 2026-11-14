@@ -340,19 +340,6 @@ public class ServerlessPluginExtensionPointsTests extends OpenSearchTestCase {
         }
     }
 
-    /** With the switch off, the node is as it was: the same plugin cannot start. */
-    public void testTheSwitchRestoresTheOldBehaviour() {
-        final Exception failure = expectThrows(
-            Exception.class,
-            () -> new ServerlessNode(
-                nodeSettings("extensions-off", Settings.builder().put("serverless.plugin_extensions.enabled", false).build()),
-                List.of(new ClassicOrderPlugin())
-            ).close()
-        );
-        final String reported = failure + " / " + failure.getCause();
-        assertTrue("an unregistered setting is what stops it: " + reported, reported.contains("not registered"));
-    }
-
     /** Both of core's other createComponents overloads are called. */
     public void testTheRegistryAndTelemetryOverloadsAreCalled() throws Exception {
         try (

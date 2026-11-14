@@ -221,8 +221,6 @@ public final class ServerlessBootstrap implements Closeable {
         ReconcileScheduler openedScheduler = null;
         try {
             node.startup().start();
-            node.projector().setReuseProjections(NodeSettings.VIEW_REUSE_PROJECTIONS.get(complete));
-            node.nodeCapacity().setRouteTakeovers(ActivationSettings.TAKEOVER_ROUTE_TO_WINNER.get(complete));
             logger.info("startup: node started at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
 
             final org.opensearch.serverless.store.ObjectStoreHandle store = org.opensearch.serverless.store.ObjectStores.create(

@@ -12,7 +12,6 @@ import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.shell.WritePools;
 import org.opensearch.test.OpenSearchTestCase;
-import org.opensearch.threadpool.ThreadPool;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -22,36 +21,24 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Document writes wait for the node log on a pool sized for waiting, while no more of them apply to the engine at once
- * than core's {@code write} pool had threads; switched off, everything is as it was.
+ * than core's {@code write} pool had threads.
  */
 public class WritePoolsTests extends OpenSearchTestCase {
 
-    private static Settings cores(int processors, boolean enabled) {
-        return Settings.builder()
-            .put("node.processors", processors)
-            .put(org.opensearch.serverless.shell.WriteSettings.WAIT_POOL_ENABLED.getKey(), enabled)
-            .build();
+    private static Settings cores(int processors) {
+        return Settings.builder().put("node.processors", processors).build();
     }
 
-    public void testSizesGrowWithCoresWhenOn() {
-        final Settings on = cores(4, true);
-        assertEquals(WritePools.POOL, WritePools.writePool(on));
+    public void testSizesGrowWithCores() {
+        final Settings on = cores(4);
         assertEquals(4 * WritePools.DEFAULT_THREADS_PER_CORE, WritePools.threads(on));
         assertEquals(5, WritePools.applyPermits(on));
         assertEquals(1_536, WritePools.defaultMaxInFlight(on));
-        assertEquals("never below the old cap", 1_024, WritePools.defaultMaxInFlight(cores(1, true)));
-    }
-
-    public void testOffIsAsBefore() {
-        final Settings off = cores(4, false);
-        assertEquals(ThreadPool.Names.WRITE, WritePools.writePool(off));
-        assertEquals(4, WritePools.threads(off));
-        assertEquals(1_024, WritePools.defaultMaxInFlight(off));
-        assertEquals("no gate", -1, WritePools.of(off).freePermits());
+        assertEquals("never below the old cap", 1_024, WritePools.defaultMaxInFlight(cores(1)));
     }
 
     public void testNoMoreApplyAtOnceThanThePermits() throws Exception {
-        final WritePools pools = WritePools.of(cores(2, true));
+        final WritePools pools = WritePools.of(cores(2));
         final List<Releasable> held = new ArrayList<>();
         for (int i = 0; i < 3; i++) {
             held.add(pools.enterApply());

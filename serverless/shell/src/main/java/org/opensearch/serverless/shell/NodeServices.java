@@ -437,7 +437,7 @@ public final class NodeServices implements Closeable {
         if (indexNameExpressionResolver == null) {
             indexNameExpressionResolver = new RefusingIndexNameExpressionResolver(
                 threadPool.getThreadContext(),
-                name -> PluginSettings.INDICES_VIEW.get(settings) && node.get().isSystemIndex(name),
+                name -> node.get().isSystemIndex(name),
                 this::indicesFromPlane
             );
         }
@@ -446,13 +446,13 @@ public final class NodeServices implements Closeable {
 
     /**
      * The indices a name or a trailing wildcard names in the metadata plane, for the plugins' resolver: an index, an alias's
-     * members, or the indices a prefix lists (capped). Null when the switch is off, there is no plane yet, or the name is a
+     * members, or the indices a prefix lists (capped). Null when there is no plane yet, or the name is a
      * data stream, so the resolver refuses as before.
      */
     private java.util.List<org.opensearch.core.index.Index> indicesFromPlane(String name) {
         final ServerlessNode serving = node.get();
         final org.opensearch.serverless.metadata.MetadataPlane plane = serving == null ? null : serving.metadataPlane;
-        if (plane == null || ServerlessPlugins.nameResolution(settings) == false) {
+        if (plane == null) {
             return null;
         }
         try {

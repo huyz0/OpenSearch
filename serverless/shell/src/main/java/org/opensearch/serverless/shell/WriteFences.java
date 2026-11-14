@@ -153,8 +153,7 @@ public final class WriteFences {
             node.descriptorRefresh.applyIfNewer(shardId.getIndexName(), routed.get().descriptor(), routed.get().readStartedNanos());
             return;
         }
-        final boolean byStripe = confirmsByStripe();
-        if (byStripe && confirmByStripe(plane, shardId, uuid, window)) {
+        if (confirmByStripe(plane, shardId, uuid, window)) {
             return;
         }
         synchronized (incarnationLocks[Math.floorMod(uuid.hashCode(), incarnationLocks.length)]) {
@@ -163,9 +162,7 @@ public final class WriteFences {
             }
             // Read before the descriptor, so that a change the stripe does not yet name is one the descriptor read can
             // still see, or one applied after it, which a later read of the stripe names.
-            final org.opensearch.serverless.metadata.ChangeStripes.Snapshot stripeBefore = byStripe
-                ? stripeBeforeRead(plane, shardId)
-                : null;
+            final org.opensearch.serverless.metadata.ChangeStripes.Snapshot stripeBefore = stripeBeforeRead(plane, shardId);
             // Stamped with when the read began, never when it returned: the descriptor was live at some
             // instant after this, so this is the earliest the confirmation can honestly claim.
             final long startedAt = System.nanoTime();
@@ -198,27 +195,6 @@ public final class WriteFences {
                 incarnationConfirmedAtNanos.values().removeIf(at -> now - at > window);
             }
         }
-    }
-
-    /** Null until first asked, then the node setting unless a caller set it. */
-    private volatile Boolean byStripe;
-
-    /**
-     * Sets whether writes may confirm an incarnation by its change stripe; see {@link org.opensearch.serverless.shell.WriteSettings#CONFIRM_INCARNATION_BY_STRIPE}.
-     *
-     * @param on true to confirm by stripe when it proves the descriptor unchanged
-     */
-    public void setConfirmByStripe(boolean on) {
-        this.byStripe = on;
-    }
-
-    private boolean confirmsByStripe() {
-        Boolean on = byStripe;
-        if (on == null) {
-            on = node.settings == null || WriteSettings.CONFIRM_INCARNATION_BY_STRIPE.get(node.settings);
-            byStripe = on;
-        }
-        return on;
     }
 
     /** Where an incarnation's stripe stood when its descriptor was last read live. */
