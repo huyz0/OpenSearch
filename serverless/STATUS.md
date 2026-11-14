@@ -240,8 +240,11 @@ every index carries its creation date. With these the anomaly-detection plugin c
 their schedule (it cannot yet read the tenant index a detector watches: the plugin's name resolver answers only plugin
 indices), Index Management moves an index through its policy states (`min_index_age` transitions, read-only, delete;
 rollover still needs a write alias, which the shell refuses), and ML Commons trains, predicts, creates connectors, and
-registers and deploys remote models. A dynamic plugin setting changed through `/_cluster/settings` is stored but not
-applied to the running plugin (the register is a store, not a settings service); set it in the node's settings.
+registers and deploys remote models. A plugin's dynamic setting changed through `/_cluster/settings` reaches the running
+plugin (`serverless.plugin_cluster_settings.enabled`, on): a value the setting refuses is refused at the write; the node
+that served the write applies it when the write returns, and every other node within
+`serverless.plugin_cluster_settings.refresh_interval` (30 s, one register read per node, only where plugins declare dynamic
+settings); a removed key returns to the node's value or the default. Core's own dynamic settings are not applied this way.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,

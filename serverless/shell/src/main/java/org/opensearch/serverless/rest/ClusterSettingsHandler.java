@@ -245,9 +245,20 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
                     }
+                    if (node.get() != null) {
+                        try {
+                            node.get().pluginClusterSettings().check(flat);
+                        } catch (IllegalArgumentException e) {
+                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+                        }
+                    }
                     final Settings written = metadata.clusterConfig().update(flat);
                     // This node's next publishes follow at once; the others within their next read of the register.
                     org.opensearch.serverless.shell.SegmentPlacement.applyCluster(node.get(), written);
+                    // And this node's plugins see their settings change when the write returns, as on a classic node.
+                    if (node.get() != null) {
+                        node.get().pluginClusterSettings().apply(written);
+                    }
                     return nativeResponse(written);
                 }, org.opensearch.serverless.shell.ActionGate.identity(ClusterUpdateSettingsResponse.class));
                 try (var builder = channel.newBuilder()) {
