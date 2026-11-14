@@ -222,9 +222,18 @@ public final class NodeStartup {
         // and before onNodeStarted, because a plugin told the node is up may immediately call its own
         // action.
         node.pluginActions = node.wiring.buildPluginActions();
-        if (node.pluginInjector != null) {
-            node.pluginInjector.services().forEach(org.opensearch.common.lifecycle.LifecycleComponent::start);
+        // The plugins' lifecycle components, then the services their injector built, as core starts them.
+        if (ServerlessPlugins.componentLifecycle(node.settings)) {
+            for (Object component : node.plugins.components()) {
+                if (component instanceof org.opensearch.common.lifecycle.LifecycleComponent lifecycle) {
+                    node.pluginLifecycle.add(lifecycle);
+                }
+            }
         }
+        if (node.pluginInjector != null) {
+            node.pluginLifecycle.addAll(node.pluginInjector.services());
+        }
+        node.pluginLifecycle.forEach(org.opensearch.common.lifecycle.LifecycleComponent::start);
 
         // And then tell them the node is up. A plugin that has to read its own index cannot do it while
         // components are being built; this is the event it waits for. Deferred until the node also has its
