@@ -321,6 +321,27 @@ public final class ServerlessPlugins {
     }
 
     /**
+     * Defaults the shell gives a plugin's own setting, under anything an operator sets.
+     *
+     * <p>{@code prometheus.indices}: the Prometheus exporter reports a series per index by default. A node here
+     * can serve thousands of small indices, and a series per index per node is a cardinality no Prometheus
+     * should be handed by default; node and cluster series are what a fleet is watched by. An operator who wants
+     * per-index series sets it to true.
+     */
+    static final java.util.Map<String, String> PLUGIN_DEFAULTS = java.util.Map.of("prometheus.indices", "false");
+
+    private boolean registers(String key) {
+        for (Plugin plugin : plugins) {
+            for (org.opensearch.common.settings.Setting<?> setting : plugin.getSettings()) {
+                if (setting.getKey().equals(key)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
      * Layers every plugin's {@code additionalSettings} under the settings an operator supplied.
      *
      * <p>Core's {@code PluginsService#updatedSettings} does this for the plugins it loaded; this does it for
@@ -353,6 +374,11 @@ public final class ServerlessPlugins {
                 }
             }
             merged.put(additional);
+        }
+        for (java.util.Map.Entry<String, String> entry : PLUGIN_DEFAULTS.entrySet()) {
+            if (registers(entry.getKey()) && contributedBy.containsKey(entry.getKey()) == false) {
+                merged.put(entry.getKey(), entry.getValue());
+            }
         }
         return merged.put(supplied).build();
     }
@@ -454,6 +480,17 @@ public final class ServerlessPlugins {
 
     static boolean documentBatches(Settings settings) {
         return settings.getAsBoolean(DOCUMENT_BATCHES, true);
+    }
+
+    /**
+     * Whether the plugin client answers node info, node stats, indices stats and refresh: on by default.
+     *
+     * <p>Off, a metrics exporter and a plugin that refreshes its own index are refused by name, as before.
+     */
+    public static final String NODE_ANSWERS = "serverless.plugin_client.node_answers.enabled";
+
+    static boolean nodeAnswers(Settings settings) {
+        return settings.getAsBoolean(NODE_ANSWERS, true);
     }
 
     private static boolean extensions(Settings settings) {

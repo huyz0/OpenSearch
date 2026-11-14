@@ -963,6 +963,16 @@ public final class ServerlessNode implements Closeable {
         return roles;
     }
 
+    private PluginNodeAnswers.Monitors monitors;
+
+    /** The monitoring services plugins read node statistics from, built the first time one asks. */
+    synchronized PluginNodeAnswers.Monitors monitors() throws java.io.IOException {
+        if (monitors == null) {
+            monitors = new PluginNodeAnswers.Monitors(this);
+        }
+        return monitors;
+    }
+
     /**
      * Returns this node's shard reconciler.
      *
