@@ -8,13 +8,14 @@
 
 /*
  * Code and comments describe what the code does and why, not the plan item or document section it
- * came from. Milestone, decision and risk ids (M23, D2, R11), probe ids (S0, F4), phase numbers and
+ * came from. Milestone, decision and risk ids (M23, D2, R11), probe ids (S0, F4), phase numbers, PR numbers and
  * section references into design documents that are not in this repository go stale and mean nothing
  * to a reader, so precommit rejects them. Name the behaviour or the design rule instead.
  */
 tasks.named('forbiddenPatterns').configure {
-  rule name: 'plan reference (milestone, decision, risk or probe id)', pattern: /\b(M[1-9][0-9]|D[1-9]|R(1[0-9]?|[3-9])|S[01]|F[0-9])\b/
+  rule name: 'plan reference (milestone, decision, risk or probe id)', pattern: /\b(M[1-9][0-9]?|D[1-9]|R(1[0-9]?|[3-9])|S[01]|F[0-9])\b/
   rule name: 'design-document section reference', pattern: /§|&sect;|\b[Pp]hase [0-9]+\b|\b[Mm]ilestone/
   rule name: 'reference to a planning document not in this repository',
     pattern: /rfc-serverless-(shell|opensearch|metadata-plane)\.md|[a-z0-9]-(notes|findings)\.md|HANDOFF\.md|\bplan-[a-z0-9-]+\.md/
+  rule name: 'pull request or issue number (name the change instead)', pattern: /(^|[\s(])#[0-9]{2,}\b|\bPR ?#?[0-9]+\b/
 }
