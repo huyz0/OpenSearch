@@ -27,6 +27,8 @@ final class IndexCreateRequest {
     final Settings settings;
     /** Whether the caller named a shard count, as opposed to falling through to the default of one. */
     final boolean explicitShards;
+    /** The aliases the body names, each with its options, applied once the index exists. */
+    Map<String, Map<String, Object>> aliases = Map.of();
 
     /**
      * The shard count to create with: the caller's if they gave one, else a template's, else the default.
@@ -191,14 +193,25 @@ final class IndexCreateRequest {
             return new IndexCreateRequest(fromQuery, body, null, fromQuery != 1);
         }
 
-        if (parsed.containsKey("aliases")) {
-            // Refused rather than dropped. An alias silently not created is a search that silently
-            // matches nothing later, which is the same class of failure this whole parse exists to end.
-            throw new IndexAdminHandler.RefusedException(
-                RestStatus.NOT_IMPLEMENTED,
-                "unsupported_setting",
-                "'aliases' in a create-index body is not supported here; create the index, then PUT /_alias/{name}"
-            );
+        final Map<String, Map<String, Object>> aliases = new java.util.LinkedHashMap<>();
+        if (parsed.get("aliases") instanceof Map<?, ?> named) {
+            // Each option checked as the alias API checks it: an option this design cannot honour is refused before the
+            // index is created, rather than the index created and the alias refused after.
+            for (Map.Entry<?, ?> entry : named.entrySet()) {
+                final Map<String, Object> options = new java.util.LinkedHashMap<>();
+                if (entry.getValue() instanceof Map<?, ?> given) {
+                    for (Map.Entry<?, ?> option : given.entrySet()) {
+                        options.put(String.valueOf(option.getKey()), option.getValue());
+                    }
+                }
+                final String refused = AliasHandler.unsupportedAliasOption(options);
+                if (refused != null) {
+                    throw new IndexAdminHandler.RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_alias_option", refused);
+                }
+                aliases.put(String.valueOf(entry.getKey()), options);
+            }
+        } else if (parsed.containsKey("aliases")) {
+            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "'aliases' must be an object");
         }
 
         String mapping = null;
@@ -230,7 +243,9 @@ final class IndexCreateRequest {
             throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "'settings' must be an object");
         }
 
-        return fromSettings(settings, mapping, fromQuery);
+        final IndexCreateRequest request = fromSettings(settings, mapping, fromQuery);
+        request.aliases = Map.copyOf(aliases);
+        return request;
     }
 
     static IndexCreateRequest fromSettings(Settings settings, String mapping, int fromQuery) throws IndexAdminHandler.RefusedException {

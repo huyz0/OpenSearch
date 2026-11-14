@@ -39,14 +39,15 @@ final class AliasUpdates {
         RestRequest.Method method,
         String indexParam,
         String aliasName,
-        List<String> indices
+        List<String> indices,
+        Boolean isWriteIndex
     ) throws Exception {
         {
             try {
                 if (indexParam != null) {
                     switch (method) {
-                        case PUT, POST -> attach(channel, metadata, aliasName, indices, true);
-                        case DELETE -> attach(channel, metadata, aliasName, indices, false);
+                        case PUT, POST -> attach(channel, metadata, aliasName, indices, true, isWriteIndex);
+                        case DELETE -> attach(channel, metadata, aliasName, indices, false, null);
                         case GET, HEAD -> AliasReads.membership(channel, metadata, aliasName, indices, method == RestRequest.Method.HEAD);
                         default -> channel.sendResponse(
                             IndexAdminHandler.error(
@@ -60,7 +61,7 @@ final class AliasUpdates {
                     return;
                 }
                 switch (method) {
-                    case PUT, POST -> create(channel, metadata, aliasName, indices);
+                    case PUT, POST -> create(channel, metadata, aliasName, indices, isWriteIndex);
                     case GET -> AliasReads.read(channel, metadata, aliasName);
                     case HEAD -> {
                         // An existence check on a name: the same one register read a GET does, and no body.
@@ -103,10 +104,17 @@ final class AliasUpdates {
      * @param name the alias
      * @param indices the indices to add or remove
      * @param adding whether to add or remove them
+     * @param isWriteIndex for an add, true to mark the index as the alias's write index, false to unmark it, null to leave it
      * @throws IOException if the read or the swap fails
      */
-    void attach(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name, List<String> indices, boolean adding)
-        throws IOException {
+    void attach(
+        org.opensearch.rest.RestChannel channel,
+        MetadataPlane metadata,
+        String name,
+        List<String> indices,
+        boolean adding,
+        Boolean isWriteIndex
+    ) throws IOException {
         if (adding) {
             for (String index : indices) {
                 if (handler.isSystemIndex(index)) {
@@ -133,7 +141,7 @@ final class AliasUpdates {
                 }
             }
         }
-        final AliasSwap.Refusal failure = AliasSwap.swap(metadata, name, indices, adding);
+        final AliasSwap.Refusal failure = AliasSwap.swap(metadata, name, indices, adding, isWriteIndex);
         if (failure != null) {
             channel.sendResponse(IndexAdminHandler.error(channel, failure.status(), failure.type(), failure.reason()));
             return;
@@ -248,6 +256,7 @@ final class AliasUpdates {
                         step.put("op", String.valueOf(entry.getKey()));
                         step.put("alias", aliasName);
                         step.put("index", name);
+                        step.put("is_write_index", AliasHandler.writeIndexFlag(detail));
                         // Tri-state, as core reads it: unspecified means "404 if the whole request removed
                         // nothing", true means "404 if this step removes nothing", false means silence.
                         step.put(
@@ -304,6 +313,8 @@ final class AliasUpdates {
                 return;
             }
             final List<String> now = new ArrayList<>(before == null ? List.of() : before.indices());
+            String writeMember = before == null ? null : before.writeMember();
+            int marked = 0;
             // Whether any remove found what it named, for core's rule that a request removing nothing is a 404.
             boolean removedSomething = false;
             boolean removing = false;
@@ -334,6 +345,12 @@ final class AliasUpdates {
                     }
                     if (now.contains(index) == false) {
                         now.add(index);
+                    }
+                    if (Boolean.TRUE.equals(step.get("is_write_index"))) {
+                        writeMember = index;
+                        marked++;
+                    } else if (Boolean.FALSE.equals(step.get("is_write_index")) && index.equals(writeMember)) {
+                        writeMember = null;
                     }
                 } else if ("remove".equals(step.get("op"))) {
                     removing = true;
@@ -376,6 +393,20 @@ final class AliasUpdates {
                     return;
                 }
             }
+            if (marked > 1) {
+                channel.sendResponse(
+                    IndexAdminHandler.error(
+                        channel,
+                        RestStatus.BAD_REQUEST,
+                        "illegal_state_exception",
+                        "alias [" + alias + "] has more than one write index"
+                    )
+                );
+                return;
+            }
+            if (writeMember != null && now.contains(writeMember) == false) {
+                writeMember = null;
+            }
             if (removing && removedSomething == false && now.equals(before == null ? List.of() : before.indices())) {
                 // Core's default when must_exist is unspecified and the request removed nothing at all:
                 // aliases_not_found_exception, because a 200 would report a removal that did not happen. A
@@ -405,17 +436,21 @@ final class AliasUpdates {
                     return;
                 }
                 try {
-                    metadata.createAlias(new AliasRecord(alias, now));
+                    metadata.createAlias(new AliasRecord(alias, now).withWriteMember(writeMember));
                     applied = true;
                 } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
                     continue;
                 }
-            } else if (now.equals(before.indices())) {
+            } else if (now.equals(before.indices()) && java.util.Objects.equals(writeMember, before.writeMember())) {
                 applied = true; // nothing to swap: the record already says this
             } else if (now.isEmpty()) {
                 applied = metadata.deleteAlias(before, resolved.generation());
             } else {
-                applied = metadata.updateAlias(before, MetadataPlane.withIndices(before, now), resolved.generation()).isPresent();
+                applied = metadata.updateAlias(
+                    before,
+                    MetadataPlane.withIndices(before, now).withWriteMember(writeMember),
+                    resolved.generation()
+                ).isPresent();
             }
             if (applied) {
                 acknowledge(channel);
@@ -432,7 +467,19 @@ final class AliasUpdates {
         );
     }
 
-    void create(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name, List<String> indices) throws IOException {
+    void create(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name, List<String> indices, Boolean isWriteIndex)
+        throws IOException {
+        if (Boolean.TRUE.equals(isWriteIndex) && indices.size() != 1) {
+            channel.sendResponse(
+                IndexAdminHandler.error(
+                    channel,
+                    RestStatus.BAD_REQUEST,
+                    "illegal_argument_exception",
+                    "is_write_index marks one index; this request names " + indices.size()
+                )
+            );
+            return;
+        }
         // Every index named has to exist. An alias created over a typo would resolve to nothing and look
         // like an empty index, which is the failure this whole surface is arranged to avoid -- and unlike a
         // search, the mistake here is permanent until somebody notices.
@@ -456,7 +503,7 @@ final class AliasUpdates {
             }
         }
         try {
-            metadata.createAlias(new AliasRecord(name, indices));
+            metadata.createAlias(new AliasRecord(name, indices).withWriteMember(Boolean.TRUE.equals(isWriteIndex) ? indices.get(0) : null));
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
             channel.sendResponse(
                 IndexAdminHandler.error(

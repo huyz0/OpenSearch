@@ -290,6 +290,7 @@ public final class NodeStartup {
         for (ShardAssignment assignment : opening) {
             assignments.put(ServerlessNode.shardKey(assignment.indexName(), assignment.shardId()), assignment);
         }
-        return node.pluginIndices().withAliases(node.projector.project(descriptors.values(), assignments.values()));
+        final ClusterState projected = node.projector.project(descriptors.values(), assignments.values());
+        return node.pluginIndices().withAliases(ViewAliases.with(projected, descriptors.values(), node.metadataPlane, node));
     }
 }
