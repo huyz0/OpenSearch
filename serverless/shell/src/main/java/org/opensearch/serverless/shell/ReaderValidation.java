@@ -100,25 +100,22 @@ final class ReaderValidation {
         this.readerCheckMillis = Math.max(0L, millis);
     }
 
-    /** How long a check that found a live writer stands, in milliseconds, while the membership shows it still live. */
-    static final String LIVE_OWNER_CHECK = "serverless.search.reader_check.live_owner_millis";
-
     /**
-     * The default of {@value #LIVE_OWNER_CHECK}: one lease renewal interval at the default TTL.
-     *
-     * <p>A check that found the shard's writer live re-read the head every second: one read per searched shard per
-     * second, the largest store cost a searched index had. While that writer stays live a head read cannot refuse the
-     * reader anyway: a newer live owner is recorded and the reader goes on serving, lagging it by the publish window by
-     * design. The read matters once nobody live writes the shard, and while the writer the check found holds its lease
-     * without a gap nobody can have taken the shard from it: a successor takes a shard only after revoking a lease it
-     * judged run out, and a writer that lets go publishes first and pushes the commit to the readers.
-     *
-     * <p>So the check stands, without a read, while the membership snapshot shows the same process holding its lease
-     * and proves it held it throughout: the copy held now is the one the check saw, or a renewal stamped before that
-     * copy ran out (a renewal stamps its time plus the TTL). Any gap -- the snapshot's copy run out, a restart, a lease
-     * that went -- brings the full check back, as does the window passing. Zero, or a value below the reader check
-     * window, keeps one window for both.
-     */
+    * The default of {@code serverless.search.reader_check.live_owner_millis}: one lease renewal interval at the default TTL.
+    *
+    * <p>A check that found the shard's writer live re-read the head every second: one read per searched shard per
+    * second, the largest store cost a searched index had. While that writer stays live a head read cannot refuse the
+    * reader anyway: a newer live owner is recorded and the reader goes on serving, lagging it by the publish window by
+    * design. The read matters once nobody live writes the shard, and while the writer the check found holds its lease
+    * without a gap nobody can have taken the shard from it: a successor takes a shard only after revoking a lease it
+    * judged run out, and a writer that lets go publishes first and pushes the commit to the readers.
+    *
+    * <p>So the check stands, without a read, while the membership snapshot shows the same process holding its lease
+    * and proves it held it throughout: the copy held now is the one the check saw, or a renewal stamped before that
+    * copy ran out (a renewal stamps its time plus the TTL). Any gap -- the snapshot's copy run out, a restart, a lease
+    * that went -- brings the full check back, as does the window passing. Zero, or a value below the reader check
+    * window, keeps one window for both.
+    */
     static final long LIVE_OWNER_CHECK_MILLIS = 10_000L;
 
     private volatile long liveOwnerCheckMillis = LIVE_OWNER_CHECK_MILLIS;

@@ -15,7 +15,6 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.transport.TailOverlays;
 import org.opensearch.test.OpenSearchTestCase;
 
 /**
@@ -36,7 +35,7 @@ public class ReaderCheckWindowTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put(TailOverlays.ENABLED, false)
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_ENABLED.getKey(), false)
             .put(extra)
             .build();
     }

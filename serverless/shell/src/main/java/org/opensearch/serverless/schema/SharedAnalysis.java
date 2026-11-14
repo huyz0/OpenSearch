@@ -17,6 +17,7 @@ import org.opensearch.index.analysis.IndexAnalyzersProvider;
 import org.opensearch.index.mapper.Mapping;
 import org.opensearch.index.mapper.SharedMappings;
 import org.opensearch.indices.IndicesService;
+import org.opensearch.serverless.settings.ServerlessSettings;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -55,31 +56,38 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class SharedAnalysis implements IndexAnalyzersProvider {
 
-    /** Node setting that turns sharing on. */
-    public static final String ENABLED = "serverless.schema.sharing.enabled";
     /**
-     * On: at 3,000 open indices with one 150-field mapping, heap per open index went from 182 to 92 KB, opening them
-     * took no longer (2-12% less over five runs), first-write p50 and p99 were within 1%, and no store request changes.
-     */
+    * On: at 3,000 open indices with one 150-field mapping, heap per open index went from 182 to 92 KB, opening them
+    * took no longer (2-12% less over five runs), first-write p50 and p99 were within 1%, and no store request changes.
+    */
     static final boolean ENABLED_DEFAULT = true;
 
-    /** Settings that only name, count or place an index, so differ between indices that could share. */
-    private static final Set<String> IDENTITY_SETTINGS = Set.of(
-        "index.uuid",
-        "index.provided_name",
-        "index.creation_date",
-        "index.history.uuid",
-        "index.number_of_shards",
-        "index.number_of_replicas",
-        "index.auto_expand_replicas",
-        "index.refresh_interval",
-        "index.priority",
-        "index.serverless.storage_uuid",
-        "index.serverless.bucket",
-        "index.serverless.bucket_group",
-        "index.serverless.segment_placement",
-        "index.serverless.tail_overlay"
-    );
+    /**
+     * Settings that only name, count or place an index, so differ between indices that could share. The shell's own
+     * index settings are added from {@link ServerlessSettings#indexScoped()}: each names, places or routes an index,
+     * and none changes its schema.
+     */
+    private static final Set<String> IDENTITY_SETTINGS = identitySettings();
+
+    private static Set<String> identitySettings() {
+        final Set<String> keys = new java.util.HashSet<>(
+            Set.of(
+                "index.uuid",
+                "index.provided_name",
+                "index.creation_date",
+                "index.history.uuid",
+                "index.number_of_shards",
+                "index.number_of_replicas",
+                "index.auto_expand_replicas",
+                "index.refresh_interval",
+                "index.priority"
+            )
+        );
+        for (org.opensearch.common.settings.Setting<?> setting : ServerlessSettings.indexScoped()) {
+            keys.add(setting.getKey());
+        }
+        return Set.copyOf(keys);
+    }
 
     private static final String[] IDENTITY_PREFIXES = { "index.blocks.", "index.routing.allocation." };
 
@@ -93,7 +101,7 @@ public final class SharedAnalysis implements IndexAnalyzersProvider {
      * @return the sharing installed, or null if it is off
      */
     public static SharedAnalysis install(Settings nodeSettings, IndicesService indicesService) {
-        if (nodeSettings.getAsBoolean(ENABLED, ENABLED_DEFAULT) == false) {
+        if (SchemaSettings.SHARING_ENABLED.get(nodeSettings) == false) {
             return null;
         }
         final SharedAnalysis shared = new SharedAnalysis();

@@ -80,7 +80,7 @@ public class UnitSplitBuildTests extends OpenSearchTestCase {
             final BackgroundReconciler firstLoop = new BackgroundReconciler(first, plane).setDemandDrivenActivation(true);
             try (ReconcileScheduler ignored = scheduler(first, plane, clock, firstLoop)) {
                 final String create = "{\"settings\":{\"number_of_shards\":4,\""
-                    + ShardMode.SETTING
+                    + org.opensearch.serverless.routing.RoutingSettings.SHARD_MODE.getKey()
                     + "\":\"adaptive\"},"
                     + "\"mappings\":{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}}";
                 assertEquals(200, send(first, "PUT", "/grow", create).status());

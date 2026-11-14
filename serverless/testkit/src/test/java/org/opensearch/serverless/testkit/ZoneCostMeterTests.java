@@ -13,12 +13,10 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
-import org.opensearch.serverless.cluster.ZonePreference;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.transport.ForwardedBulkRequest;
 import org.opensearch.serverless.transport.ForwardedSearchRequest;
-import org.opensearch.serverless.transport.ShardRouter;
 import org.opensearch.serverless.transport.ZoneTraffic;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -54,7 +52,10 @@ public class ZoneCostMeterTests extends OpenSearchTestCase {
 
     public void testZonePreferencesCutCrossZoneBytes() throws Exception {
         final Measured before = run(
-            Settings.builder().put(ZonePreference.ENABLED, false).put(ShardRouter.COMPRESS_CROSS_ZONE, false).build()
+            Settings.builder()
+                .put(org.opensearch.serverless.cluster.ReaderPlacementSettings.ZONE_LOCAL_ENABLED.getKey(), false)
+                .put(org.opensearch.serverless.transport.ShardRouterSettings.COMPRESS_CROSS_ZONE.getKey(), false)
+                .build()
         );
         final Measured after = run(Settings.EMPTY);
         logger.info("ZONEMETER|before|{}", before);

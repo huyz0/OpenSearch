@@ -14,10 +14,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.transport.CommitPush;
 import org.opensearch.serverless.transport.RefreshVisibility;
-import org.opensearch.serverless.transport.TailOverlays;
-import org.opensearch.serverless.transport.TailPush;
 import org.opensearch.serverless.transport.TailPushRequest;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -55,10 +52,10 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put(CommitPush.ENABLED, true)
-            .put(TailPush.LINGER_SETTING, 1_000L);
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_PUSH_LINGER_MILLIS.getKey(), 1_000L);
         if (mode != null) {
-            builder.put(RefreshVisibility.NODE_SETTING, mode);
+            builder.put(org.opensearch.serverless.transport.ReaderPushSettings.REFRESH_VISIBILITY.getKey(), mode);
         }
         return builder.build();
     }
@@ -185,7 +182,7 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
     public void testWithoutTheOverlayARefreshIsNotClaimedOnSearchNodes() throws Exception {
         withNodes(
             RefreshVisibility.Mode.SERVING.settingValue(),
-            Settings.builder().put(TailOverlays.INDEX_SETTING, "false").build(),
+            Settings.builder().put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey(), "false").build(),
             (plane, writer, reader, join) -> {
                 final Response put = send(writer, "PUT", "/" + INDEX + "/_doc/commit-only?refresh=true", doc("commit-only"));
                 assertEquals(201, put.status());

@@ -35,9 +35,6 @@ import java.util.WeakHashMap;
  */
 public final class SearchReadiness {
 
-    /** Whether a search node joins unready and turns ready only once it has warmed. */
-    public static final String WARM_ON_JOIN = "serverless.search.warm_on_join";
-
     /** Where the node is in its life as a reader. */
     public enum State {
         /** Joined, not yet sent searches: its cache is warming. */
@@ -68,7 +65,7 @@ public final class SearchReadiness {
         synchronized (BY_NODE) {
             return BY_NODE.computeIfAbsent(
                 node,
-                n -> new SearchReadiness(n.roles().contains(ServerlessNode.ROLE_SEARCH), n.settings().getAsBoolean(WARM_ON_JOIN, false))
+                n -> new SearchReadiness(n.roles().contains(ServerlessNode.ROLE_SEARCH), SearchSettings.WARM_ON_JOIN.get(n.settings()))
             );
         }
     }

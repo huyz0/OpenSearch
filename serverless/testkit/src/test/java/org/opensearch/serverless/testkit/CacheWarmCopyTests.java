@@ -16,7 +16,6 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.cluster.ReaderPlacement;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.SearchReadiness;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.BlockCache;
 import org.opensearch.serverless.transport.CacheWarmCopy;
@@ -75,13 +74,20 @@ public class CacheWarmCopyTests extends OpenSearchTestCase {
         try (
             ServerlessNode peer = new ServerlessNode(nodeSettings("copy-peer", "search", Settings.EMPTY));
             ServerlessNode joiner = new ServerlessNode(
-                nodeSettings("copy-joiner", "search", Settings.builder().put(SearchReadiness.WARM_ON_JOIN, true).build())
+                nodeSettings(
+                    "copy-joiner",
+                    "search",
+                    Settings.builder().put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), true).build()
+                )
             );
             ServerlessNode slow = new ServerlessNode(
                 nodeSettings(
                     "copy-slow",
                     "search",
-                    Settings.builder().put(SearchReadiness.WARM_ON_JOIN, true).put(CacheWarmCopy.MAX_BYTES_PER_SECOND, 64 * 1024).build()
+                    Settings.builder()
+                        .put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), true)
+                        .put(org.opensearch.serverless.transport.WarmCopySettings.MAX_BYTES_PER_SECOND.getKey(), 64 * 1024)
+                        .build()
                 )
             )
         ) {

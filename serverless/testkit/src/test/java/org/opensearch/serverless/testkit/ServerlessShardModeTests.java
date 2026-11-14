@@ -88,7 +88,9 @@ public class ServerlessShardModeTests extends OpenSearchTestCase {
     }
 
     private static String create(int shards, String mode) {
-        final String modeSetting = mode == null ? "" : ",\"" + ShardMode.SETTING + "\":\"" + mode + "\"";
+        final String modeSetting = mode == null
+            ? ""
+            : ",\"" + org.opensearch.serverless.routing.RoutingSettings.SHARD_MODE.getKey() + "\":\"" + mode + "\"";
         return "{\"settings\":{\"number_of_shards\":" + shards + modeSetting + "}," + MAPPINGS + "}";
     }
 
@@ -267,7 +269,12 @@ public class ServerlessShardModeTests extends OpenSearchTestCase {
             assertTrue(plane.describe("bad").isEmpty());
 
             assertEquals(200, send(node, "PUT", "/set", create(2, "fixed")).status());
-            final Response change = send(node, "PUT", "/set/_settings", "{\"" + ShardMode.SETTING + "\":\"adaptive\"}");
+            final Response change = send(
+                node,
+                "PUT",
+                "/set/_settings",
+                "{\"" + org.opensearch.serverless.routing.RoutingSettings.SHARD_MODE.getKey() + "\":\"adaptive\"}"
+            );
             assertEquals(change.body(), 501, change.status());
             assertTrue(change.body(), change.body().contains("cannot be changed"));
             assertEquals(ShardMode.FIXED, plane.describe("set").orElseThrow().layout().mode());

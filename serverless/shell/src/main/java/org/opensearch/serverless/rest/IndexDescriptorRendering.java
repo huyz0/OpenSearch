@@ -78,7 +78,10 @@ final class IndexDescriptorRendering {
         // The declared count: an adaptive index reports what the user asked for, not how many units hold it.
         settings.put("number_of_shards", Integer.toString(descriptor.declaredShards()));
         if (descriptor.layout() != null) {
-            settings.put("serverless.shard_mode", descriptor.layout().mode().settingValue());
+            settings.put(
+                org.opensearch.serverless.routing.RoutingSettings.SHARD_MODE.getKey().substring("index.".length()),
+                descriptor.layout().mode().settingValue()
+            );
         }
         // Zero, and true: a shard here has exactly one writer, and its redundancy is the object store
         // rather than a second copy. Reporting it is more honest than omitting it, because a client

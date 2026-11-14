@@ -50,36 +50,8 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
 
     private static final Logger LOG = LogManager.getLogger(TailOverlays.class);
 
-    /**
-     * The node's default for whether writes are searchable before they are published: writers push what they
-     * acknowledge to the search nodes serving the shard, and those search it on top of the commit. On by default.
-     */
-    public static final String ENABLED = "serverless.search.tail_overlay.enabled";
-
-    /** The index setting, which wins over the cluster's: {@code true} or {@code false}, dynamic. */
-    public static final String INDEX_SETTING = "index.serverless.tail_overlay";
-
-    /** The cluster setting, in the {@code cluster/config} register, which wins over the node's. */
-    public static final String CLUSTER_SETTING = "serverless.tail_overlay";
-
-    /**
-     * How long a shard whose writes its search nodes already see may wait to be published, when its index sets no
-     * refresh interval: the node's publish age is raised to this. Publishing then decides only what a new reader opens
-     * and how much a successor replays, not how soon a write is searchable, and each publish is PUTs.
-     */
-    public static final String PUBLISH_MAX_AGE = "serverless.search.tail_overlay.publish_max_age_millis";
-
-    /** The default of {@link #PUBLISH_MAX_AGE}. */
+    /** The default of {@link org.opensearch.serverless.transport.ReaderPushSettings#TAIL_OVERLAY_PUBLISH_MAX_AGE_MILLIS}. */
     public static final long DEFAULT_PUBLISH_MAX_AGE_MILLIS = 10_000L;
-
-    /** The index setting's definition. */
-    public static final org.opensearch.common.settings.Setting<String> INDEX = new org.opensearch.common.settings.Setting<>(
-        INDEX_SETTING,
-        "",
-        TailOverlays::parse,
-        org.opensearch.common.settings.Setting.Property.IndexScope,
-        org.opensearch.common.settings.Setting.Property.Dynamic
-    );
 
     /** How long a shard's records are kept after its last overlay closed, for the one about to open. */
     static final long KEEP_AFTER_CLOSE_NANOS = java.util.concurrent.TimeUnit.SECONDS.toNanos(30);
@@ -94,7 +66,7 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
      * @return true if on
      */
     public static boolean enabled(Settings settings) {
-        return settings.getAsBoolean(ENABLED, true);
+        return ReaderPushSettings.TAIL_OVERLAY_ENABLED.get(settings);
     }
 
     static String parse(String value) {
@@ -128,18 +100,8 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
      * @return true if on
      */
     public static boolean on(Settings indexSettings, String cluster, boolean nodeDefault) {
-        final String index = indexSettings == null ? null : indexSettings.get(INDEX_SETTING);
-        for (String value : new String[] { index, cluster }) {
-            if (value == null || value.isEmpty()) {
-                continue;
-            }
-            try {
-                return "true".equals(parse(value));
-            } catch (IllegalArgumentException e) {
-                // A value the register holds that is neither: the next, less specific, setting decides.
-            }
-        }
-        return nodeDefault;
+        final String index = indexSettings == null ? null : indexSettings.get(ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey());
+        return org.opensearch.serverless.settings.LayeredSetting.resolve(index, cluster, value -> "true".equals(parse(value)), nodeDefault);
     }
 
     private volatile String cluster;
@@ -150,7 +112,7 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
      * @param settings the cluster's settings
      */
     public void applyCluster(Settings settings) {
-        this.cluster = settings.get(CLUSTER_SETTING);
+        this.cluster = settings.get(ReaderPushSettings.TAIL_OVERLAY_CLUSTER.getKey());
     }
 
     /**
@@ -228,7 +190,7 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
     TailOverlays(ShardRouter router) {
         this.router = router;
         this.enabled = enabled(router.node.settings());
-        this.publishMaxAgeMillis = router.node.settings().getAsLong(PUBLISH_MAX_AGE, DEFAULT_PUBLISH_MAX_AGE_MILLIS);
+        this.publishMaxAgeMillis = ReaderPushSettings.TAIL_OVERLAY_PUBLISH_MAX_AGE_MILLIS.get(router.node.settings());
     }
 
     /** Registers the handler that takes pushes. Called once, at startup, after the router's own. */

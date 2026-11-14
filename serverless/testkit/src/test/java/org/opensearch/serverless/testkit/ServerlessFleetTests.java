@@ -11,7 +11,6 @@ package org.opensearch.serverless.testkit;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.net.URI;
@@ -58,11 +57,16 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
 
     /** Capped at two shards each, so four shards cannot fit on one node. */
     private Map<String, String> cappedSettings() {
-        return Map.of(ServerlessBootstrap.LEASE_TTL, TTL, ServerlessBootstrap.MAX_SHARDS, "2");
+        return Map.of(
+            org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(),
+            TTL,
+            org.opensearch.serverless.shell.ActivationSettings.MAX_SHARDS.getKey(),
+            "2"
+        );
     }
 
     private Map<String, String> settings() {
-        return Map.of(ServerlessBootstrap.LEASE_TTL, TTL);
+        return Map.of(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), TTL);
     }
 
     /**
@@ -243,11 +247,11 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
     public void testASearchMissingAShardSaysSoInsteadOfUnderReportingSilently() throws Exception {
         final var store = createTempDir();
         final Map<String, String> neverPublish = Map.of(
-            ServerlessBootstrap.LEASE_TTL,
+            org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(),
             TTL,
-            ServerlessBootstrap.MAX_SHARDS,
+            org.opensearch.serverless.shell.ActivationSettings.MAX_SHARDS.getKey(),
             "2",
-            ServerlessBootstrap.PUBLISH_DEBOUNCE,
+            org.opensearch.serverless.shell.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(),
             "600000"
         );
         try (

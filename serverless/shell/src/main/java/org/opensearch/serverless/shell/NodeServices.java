@@ -437,7 +437,7 @@ public final class NodeServices implements Closeable {
         if (indexNameExpressionResolver == null) {
             indexNameExpressionResolver = new RefusingIndexNameExpressionResolver(
                 threadPool.getThreadContext(),
-                name -> settings.getAsBoolean(PluginIndicesView.ENABLED, true) && node.get().isSystemIndex(name),
+                name -> PluginSettings.INDICES_VIEW.get(settings) && node.get().isSystemIndex(name),
                 this::indicesFromPlane
             );
         }

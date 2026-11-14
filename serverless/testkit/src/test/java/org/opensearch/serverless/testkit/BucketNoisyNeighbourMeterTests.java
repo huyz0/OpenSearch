@@ -55,10 +55,10 @@ public class BucketNoisyNeighbourMeterTests extends OpenSearchTestCase {
             .put("serverless.wal.node_log.commits", true)
             .put("serverless.segments.node_pack.enabled", true)
             .put("serverless.buckets.enabled", true)
-            .put(org.opensearch.serverless.shell.ServerlessBootstrap.NODE_LOG_PUBLISH_MAX_AGE, 0L)
-            .put(org.opensearch.serverless.shell.ServerlessBootstrap.PUBLISH_MIN_INTERVAL, 0L)
+            .put(org.opensearch.serverless.shell.WriteSettings.NODE_LOG_PUBLISH_MAX_AGE_MILLIS.getKey(), 0L)
+            .put(org.opensearch.serverless.shell.WriteSettings.PUBLISH_MIN_INTERVAL_MILLIS.getKey(), 0L)
             .put(
-                org.opensearch.serverless.shell.LogCommitCheckpoint.SETTING,
+                org.opensearch.serverless.shell.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey(),
                 org.opensearch.serverless.store.CommitStaging.MIN_STAGED_MILLIS
             )
             .build();

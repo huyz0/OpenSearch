@@ -15,7 +15,7 @@ import java.util.Locale;
 /**
  * How an index's units start and whether they change by themselves.
  *
- * <p>Set once, at creation, with {@value #SETTING}. An index created without it has no unit layout at
+ * <p>Set once, at creation, with {@code index.serverless.shard_mode}. An index created without it has no unit layout at
  * all and routes as it always has, so nothing about an existing index, or a new one that does not ask,
  * changes.
  */
@@ -32,14 +32,11 @@ public enum ShardMode {
      */
     ADAPTIVE;
 
-    /** The index setting that selects the mode. */
-    public static final String SETTING = "index.serverless.shard_mode";
-
     /**
-     * Returns the mode's name as it is written in settings and in the descriptor.
-     *
-     * @return the lowercase name
-     */
+    * Returns the mode's name as it is written in settings and in the descriptor.
+    *
+    * @return the lowercase name
+    */
     public String settingValue() {
         return name().toLowerCase(Locale.ROOT);
     }
@@ -59,7 +56,9 @@ public enum ShardMode {
                 }
             }
         }
-        throw new IllegalArgumentException("[" + SETTING + "] must be [fixed] or [adaptive], got [" + value + "]");
+        throw new IllegalArgumentException(
+            "[" + RoutingSettings.SHARD_MODE.getKey() + "] must be [fixed] or [adaptive], got [" + value + "]"
+        );
     }
 
     /**
@@ -70,7 +69,7 @@ public enum ShardMode {
      * @throws IllegalArgumentException when the value is not a mode
      */
     public static ShardMode requested(Settings settings) {
-        final String value = settings == null ? null : settings.get(SETTING);
+        final String value = settings == null ? null : settings.get(RoutingSettings.SHARD_MODE.getKey());
         return value == null ? null : parse(value);
     }
 
@@ -81,14 +80,14 @@ public enum ShardMode {
      * shard has no use for it: routing happens before a document reaches a shard.
      *
      * @param settings the settings, or null
-     * @return the same settings without {@value #SETTING}
+     * @return the same settings without {@code index.serverless.shard_mode}
      */
     public static Settings without(Settings settings) {
-        if (settings == null || settings.get(SETTING) == null) {
+        if (settings == null || settings.get(RoutingSettings.SHARD_MODE.getKey()) == null) {
             return settings;
         }
         final Settings.Builder builder = Settings.builder().put(settings);
-        builder.remove(SETTING);
+        builder.remove(RoutingSettings.SHARD_MODE.getKey());
         return builder.build();
     }
 }

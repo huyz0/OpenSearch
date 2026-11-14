@@ -54,23 +54,11 @@ public final class NodeStartup {
                     writeOwnLease(plane, epochs);
                 },
                     (shardId, term) -> node.leases.ownsAtTerm(plane, shardId, term),
-                    node.settings.getAsLong(
-                        "serverless.wal.node_log.window_millis",
-                        org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_WINDOW_MILLIS
-                    ),
-                    node.settings.getAsLong(
-                        "serverless.wal.node_log.max_bytes",
-                        org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_MAX_BYTES
-                    ),
-                    node.settings.getAsInt(
-                        "serverless.wal.node_log.max_records",
-                        org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_MAX_RECORDS
-                    )
+                    org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.get(node.settings),
+                    org.opensearch.serverless.store.NodeLogSettings.MAX_BYTES.get(node.settings),
+                    org.opensearch.serverless.store.NodeLogSettings.MAX_RECORDS.get(node.settings)
                 );
-                final long flushAfter = 2 * node.settings.getAsLong(
-                    "serverless.wal.node_log.window_millis",
-                    org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_WINDOW_MILLIS
-                );
+                final long flushAfter = 2 * org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.get(node.settings);
                 writer.flushLoggedCommitsWith(
                     task -> node.threadPool()
                         .schedule(
@@ -82,34 +70,21 @@ public final class NodeStartup {
                 writer.runAfterOpensOn(node.threadPool().generic());
                 writer.committer()
                     .hedgeAppends(
-                        node.settings.getAsLong(
-                            org.opensearch.serverless.store.NodeLogCommitter.HEDGE_AFTER_SETTING,
-                            org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_HEDGE_AFTER_MILLIS
-                        ),
+                        org.opensearch.serverless.store.NodeLogSettings.HEDGE_AFTER_MILLIS.get(node.settings),
                         node.threadPool().generic()
                     );
                 writer.committer()
                     .admitConcurrently(
-                        node.settings.getAsInt(
-                            org.opensearch.serverless.store.NodeLogCommitter.ADMISSION_CONCURRENCY_SETTING,
-                            org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_ADMISSION_CONCURRENCY
-                        ),
+                        org.opensearch.serverless.store.NodeLogSettings.ADMISSION_CONCURRENCY.get(node.settings),
                         node.threadPool().generic()
                     );
                 writer.committer()
                     .boundBlobs(
-                        node.settings.getAsBoolean(org.opensearch.serverless.store.NodeLogCommitter.SPLIT_SETTING, true),
-                        node.settings.getAsBoolean(org.opensearch.serverless.store.NodeLogCommitter.HEDGE_BY_SIZE_SETTING, true)
+                        org.opensearch.serverless.store.NodeLogSettings.SPLIT_LARGE_BATCHES.get(node.settings),
+                        org.opensearch.serverless.store.NodeLogSettings.HEDGE_BY_SIZE.get(node.settings)
                     );
-                writer.committer()
-                    .flushWhenIdle(node.settings.getAsBoolean(org.opensearch.serverless.store.NodeLogCommitter.IDLE_FLUSH_SETTING, false));
-                writer.committer()
-                    .followUnlocked(
-                        node.settings.getAsBoolean(
-                            org.opensearch.serverless.store.NodeLogCommitter.FOLLOW_UNLOCKED_SETTING,
-                            org.opensearch.serverless.store.NodeLogCommitter.DEFAULT_FOLLOW_UNLOCKED
-                        )
-                    );
+                writer.committer().flushWhenIdle(org.opensearch.serverless.store.NodeLogSettings.IDLE_FLUSH.get(node.settings));
+                writer.committer().followUnlocked(org.opensearch.serverless.store.NodeLogSettings.FOLLOW_UNLOCKED.get(node.settings));
                 node.nodeLogWriter = writer;
             }
             if (node.reconciler != null && node.nodeLogHooked == false) {
@@ -169,12 +144,12 @@ public final class NodeStartup {
         final boolean secureTransport = Netty4ModulePlugin.NETTY_SECURE_TRANSPORT_NAME.equals(transportType)
             || node.services.secureSettingsFactories().isEmpty() == false;
         if (secureTransport == false) {
-            if (ServerlessNode.REQUIRE_SECURE_TRANSPORT_SETTING.get(node.settings)) {
+            if (NodeSettings.REQUIRE_SECURE_TRANSPORT.get(node.settings)) {
                 throw new IllegalStateException(
                     "transport.type is ["
                         + transportType
                         + "] and "
-                        + ServerlessNode.REQUIRE_SECURE_TRANSPORT_SETTING.getKey()
+                        + NodeSettings.REQUIRE_SECURE_TRANSPORT.getKey()
                         + " is true: forwarded requests would carry the deployment secret in the clear"
                 );
             }
@@ -202,8 +177,7 @@ public final class NodeStartup {
         // not final until the transport has bound and told us the address it got.
         node.projector = new LocalViewProjector(ClusterName.CLUSTER_NAME_SETTING.get(node.settings), node.localNode);
         node.reconciler = new ShardReconciler(node.indicesService, node.localNode);
-        final boolean nodePacksByDefault = node.packSegments
-            && node.settings.getAsBoolean(NodePackWiring.ENABLED, NodePackWiring.ENABLED_DEFAULT);
+        final boolean nodePacksByDefault = node.packSegments && WriteSettings.NODE_PACK_ENABLED.get(node.settings);
         node.reconciler.setNodePackPlacement(
             shard -> node.packSegments
                 && SegmentPlacement.nodePacks(shard.indexSettings().getSettings(), node.clusterSegmentPlacement, nodePacksByDefault)

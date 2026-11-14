@@ -15,7 +15,6 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.transport.CommitPush;
 import org.opensearch.serverless.transport.RefreshVisibility;
 import org.opensearch.serverless.transport.TailFetchRequest;
 import org.opensearch.test.OpenSearchTestCase;
@@ -63,7 +62,7 @@ public class RefreshEverywhereMeterTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put(CommitPush.ENABLED, true)
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
             .build();
     }
 
@@ -95,7 +94,9 @@ public class RefreshEverywhereMeterTests extends OpenSearchTestCase {
     }
 
     private static void setMode(RefreshVisibility.Mode mode, ServerlessNode... nodes) {
-        final Settings cluster = Settings.builder().put(RefreshVisibility.CLUSTER_SETTING, mode.settingValue()).build();
+        final Settings cluster = Settings.builder()
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.REFRESH_VISIBILITY_CLUSTER.getKey(), mode.settingValue())
+            .build();
         for (ServerlessNode node : nodes) {
             node.router().refreshVisibility().applyCluster(cluster);
         }

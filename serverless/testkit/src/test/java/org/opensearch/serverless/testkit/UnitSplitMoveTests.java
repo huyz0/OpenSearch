@@ -16,7 +16,6 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.ReconcileScheduler;
-import org.opensearch.serverless.routing.ShardMode;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.split.UnitSplitMover;
 import org.opensearch.test.OpenSearchTestCase;
@@ -79,7 +78,7 @@ public class UnitSplitMoveTests extends OpenSearchTestCase {
             scheduler.start();
             try (scheduler) {
                 final String create = "{\"settings\":{\"number_of_shards\":4,\""
-                    + ShardMode.SETTING
+                    + org.opensearch.serverless.routing.RoutingSettings.SHARD_MODE.getKey()
                     + "\":\"adaptive\"},"
                     + "\"mappings\":{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}}";
                 assertEquals(200, send(node, "PUT", "/grow", create).status());

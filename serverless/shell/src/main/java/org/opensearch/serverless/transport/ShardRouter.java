@@ -64,12 +64,6 @@ public final class ShardRouter {
     final TransportAuthenticator authenticator;
     /** Answers the work other nodes forward here. */
     final ForwardedWorkHandlers handlers = new ForwardedWorkHandlers(this);
-    /**
-     * Whether forwards to a peer in another zone are compressed, true by default. Forwarded documents and search hits
-     * are mostly JSON source, which compresses several times over, and traffic between zones is billed by the byte.
-     */
-    public static final String COMPRESS_CROSS_ZONE = "serverless.network.compress_cross_zone";
-
     /** Bytes exchanged with peers, by whether they stayed in this node's zone. */
     final ZoneTraffic zoneTraffic = new ZoneTraffic();
     private final CommitPush commitPush;
@@ -99,10 +93,10 @@ public final class ShardRouter {
             () -> TransportAuthenticator.identity(node.localNode()),
             () -> plane.get() == null ? System.currentTimeMillis() : plane.get().clock().getAsLong(),
             () -> forwardTimeout().millis(),
-            node.settings().getAsInt("serverless.transport.replay_cache.capacity", 65_536)
+            ShardRouterSettings.REPLAY_CACHE_CAPACITY.get(node.settings())
         );
-        this.meterZones = node.settings().getAsBoolean(ZoneTraffic.ENABLED, true);
-        this.compressCrossZone = node.settings().getAsBoolean(COMPRESS_CROSS_ZONE, true);
+        this.meterZones = ShardRouterSettings.ZONE_METER_ENABLED.get(node.settings());
+        this.compressCrossZone = ShardRouterSettings.COMPRESS_CROSS_ZONE.get(node.settings());
         this.localZone = org.opensearch.serverless.cluster.Zones.localZone(node.settings());
         this.commitPush = new CommitPush(this);
         this.tailPush = new TailPush(this);

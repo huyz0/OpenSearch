@@ -18,7 +18,6 @@ import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessBootstrap;
-import org.opensearch.serverless.store.ObjectStores;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.net.URI;
@@ -160,13 +159,13 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
 
         // The fleet, each node behind its own proxy.
         final URI store = URI.create(endpoint);
-        nodeSettings.put(ObjectStores.TYPE, "s3");
-        nodeSettings.put(ObjectStores.BUCKET, bucket);
-        nodeSettings.put(ObjectStores.PATH_STYLE, prop("path_style", "true"));
-        nodeSettings.put(ObjectStores.REGION, prop("region", "us-east-1"));
-        nodeSettings.put(ServerlessBootstrap.PROVIDER_ACK, "true");
-        nodeSettings.put(ServerlessBootstrap.LEASE_TTL, Long.toString(ttlMillis));
-        nodeSettings.put(ServerlessBootstrap.MAX_SHARDS, prop("max_shards", "100"));
+        nodeSettings.put(org.opensearch.serverless.store.ObjectStoreSettings.TYPE.getKey(), "s3");
+        nodeSettings.put(org.opensearch.serverless.store.ObjectStoreSettings.BUCKET.getKey(), bucket);
+        nodeSettings.put(org.opensearch.serverless.store.ObjectStoreSettings.PATH_STYLE_ACCESS.getKey(), prop("path_style", "true"));
+        nodeSettings.put(org.opensearch.serverless.store.ObjectStoreSettings.REGION.getKey(), prop("region", "us-east-1"));
+        nodeSettings.put(org.opensearch.serverless.store.ObjectStoreSettings.PROVIDER_ACK.getKey(), "true");
+        nodeSettings.put(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), Long.toString(ttlMillis));
+        nodeSettings.put(org.opensearch.serverless.shell.ActivationSettings.MAX_SHARDS.getKey(), prop("max_shards", "100"));
         nodeSettings.put("serverless.roles", "ingest,search");
         // Any node setting, as tests.fleet.setting.<name>: what an A/B run changes without a code change.
         nodeSettings.putAll(settingOverrides());
@@ -1496,7 +1495,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
 
     private NodeProcess startNode(int i) throws Exception {
         final Map<String, String> settings = new LinkedHashMap<>(nodeSettings);
-        settings.put(ObjectStores.ENDPOINT, proxies.get(i).endpoint());
+        settings.put(org.opensearch.serverless.store.ObjectStoreSettings.ENDPOINT.getKey(), proxies.get(i).endpoint());
         settings.put("cluster.name", "serverless-fleet");
         return NodeProcess.start(
             "n" + i,

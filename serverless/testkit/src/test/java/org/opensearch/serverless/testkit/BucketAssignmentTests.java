@@ -92,15 +92,21 @@ public class BucketAssignmentTests extends OpenSearchTestCase {
     }
 
     public void testTheIndexSettingWinsOverTheClusterAndNodeDefaults() {
-        final Settings off = Settings.builder().put(BucketPolicy.INDEX_SETTING, "off").build();
-        final Settings auto = Settings.builder().put(BucketPolicy.INDEX_SETTING, "AUTO").build();
+        final Settings off = Settings.builder().put(org.opensearch.serverless.bucket.BucketSettings.INDEX_POLICY.getKey(), "off").build();
+        final Settings auto = Settings.builder().put(org.opensearch.serverless.bucket.BucketSettings.INDEX_POLICY.getKey(), "AUTO").build();
         assertFalse(BucketPolicy.wanted(off, "auto", true));
         assertTrue(BucketPolicy.wanted(auto, "off", false));
         assertFalse(BucketPolicy.wanted(Settings.EMPTY, "off", true));
         assertTrue(BucketPolicy.wanted(Settings.EMPTY, null, true));
         assertFalse(BucketPolicy.wanted(Settings.EMPTY, null, false));
         expectThrows(IllegalArgumentException.class, () -> BucketPolicy.check("sometimes"));
-        assertEquals("tenant-9", BucketPolicy.group("logs", Settings.builder().put(BucketPolicy.GROUP_SETTING, "tenant-9").build()));
+        assertEquals(
+            "tenant-9",
+            BucketPolicy.group(
+                "logs",
+                Settings.builder().put(org.opensearch.serverless.bucket.BucketSettings.GROUP.getKey(), "tenant-9").build()
+            )
+        );
         assertEquals("logs", BucketPolicy.group("logs", Settings.EMPTY));
     }
 

@@ -9,13 +9,12 @@
 package org.opensearch.serverless.shell;
 
 import org.opensearch.common.settings.Settings;
-import org.opensearch.serverless.reconcile.ReconcileScheduler;
 import org.opensearch.serverless.store.CommitStaging;
 
 /**
  * How old a commit recorded with the node log gets before its shard's manifest is written: the checkpoint age.
  *
- * <p>Set on the node ({@value #SETTING}), and changeable at runtime for the whole cluster with the same key in the
+ * <p>Set on the node ({@code serverless.wal.node_log.commits.checkpoint_millis}), and changeable at runtime for the whole cluster with the same key in the
  * cluster's config register, which each node reads with the segment placement, in the same GET. The cluster's value
  * wins. Either must be at least {@link CommitStaging#MIN_COMMIT_PERIODS} commit periods, the least time between two
  * publishes of one shard, and at most half the pack deadline ({@link CommitStaging#check}). A node refuses to start on
@@ -23,9 +22,6 @@ import org.opensearch.serverless.store.CommitStaging;
  * period makes a written value invalid keeps its own, with a warning.
  */
 public final class LogCommitCheckpoint {
-
-    /** The setting, on the node and in the cluster's config register. */
-    public static final String SETTING = "serverless.wal.node_log.commits.checkpoint_millis";
 
     private LogCommitCheckpoint() {}
 
@@ -37,14 +33,8 @@ public final class LogCommitCheckpoint {
      * @return the period
      */
     public static long commitPeriodMillis(Settings settings) {
-        final long maxAge = settings.getAsLong(
-            ServerlessBootstrap.NODE_LOG_PUBLISH_MAX_AGE,
-            ServerlessBootstrap.DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS
-        );
-        final long spacing = settings.getAsLong(
-            ServerlessBootstrap.PUBLISH_MIN_INTERVAL,
-            ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL.millis()
-        );
+        final long maxAge = WriteSettings.NODE_LOG_PUBLISH_MAX_AGE_MILLIS.get(settings);
+        final long spacing = WriteSettings.PUBLISH_MIN_INTERVAL_MILLIS.get(settings);
         return Math.max(0L, Math.max(maxAge, spacing));
     }
 
@@ -56,10 +46,10 @@ public final class LogCommitCheckpoint {
      * @throws IllegalArgumentException if it is out of bounds for the node's commit period
      */
     static long nodeValue(Settings settings) {
-        final long millis = settings.getAsLong(SETTING, CommitStaging.DEFAULT_MAX_STAGED_MILLIS);
+        final long millis = WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.get(settings);
         final String invalid = CommitStaging.check(millis, commitPeriodMillis(settings));
         if (invalid != null) {
-            throw new IllegalArgumentException("[" + SETTING + "]: " + invalid);
+            throw new IllegalArgumentException("[" + WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey() + "]: " + invalid);
         }
         return millis;
     }
@@ -76,12 +66,14 @@ public final class LogCommitCheckpoint {
         try {
             millis = Long.parseLong(String.valueOf(value).trim());
         } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("[" + SETTING + "] must be a number of milliseconds, got [" + value + "]");
+            throw new IllegalArgumentException(
+                "[" + WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey() + "] must be a number of milliseconds, got [" + value + "]"
+            );
         }
         final long period = node == null ? commitPeriodMillis(Settings.EMPTY) : commitPeriodMillis(node.settings);
         final String invalid = CommitStaging.check(millis, period);
         if (invalid != null) {
-            throw new IllegalArgumentException("[" + SETTING + "]: " + invalid);
+            throw new IllegalArgumentException("[" + WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey() + "]: " + invalid);
         }
     }
 
@@ -96,7 +88,7 @@ public final class LogCommitCheckpoint {
         if (node == null) {
             return;
         }
-        final String value = cluster.get(SETTING);
+        final String value = cluster.get(WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey());
         long millis = node.nodeLogCommitCheckpointMillis;
         if (value != null && value.isEmpty() == false) {
             try {

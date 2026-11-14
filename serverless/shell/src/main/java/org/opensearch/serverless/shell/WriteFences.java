@@ -200,29 +200,11 @@ public final class WriteFences {
         }
     }
 
-    /**
-     * Whether a write may confirm its index's incarnation by the index's change stripe instead of its descriptor, when
-     * the stripe names no change to it since its descriptor was last read here. Node setting {@value #CONFIRM_BY_STRIPE}.
-     *
-     * <p><b>What it saves.</b> A descriptor read per index per fence window, which for an index written less often than
-     * that is a GET on nearly every write, before the engine runs. A stripe is shared by every index hashing to it, and
-     * while writes to it keep arriving it is read in the background about twice a window, so a write finds a stripe read
-     * already in hand and reads nothing. A node writing many indices reads at most {@value
-     * org.opensearch.serverless.metadata.ChangeStripes#STRIPES} stripes twice a window rather than one descriptor per
-     * index.
-     *
-     * <p><b>What it keeps.</b> The fence: a write is acknowledged only after a read that began within the window, of the
-     * stripe or of the descriptor, showed its incarnation live and unchanged; a delete bumps the stripe before it applies
-     * and after it, and answers only after the settle wait. And the freshness: a stripe that names any change to the
-     * index, a mapping or settings update included, sends the write to read the descriptor and apply it, as before.
-     */
-    public static final String CONFIRM_BY_STRIPE = "serverless.write.confirm_incarnation_by_stripe";
-
     /** Null until first asked, then the node setting unless a caller set it. */
     private volatile Boolean byStripe;
 
     /**
-     * Sets whether writes may confirm an incarnation by its change stripe; see {@link #CONFIRM_BY_STRIPE}.
+     * Sets whether writes may confirm an incarnation by its change stripe; see {@link org.opensearch.serverless.shell.WriteSettings#CONFIRM_INCARNATION_BY_STRIPE}.
      *
      * @param on true to confirm by stripe when it proves the descriptor unchanged
      */
@@ -233,7 +215,7 @@ public final class WriteFences {
     private boolean confirmsByStripe() {
         Boolean on = byStripe;
         if (on == null) {
-            on = node.settings == null || node.settings.getAsBoolean(CONFIRM_BY_STRIPE, true);
+            on = node.settings == null || WriteSettings.CONFIRM_INCARNATION_BY_STRIPE.get(node.settings);
             byStripe = on;
         }
         return on;
@@ -258,28 +240,19 @@ public final class WriteFences {
     );
     private final int[] stripeAsksBefore = new int[org.opensearch.serverless.metadata.ChangeStripes.STRIPES];
 
-    /**
-     * How many writes must have asked for a stripe within its last two background periods (about four fifths of a fence
-     * window) for the background to keep reading it; node setting, default 2. Below that, a write reads its stripe itself
-     * when its last read is older than the window, which a stripe written that rarely needed anyway: a read the
-     * background made for a lone write was never used by another one, and a lone write cost five reads that way rather
-     * than one. 0 keeps every stripe asked within two windows read in the background, as before.
-     */
-    public static final String STRIPE_REFRESH_MIN_ASKS = "serverless.write.stripe_refresh_min_asks";
-
     private volatile Integer stripeRefreshMinAsks;
 
     private int stripeRefreshMinAsks() {
         Integer min = stripeRefreshMinAsks;
         if (min == null) {
-            min = node.settings == null ? 2 : Math.max(0, node.settings.getAsInt(STRIPE_REFRESH_MIN_ASKS, 2));
+            min = node.settings == null ? 2 : Math.max(0, WriteSettings.STRIPE_REFRESH_MIN_ASKS.get(node.settings));
             stripeRefreshMinAsks = min;
         }
         return min;
     }
 
     /**
-     * Sets how many asks keep a stripe read in the background; see {@link #STRIPE_REFRESH_MIN_ASKS}.
+     * Sets how many asks keep a stripe read in the background; see {@link org.opensearch.serverless.shell.WriteSettings#STRIPE_REFRESH_MIN_ASKS}.
      *
      * @param asks the threshold, 0 for every stripe asked within two windows
      */

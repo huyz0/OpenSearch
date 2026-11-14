@@ -7,14 +7,117 @@
  */
 package org.opensearch.serverless.shell;
 
+import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Setting.Property;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
+import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.settings.SettingsProvider;
+
+import java.util.List;
 
 /**
  * How a node's searches fan out and resolve patterns, read from the node's settings.
  */
-public final class SearchSettings {
+public final class SearchSettings implements SettingsProvider {
+
+    /** The {@code serverless.search.pattern.max_indices} setting. */
+    public static final Setting<Integer> PATTERN_MAX_INDICES = Setting.intSetting(
+        "serverless.search.pattern.max_indices",
+        MetadataPlane.DEFAULT_PATTERN_CAP,
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.search.fanout.concurrency} setting. */
+    public static final Setting<Integer> FANOUT_CONCURRENCY = Setting.intSetting(
+        "serverless.search.fanout.concurrency",
+        SearchSettings.DEFAULT_SEARCH_FANOUT_CONCURRENCY,
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.search.resolve_from_rollups} setting. */
+    public static final Setting<Boolean> RESOLVE_FROM_ROLLUPS = Setting.boolSetting(
+        "serverless.search.resolve_from_rollups",
+        true,
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.search.rollup.cache_millis} setting. */
+    public static final Setting<Long> ROLLUP_CACHE_MILLIS = Setting.longSetting(
+        "serverless.search.rollup.cache_millis",
+        0L,
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.search.rollup.min_indices} setting. */
+    public static final Setting<Integer> ROLLUP_MIN_INDICES = Setting.intSetting(
+        "serverless.search.rollup.min_indices",
+        SearchSettings.DEFAULT_ROLLUP_MIN_INDICES,
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.search.max_activations_per_query} setting. */
+    public static final Setting<Integer> MAX_ACTIVATIONS_PER_QUERY = Setting.intSetting(
+        "serverless.search.max_activations_per_query",
+        SearchSettings.DEFAULT_SEARCH_ACTIVATION_BUDGET,
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.search.prune} setting. */
+    public static final Setting<Boolean> PRUNE = Setting.boolSetting("serverless.search.prune", true, Property.NodeScope);
+
+    /** Whether a search node joins unready and turns ready only once it has warmed. */
+    public static final Setting<Boolean> WARM_ON_JOIN = Setting.boolSetting("serverless.search.warm_on_join", false, Property.NodeScope);
+
+    /** The longest a joining node stays warming before it turns ready regardless. */
+    public static final Setting<TimeValue> WARM_ON_JOIN_MAX_WAIT = Setting.timeSetting(
+        "serverless.search.warm_on_join.max_wait",
+        SearchWarmup.DEFAULT_MAX_WAIT,
+        Property.NodeScope
+    );
+
+    /**
+     * The share of its peers' named warm blocks a joiner holds before it turns ready, from 0 to 1. The rest keeps
+     * copying after: the coldest tenth of a hot set is worth less than the minutes it can take, especially from a slow
+     * peer.
+     */
+    public static final Setting<Double> WARM_ON_JOIN_READY_FRACTION = Setting.doubleSetting(
+        "serverless.search.warm_on_join.ready_fraction",
+        SearchWarmup.DEFAULT_READY_FRACTION,
+        -Double.MAX_VALUE,
+        Property.NodeScope
+    );
+
+    /** The longest a drain waits for its peers to take over. */
+    public static final Setting<TimeValue> DRAIN_MAX_WAIT = Setting.timeSetting(
+        "serverless.search.drain.max_wait",
+        SearchDrain.DEFAULT_MAX_WAIT,
+        Property.NodeScope
+    );
+
+    /** How long a draining node waits for coordinators to see its role gone; by default two thirds of the lease TTL. */
+    public static final Setting<String> DRAIN_SETTLE = Setting.simpleString("serverless.search.drain.settle", Property.NodeScope);
+
+    /** Whether shutting down drains first. Defaults to {@link #WARM_ON_JOIN}: the same deployments want both. */
+    public static final Setting<Boolean> DRAIN_ON_SHUTDOWN = Setting.boolSetting(
+        "serverless.search.drain.on_shutdown",
+        WARM_ON_JOIN,
+        Property.NodeScope
+    );
+
+    /** How long a check that found a live writer stands, in milliseconds, while the membership shows it still live. */
+    public static final Setting<Long> READER_CHECK_LIVE_OWNER_MILLIS = Setting.longSetting(
+        "serverless.search.reader_check.live_owner_millis",
+        ReaderValidation.LIVE_OWNER_CHECK_MILLIS,
+        Property.NodeScope
+    );
 
     private final Settings settings;
+
+    /** Used by {@link java.util.ServiceLoader}, which only reads the settings this class defines. */
+    public SearchSettings() {
+        this(Settings.EMPTY);
+    }
 
     /**
      * Reads search settings from a node's settings.
@@ -35,10 +138,7 @@ public final class SearchSettings {
      * @return the cap
      */
     public int patternCap() {
-        return settings.getAsInt(
-            "serverless.search.pattern.max_indices",
-            org.opensearch.serverless.metadata.MetadataPlane.DEFAULT_PATTERN_CAP
-        );
+        return SearchSettings.PATTERN_MAX_INDICES.get(settings);
     }
 
     /** How many shards a search works on at once by default. */
@@ -53,7 +153,7 @@ public final class SearchSettings {
      * @return the width, at least one
      */
     public int searchFanoutConcurrency() {
-        return Math.max(1, settings.getAsInt("serverless.search.fanout.concurrency", DEFAULT_SEARCH_FANOUT_CONCURRENCY));
+        return Math.max(1, SearchSettings.FANOUT_CONCURRENCY.get(settings));
     }
 
     /** How many indices a prefix pattern must match before a search reads its group's digest rollups. */
@@ -67,7 +167,7 @@ public final class SearchSettings {
      * @return true to resolve from the rollups
      */
     public boolean resolveFromRollups() {
-        return settings.getAsBoolean("serverless.search.resolve_from_rollups", true);
+        return SearchSettings.RESOLVE_FROM_ROLLUPS.get(settings);
     }
 
     /**
@@ -79,7 +179,7 @@ public final class SearchSettings {
      * @return the age in milliseconds; zero to read the group every time
      */
     public long rollupCacheMillis() {
-        return Math.max(0L, settings.getAsLong("serverless.search.rollup.cache_millis", 0L));
+        return Math.max(0L, SearchSettings.ROLLUP_CACHE_MILLIS.get(settings));
     }
 
     /**
@@ -89,7 +189,7 @@ public final class SearchSettings {
      * @return the threshold
      */
     public int rollupMinIndices() {
-        return Math.max(1, settings.getAsInt("serverless.search.rollup.min_indices", DEFAULT_ROLLUP_MIN_INDICES));
+        return Math.max(1, SearchSettings.ROLLUP_MIN_INDICES.get(settings));
     }
 
     /** How many cold shards one search may activate by default. */
@@ -105,7 +205,7 @@ public final class SearchSettings {
      * @return the budget, at least one
      */
     public int searchActivationBudget() {
-        return Math.max(1, settings.getAsInt("serverless.search.max_activations_per_query", DEFAULT_SEARCH_ACTIVATION_BUDGET));
+        return Math.max(1, SearchSettings.MAX_ACTIVATIONS_PER_QUERY.get(settings));
     }
 
     /**
@@ -115,6 +215,26 @@ public final class SearchSettings {
      * @return true when pruning is on
      */
     public boolean searchPruning() {
-        return settings.getAsBoolean("serverless.search.prune", true);
+        return SearchSettings.PRUNE.get(settings);
+    }
+
+    @Override
+    public List<Setting<?>> settings() {
+        return List.of(
+            PATTERN_MAX_INDICES,
+            FANOUT_CONCURRENCY,
+            RESOLVE_FROM_ROLLUPS,
+            ROLLUP_CACHE_MILLIS,
+            ROLLUP_MIN_INDICES,
+            MAX_ACTIVATIONS_PER_QUERY,
+            PRUNE,
+            WARM_ON_JOIN,
+            WARM_ON_JOIN_MAX_WAIT,
+            WARM_ON_JOIN_READY_FRACTION,
+            DRAIN_MAX_WAIT,
+            DRAIN_SETTLE,
+            DRAIN_ON_SHUTDOWN,
+            READER_CHECK_LIVE_OWNER_MILLIS
+        );
     }
 }

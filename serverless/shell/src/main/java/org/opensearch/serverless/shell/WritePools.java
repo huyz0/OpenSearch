@@ -23,7 +23,7 @@ import java.util.concurrent.Semaphore;
  * waiting, not working. Core's {@code write} pool has as many threads as cores, plus one at most: on four cores, four
  * threads each holding a write for about a quarter of a second took about sixteen REST writes a second, whatever the
  * document size, and the rest waited in its queue for seconds. The pool a forwarded write is applied on at its owner
- * was sized the same way. With {@link #ENABLED} on, both have {@link #THREADS_PER_CORE} threads a core, enough for the
+ * was sized the same way. With {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} on, both have {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_THREADS_PER_CORE} threads a core, enough for the
  * waiting a node's CPU can feed.
  *
  * <p><b>What stays bounded by cores.</b> Applying an operation to the engine is the CPU-bound part, and the number of
@@ -39,25 +39,19 @@ import java.util.concurrent.Semaphore;
  */
 public final class WritePools {
 
-    /** Whether document writes run on {@link #POOL} and forwarded writes on a pool of the same size, with the apply gate. */
-    public static final String ENABLED = "serverless.write.wait_pool.enabled";
-
-    /** The default for {@link #ENABLED}. */
+    /** The default for {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED}. */
     public static final boolean DEFAULT_ENABLED = true;
 
-    /** Threads per core of {@link #POOL}, and of the forwarded-write pool, when {@link #ENABLED} is on. */
-    public static final String THREADS_PER_CORE = "serverless.write.wait_pool.threads_per_core";
-
-    /** The default for {@link #THREADS_PER_CORE}. */
+    /** The default for {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_THREADS_PER_CORE}. */
     public static final int DEFAULT_THREADS_PER_CORE = 64;
 
-    /** Writes in flight per core the limiter allows by default when {@link #ENABLED} is on. */
+    /** Writes in flight per core the limiter allows by default when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is on. */
     public static final int IN_FLIGHT_PER_CORE = 384;
 
     /** The limiter's in-flight cap before it grew with cores, and its floor since. */
     public static final int MIN_IN_FLIGHT = 1_024;
 
-    /** The pool document writes run on when {@link #ENABLED} is on. */
+    /** The pool document writes run on when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is on. */
     public static final String POOL = "serverless_write";
 
     private final Semaphore gate;
@@ -70,7 +64,7 @@ public final class WritePools {
      * Builds the gate for a node.
      *
      * @param settings the node settings
-     * @return the gate, letting everything through when {@link #ENABLED} is off
+     * @return the gate, letting everything through when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is off
      */
     public static WritePools of(Settings settings) {
         // Not fair: a fair gate hands each released permit to the longest waiter, a thread switch per apply, and with
@@ -82,24 +76,24 @@ public final class WritePools {
      * Reports whether writes run on the waiting-sized pools.
      *
      * @param settings the node settings
-     * @return true when {@link #ENABLED} is on
+     * @return true when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is on
      */
     public static boolean enabled(Settings settings) {
-        return settings.getAsBoolean(ENABLED, DEFAULT_ENABLED);
+        return WriteSettings.WAIT_POOL_ENABLED.get(settings);
     }
 
     /**
      * Names the pool a node runs document writes on.
      *
      * @param settings the node settings
-     * @return {@link #POOL}, or core's {@code write} pool when {@link #ENABLED} is off
+     * @return {@link #POOL}, or core's {@code write} pool when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is off
      */
     public static String writePool(Settings settings) {
         return enabled(settings) ? POOL : ThreadPool.Names.WRITE;
     }
 
     /**
-     * How many threads a pool that waits for writes has: as many as cores when {@link #ENABLED} is off, as before.
+     * How many threads a pool that waits for writes has: as many as cores when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is off, as before.
      *
      * @param settings the node settings
      * @return the thread count
@@ -109,7 +103,7 @@ public final class WritePools {
         if (enabled(settings) == false) {
             return processors;
         }
-        return Math.max(processors, processors * Math.max(1, settings.getAsInt(THREADS_PER_CORE, DEFAULT_THREADS_PER_CORE)));
+        return Math.max(processors, processors * Math.max(1, WriteSettings.WAIT_POOL_THREADS_PER_CORE.get(settings)));
     }
 
     /**
@@ -126,7 +120,7 @@ public final class WritePools {
      * The limiter's default cap on writes in flight.
      *
      * @param settings the node settings
-     * @return 1,024, or with {@link #ENABLED} on, {@link #IN_FLIGHT_PER_CORE} a core and at least 1,024
+     * @return 1,024, or with {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} on, {@link #IN_FLIGHT_PER_CORE} a core and at least 1,024
      */
     public static int defaultMaxInFlight(Settings settings) {
         if (enabled(settings) == false) {

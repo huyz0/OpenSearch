@@ -46,7 +46,7 @@ public class TailGrantDoubtTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put(RefreshVisibility.NODE_SETTING, RefreshVisibility.Mode.EVERYWHERE.settingValue())
+            .put(ReaderPushSettings.REFRESH_VISIBILITY.getKey(), RefreshVisibility.Mode.EVERYWHERE.settingValue())
             .build();
         try (ServerlessNode writer = new ServerlessNode(settings)) {
             writer.startup().start();

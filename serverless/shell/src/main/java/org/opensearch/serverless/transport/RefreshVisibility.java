@@ -63,12 +63,6 @@ public final class RefreshVisibility {
         }
     }
 
-    /** The node's default. */
-    public static final String NODE_SETTING = "serverless.search.refresh_visibility";
-
-    /** The cluster setting, which wins over the node's. */
-    public static final String CLUSTER_SETTING = "serverless.refresh_visibility";
-
     /** The default mode, when neither the cluster nor the node names one. */
     public static final Mode DEFAULT = Mode.EVERYWHERE;
 
@@ -89,7 +83,7 @@ public final class RefreshVisibility {
     private volatile Mode cluster;
 
     RefreshVisibility(Settings nodeSettings) {
-        final String value = nodeSettings.get(NODE_SETTING);
+        final String value = nodeSettings.get(ReaderPushSettings.REFRESH_VISIBILITY.getKey());
         this.nodeDefault = value == null || value.isEmpty() ? DEFAULT : Mode.parse(value);
     }
 
@@ -109,7 +103,7 @@ public final class RefreshVisibility {
      * @param settings the cluster's settings
      */
     public void applyCluster(Settings settings) {
-        final String value = settings.get(CLUSTER_SETTING);
+        final String value = settings.get(ReaderPushSettings.REFRESH_VISIBILITY_CLUSTER.getKey());
         Mode parsed = null;
         if (value != null && value.isEmpty() == false) {
             try {

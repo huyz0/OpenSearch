@@ -83,7 +83,7 @@ public final class BucketStore {
     }
 
     /**
-     * Sets how manifests are written from a node's settings ({@link BucketSettings#MANIFEST_CODEC}).
+     * Sets how manifests are written from a node's settings ({@link org.opensearch.serverless.bucket.BucketSettings#MANIFEST_CODEC}).
      *
      * @param settings the node settings
      * @return this

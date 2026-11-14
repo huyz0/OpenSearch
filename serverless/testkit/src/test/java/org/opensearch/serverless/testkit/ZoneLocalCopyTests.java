@@ -72,13 +72,21 @@ public class ZoneLocalCopyTests extends OpenSearchTestCase {
                 writer.shards().publishShard(shardId, plane.heads().read("hot", s).orElseThrow().term());
             }
         }
-        final Settings joining = Settings.builder().put(SearchReadiness.WARM_ON_JOIN, true).build();
+        final Settings joining = Settings.builder().put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), true).build();
         try (
             ServerlessNode peer = new ServerlessNode(settings("zc-peer", "search", "zone-b", Settings.EMPTY));
             ServerlessNode far = new ServerlessNode(settings("zc-far", "search", "zone-a", joining));
             ServerlessNode near = new ServerlessNode(settings("zc-near", "search", "zone-b", joining));
             ServerlessNode allowed = new ServerlessNode(
-                settings("zc-allowed", "search", "zone-a", Settings.builder().put(joining).put(CacheWarmCopy.CROSS_ZONE, true).build())
+                settings(
+                    "zc-allowed",
+                    "search",
+                    "zone-a",
+                    Settings.builder()
+                        .put(joining)
+                        .put(org.opensearch.serverless.transport.WarmCopySettings.CROSS_ZONE.getKey(), true)
+                        .build()
+                )
             )
         ) {
             for (ServerlessNode node : List.of(peer, far, near, allowed)) {
