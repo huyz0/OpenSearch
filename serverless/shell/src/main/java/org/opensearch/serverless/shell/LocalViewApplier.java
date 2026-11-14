@@ -246,7 +246,7 @@ final class LocalViewApplier {
             source = metadataPlane.get().membership();
         }
         if (source == null || source.current().isEmpty()) {
-            return state;
+            return namesClusterManager ? withClusterManager(state, java.util.Set.of()) : state;
         }
         final DiscoveryNodes.Builder nodes = DiscoveryNodes.builder(state.nodes());
         boolean changed = false;
@@ -261,7 +261,45 @@ final class LocalViewApplier {
                 logger.debug("not describing {} in the local view: {}", lease.nodeId(), e.getMessage());
             }
         }
-        return changed ? ClusterState.builder(state).nodes(nodes).build() : state;
+        final ClusterState withPeers = changed ? ClusterState.builder(state).nodes(nodes).build() : state;
+        return namesClusterManager ? withClusterManager(withPeers, source.current()) : withPeers;
+    }
+
+    private volatile boolean namesClusterManager;
+
+    /**
+     * Whether the view names a cluster manager: set when plugins are installed and the plugin cluster view is on.
+     *
+     * <p>The shell has no cluster manager and its own code never asks for one. Plugins do: the security plugin
+     * will not load its configuration while {@code getClusterManagerNode()} is null, and most plugins run their
+     * once-per-cluster work -- sweepers, schedulers, cleanup -- only where {@code isLocalNodeElectedClusterManager()}
+     * holds. So the view names one, chosen without an election: the live member with the lowest node id.
+     *
+     * <p><b>Why that rule.</b> Every node computes the same answer from the leases it already reads, so naming a
+     * leader costs no request. It is not a lock: two nodes can briefly disagree while a lease lapses or a lagging
+     * membership view catches up, so for a moment two nodes may each believe they lead, or none. Classic
+     * OpenSearch has the same window during an election, and the plugins that care already guard their singleton
+     * work with a lock document in their own index (Job Scheduler does), not with the election alone.
+     */
+    void namesClusterManager(boolean names) {
+        this.namesClusterManager = names;
+    }
+
+    private ClusterState withClusterManager(ClusterState state, java.util.Set<NodeLease> leases) {
+        final long now = metadataPlane.get() == null ? System.currentTimeMillis() : metadataPlane.get().clock().getAsLong();
+        String leader = localNodeId.get();
+        for (NodeLease lease : leases) {
+            if (lease.revoked() || lease.isExpiredAt(now) || state.nodes().nodeExists(lease.nodeId()) == false) {
+                continue;
+            }
+            if (lease.nodeId().compareTo(leader) < 0) {
+                leader = lease.nodeId();
+            }
+        }
+        if (leader.equals(state.nodes().getClusterManagerNodeId())) {
+            return state;
+        }
+        return ClusterState.builder(state).nodes(DiscoveryNodes.builder(state.nodes()).clusterManagerNodeId(leader)).build();
     }
 
     /** A peer as the data plane would see it, from its lease: id, ephemeral id, address and roles all from there. */

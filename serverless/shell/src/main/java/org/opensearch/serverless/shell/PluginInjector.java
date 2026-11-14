@@ -236,7 +236,8 @@ final class PluginInjector {
             && name.startsWith("jdk.") == false
             && name.startsWith("org.opensearch.common.lifecycle.") == false
             && name.startsWith("org.opensearch.core.xcontent.") == false
-            && name.startsWith("org.opensearch.core.common.io.stream.") == false
+            // The stream package's marker interfaces only: its registry is a service plugins take by type.
+            && (type.isInterface() == false || name.startsWith("org.opensearch.core.common.io.stream.") == false)
             && name.equals("org.opensearch.common.lease.Releasable") == false;
     }
 }

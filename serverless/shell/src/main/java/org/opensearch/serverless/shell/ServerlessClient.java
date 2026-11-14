@@ -140,6 +140,22 @@ public final class ServerlessClient extends AbstractClient {
         if (org.opensearch.action.search.SearchAction.INSTANCE.name().equals(action.name())) {
             return search((org.opensearch.action.search.SearchRequest) request, serving, metadata);
         }
+        if (ServerlessPlugins.clusterView(serving.settings)) {
+            if (org.opensearch.action.admin.cluster.health.ClusterHealthAction.INSTANCE.name().equals(action.name())) {
+                return PluginClusterAnswers.health(
+                    serving,
+                    metadata,
+                    (org.opensearch.action.admin.cluster.health.ClusterHealthRequest) request
+                );
+            }
+            if (org.opensearch.action.admin.cluster.state.ClusterStateAction.INSTANCE.name().equals(action.name())) {
+                return PluginClusterAnswers.state(
+                    serving,
+                    metadata,
+                    (org.opensearch.action.admin.cluster.state.ClusterStateRequest) request
+                );
+            }
+        }
         // A plugin's own action, after the shell's allowlist and never before it: a plugin must not be able
         // to take over "indices:data/write/index" by declaring it. PluginActions refuses a duplicate among
         // plugins for the same reason, and this ordering settles the one case it cannot see.
@@ -160,6 +176,7 @@ public final class ServerlessClient extends AbstractClient {
                 + CreateIndexAction.INSTANCE.name()
                 + " and "
                 + org.opensearch.action.search.SearchAction.INSTANCE.name()
+                + (ServerlessPlugins.clusterView(serving.settings) ? ", cluster:monitor/health, cluster:monitor/state" : "")
                 + (serving.pluginActions().isEmpty() ? "" : ", plus what the plugins provide: " + serving.pluginActions().names())
         );
     }

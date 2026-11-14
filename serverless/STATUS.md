@@ -185,7 +185,11 @@ Plugin objects are built by core's own injector (`serverless.plugin_injector.ena
 singletons, and the node's services are bound by their class and supertypes. Core services the shell does not run
 (repositories, point-in-time transport, extensions) are bound as empty stand-ins. Plugins hear `onNodeStarted` once the
 node is started and has its metadata plane. With this, the security plugin (with the rule framework) starts over TLS
-and creates its configuration index; it then waits for cluster health, which the plugin client does not yet answer.
+and creates its configuration index. On a node with plugins the view names a cluster manager -- the live member with
+the lowest node id, chosen from the leases every node already reads, no election -- and the plugin client answers cluster
+health (green for every index the metadata plane describes, since a dormant shard opens on demand) and cluster state (the
+node's view plus the metadata of each index the request names) (`serverless.plugin_cluster_view.enabled`, on). The
+security plugin passes its health wait and then needs multi-get from the client.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,
