@@ -11,7 +11,6 @@ package org.opensearch.serverless.shell;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
-import org.opensearch.threadpool.ThreadPool;
 
 import java.util.concurrent.Semaphore;
 
@@ -23,7 +22,7 @@ import java.util.concurrent.Semaphore;
  * waiting, not working. Core's {@code write} pool has as many threads as cores, plus one at most: on four cores, four
  * threads each holding a write for about a quarter of a second took about sixteen REST writes a second, whatever the
  * document size, and the rest waited in its queue for seconds. The pool a forwarded write is applied on at its owner
- * was sized the same way. With {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} on, both have {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_THREADS_PER_CORE} threads a core, enough for the
+ * was sized the same way. Both have {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_THREADS_PER_CORE} threads a core, enough for the
  * waiting a node's CPU can feed.
  *
  * <p><b>What stays bounded by cores.</b> Applying an operation to the engine is the CPU-bound part, and the number of
@@ -39,19 +38,16 @@ import java.util.concurrent.Semaphore;
  */
 public final class WritePools {
 
-    /** The default for {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED}. */
-    public static final boolean DEFAULT_ENABLED = true;
-
     /** The default for {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_THREADS_PER_CORE}. */
     public static final int DEFAULT_THREADS_PER_CORE = 64;
 
-    /** Writes in flight per core the limiter allows by default when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is on. */
+    /** Writes in flight per core the limiter allows by default. */
     public static final int IN_FLIGHT_PER_CORE = 384;
 
     /** The limiter's in-flight cap before it grew with cores, and its floor since. */
     public static final int MIN_IN_FLIGHT = 1_024;
 
-    /** The pool document writes run on when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is on. */
+    /** The pool document writes run on. */
     public static final String POOL = "serverless_write";
 
     private final Semaphore gate;
@@ -64,45 +60,22 @@ public final class WritePools {
      * Builds the gate for a node.
      *
      * @param settings the node settings
-     * @return the gate, letting everything through when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is off
+     * @return the gate
      */
     public static WritePools of(Settings settings) {
         // Not fair: a fair gate hands each released permit to the longest waiter, a thread switch per apply, and with
         // thousands of writers queued that handing-over, not CPU, was what bounded a node's bulk rate.
-        return new WritePools(enabled(settings) ? new Semaphore(applyPermits(settings), false) : null);
+        return new WritePools(new Semaphore(applyPermits(settings), false));
     }
 
     /**
-     * Reports whether writes run on the waiting-sized pools.
-     *
-     * @param settings the node settings
-     * @return true when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is on
-     */
-    public static boolean enabled(Settings settings) {
-        return WriteSettings.WAIT_POOL_ENABLED.get(settings);
-    }
-
-    /**
-     * Names the pool a node runs document writes on.
-     *
-     * @param settings the node settings
-     * @return {@link #POOL}, or core's {@code write} pool when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is off
-     */
-    public static String writePool(Settings settings) {
-        return enabled(settings) ? POOL : ThreadPool.Names.WRITE;
-    }
-
-    /**
-     * How many threads a pool that waits for writes has: as many as cores when {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} is off, as before.
+     * How many threads a pool that waits for writes has.
      *
      * @param settings the node settings
      * @return the thread count
      */
     public static int threads(Settings settings) {
         final int processors = OpenSearchExecutors.allocatedProcessors(settings);
-        if (enabled(settings) == false) {
-            return processors;
-        }
         return Math.max(processors, processors * Math.max(1, WriteSettings.WAIT_POOL_THREADS_PER_CORE.get(settings)));
     }
 
@@ -120,12 +93,9 @@ public final class WritePools {
      * The limiter's default cap on writes in flight.
      *
      * @param settings the node settings
-     * @return 1,024, or with {@link org.opensearch.serverless.shell.WriteSettings#WAIT_POOL_ENABLED} on, {@link #IN_FLIGHT_PER_CORE} a core and at least 1,024
+     * @return {@link #IN_FLIGHT_PER_CORE} a core, and at least 1,024
      */
     public static int defaultMaxInFlight(Settings settings) {
-        if (enabled(settings) == false) {
-            return MIN_IN_FLIGHT;
-        }
         return Math.max(MIN_IN_FLIGHT, IN_FLIGHT_PER_CORE * OpenSearchExecutors.allocatedProcessors(settings));
     }
 
@@ -136,25 +106,21 @@ public final class WritePools {
      * @throws java.io.IOException if interrupted while waiting, before anything was applied
      */
     public Releasable enterApply() throws java.io.IOException {
-        final Semaphore permits = gate;
-        if (permits == null) {
-            return () -> {};
-        }
         try {
-            permits.acquire();
+            gate.acquire();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new java.io.IOException("interrupted waiting to apply a write; nothing was applied", e);
         }
-        return permits::release;
+        return gate::release;
     }
 
     /**
      * Reports how many applies could start now, for tests.
      *
-     * @return free permits, or -1 with no gate
+     * @return free permits
      */
     public int freePermits() {
-        return gate == null ? -1 : gate.availablePermits();
+        return gate.availablePermits();
     }
 }

@@ -141,59 +141,47 @@ public final class ServerlessClient extends AbstractClient {
         if (org.opensearch.action.search.SearchAction.INSTANCE.name().equals(action.name())) {
             return search((org.opensearch.action.search.SearchRequest) request, serving, metadata);
         }
-        if (ServerlessPlugins.documentBatches(serving.settings)) {
-            if (org.opensearch.action.get.MultiGetAction.INSTANCE.name().equals(action.name())) {
-                return PluginDocumentActions.multiGet((org.opensearch.action.get.MultiGetRequest) request, operations);
-            }
-            if (org.opensearch.action.bulk.BulkAction.INSTANCE.name().equals(action.name())) {
-                return PluginDocumentActions.bulk((org.opensearch.action.bulk.BulkRequest) request, operations);
-            }
-            if (org.opensearch.action.update.UpdateAction.INSTANCE.name().equals(action.name())) {
-                return PluginDocumentActions.update((org.opensearch.action.update.UpdateRequest) request, operations);
-            }
-            if (org.opensearch.index.reindex.UpdateByQueryAction.NAME.equals(action.name())) {
-                return operations.updateByQuery((org.opensearch.index.reindex.UpdateByQueryRequest) request);
-            }
-            if (org.opensearch.index.reindex.DeleteByQueryAction.NAME.equals(action.name())) {
-                return PluginDocumentActions.deleteByQuery((org.opensearch.index.reindex.DeleteByQueryRequest) request, operations);
-            }
+        if (org.opensearch.action.get.MultiGetAction.INSTANCE.name().equals(action.name())) {
+            return PluginDocumentActions.multiGet((org.opensearch.action.get.MultiGetRequest) request, operations);
         }
-        if (ServerlessPlugins.clusterView(serving.settings)) {
-            if (org.opensearch.action.admin.cluster.health.ClusterHealthAction.INSTANCE.name().equals(action.name())) {
-                return PluginClusterAnswers.health(
-                    serving,
-                    metadata,
-                    (org.opensearch.action.admin.cluster.health.ClusterHealthRequest) request
-                );
-            }
-            if (org.opensearch.action.admin.cluster.state.ClusterStateAction.INSTANCE.name().equals(action.name())) {
-                return PluginClusterAnswers.state(
-                    serving,
-                    metadata,
-                    (org.opensearch.action.admin.cluster.state.ClusterStateRequest) request
-                );
-            }
+        if (org.opensearch.action.bulk.BulkAction.INSTANCE.name().equals(action.name())) {
+            return PluginDocumentActions.bulk((org.opensearch.action.bulk.BulkRequest) request, operations);
         }
-        if (ServerlessPlugins.nodeAnswers(serving.settings)) {
-            if (org.opensearch.action.admin.cluster.node.info.NodesInfoAction.INSTANCE.name().equals(action.name())) {
-                return PluginNodeAnswers.nodesInfo(serving, (org.opensearch.action.admin.cluster.node.info.NodesInfoRequest) request);
-            }
-            if (org.opensearch.action.admin.cluster.node.stats.NodesStatsAction.INSTANCE.name().equals(action.name())) {
-                return PluginNodeAnswers.nodesStats(serving, (org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest) request);
-            }
-            if (org.opensearch.action.admin.indices.stats.IndicesStatsAction.INSTANCE.name().equals(action.name())) {
-                return PluginNodeAnswers.indicesStats(serving, (org.opensearch.action.admin.indices.stats.IndicesStatsRequest) request);
-            }
-            if (org.opensearch.action.admin.indices.refresh.RefreshAction.INSTANCE.name().equals(action.name())) {
-                return PluginNodeAnswers.refresh(serving, (org.opensearch.action.admin.indices.refresh.RefreshRequest) request);
-            }
+        if (org.opensearch.action.update.UpdateAction.INSTANCE.name().equals(action.name())) {
+            return PluginDocumentActions.update((org.opensearch.action.update.UpdateRequest) request, operations);
         }
-        if (ServerlessPlugins.indexAdmin(serving.settings)) {
-            final ActionResponse answered = indexAdmin(action.name(), request, serving, metadata);
-            if (answered != null) {
-                serving.pluginIndices().changed(PluginIndicesView.touchedBy(request, answered));
-                return answered;
-            }
+        if (org.opensearch.index.reindex.UpdateByQueryAction.NAME.equals(action.name())) {
+            return operations.updateByQuery((org.opensearch.index.reindex.UpdateByQueryRequest) request);
+        }
+        if (org.opensearch.index.reindex.DeleteByQueryAction.NAME.equals(action.name())) {
+            return PluginDocumentActions.deleteByQuery((org.opensearch.index.reindex.DeleteByQueryRequest) request, operations);
+        }
+        if (org.opensearch.action.admin.cluster.health.ClusterHealthAction.INSTANCE.name().equals(action.name())) {
+            return PluginClusterAnswers.health(
+                serving,
+                metadata,
+                (org.opensearch.action.admin.cluster.health.ClusterHealthRequest) request
+            );
+        }
+        if (org.opensearch.action.admin.cluster.state.ClusterStateAction.INSTANCE.name().equals(action.name())) {
+            return PluginClusterAnswers.state(serving, metadata, (org.opensearch.action.admin.cluster.state.ClusterStateRequest) request);
+        }
+        if (org.opensearch.action.admin.cluster.node.info.NodesInfoAction.INSTANCE.name().equals(action.name())) {
+            return PluginNodeAnswers.nodesInfo(serving, (org.opensearch.action.admin.cluster.node.info.NodesInfoRequest) request);
+        }
+        if (org.opensearch.action.admin.cluster.node.stats.NodesStatsAction.INSTANCE.name().equals(action.name())) {
+            return PluginNodeAnswers.nodesStats(serving, (org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.stats.IndicesStatsAction.INSTANCE.name().equals(action.name())) {
+            return PluginNodeAnswers.indicesStats(serving, (org.opensearch.action.admin.indices.stats.IndicesStatsRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.refresh.RefreshAction.INSTANCE.name().equals(action.name())) {
+            return PluginNodeAnswers.refresh(serving, (org.opensearch.action.admin.indices.refresh.RefreshRequest) request);
+        }
+        final ActionResponse answered = indexAdmin(action.name(), request, serving, metadata);
+        if (answered != null) {
+            serving.pluginIndices().changed(PluginIndicesView.touchedBy(request, answered));
+            return answered;
         }
         // A plugin's own action, after the shell's allowlist and never before it: a plugin must not be able
         // to take over "indices:data/write/index" by declaring it. PluginActions refuses a duplicate among
@@ -215,20 +203,14 @@ public final class ServerlessClient extends AbstractClient {
                 + CreateIndexAction.INSTANCE.name()
                 + " and "
                 + org.opensearch.action.search.SearchAction.INSTANCE.name()
-                + (ServerlessPlugins.documentBatches(serving.settings)
-                    ? ", indices:data/read/mget, indices:data/write/bulk, indices:data/write/update,"
-                        + " indices:data/write/update/byquery, indices:data/write/delete/byquery"
-                    : "")
-                + (ServerlessPlugins.clusterView(serving.settings) ? ", cluster:monitor/health, cluster:monitor/state" : "")
-                + (ServerlessPlugins.indexAdmin(serving.settings)
-                    ? ", indices:admin/exists, indices:admin/get, indices:admin/mappings/get, indices:admin/mappings/fields/get,"
-                        + " indices:admin/settings/get,"
-                        + " indices:admin/aliases/get, indices:admin/mapping/put, indices:admin/settings/update, indices:admin/delete,"
-                        + " indices:admin/aliases, indices:admin/rollover"
-                    : "")
-                + (ServerlessPlugins.nodeAnswers(serving.settings)
-                    ? ", cluster:monitor/nodes/info, cluster:monitor/nodes/stats, indices:monitor/stats, indices:admin/refresh"
-                    : "")
+                + ", indices:data/read/mget, indices:data/write/bulk, indices:data/write/update,"
+                + " indices:data/write/update/byquery, indices:data/write/delete/byquery"
+                + ", cluster:monitor/health, cluster:monitor/state"
+                + ", indices:admin/exists, indices:admin/get, indices:admin/mappings/get, indices:admin/mappings/fields/get,"
+                + " indices:admin/settings/get,"
+                + " indices:admin/aliases/get, indices:admin/mapping/put, indices:admin/settings/update, indices:admin/delete,"
+                + " indices:admin/aliases, indices:admin/rollover"
+                + ", cluster:monitor/nodes/info, cluster:monitor/nodes/stats, indices:monitor/stats, indices:admin/refresh"
                 + (serving.pluginActions().isEmpty() ? "" : ", plus what the plugins provide: " + serving.pluginActions().names())
         );
     }
@@ -458,9 +440,7 @@ public final class ServerlessClient extends AbstractClient {
         // asks for both at once -- the alerting plugin creates each history index with its write alias -- so the
         // client takes the aliases off, creates the index, then adds them through the alias path. Not atomic: an
         // index whose alias failed is left, as a REST caller doing the two steps would leave it.
-        final java.util.List<org.opensearch.action.admin.indices.alias.Alias> aliases = ServerlessPlugins.indexAdmin(node.get().settings)
-            ? new java.util.ArrayList<>(request.aliases())
-            : java.util.List.of();
+        final java.util.List<org.opensearch.action.admin.indices.alias.Alias> aliases = new java.util.ArrayList<>(request.aliases());
         request.aliases().removeAll(aliases);
         try {
             org.opensearch.serverless.rest.IndexAdminHandler.createIndex(node.get(), metadata, request);

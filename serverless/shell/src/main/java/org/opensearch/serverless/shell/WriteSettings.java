@@ -46,28 +46,6 @@ public final class WriteSettings implements SettingsProvider {
     );
 
     /**
-     * Whether a write may confirm its index's incarnation by the index's change stripe instead of its descriptor, when
-     * the stripe names no change to it since its descriptor was last read here. Node setting {@code serverless.write.confirm_incarnation_by_stripe}.
-     *
-     * <p><b>What it saves.</b> A descriptor read per index per fence window, which for an index written less often than
-     * that is a GET on nearly every write, before the engine runs. A stripe is shared by every index hashing to it, and
-     * while writes to it keep arriving it is read in the background about twice a window, so a write finds a stripe read
-     * already in hand and reads nothing. A node writing many indices reads at most {@value
-     * org.opensearch.serverless.metadata.ChangeStripes#STRIPES} stripes twice a window rather than one descriptor per
-     * index.
-     *
-     * <p><b>What it keeps.</b> The fence: a write is acknowledged only after a read that began within the window, of the
-     * stripe or of the descriptor, showed its incarnation live and unchanged; a delete bumps the stripe before it applies
-     * and after it, and answers only after the settle wait. And the freshness: a stripe that names any change to the
-     * index, a mapping or settings update included, sends the write to read the descriptor and apply it, as before.
-     */
-    public static final Setting<Boolean> CONFIRM_INCARNATION_BY_STRIPE = Setting.boolSetting(
-        "serverless.write.confirm_incarnation_by_stripe",
-        true,
-        Property.NodeScope
-    );
-
-    /**
      * How many writes must have asked for a stripe within its last two background periods (about four fifths of a fence
      * window) for the background to keep reading it; node setting, default 2. Below that, a write reads its stripe itself
      * when its last read is older than the window, which a stripe written that rarely needed anyway: a read the
@@ -80,14 +58,7 @@ public final class WriteSettings implements SettingsProvider {
         Property.NodeScope
     );
 
-    /** Whether document writes run on {@link WritePools#POOL} and forwarded writes on a pool of the same size, with the apply gate. */
-    public static final Setting<Boolean> WAIT_POOL_ENABLED = Setting.boolSetting(
-        "serverless.write.wait_pool.enabled",
-        WritePools.DEFAULT_ENABLED,
-        Property.NodeScope
-    );
-
-    /** Threads per core of {@link WritePools#POOL}, and of the forwarded-write pool, when {@link #WAIT_POOL_ENABLED} is on. */
+    /** Threads per core of {@link WritePools#POOL}, and of the forwarded-write pool. */
     public static final Setting<Integer> WAIT_POOL_THREADS_PER_CORE = Setting.intSetting(
         "serverless.write.wait_pool.threads_per_core",
         WritePools.DEFAULT_THREADS_PER_CORE,
@@ -202,9 +173,7 @@ public final class WriteSettings implements SettingsProvider {
             BACKPRESSURE_TARGET_MILLIS,
             BACKPRESSURE_BUDGET_MILLIS,
             BACKPRESSURE_MIN_IN_FLIGHT,
-            CONFIRM_INCARNATION_BY_STRIPE,
             STRIPE_REFRESH_MIN_ASKS,
-            WAIT_POOL_ENABLED,
             WAIT_POOL_THREADS_PER_CORE,
             SEGMENTS_PACK,
             NODE_PACK_ENABLED,

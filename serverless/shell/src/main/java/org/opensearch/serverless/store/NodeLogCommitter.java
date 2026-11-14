@@ -63,9 +63,6 @@ public final class NodeLogCommitter {
      * short enough that a write is acknowledged within a quarter of a second.
      */
     public static final java.util.Set<Long> ALLOWED_WINDOW_MILLIS = java.util.Set.of(100L, 200L, 250L);
-    /** The default for {@link org.opensearch.serverless.store.NodeLogSettings#FOLLOW_UNLOCKED}. */
-    public static final boolean DEFAULT_FOLLOW_UNLOCKED = true;
-
     /** The default {@link org.opensearch.serverless.store.NodeLogSettings#ADMISSION_CONCURRENCY}. */
     public static final int DEFAULT_ADMISSION_CONCURRENCY = 32;
 
@@ -127,8 +124,6 @@ public final class NodeLogCommitter {
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition changed = lock.newCondition();
     private final Deque<Window> windows = new ArrayDeque<>();
-    private volatile boolean splitLargeBatches = true;
-    private volatile boolean hedgeBySize = true;
     private final TreeMap<Long, EpochState> epochs = new TreeMap<>();
     private boolean flushing;
     /** The epoch being written, or -1 when the next window must open one. */
@@ -198,7 +193,7 @@ public final class NodeLogCommitter {
             final List<Window> joinedWindows = joinAll(shard, term, records);
             final Window mine = joinedWindows.get(joinedWindows.size() - 1);
             // Windows are written in order, one at a time, so the last of them landing means the others were written.
-            if (followUnlocked && mine.driven) {
+            if (mine.driven) {
                 // Another writer already waits on this window and will write it, or the ones before it, when due: this
                 // one waits for it to land without the lock, so a blob that lands does not wake its hundreds of writers
                 // to take the lock one after another before any of them can return.
@@ -254,23 +249,6 @@ public final class NodeLogCommitter {
                 Thread.currentThread().interrupt();
             }
         }
-    }
-
-    /** See {@link #followUnlocked(boolean)}. */
-    private volatile boolean followUnlocked = DEFAULT_FOLLOW_UNLOCKED;
-
-    /**
-     * Whether a writer that joins a window another writer already waits on waits for it without the lock. One writer a
-     * window drives it as before, lingering and writing under the lock; the rest wait on the window alone. Off, every
-     * writer waits under the lock, and a blob landing wakes all of them to take it in turn, which on a busy node is
-     * tens to over a hundred milliseconds before the last of them returns.
-     *
-     * @param on whether followers wait without the lock
-     * @return this
-     */
-    public NodeLogCommitter followUnlocked(boolean on) {
-        this.followUnlocked = on;
-        return this;
     }
 
     /**
@@ -381,9 +359,6 @@ public final class NodeLogCommitter {
      * @return the windows they joined, oldest first
      */
     private List<Window> joinAll(ShardKey shard, long term, List<WalRecord> records) {
-        if (splitLargeBatches == false) {
-            return List.of(join(shard, term, records));
-        }
         final List<Window> joined = new ArrayList<>(1);
         int from = 0;
         while (from < records.size()) {
@@ -1056,7 +1031,7 @@ public final class NodeLogCommitter {
 
     /** The most recent PUT durations, for the hedge delay; guarded by itself. */
     private final long[] recentPutNanos = new long[RECENT_PUTS];
-    /** The sizes of the same PUTs, for {@link org.opensearch.serverless.store.NodeLogSettings#HEDGE_BY_SIZE}; guarded by {@link #recentPutNanos}. */
+    /** The sizes of the same PUTs, to scale a larger blob's hedge delay; guarded by {@link #recentPutNanos}. */
     private final long[] recentPutBytes = new long[RECENT_PUTS];
     private int recentPuts;
     private static final int RECENT_PUTS = 128;
@@ -1081,7 +1056,7 @@ public final class NodeLogCommitter {
 
     /**
      * How long a PUT of this many bytes waits before it is sent again: {@link #hedgeDelayNanos()}, scaled up by how many
-     * times the median of the recent PUTs' sizes it is when {@link org.opensearch.serverless.store.NodeLogSettings#HEDGE_BY_SIZE} is on. A blob ten times the
+     * times the median of the recent PUTs' sizes it is. A blob ten times the
      * usual size takes about ten times as long to send; hedged on the usual PUTs' tail, it was nearly always sent twice.
      *
      * @param blobBytes the blob's size; zero or less scales nothing
@@ -1103,7 +1078,7 @@ public final class NodeLogCommitter {
         }
         java.util.Arrays.sort(sorted);
         final long delay = Math.max(configured, sorted[(int) Math.min(sorted.length - 1, Math.floor(HEDGE_QUANTILE * sorted.length))]);
-        if (hedgeBySize == false || blobBytes <= 0) {
+        if (blobBytes <= 0) {
             return delay;
         }
         java.util.Arrays.sort(sizes);
@@ -1112,17 +1087,6 @@ public final class NodeLogCommitter {
             return delay;
         }
         return (long) Math.min(Long.MAX_VALUE / 4.0, delay * ((double) blobBytes / median));
-    }
-
-    /**
-     * Sets {@link org.opensearch.serverless.store.NodeLogSettings#SPLIT_LARGE_BATCHES} and {@link org.opensearch.serverless.store.NodeLogSettings#HEDGE_BY_SIZE}.
-     *
-     * @param split whether a shard's records that would carry a window past its bounds are split across windows
-     * @param bySize whether a larger blob waits longer before it is hedged
-     */
-    public void boundBlobs(boolean split, boolean bySize) {
-        this.splitLargeBatches = split;
-        this.hedgeBySize = bySize;
     }
 
     private volatile java.util.concurrent.Executor hedgeExecutor;

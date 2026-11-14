@@ -20,20 +20,9 @@ import java.util.Set;
 final class DirtyPublishing {
 
     private final BackgroundReconciler reconciler;
-    /** Null until first asked: the reconciler's node is set after this is built. */
-    private volatile Boolean trustOwnHead;
 
     DirtyPublishing(BackgroundReconciler reconciler) {
         this.reconciler = reconciler;
-    }
-
-    private boolean trustsOwnHead() {
-        Boolean on = trustOwnHead;
-        if (on == null) {
-            on = reconciler.node.settings() == null || ReconcileSettings.TRUST_OWN_HEAD.get(reconciler.node.settings());
-            trustOwnHead = on;
-        }
-        return on;
     }
 
     /** Reads a shard's head and notes it, as {@code LeaseUpkeep#recentOrReadHead} does when its sighting is old. */
@@ -343,11 +332,9 @@ final class DirtyPublishing {
             // The heartbeat read this head a moment ago; the manifest's own compare-and-swap is the
             // fence that matters, so a head up to one renewal old is as good here as a fresh read. So is
             // one of any age that named this node at the shard's term, while this node's lease has held since.
-            final var head = trustsOwnHead()
-                ? reconciler.node.leases()
-                    .ownHeadUnderUnbrokenLease(reconciler.plane, shardId, shard.getOperationPrimaryTerm())
-                    .or(() -> readHead(shardId))
-                : reconciler.leases.recentOrReadHead(shardId);
+            final var head = reconciler.node.leases()
+                .ownHeadUnderUnbrokenLease(reconciler.plane, shardId, shard.getOperationPrimaryTerm())
+                .or(() -> readHead(shardId));
             if (head.isEmpty() || reconciler.node.localNode().getId().equals(head.get().ownerNodeId()) == false) {
                 return false;
             }

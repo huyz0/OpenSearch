@@ -84,19 +84,4 @@ public class ServerlessPluginClientBatchTests extends OpenSearchTestCase {
             );
         }
     }
-
-    /** With the switch off, the client refuses the batches by name, as before. */
-    public void testTheSwitchRefusesBatches() throws Exception {
-        try (
-            ServerlessBootstrap boot = ServerlessBootstrap.start(
-                nodeSettings("batches-off", Settings.builder().put("serverless.plugin_client.batches.enabled", false).build())
-            )
-        ) {
-            final Exception refused = expectThrows(
-                Exception.class,
-                () -> boot.node().services().client().multiGet(new MultiGetRequest().add("any", "id")).actionGet()
-            );
-            assertTrue(refused.toString(), org.opensearch.ExceptionsHelper.stackTrace(refused).contains("does not implement action"));
-        }
-    }
 }

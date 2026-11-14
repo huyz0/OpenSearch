@@ -91,13 +91,6 @@ public final class ActivationSettings implements SettingsProvider {
         Property.NodeScope
     );
 
-    /** Whether requests for a dead member's shard go to the one survivor named for it; on by default. */
-    public static final Setting<Boolean> TAKEOVER_ROUTE_TO_WINNER = Setting.boolSetting(
-        "serverless.takeover.route_to_winner",
-        true,
-        Property.NodeScope
-    );
-
     /** How far past its cap a node may take a dead member's shards, as a fraction of the cap; 0 turns it off. */
     public static final Setting<Double> TAKEOVER_OVERCOMMIT = Setting.doubleSetting(
         "serverless.takeover.overcommit",
@@ -121,7 +114,6 @@ public final class ActivationSettings implements SettingsProvider {
             PACED_BY_WRITES,
             TARGET_MILLIS,
             CONCURRENCY,
-            TAKEOVER_ROUTE_TO_WINNER,
             TAKEOVER_OVERCOMMIT
         );
     }

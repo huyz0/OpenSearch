@@ -167,14 +167,4 @@ public class ServerlessPluginIndicesViewTests extends OpenSearchTestCase {
             assertEquals(0, none.getTotalShards());
         }
     }
-
-    /** With the switch off, the view holds only what the node serves, as before. */
-    public void testTheSwitchLeavesThemOut() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final MetadataPlane plane = plane(clock);
-        plane.createIndex(new IndexDescriptor(".probe-plugin-config", "uuid-config-0000000", 1, MAPPING, null));
-        try (ServerlessNode a = started("off-a", plane, Settings.builder().put("serverless.plugin_indices_view.enabled", false).build())) {
-            assertNull(a.clusterService().state().metadata().index(".probe-plugin-config"));
-        }
-    }
 }

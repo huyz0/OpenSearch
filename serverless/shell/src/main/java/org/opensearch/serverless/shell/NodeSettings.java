@@ -39,16 +39,6 @@ public final class NodeSettings implements SettingsProvider {
     );
 
     /**
-     * Whether the membership view reports a peer's renewal as that peer leaving and joining again, as it did before it
-     * compared members rather than whole leases. False by default; true only to compare with the old behaviour.
-     */
-    public static final Setting<Boolean> MEMBERSHIP_RENEWALS_AS_CHANGES = Setting.boolSetting(
-        "serverless.membership.renewals_as_changes",
-        false,
-        Property.NodeScope
-    );
-
-    /**
      * Refuse to start on a plaintext transport.
      *
      * <p>Forwarded requests carry the deployment's transport secret; on a plaintext transport it crosses
@@ -67,15 +57,6 @@ public final class NodeSettings implements SettingsProvider {
     public static final Setting<Long> LEASE_TTL_MILLIS = Setting.longSetting(
         "serverless.lease.ttl_millis",
         ServerlessBootstrap.DEFAULT_LEASE_TTL_MILLIS,
-        Property.NodeScope
-    );
-
-    /**
-     * Whether the local view reuses an unchanged index's last projection; on by default. Off only to measure what it saves.
-     */
-    public static final Setting<Boolean> VIEW_REUSE_PROJECTIONS = Setting.boolSetting(
-        "serverless.view.reuse_projections",
-        true,
         Property.NodeScope
     );
 
@@ -165,10 +146,8 @@ public final class NodeSettings implements SettingsProvider {
         return List.of(
             ROLES,
             STORAGE_UUID,
-            MEMBERSHIP_RENEWALS_AS_CHANGES,
             REQUIRE_SECURE_TRANSPORT,
             LEASE_TTL_MILLIS,
-            VIEW_REUSE_PROJECTIONS,
             HEAD_VERIFY_INTERVAL_MILLIS,
             DESCRIPTOR_REFRESH_INTERVAL_MILLIS,
             JANITOR_INTERVAL_MILLIS,

@@ -57,12 +57,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class SharedAnalysis implements IndexAnalyzersProvider {
 
     /**
-    * On: at 3,000 open indices with one 150-field mapping, heap per open index went from 182 to 92 KB, opening them
-    * took no longer (2-12% less over five runs), first-write p50 and p99 were within 1%, and no store request changes.
-    */
-    static final boolean ENABLED_DEFAULT = true;
-
-    /**
      * Settings that only name, count or place an index, so differ between indices that could share. The shell's own
      * index settings are added from {@link ServerlessSettings#indexScoped()}: each names, places or routes an index,
      * and none changes its schema.
@@ -94,16 +88,12 @@ public final class SharedAnalysis implements IndexAnalyzersProvider {
     private final Map<String, Group> groups = new HashMap<>();
 
     /**
-     * Has every index this node opens from now on share analyzers and parsed mappings, if the node's settings say so.
+     * Has every index this node opens from now on share analyzers and parsed mappings.
      *
-     * @param nodeSettings the node's settings
      * @param indicesService the node's indices service
-     * @return the sharing installed, or null if it is off
+     * @return the sharing installed
      */
-    public static SharedAnalysis install(Settings nodeSettings, IndicesService indicesService) {
-        if (SchemaSettings.SHARING_ENABLED.get(nodeSettings) == false) {
-            return null;
-        }
+    public static SharedAnalysis install(IndicesService indicesService) {
         final SharedAnalysis shared = new SharedAnalysis();
         indicesService.setIndexAnalyzersProvider(shared);
         return shared;

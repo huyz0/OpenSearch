@@ -214,7 +214,7 @@ unpublished record of every shard is, so a successor reads it without a listing.
     has not answered in that time, or in the 95th percentile of the last 128 PUTs when that is longer, and lands on
     whichever answers first. A PUT that finds its slot taken reads it back to tell its own other PUT from a fence. It
     costs about one PUT in a hundred on the meter, and at most one in twenty, and cut p99 from 386 to 350 ms there.
-  - `serverless.write.confirm_incarnation_by_stripe` (on by default) takes the incarnation read off the ack path.
+  - A write confirms its index's incarnation by change stripe, which takes the incarnation read off the ack path.
     Every descriptor update bumps one of 16 change-stripe registers (`index-changes/stripe-NN`) after it applies,
     and every delete bumps one before and after; a create bumps none. A writer that has read an index's descriptor
     confirms it afterwards by the index's stripe, which names every change since; each stripe being written is read
@@ -230,10 +230,9 @@ unpublished record of every shard is, so a successor reads it without a listing.
     log PUTs. Leave it off on nodes that take writes all day, where it gains little. Turn it on for low-traffic nodes
     (a few writes a second or fewer) whose clients need a p50 near 150 ms rather than near 250-300 ms, and that can
     pay roughly a third more log PUTs for it.
-  - `serverless.wal.node_log.follow_unlocked` (on by default): of the writers waiting on one window, one waits under
-    the committer's lock and writes it when due; the rest wait on the window alone. Off, a landed blob woke all of its
-    writers to retake the lock one at a time, hundreds of them on a busy node. 4 vCPU, 3,000 single docs/s: log wait
-    410 -> 304 ms, p99 831 -> 707 ms. The apply gate (`serverless.write.wait_pool.enabled`) is now taken once per
+  - Of the writers waiting on one node-log window, one waits under the committer's lock and writes it when due; the
+    rest wait on the window alone. Before, a landed blob woke all of its writers to retake the lock one at a time, hundreds of them on a busy node. 4 vCPU, 3,000 single docs/s: log wait
+    410 -> 304 ms, p99 831 -> 707 ms. The apply gate is now taken once per
     bulk pass, not once per document, and is not fair: bulks of 10 on 4 vCPU went from about 5,300 docs/s
     (p50 2 s) to 8,000 docs/s at p99 622 ms. See `write-throughput-results.md` for the numbers by core count.
 - **Deleting.** A node deletes its own blobs behind the trim point its lease records: the oldest record any of its
@@ -531,7 +530,7 @@ With zones set:
   coordinator) goes first to a reader in the coordinator's zone. Each zone keeps its own warm reader for such a
   shard. A cold shard keeps its single reader wherever placement puts it. A zone's reader with
   `serverless.search.zone_local.spill_in_flight` (8) more searches in flight than placement's own choice gives way
-  to it. Turn it off with `serverless.search.zone_local.enabled=false`.
+  to it.
 - A joining node copies warm blocks only from peers in its zone, and reads the rest from the object store. A copy
   from another zone costs about 400 times the store reads it replaces. A drain hands over the same way.
   `serverless.search.warm_copy.cross_zone=true` restores copying from any zone.
@@ -699,7 +698,7 @@ hints until recovery; reverse lookups verify them against published membership.
 
 A write is acknowledged once its node-log window lands, so its thread mostly waits. On core's `write` pool (one thread per
 core, plus one at most) that waiting capped REST single-document writes at about 16 a second on a 4-core node, whatever
-the document size, with the rest queued for seconds. `serverless.write.wait_pool.enabled` (on by default) runs REST
+the document size, with the rest queued for seconds. The shell runs REST
 writes, bulk shard groups and updates on `serverless_write`, and forwarded writes on `serverless_forwarded_write`, both
 with `serverless.write.wait_pool.threads_per_core` threads per core (64 by default). The engine apply itself still goes
 through a gate of cores + 1 permits, as many as the old pool had threads, so CPU use and the number of Lucene indexing

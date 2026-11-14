@@ -36,13 +36,6 @@ public final class ReaderPushSettings implements SettingsProvider {
         Property.NodeScope
     );
 
-    /** Whether a reader moved onto a pushed commit reuses the descriptor it holds when the writer's is no newer. */
-    public static final Setting<Boolean> COMMIT_PUSH_REUSE_DESCRIPTOR = Setting.boolSetting(
-        "serverless.search.commit_push.reuse_descriptor",
-        true,
-        Property.NodeScope
-    );
-
     /** Whether a search node skips the periodic register look for readers its live writer pushes. */
     public static final Setting<Boolean> COMMIT_PUSH_TRUST = Setting.boolSetting(
         "serverless.search.commit_push.trust",
@@ -117,7 +110,6 @@ public final class ReaderPushSettings implements SettingsProvider {
         return List.of(
             COMMIT_PUSH_ENABLED,
             COMMIT_PUSH_INLINE_BYTES,
-            COMMIT_PUSH_REUSE_DESCRIPTOR,
             COMMIT_PUSH_TRUST,
             COMMIT_PUSH_TRUST_BACKSTOP_MILLIS,
             TAIL_OVERLAY_ENABLED,

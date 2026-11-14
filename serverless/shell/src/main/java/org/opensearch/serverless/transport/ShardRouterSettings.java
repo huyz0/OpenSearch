@@ -21,13 +21,6 @@ import java.util.List;
  */
 public final class ShardRouterSettings implements SettingsProvider {
 
-    /** Whether the meter counts, {@code true} by default; the count costs less than the request's MAC already does. */
-    public static final Setting<Boolean> ZONE_METER_ENABLED = Setting.boolSetting(
-        "serverless.network.zone_meter.enabled",
-        true,
-        Property.NodeScope
-    );
-
     /**
      * Whether forwards to a peer in another zone are compressed, true by default. Forwarded documents and search hits
      * are mostly JSON source, which compresses several times over, and traffic between zones is billed by the byte.
@@ -50,6 +43,6 @@ public final class ShardRouterSettings implements SettingsProvider {
 
     @Override
     public List<Setting<?>> settings() {
-        return List.of(ZONE_METER_ENABLED, COMPRESS_CROSS_ZONE, REPLAY_CACHE_CAPACITY);
+        return List.of(COMPRESS_CROSS_ZONE, REPLAY_CACHE_CAPACITY);
     }
 }

@@ -126,14 +126,13 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
         }
     }
 
-    /** A two-day range over eight days: six shards skipped, and the answer the same as with pruning off. */
+    /** A two-day range over eight days: six shards skipped, and the answer counts only the two that match. */
     public void testARangeSearchSkipsTheShardsItCannotMatch() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final java.nio.file.Path dir = createTempDir();
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, dir, false), BlobPath.cleanPath(), clock::get, TTL);
         final String query = "{\"size\":100,\"query\":{\"bool\":{\"filter\":[{\"range\":{\"@timestamp\":"
             + "{\"gte\":\"2026-09-03\",\"lte\":\"2026-09-04T12:00:00Z\"}}}]}},\"aggs\":{\"most\":{\"max\":{\"field\":\"n\"}}}}";
-        final String pruned;
         try (ServerlessNode node = new ServerlessNode(nodeSettings("prune", Settings.EMPTY))) {
             node.startup().start();
             node.setMetadataPlane(plane);
@@ -145,21 +144,6 @@ public class ServerlessPruningTests extends OpenSearchTestCase {
             assertTrue("and counted as successful: " + answer.body(), answer.body().contains("\"successful\":8"));
             assertTrue("aggregations over what matched: " + answer.body(), answer.body().contains("\"value\":403.0"));
             assertTrue("only the unskipped shards were opened", node.reconciler().openShards().size() <= 2);
-            pruned = answer.body();
-        }
-        final MetadataPlane again = new MetadataPlane(new FsBlobStore(1024, dir, false), BlobPath.cleanPath(), clock::get, TTL);
-        try (
-            ServerlessNode node = new ServerlessNode(
-                nodeSettings("no-prune", Settings.builder().put("serverless.search.prune", false).build())
-            )
-        ) {
-            node.startup().start();
-            node.setMetadataPlane(again);
-            final Response unpruned = send(node, "POST", "/logs-*/_search", query);
-            assertEquals(unpruned.body(), 200, unpruned.status());
-            assertEquals(0L, first(SKIPPED, unpruned.body()));
-            assertEquals(first(TOTAL, pruned), first(TOTAL, unpruned.body()));
-            assertTrue(unpruned.body().contains("\"value\":403.0"));
         }
     }
 

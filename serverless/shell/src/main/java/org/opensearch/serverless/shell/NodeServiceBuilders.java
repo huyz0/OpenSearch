@@ -274,7 +274,7 @@ final class NodeServiceBuilders {
         final java.util.Set<org.opensearch.common.settings.Setting<?>> known = new java.util.HashSet<>(
             IndexScopedSettings.BUILT_IN_INDEX_SETTINGS
         );
-        known.addAll(services.plugins.indexSettings(services.settings));
+        known.addAll(services.plugins.indexSettings());
         // The shell's own index settings, each defined once by its feature package.
         known.addAll(org.opensearch.serverless.settings.ServerlessSettings.indexScoped());
         return new IndexScopedSettings(services.settings, known);

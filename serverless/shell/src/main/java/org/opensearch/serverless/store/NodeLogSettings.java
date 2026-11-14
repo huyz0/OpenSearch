@@ -58,13 +58,6 @@ public final class NodeLogSettings implements SettingsProvider {
     /** Whether a record that finds the log quiet for a window is written at once; see {@link NodeLogCommitter#flushWhenIdle}. */
     public static final Setting<Boolean> IDLE_FLUSH = Setting.boolSetting("serverless.wal.node_log.idle_flush", false, Property.NodeScope);
 
-    /** Whether writers that join a window someone already drives wait for it without the lock; see {@link NodeLogCommitter#followUnlocked}. */
-    public static final Setting<Boolean> FOLLOW_UNLOCKED = Setting.boolSetting(
-        "serverless.wal.node_log.follow_unlocked",
-        NodeLogCommitter.DEFAULT_FOLLOW_UNLOCKED,
-        Property.NodeScope
-    );
-
     /**
      * How many shards new to an epoch are checked at once before the window carrying their first records is written; one
      * checks them one after another. See {@link NodeLogCommitter#admitConcurrently}.
@@ -72,26 +65,6 @@ public final class NodeLogSettings implements SettingsProvider {
     public static final Setting<Integer> ADMISSION_CONCURRENCY = Setting.intSetting(
         "serverless.wal.node_log.admission_concurrency",
         NodeLogCommitter.DEFAULT_ADMISSION_CONCURRENCY,
-        Property.NodeScope
-    );
-
-    /**
-     * Whether one shard's records that would carry a window past its byte or record bound are split across consecutive
-     * windows, so that no blob grows far past the bound; off, they join one window whole, however many there are.
-     */
-    public static final Setting<Boolean> SPLIT_LARGE_BATCHES = Setting.boolSetting(
-        "serverless.wal.node_log.split_large_batches",
-        true,
-        Property.NodeScope
-    );
-
-    /**
-     * Whether a window's hedge waits longer in proportion to how much larger its blob is than the recent ones; off, every
-     * blob waits the same, and a blob many times the usual size is nearly always sent twice.
-     */
-    public static final Setting<Boolean> HEDGE_BY_SIZE = Setting.boolSetting(
-        "serverless.wal.node_log.hedge_by_size",
-        true,
         Property.NodeScope
     );
 
@@ -121,10 +94,7 @@ public final class NodeLogSettings implements SettingsProvider {
             MAX_RECORDS,
             HEDGE_AFTER_MILLIS,
             IDLE_FLUSH,
-            FOLLOW_UNLOCKED,
             ADMISSION_CONCURRENCY,
-            SPLIT_LARGE_BATCHES,
-            HEDGE_BY_SIZE,
             GROUP_COMMIT_MAX_RECORDS,
             GROUP_COMMIT_MAX_BYTES
         );

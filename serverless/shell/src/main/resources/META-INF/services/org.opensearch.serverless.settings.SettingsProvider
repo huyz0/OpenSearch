@@ -1,10 +1,8 @@
 org.opensearch.serverless.bucket.BucketSettings
 org.opensearch.serverless.cluster.ReaderPlacementSettings
 org.opensearch.serverless.engine.WriterEngineSettings
-org.opensearch.serverless.reconcile.ReconcileSettings
 org.opensearch.serverless.rest.BulkSettings
 org.opensearch.serverless.routing.RoutingSettings
-org.opensearch.serverless.schema.SchemaSettings
 org.opensearch.serverless.shell.ActivationSettings
 org.opensearch.serverless.shell.NodeSettings
 org.opensearch.serverless.shell.PluginSettings

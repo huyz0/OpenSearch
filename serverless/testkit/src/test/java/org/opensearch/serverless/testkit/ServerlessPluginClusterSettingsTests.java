@@ -130,30 +130,4 @@ public class ServerlessPluginClusterSettingsTests extends OpenSearchTestCase {
             assertBusy(() -> assertTrue(onB.onlyOnMl), 30, TimeUnit.SECONDS);
         }
     }
-
-    public void testTheSwitchLeavesPluginsAsTheyStarted() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final MetadataPlane plane = new MetadataPlane(
-            new FsBlobStore(1024, createTempDir(), false),
-            BlobPath.cleanPath(),
-            clock::get,
-            30_000L
-        );
-        final DynamicPlugin plugin = new DynamicPlugin();
-        try (
-            ServerlessNode node = started(
-                "settings-off",
-                plane,
-                plugin,
-                Settings.builder().put("serverless.plugin_cluster_settings.enabled", false).build()
-            )
-        ) {
-            final TransportAddress http = node.boundHttpAddress().publishAddress();
-            assertEquals(
-                200,
-                send(http, "PUT", "/_cluster/settings", "{\"persistent\":{\"plugins.probe.only_run_on_ml_node\":false}}").status()
-            );
-            assertTrue("stored, and not applied", plugin.onlyOnMl);
-        }
-    }
 }

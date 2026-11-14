@@ -70,7 +70,6 @@ public final class ShardRouter {
     private final TailPush tailPush;
     private final TailOverlays tailOverlays;
     private final RefreshVisibility refreshVisibility;
-    private final boolean meterZones;
     private final boolean compressCrossZone;
     private final String localZone;
 
@@ -95,7 +94,6 @@ public final class ShardRouter {
             () -> forwardTimeout().millis(),
             ShardRouterSettings.REPLAY_CACHE_CAPACITY.get(node.settings())
         );
-        this.meterZones = ShardRouterSettings.ZONE_METER_ENABLED.get(node.settings());
         this.compressCrossZone = ShardRouterSettings.COMPRESS_CROSS_ZONE.get(node.settings());
         this.localZone = org.opensearch.serverless.cluster.Zones.localZone(node.settings());
         this.commitPush = new CommitPush(this);
@@ -181,9 +179,6 @@ public final class ShardRouter {
     }
 
     private void meterRequest(String action, org.opensearch.transport.TransportRequest request, DiscoveryNode recipient) {
-        if (meterZones == false) {
-            return;
-        }
         try {
             zoneTraffic.record(pathTo(recipient), action, ZoneTraffic.sizeOf(request));
         } catch (IOException | RuntimeException e) {
@@ -936,9 +931,6 @@ public final class ShardRouter {
 
         @Override
         public T read(org.opensearch.core.common.io.stream.StreamInput in) throws IOException {
-            if (router.meterZones == false) {
-                return reader.read(in);
-            }
             // The answer arrives whole in memory, so what is left to read before and after is its size.
             final int before = in.available();
             final T answer = reader.read(in);

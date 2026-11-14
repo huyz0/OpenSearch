@@ -58,7 +58,7 @@ public final class PluginClusterSettings {
     }
 
     private boolean active() {
-        return PluginSettings.CLUSTER_SETTINGS.get(node.settings) && dynamic.isEmpty() == false;
+        return dynamic.isEmpty() == false;
     }
 
     /** The register's values for settings a plugin declares as dynamic. */

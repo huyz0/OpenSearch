@@ -205,20 +205,6 @@ public class ServerlessPluginInjectorTests extends OpenSearchTestCase {
         assertEquals("closing the node must stop the plugin's lifecycle service", "stopped", SERVICE_STATE.get());
     }
 
-    /** With the switch off, actions are resolved by constructor only, and a module-bound type cannot be found. */
-    public void testTheSwitchFallsBackToConstructorResolution() throws Exception {
-        try (
-            ServerlessNode node = new ServerlessNode(
-                nodeSettings("injector-off", Settings.builder().put("serverless.plugin_injector.enabled", false).build()),
-                List.of(new GuicePlugin())
-            )
-        ) {
-            final IllegalStateException failure = expectThrows(IllegalStateException.class, () -> node.startup().start());
-            assertTrue("the missing type must be named: " + failure.getMessage(), failure.getMessage().contains("Registry"));
-            assertEquals("no lifecycle service is started without the injector", "none", SERVICE_STATE.get());
-        }
-    }
-
     /** An action asking for the stream transport is built, and gets none. */
     public void testStreamTransportIsBoundAsAbsent() throws Exception {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("injector-stream", Settings.EMPTY), List.of(new StreamPlugin()))) {

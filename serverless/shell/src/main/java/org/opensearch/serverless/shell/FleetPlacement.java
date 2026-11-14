@@ -131,27 +131,6 @@ final class FleetPlacement {
 
     private volatile double takeoverOvercommit = 0.0;
 
-    private volatile boolean routeTakeovers = true;
-
-    /**
-     * Sets whether requests for a dead member's shard go to the one survivor named for it: on by default; off only to
-     * measure what it saves.
-     *
-     * @param route whether to
-     */
-    public void setRouteTakeovers(boolean route) {
-        this.routeTakeovers = route;
-    }
-
-    /**
-     * Whether requests for a dead member's shard go to the one survivor named for it.
-     *
-     * @return true if they do
-     */
-    public boolean routesTakeovers() {
-        return routeTakeovers;
-    }
-
     /**
      * Sets how far past its cap a member may take a dead member's shards, as BackgroundReconciler does: the ceiling a
      * member's room is judged against when choosing who takes over a shard.
@@ -260,9 +239,6 @@ final class FleetPlacement {
      * @return true to leave it to the member named
      */
     public boolean takeoverBelongsElsewhere(MetadataPlane plane, String indexName, int shard) {
-        if (routeTakeovers == false) {
-            return false;
-        }
         try {
             final var head = plane.heads().read(indexName, shard);
             if (head.isEmpty()

@@ -53,7 +53,8 @@ public class ZoneCostMeterTests extends OpenSearchTestCase {
     public void testZonePreferencesCutCrossZoneBytes() throws Exception {
         final Measured before = run(
             Settings.builder()
-                .put(org.opensearch.serverless.cluster.ReaderPlacementSettings.ZONE_LOCAL_ENABLED.getKey(), false)
+                // No shard is ever hot enough to prefer a reader in the coordinator's zone.
+                .put(org.opensearch.serverless.cluster.ReaderPlacementSettings.ZONE_LOCAL_MIN_PER_SECOND.getKey(), Double.MAX_VALUE)
                 .put(org.opensearch.serverless.transport.ShardRouterSettings.COMPRESS_CROSS_ZONE.getKey(), false)
                 .build()
         );

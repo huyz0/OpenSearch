@@ -165,19 +165,4 @@ public class ServerlessPluginIndexAdminTests extends OpenSearchTestCase {
             assertTrue(client.admin().indices().exists(new IndicesExistsRequest("alerts-000002")).actionGet().isExists());
         }
     }
-
-    /** With the switch off, the client refuses them by name, as before. */
-    public void testTheSwitchRefusesThem() throws Exception {
-        try (
-            ServerlessBootstrap boot = ServerlessBootstrap.start(
-                nodeSettings("admin-off", Settings.builder().put("serverless.plugin_client.index_admin.enabled", false).build())
-            )
-        ) {
-            final Exception refused = expectThrows(
-                Exception.class,
-                () -> boot.node().services().client().admin().indices().exists(new IndicesExistsRequest("any")).actionGet()
-            );
-            assertTrue(refused.toString(), org.opensearch.ExceptionsHelper.stackTrace(refused).contains("does not implement action"));
-        }
-    }
 }
