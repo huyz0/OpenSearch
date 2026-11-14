@@ -585,6 +585,15 @@ public final class ServerlessNode implements Closeable {
     }
 
     /**
+     * The index settings this node validates against: core's, the shell's own and those its plugins declare.
+     *
+     * @return the settings
+     */
+    public org.opensearch.common.settings.IndexScopedSettings indexScopedSettings() {
+        return services.indexScopedSettings();
+    }
+
+    /**
      * Returns the signal sink, so callers on the request path can report what they saw.
      *
      * @return the signals, never null

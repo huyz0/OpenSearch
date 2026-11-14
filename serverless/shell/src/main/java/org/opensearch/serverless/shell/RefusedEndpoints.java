@@ -22,6 +22,25 @@ final class RefusedEndpoints {
     private RefusedEndpoints() {}
 
     /**
+     * Registers a refusal, unless a plugin already serves the route.
+     *
+     * <p>The plugins' handlers are registered first, so a route a plugin serves is taken by the time its refusal
+     * comes. The refusal yields: it states why the shell itself does not serve an endpoint, and once a plugin
+     * serves it that statement is no longer true. The case that found it is the painless module, loaded as a
+     * bundle for k-NN and alerting, whose script-execution endpoint used to fail the node's start against the
+     * shell's refusal of the same path.
+     */
+    private static void refuse(RestController controller, org.opensearch.rest.RestHandler refusal) {
+        try {
+            controller.registerHandler(refusal);
+        } catch (IllegalArgumentException e) {
+            if (e.getMessage() == null || e.getMessage().startsWith("Cannot replace existing handler") == false) {
+                throw e;
+            }
+        }
+    }
+
+    /**
      * Registers a refusal for every endpoint this shell does not serve.
      *
      * @param controller the controller the shell's own handlers are already registered on
@@ -35,7 +54,8 @@ final class RefusedEndpoints {
         // The allowlist and the enumeration rule together: listing a deployment's indices is an inventory
         // operation, not a serving one. Offering it here -- even paginated -- invites a caller to walk
         // a hundred million indices through a request path, so the request path does not offer it.
-        controller.registerHandler(
+        refuse(
+            controller,
             new NotImplementedHandler(
                 "/_serverless/indices",
                 "enumerating indices is a maintenance operation, not a serving one; "
@@ -47,7 +67,7 @@ final class RefusedEndpoints {
         // and is not going to grow. The endpoints that only needed the lease registry or one index's shard
         // heads are served instead, above.
         for (String path : new String[] { "/_cluster/state", "/_cluster/stats", "/_cat" }) {
-            controller.registerHandler(new NotImplementedHandler(path, noGlobalState));
+            refuse(controller, new NotImplementedHandler(path, noGlobalState));
         }
 
         // Refusals that used to share the "no cluster-wide state" reason and are not actually refused for
@@ -96,7 +116,7 @@ final class RefusedEndpoints {
                     + "about itself; GET /_serverless/stats answers for the node it is sent to, and "
                     + "?nodes=_all for the fleet" },
             { "/_list/shards", "the same unbounded listing as _cat/shards" } }) {
-            controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
+            refuse(controller, new NotImplementedHandler(refusal[0], refusal[1]));
         }
 
         // Refused for a reason of its own, and the reason has changed. The fan-out this used to be waiting
@@ -105,7 +125,8 @@ final class RefusedEndpoints {
         // os, jvm, fs, transport and thread_pool, and none of those numbers are produced here. Serving the
         // shell's own document under this name would hand a client that parses core's schema something that
         // looks right and answers nothing, which is worse than a refusal that points at the real endpoint.
-        controller.registerHandler(
+        refuse(
+            controller,
             new NotImplementedHandler(
                 "/_nodes/stats",
                 "this endpoint's body is core's node-statistics schema -- indices, os, jvm, fs, transport, "
@@ -115,7 +136,8 @@ final class RefusedEndpoints {
                     + "did not answer"
             )
         );
-        controller.registerHandler(
+        refuse(
+            controller,
             new NotImplementedHandler(
                 "/_tasks",
                 "there is no cluster-wide task registry: work here belongs to the node doing it and does not "
@@ -332,7 +354,7 @@ final class RefusedEndpoints {
             {
                 "/{index}/_mapping/field/{fields}",
                 "GET /{index}/_mapping returns the whole mapping, which is one register read either way" } }) {
-            controller.registerHandler(new NotImplementedHandler(refusal[0], refusal[1]));
+            refuse(controller, new NotImplementedHandler(refusal[0], refusal[1]));
         }
     }
 }

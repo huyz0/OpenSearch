@@ -48,9 +48,9 @@ import java.util.Optional;
  * descriptor read per index rather than a head read per shard. Red means the metadata plane could not be read.
  * An index that does not exist is waited for until the request's timeout, as core does, and then reported red.
  *
- * <p><b>What state means here.</b> The node's own view, which holds the indices it serves and the live nodes,
- * with the metadata of every index the request names added from the metadata plane, so a plugin asking about
- * an index this node has not opened still finds its settings and mappings.
+ * <p><b>What state means here.</b> The node's own view, which holds the indices it serves and the live nodes.
+ * A request that names indices gets exactly those, described from the metadata plane when this node has not
+ * opened them, so a plugin asking about such an index still finds its settings and mappings.
  */
 final class PluginClusterAnswers {
 
@@ -90,13 +90,24 @@ final class PluginClusterAnswers {
         }
         final List<IndexMetadata> found = new ArrayList<>();
         describe(node, plane, named, found);
-        final Metadata.Builder metadata = Metadata.builder(view.metadata());
+        // Only the named indices, as core filters a state request by its indices: index management resolves the
+        // indices a policy is attached to from this, and given the whole view it attached a policy to its own
+        // configuration index too.
+        final Metadata.Builder metadata = Metadata.builder(view.metadata()).removeAllIndices();
+        final RoutingTable.Builder routing = RoutingTable.builder();
         for (IndexMetadata index : found) {
-            if (view.metadata().hasIndex(index.getIndex().getName()) == false) {
-                metadata.put(index, false);
+            final String name = index.getIndex().getName();
+            final IndexMetadata held = view.metadata().index(name);
+            metadata.put(held != null ? held : index, false);
+            if (held != null && view.routingTable().hasIndex(name)) {
+                routing.add(view.routingTable().index(name));
             }
         }
-        return new ClusterStateResponse(view.getClusterName(), ClusterState.builder(view).metadata(metadata).build(), false);
+        return new ClusterStateResponse(
+            view.getClusterName(),
+            ClusterState.builder(view).metadata(metadata).routingTable(routing.build()).build(),
+            false
+        );
     }
 
     /**

@@ -133,10 +133,13 @@ public class ServerlessPluginClusterViewTests extends OpenSearchTestCase {
     public void testStateThroughThePluginClient() throws Exception {
         final MetadataPlane plane = plane();
         plane.createIndex(new IndexDescriptor("tenant-a", "uuid-view-state-0", 1, MAPPING, null));
+        final IndexDescriptor held = new IndexDescriptor("tenant-b", "uuid-view-state-1", 1, MAPPING, null);
+        plane.createIndex(held);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("view-state", Settings.EMPTY), List.of(new AnyPlugin()))) {
             node.startup().start();
             node.setMetadataPlane(plane);
-            reapply(node);
+            // tenant-b is in this node's view; tenant-a is not.
+            node.applyLocalView(node.projector().project(List.of(held), List.of()), () -> 10_000L);
             final var state = node.services()
                 .client()
                 .admin()
@@ -147,6 +150,7 @@ public class ServerlessPluginClusterViewTests extends OpenSearchTestCase {
             assertEquals(node.localNode().getId(), state.nodes().getClusterManagerNodeId());
             assertNotNull("the named index must be described", state.metadata().index("tenant-a"));
             assertEquals(1, state.metadata().index("tenant-a").getNumberOfShards());
+            assertNull("an index the request did not name is left out, as core filters it", state.metadata().index("tenant-b"));
         }
     }
 }

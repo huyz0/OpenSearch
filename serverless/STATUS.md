@@ -193,7 +193,14 @@ security plugin passes its health wait. The plugin client also runs multi-get, b
 the single-document path (`serverless.plugin_client.batches.enabled`, on), and a plugin's first write to a shard
 nobody holds waits for this node to take it, as a REST write does, instead of being refused. With these the released
 3.9 security plugin (with the rule framework and transport-grpc bundles) loads its configuration, authenticates users
-and enforces index permissions on the shell.
+and enforces index permissions on the shell. A cluster-state request that names indices returns only those, as core
+filters it, so Index Management attaches a policy to the indices it names and not to its own configuration index;
+Index Management's policy create, add and explain work. A plugin's script languages and contexts are registered
+(the painless module loaded as a bundle carries the allowlists of the plugins that extend it), a plugin's index
+settings are accepted at creation, on update and in templates, and a route the shell refuses is served by a plugin that
+registers it. With these, k-NN (with the painless and transport-grpc bundles) creates `index.knn` indices and answers
+`knn` queries and `knn_score` scripts on the Lucene engine. The faiss and nmslib engines need k-NN's native libraries on
+`java.library.path`, which the plugin zip does not carry and the stock tarball does.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,
