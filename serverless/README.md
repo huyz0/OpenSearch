@@ -251,7 +251,7 @@ unpublished record of every shard is, so a successor reads it without a listing.
   logged commit. Switch packs per index with `index.serverless.segment_placement` (`segment_blob` or `node_pack`), for
   the cluster with `serverless.segment_placement` in the cluster settings, or for a node with
   `serverless.segments.node_pack.enabled`; the index wins over the cluster, the cluster over the node, and a switch
-  moves nothing already written. Turn log commits off with `serverless.wal.node_log.commits=false`. Measured locally at
+  moves nothing already written. Measured locally at
   1,000 shards on one node (20 ms per store request, 1 in 50 at 200 ms), against one blob per segment and a manifest per
   publish: 0.68 PUT+LIST per shard publish instead of 2.09, 4.7 GETs instead of 5.7, write p99 823 ms instead of about
   885, a cold open 21.8 GETs instead of 25.3 and its first search about 268 ms instead of 295. The price is takeover:
@@ -724,8 +724,7 @@ without it and were all accepted with it, at about 1 GB of live heap. See `big-b
 ## Open files per node
 
 Each open writer shard holds one file descriptor, Lucene's `write.lock`: a writer keeps no local translog, since an
-acknowledged write is durable in the node log (`serverless.translog.local: true` brings core's disk translog back, and
-two more descriptors per writer). Segment files hold none: published ones are read through the block cache and fresh
+acknowledged write is durable in the node log. Segment files hold none: published ones are read through the block cache and fresh
 ones from memory (see "Fresh segments in memory"; with it off, a filling segment holds four). A hibernated or released writer
 holds none. Sockets, the node's own files and the JVM come on top, a few hundred in all.
 

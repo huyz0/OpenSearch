@@ -33,7 +33,6 @@ import java.util.function.Function;
  * shard keeps one blob per segment under its own prefix. With them on, a publish's segment blobs of up to
  * {@code serverless.segments.node_pack.max_blob_bytes} go into the node's next pack, shared with whatever other shards
  * of any index publish within {@code serverless.segments.node_pack.linger_millis}; larger blobs keep their own PUT.
- * Packs build on per-segment blobs, so they apply only while {@code serverless.segments.pack.enabled} is on too.
  *
  * <p>One writer serves every shard of a node for one plane, so concurrent publishes share packs. Its epoch is the
  * wall-clock millisecond it was made at, which a restarted node has always moved past, and is recorded in the node's
@@ -64,10 +63,6 @@ final class NodePackWiring {
      * @return the publisher for a shard
      */
     static Function<ShardId, SegmentPublisher> publishers(ServerlessNode node, MetadataPlane plane) {
-        final boolean staged = logCommitsStage(node);
-        if (node.packSegments == false) {
-            return id -> staging(plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(false), node, staged);
-        }
         final boolean enabled = WriteSettings.NODE_PACK_ENABLED.get(node.settings);
         if (enabled == false) {
             collectEarlierPacks(node, plane);
@@ -80,7 +75,8 @@ final class NodePackWiring {
                 .packing(true)
                 .nodePackSource(() -> writer(node, plane), id.getIndexName(), id.getIndex().getUUID(), id.id(), maxBlobBytes);
             publisher.useNodePacks(enabled);
-            return staging(publisher, node, staged);
+            // Commits are recorded with the node log, so a shard stages them whenever its node writes one.
+            return node.nodeLogEnabled ? publisher.staging(new CommitStaging(() -> node.logCommitCheckpointMillis)) : publisher;
         };
     }
 
@@ -107,18 +103,6 @@ final class NodePackWiring {
         } catch (Exception e) {
             ServerlessNode.logger.warn("could not read this node's pack ledger; its earlier packs are collected once it writes one", e);
         }
-    }
-
-    /** On, with node packs: together they cut a publish's PUTs to a third. */
-    static final boolean LOG_COMMITS_DEFAULT = true;
-
-    /** Whether a node's shards stage their commits; the age, checked when the node was made, is the node's. */
-    static boolean logCommitsStage(ServerlessNode node) {
-        return node.nodeLogEnabled && WriteSettings.LOG_COMMITS.get(node.settings);
-    }
-
-    private static SegmentPublisher staging(SegmentPublisher publisher, ServerlessNode node, boolean stages) {
-        return stages ? publisher.staging(new CommitStaging(() -> node.logCommitCheckpointMillis)) : publisher;
     }
 
     static long maxBlobBytes(Settings settings) {

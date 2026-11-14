@@ -49,8 +49,6 @@ public class PackedPublishTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put("serverless.wal.node_log.commits", false)
-            .put("serverless.segments.pack.enabled", true)
             // One blob per segment under the shard, which is what these check.
             .put("serverless.segments.node_pack.enabled", false)
             .put("serverless.wal.node_log.window_millis", 20)
@@ -107,7 +105,8 @@ public class PackedPublishTests extends OpenSearchTestCase {
 
             write(node, shardId, "first-", 20);
             loop.publishAll();
-            final CommitManifest first = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
+            // The writer's newest commit: with log commits, the register holds it only from the next checkpoint.
+            final CommitManifest first = node.reconciler().newestCommit(shardId);
             final Set<String> firstPacks = packsOf(first);
             final String termDir = first.location(first.files().keySet().iterator().next()).termDir();
             assertEquals("one blob per segment: " + first.files(), segmentsOf(first), blobSegments(firstPacks));
@@ -123,7 +122,7 @@ public class PackedPublishTests extends OpenSearchTestCase {
 
             write(node, shardId, "second-", 20);
             loop.publishAll();
-            final CommitManifest second = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
+            final CommitManifest second = node.reconciler().newestCommit(shardId);
             final Set<String> secondPacks = packsOf(second);
             for (Map.Entry<String, String> file : first.files().entrySet()) {
                 if (second.files().containsKey(file.getKey())) {
@@ -163,7 +162,7 @@ public class PackedPublishTests extends OpenSearchTestCase {
             // updated values -- and those get a blob of their own beside the segment's.
             node.writes().delete(shardId, "first-3");
             loop.publishAll();
-            final CommitManifest third = plane.segmentPublisher("alpha", 0).readManifest().orElseThrow();
+            final CommitManifest third = node.reconciler().newestCommit(shardId);
             final Set<String> thirdPacks = packsOf(third);
             thirdPacks.removeAll(secondPacks);
             assertTrue(

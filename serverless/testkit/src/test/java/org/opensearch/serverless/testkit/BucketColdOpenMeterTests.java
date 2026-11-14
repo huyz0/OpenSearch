@@ -49,8 +49,6 @@ public class BucketColdOpenMeterTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put("serverless.wal.node_log.enabled", true)
-            .put("serverless.wal.node_log.commits", true)
             .put("serverless.segments.node_pack.enabled", true)
             .put("serverless.buckets.enabled", true)
             .put(org.opensearch.serverless.bucket.BucketSettings.MANIFEST_CODEC.getKey(), codec)

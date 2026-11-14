@@ -66,7 +66,6 @@ public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put("serverless.wal.node_log.enabled", true)
             .put("serverless.wal.node_log.window_millis", WINDOW)
             .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
             .build();

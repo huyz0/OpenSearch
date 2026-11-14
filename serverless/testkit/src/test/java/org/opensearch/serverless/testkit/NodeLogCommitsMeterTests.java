@@ -48,7 +48,7 @@ public class NodeLogCommitsMeterTests extends OpenSearchTestCase {
     private static final int WRITERS = 16;
     private static final int COLD_SHARDS = 20;
 
-    private Settings nodeSettings(String name, String roles, boolean packs, boolean logCommits) {
+    private Settings nodeSettings(String name, String roles, boolean packs) {
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-commits-meter")
@@ -57,9 +57,7 @@ public class NodeLogCommitsMeterTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put("serverless.wal.node_log.enabled", true)
             .put("serverless.wal.node_log.window_millis", 250)
-            .put("serverless.wal.node_log.commits", logCommits)
             .put("serverless.segments.node_pack.enabled", packs)
             .put("serverless.segments.node_pack.linger_millis", 250)
             .build();
@@ -77,8 +75,8 @@ public class NodeLogCommitsMeterTests extends OpenSearchTestCase {
         return sortedNanos.get(Math.max(0, at)) / 1e6;
     }
 
-    private void measure(boolean packs, boolean logCommits) throws Exception {
-        final String mode = (packs ? "node_pack" : "segment_blob") + (logCommits ? " + log commits" : " + manifest per publish");
+    private void measure(boolean packs) throws Exception {
+        final String mode = packs ? "node_pack" : "segment_blob";
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         final LatencyInjectingBlobStore slow = new LatencyInjectingBlobStore(new FsBlobStore(8192, createTempDir(), false), 0);
         try (CountingBlobStore store = new CountingBlobStore(slow)) {
@@ -88,8 +86,8 @@ public class NodeLogCommitsMeterTests extends OpenSearchTestCase {
             }
             final ExecutorService pool = Executors.newFixedThreadPool(WRITERS + 1);
             try (
-                ServerlessNode writer = new ServerlessNode(nodeSettings("meter-writer", "ingest", packs, logCommits));
-                ServerlessNode reader = new ServerlessNode(nodeSettings("meter-reader", "search", packs, logCommits))
+                ServerlessNode writer = new ServerlessNode(nodeSettings("meter-writer", "ingest", packs));
+                ServerlessNode reader = new ServerlessNode(nodeSettings("meter-reader", "search", packs))
             ) {
                 writer.startup().start();
                 writer.setMetadataPlane(plane);
@@ -199,10 +197,8 @@ public class NodeLogCommitsMeterTests extends OpenSearchTestCase {
         }
     }
 
-    public void testLogCommitsAgainstAManifestPerPublish() throws Exception {
-        measure(false, false);
-        measure(false, true);
-        measure(true, false);
-        measure(true, true);
+    public void testLogCommitsInEachPlacement() throws Exception {
+        measure(false);
+        measure(true);
     }
 }

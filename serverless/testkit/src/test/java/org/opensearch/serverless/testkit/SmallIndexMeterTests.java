@@ -39,7 +39,7 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
     private static final long IDLE_AFTER = 300_000L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"}}}";
 
-    private Settings nodeSettings(String name, String roles, boolean packs, boolean logCommits, boolean buckets) {
+    private Settings nodeSettings(String name, String roles, boolean packs, boolean buckets) {
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-small-meter")
@@ -48,8 +48,6 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put("serverless.wal.node_log.enabled", true)
-            .put("serverless.wal.node_log.commits", logCommits)
             .put("serverless.segments.node_pack.enabled", packs)
             .put("serverless.buckets.enabled", buckets)
             // Staged commits age by the real clock, and the meter's minutes pass in about a second of it: a one-second
@@ -80,8 +78,8 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
         return String.format(Locale.ROOT, " (commit register CAS=%.2f)", store.registerWritesMatching("manifest") / (double) indices);
     }
 
-    private void meter(boolean packs, boolean logCommits, boolean buckets, int indices) throws Exception {
-        final String mode = (packs ? "node_pack" : "segment_blob") + (logCommits ? " + log commits" : "") + (buckets ? " + buckets" : "");
+    private void meter(boolean packs, boolean buckets, int indices) throws Exception {
+        final String mode = (packs ? "node_pack" : "segment_blob") + (buckets ? " + buckets" : "");
         final AtomicLong clock = new AtomicLong(1_000_000L);
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
@@ -103,8 +101,8 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
                 plane.buckets().swap(manifest, org.opensearch.common.blobstore.BlobRegister.ABSENT_GENERATION).orElseThrow();
             }
             try (
-                ServerlessNode writer = new ServerlessNode(nodeSettings("small-writer", "ingest", packs, logCommits, buckets));
-                ServerlessNode reader = new ServerlessNode(nodeSettings("small-reader", "search", packs, logCommits, buckets))
+                ServerlessNode writer = new ServerlessNode(nodeSettings("small-writer", "ingest", packs, buckets));
+                ServerlessNode reader = new ServerlessNode(nodeSettings("small-reader", "search", packs, buckets))
             ) {
                 writer.setHeadVerifyIntervalMillis(300_000L).setDescriptorRefreshIntervalMillis(300_000L);
                 writer.startup().start();
@@ -213,8 +211,8 @@ public class SmallIndexMeterTests extends OpenSearchTestCase {
             org.opensearch.common.Booleans.parseBoolean(System.getProperty("tests.meter.small", "false"))
         );
         final int indices = Integer.parseInt(System.getProperty("tests.meter.small.indices", "50"));
-        meter(false, false, false, indices);
-        meter(true, true, false, indices);
-        meter(true, true, true, indices);
+        meter(false, false, indices);
+        meter(true, false, indices);
+        meter(true, true, indices);
     }
 }
