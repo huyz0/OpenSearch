@@ -168,7 +168,10 @@ final class DocumentWrites {
         long ifPrimaryTerm,
         boolean requireAbsent
     ) throws IOException {
-        final Placement placement = routing.place(index, id, customRouting);
+        Placement placement = routing.place(index, id, customRouting);
+        if (placement.local() == null && (placement.owner() == null || placement.owner().equals(node.localNode().getId()))) {
+            placement = placeOnceTaken(index, id, customRouting, placement);
+        }
         if (placement.local() != null) {
             final var outcome = deletion
                 ? node.writes().delete(placement.local(), id, customRouting, ifSeqNo, ifPrimaryTerm)
@@ -179,6 +182,33 @@ final class DocumentWrites {
             return new Written(node.localNode().getId(), outcome, placement.local());
         }
         return forwardWritten(index, id, customRouting, source, refresh, deletion, placement, ifSeqNo, ifPrimaryTerm, requireAbsent, true);
+    }
+
+    /** How long a write to a shard nobody holds waits for this node to take it; the REST write path waits as long. */
+    static final long ACTIVATION_WAIT_MILLIS = 30_000L;
+
+    /**
+     * Takes a shard nobody holds for a write that needs it, then places the write again.
+     *
+     * <p>A plugin's first write to an index it just created met a shard nobody owned and was refused as "not
+     * here"; the security plugin gave up on its default configuration that way, and index management saw it on
+     * its first policy. A user's write to the same shard waits for this node to take it, on the same
+     * single-flight activation every reconcile pass uses, and so does this. If the shard is not taken here --
+     * another node won it, this node is full, or on-demand activation is off -- the placement is returned as it
+     * now is, and the forward or the refusal follows from it as before.
+     */
+    private Placement placeOnceTaken(String index, String id, String customRouting, Placement placement) throws IOException {
+        try {
+            node.signals().activate(index, placement.shard()).get(ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException | java.util.concurrent.ExecutionException e) {
+            return placement;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return placement;
+        }
+        final Placement again = routing.place(index, id, customRouting);
+        // Only the incarnation the write was routed for: an index recreated meanwhile is a new routing decision.
+        return again.uuid() != null && again.uuid().equals(placement.uuid()) ? again : placement;
     }
 
     String forward(String index, String id, String source, boolean refresh, boolean deletion, Placement placement) throws IOException {
