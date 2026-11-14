@@ -137,42 +137,45 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
      */
     public void testAShardSurvivesBeingHandedOverTwice() throws Exception {
         final var store = createTempDir();
-        try (NodeProcess c = NodeProcess.start("chain-c", store, createTempDir(), settings())) {
+        try (
+            NodeProcess a = NodeProcess.start("chain-a", store, createTempDir(), settings());
+            NodeProcess b = NodeProcess.start("chain-b", store, createTempDir(), settings());
+            NodeProcess c = NodeProcess.start("chain-c", store, createTempDir(), settings())
+        ) {
             final List<Long> terms = new ArrayList<>();
-
-            final NodeProcess a = NodeProcess.start("chain-a", store, createTempDir(), settings());
-            final NodeProcess b = NodeProcess.start("chain-b", store, createTempDir(), settings());
-            try {
-                assertEquals(200, send(a, "PUT", "/alpha?shards=1", MAPPING).status());
-                for (int i = 1; i <= 5; i++) {
-                    assertEquals(201, putDoc(a, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}").status());
-                }
-                assertEquals("a should hold it first", a.nodeId(), owner(store));
-                terms.add(term(store));
-
-                a.killHard();
-                for (int i = 6; i <= 10; i++) {
-                    assertEquals(201, putDoc(b, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}").status());
-                }
-                assertEquals("b should have taken it", b.nodeId(), owner(store));
-                terms.add(term(store));
-            } finally {
-                b.killHard();
+            assertEquals(200, send(a, "PUT", "/alpha?shards=1", MAPPING).status());
+            for (int i = 1; i <= 5; i++) {
+                assertEquals(201, putDoc(a, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}").status());
             }
-
-            for (int i = 11; i <= 15; i++) {
-                assertEquals(201, putDoc(c, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}").status());
-            }
-            assertEquals("c should have taken it in turn", c.nodeId(), owner(store));
+            assertEquals("a should hold it first", a.nodeId(), owner(store));
             terms.add(term(store));
 
-            logger.info("chain of custody: terms {}", terms);
+            a.killHard();
+            for (int i = 6; i <= 10; i++) {
+                assertEquals(201, putDoc(b, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}").status());
+            }
+            // Either survivor may take it: b can forward the write to c, which then takes it. Which one does is
+            // placement, not what this test is about; that the next handover starts from it is.
+            final String second = owner(store);
+            assertTrue("a survivor should have taken it, not " + second, second.equals(b.nodeId()) || second.equals(c.nodeId()));
+            terms.add(term(store));
+            final NodeProcess secondOwner = second.equals(b.nodeId()) ? b : c;
+            final NodeProcess last = secondOwner == b ? c : b;
+
+            secondOwner.killHard();
+            for (int i = 11; i <= 15; i++) {
+                assertEquals(201, putDoc(last, String.valueOf(i), "{\"msg\":\"chain\",\"n\":" + i + "}").status());
+            }
+            assertEquals("the last node standing should have taken it in turn", last.nodeId(), owner(store));
+            terms.add(term(store));
+
+            logger.info("chain of custody: owners a, {}, {}; terms {}", second, last.nodeId(), terms);
             assertEquals("each handover must bump the term", 3, terms.size());
             assertTrue("terms must strictly increase across handovers: " + terms, terms.get(1) > terms.get(0));
             assertTrue("including the second handover: " + terms, terms.get(2) > terms.get(1));
 
-            send(c, "POST", "/alpha/_refresh", null);
-            final Response found = search(c, "msg:chain");
+            send(last, "POST", "/alpha/_refresh", null);
+            final Response found = search(last, "msg:chain");
             assertEquals(200, found.status());
             assertEquals("writes from all three owners must survive two handovers: " + found.body(), 15, hitCount(found.body()));
         }

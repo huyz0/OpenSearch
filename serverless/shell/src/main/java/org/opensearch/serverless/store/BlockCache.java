@@ -345,6 +345,14 @@ public final class BlockCache {
             }
         }
         try {
+            // Another reader's fetch can finish between this reader's miss and its claim: it stored the block and let go
+            // of the claim, so the claim was free to take. Fetching again would be a second request for one block.
+            final byte[] landed = stripeFor(key).get(key, true, clock.getAsLong());
+            if (landed != null) {
+                coalesced.incrementAndGet();
+                mine.complete(landed);
+                return landed;
+            }
             final byte[] block = fetcher.fetch();
             put(key, block);
             mine.complete(block);
