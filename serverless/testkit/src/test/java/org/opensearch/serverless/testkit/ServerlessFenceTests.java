@@ -67,8 +67,6 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            // The failed append is injected into the shard's own log, which only takes writes with the node log off.
-            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 
@@ -536,7 +534,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             final ShardId onA = hold(a, plane, loop, clock);
             a.writes().index(onA, "earlier", "{\"msg\":\"earlier\"}");
 
-            store.failWritesUnder("wal/t=");
+            store.failWritesUnder("nodelog/");
             final IOException refused = expectThrows(IOException.class, () -> a.writes().index(onA, "lost", "{\"msg\":\"lost\"}"));
             assertTrue(refused.getMessage(), refused.getMessage().contains("not acknowledged"));
             assertNotNull("the shard stays open for reads", a.reconciler().shard(onA));

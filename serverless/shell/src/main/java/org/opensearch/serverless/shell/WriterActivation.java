@@ -293,14 +293,7 @@ public final class WriterActivation {
         final org.opensearch.serverless.metadata.Acquisition woken = wake(plane, indexName, shardNumber, described.get());
         final org.opensearch.serverless.metadata.Acquisition acquisition = woken != null
             ? woken
-            : plane.activate(
-                indexName,
-                shardNumber,
-                node.localNode.getId(),
-                node.localNode.getEphemeralId(),
-                described.get().uuid(),
-                node.nodeLogEnabled
-            );
+            : plane.activate(indexName, shardNumber, node.localNode.getId(), node.localNode.getEphemeralId(), described.get().uuid(), true);
         node.nodeCapacity().activationPhases[1].addAndGet(System.nanoTime() - acquiringAt);
         if (acquisition.acquired() == false) {
             // The winner's head is the freshest routing fact this node has, and it was paid for: a
@@ -322,16 +315,14 @@ public final class WriterActivation {
         node.openingShards.add(openingKey);
         // The takeover fenced every older term at the swap, so the open need not list them again.
         node.reconciler.noteOlderTermsFenced(indexName, shardNumber, acquisition.head().term());
-        if (node.nodeLogEnabled) {
-            // Whose node logs the open replays: every node the head names as holding what was not published.
-            final NodeLogWriter nodeLog = node.startup().nodeLog(plane);
-            if (nodeLog != null) {
-                nodeLog.noteHeadMoved(indexName, shardNumber);
-            }
-            node.reconciler.noteNodeLogWriters(indexName, shardNumber, acquisition.head().writers());
-            // And whether the shard's own log has anything for the open to close or replay.
-            node.reconciler.noteShardLogQuiet(indexName, shardNumber, acquisition.head().term(), acquisition.head().shardLogQuiet());
+        // Whose node logs the open replays: every node the head names as holding what was not published.
+        final NodeLogWriter nodeLog = node.startup().nodeLog(plane);
+        if (nodeLog != null) {
+            nodeLog.noteHeadMoved(indexName, shardNumber);
         }
+        node.reconciler.noteNodeLogWriters(indexName, shardNumber, acquisition.head().writers());
+        // And whether the shard's own log has anything for the open to close or replay.
+        node.reconciler.noteShardLogQuiet(indexName, shardNumber, acquisition.head().term(), acquisition.head().shardLogQuiet());
         try {
             // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed
             // documents its published digest does not describe.

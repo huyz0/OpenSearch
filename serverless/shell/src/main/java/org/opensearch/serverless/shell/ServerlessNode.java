@@ -146,20 +146,9 @@ public final class ServerlessNode implements Closeable {
     final Map<org.opensearch.core.index.shard.ShardId, java.util.concurrent.locks.ReentrantReadWriteLock> shardFences =
         new java.util.concurrent.ConcurrentHashMap<>();
     /**
-     * Shares one object-store PUT between the concurrent writes to a shard. See
-     * {@link org.opensearch.serverless.store.WalGroupCommitter}: it batches only what arrives while a PUT
-     * is already in flight, so a quiet shard pays exactly what it did before and a busy one stops paying
-     * per document.
+     * This node's write log: one log for the whole node, written once per window, started with the first metadata plane
+     * it writes through. See {@link NodeLogWriter}.
      */
-    final org.opensearch.serverless.store.WalGroupCommitter walCommitter;
-
-    /**
-     * Whether writes go to one log for the whole node, written once per window, instead of one log per shard. See
-     * {@link NodeLogWriter}.
-     */
-    final boolean nodeLogEnabled;
-
-    /** This node's write log when {@link #nodeLogEnabled}, started with the first metadata plane it writes through. */
     volatile NodeLogWriter nodeLogWriter;
 
     /** Whether the reconciler has been given {@link #nodeLogWriter}, which may start before the reconciler exists. */
@@ -390,13 +379,9 @@ public final class ServerlessNode implements Closeable {
         this.writeBackpressureMax = WriteSettings.BACKPRESSURE_MAX_IN_FLIGHT.get(settings);
         this.writePools = WritePools.of(settings);
         this.writeBackpressure = NodeComponents.writeBackpressure(settings, writeBackpressureMax);
-        this.walCommitter = NodeComponents.walCommitter(settings);
-        this.nodeLogEnabled = org.opensearch.serverless.store.NodeLogSettings.ENABLED.get(settings);
-        if (nodeLogEnabled) {
-            // Refused here, at construction, rather than on the first shard it takes.
-            this.nodeLogCommitCheckpointMillis = LogCommitCheckpoint.nodeValue(settings);
-            this.logCommitCheckpointMillis = nodeLogCommitCheckpointMillis;
-        }
+        // Refused here, at construction, rather than on the first shard it takes.
+        this.nodeLogCommitCheckpointMillis = LogCommitCheckpoint.nodeValue(settings);
+        this.logCommitCheckpointMillis = nodeLogCommitCheckpointMillis;
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
         final Environment environment = new Environment(settings, null);
@@ -692,18 +677,17 @@ public final class ServerlessNode implements Closeable {
 
     /**
      * Returns whether a new index with these settings is grouped into a bucket while small: the index's setting, else
-     * the cluster's, else this node's default. Only when this node writes its node log, which a bucket's owner must.
+     * the cluster's, else this node's default.
      *
      * @param indexSettings the new index's settings
      * @return true to group it
      */
     public boolean bucketsNewIndex(Settings indexSettings) {
-        return nodeLogEnabled
-            && org.opensearch.serverless.bucket.BucketPolicy.wanted(
-                indexSettings,
-                clusterBucketPolicy,
-                org.opensearch.serverless.bucket.BucketSettings.enabled(settings)
-            );
+        return org.opensearch.serverless.bucket.BucketPolicy.wanted(
+            indexSettings,
+            clusterBucketPolicy,
+            org.opensearch.serverless.bucket.BucketSettings.enabled(settings)
+        );
     }
 
     volatile long clusterSegmentPlacementReadAtNanos;
@@ -732,16 +716,12 @@ public final class ServerlessNode implements Closeable {
     }
 
     void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
-        if (nodeLogEnabled) {
-            // Through the log, which names its epochs and writes under the lock a new epoch's recording takes.
-            startup.nodeLog(plane).renew();
-            return;
-        }
-        startup.writeOwnLease(plane, java.util.List.of());
+        // Through the log, which names its epochs and writes under the lock a new epoch's recording takes.
+        startup.nodeLog(plane).renew();
     }
 
     /**
-     * Returns this node's write log, if it writes one and has started it.
+     * Returns this node's write log, once it has started it.
      *
      * @return the log, or null
      */

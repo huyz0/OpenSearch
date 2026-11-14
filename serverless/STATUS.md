@@ -595,7 +595,7 @@ in ways worth recording, because the corrections are more instructive than the f
 
 | Finding | Class | Where |
 | --- | --- | --- |
-| A single write cost one PUT; concurrent writes now share one | cost, the dominant term | `WalGroupCommitter` |
+| A single write cost one PUT; concurrent writes now share one | cost, the dominant term | `WalGroupCommitter` (since replaced by the node log) |
 | A seal deleted a concurrently-written seal it never merged, widening a replay cutoff | data loss | `WalStore#sealAt` |
 | A zombie's records under a dead term were reclaimed once and then never | storage leak | `WalStore#onPublished` |
 | A descriptor was read from the store on every write, get and search | cost, per request | `MetadataPlane#resolveForRouting`, `ServerlessNode#ensureIncarnationLive` |

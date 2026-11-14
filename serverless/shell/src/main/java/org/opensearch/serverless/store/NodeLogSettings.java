@@ -21,9 +21,6 @@ import java.util.List;
  */
 public final class NodeLogSettings implements SettingsProvider {
 
-    /** The {@code serverless.wal.node_log.enabled} setting. */
-    public static final Setting<Boolean> ENABLED = Setting.boolSetting("serverless.wal.node_log.enabled", true, Property.NodeScope);
-
     /** How long a node's write-log window stays open: one of {@link NodeLogCommitter#ALLOWED_WINDOW_MILLIS}. */
     public static final Setting<Long> WINDOW_MILLIS = Setting.longSetting(
         "serverless.wal.node_log.window_millis",
@@ -68,35 +65,11 @@ public final class NodeLogSettings implements SettingsProvider {
         Property.NodeScope
     );
 
-    /** The {@code serverless.wal.group_commit.max_records} setting. */
-    public static final Setting<Integer> GROUP_COMMIT_MAX_RECORDS = Setting.intSetting(
-        "serverless.wal.group_commit.max_records",
-        WalGroupCommitter.DEFAULT_MAX_RECORDS,
-        Property.NodeScope
-    );
-
-    /** The {@code serverless.wal.group_commit.max_bytes} setting. */
-    public static final Setting<Long> GROUP_COMMIT_MAX_BYTES = Setting.longSetting(
-        "serverless.wal.group_commit.max_bytes",
-        WalGroupCommitter.DEFAULT_MAX_BYTES,
-        Property.NodeScope
-    );
-
     /** Used by {@link java.util.ServiceLoader}. */
     public NodeLogSettings() {}
 
     @Override
     public List<Setting<?>> settings() {
-        return List.of(
-            ENABLED,
-            WINDOW_MILLIS,
-            MAX_BYTES,
-            MAX_RECORDS,
-            HEDGE_AFTER_MILLIS,
-            IDLE_FLUSH,
-            ADMISSION_CONCURRENCY,
-            GROUP_COMMIT_MAX_RECORDS,
-            GROUP_COMMIT_MAX_BYTES
-        );
+        return List.of(WINDOW_MILLIS, MAX_BYTES, MAX_RECORDS, HEDGE_AFTER_MILLIS, IDLE_FLUSH, ADMISSION_CONCURRENCY);
     }
 }

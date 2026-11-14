@@ -42,15 +42,27 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-replay-collision")
-            // Records are planted in the shard's own log, which a node writing its node's log does not read once the
-            // shard's head says that log is quiet: what is tested is how that log's replay treats them.
-            .put("serverless.wal.node_log.enabled", false)
             .put("path.home", createTempDir())
             .put("network.host", "127.0.0.1")
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
             .build();
+    }
+
+    /**
+     * Hands the shard to an earlier writer that wrote the shard's own log, then lets its lease lapse: the head no longer
+     * says that log is quiet, so the next open reads it and replays what is planted there.
+     *
+     * @return the term the earlier writer held, which planted records carry
+     */
+    private static long handToAnOwnerOfTheShardsOwnLog(MetadataPlane plane, IndexDescriptor descriptor, AtomicLong clock)
+        throws java.io.IOException {
+        final var acquisition = plane.activate(descriptor.name(), 0, "shard-log-writer", "shard-log-writer-eph", descriptor.uuid(), false);
+        assertTrue(acquisition.acquired());
+        assertFalse(acquisition.head().shardLogQuiet());
+        clock.addAndGet(2 * TTL);
+        return acquisition.head().term();
     }
 
     public void testLegacyReplayRefusesAnInvalidLoggedDocument() throws Exception {
@@ -71,7 +83,8 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             final var descriptor = new IndexDescriptor("legacy", "uuid-legacy", 1, mapping, null);
             plane.createIndex(descriptor);
-            plane.walStore("legacy", descriptor.uuid(), 0).append(1L, new WalRecord("logged", source));
+            final long term = handToAnOwnerOfTheShardsOwnLog(plane, descriptor, clock);
+            plane.walStore("legacy", descriptor.uuid(), 0).append(term, new WalRecord("logged", source));
             try (var node = new ServerlessNode(nodeSettings("legacy-replay-result"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
@@ -122,7 +135,7 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
 
             // A different acknowledged operation under the same sequence number, at a later term: what a writer that
             // opened from an outdated commit would have written.
-            final long term = plane.heads().read("alpha", 0).orElseThrow().term() + 1;
+            final long term = handToAnOwnerOfTheShardsOwnLog(plane, alpha, clock);
             plane.walStore("alpha", alpha.uuid(), 0).append(term, new WalRecord("b", "{\"msg\":\"b\"}", 0L, term, 1L));
 
             second.startup().start();
@@ -218,7 +231,7 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             assertTrue(first.reconciler().openShards().isEmpty());
 
             // Sequence number 1, twice: an older writer's record past the fence, and its successor's own write.
-            final long term = plane.heads().read("alpha", 0).orElseThrow().term();
+            final long term = handToAnOwnerOfTheShardsOwnLog(plane, alpha, clock) - 1;
             plane.walStore("alpha", alpha.uuid(), 0).append(term, new WalRecord("stale", "{\"msg\":\"stale\"}", 1L, term, 1L));
             plane.walStore("alpha", alpha.uuid(), 0)
                 .append(term + 1, new WalRecord("acknowledged", "{\"msg\":\"acknowledged\"}", 1L, term + 1, 1L));
@@ -265,7 +278,7 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
             final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             final var descriptor = new IndexDescriptor("mixed", "uuid-mixed", 1, "{\"properties\":{\"n\":{\"type\":\"long\"}}}", null);
             plane.createIndex(descriptor);
-            plane.walStore("mixed", descriptor.uuid(), 0).append(1L, records);
+            plane.walStore("mixed", descriptor.uuid(), 0).append(handToAnOwnerOfTheShardsOwnLog(plane, descriptor, clock), records);
             try (var node = new ServerlessNode(nodeSettings("mixed-replay-order"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
@@ -330,7 +343,7 @@ public class ServerlessReplayCollisionTests extends OpenSearchTestCase {
                 null
             );
             plane.createIndex(descriptor);
-            plane.walStore("conflict", descriptor.uuid(), 0).append(1L, records);
+            plane.walStore("conflict", descriptor.uuid(), 0).append(handToAnOwnerOfTheShardsOwnLog(plane, descriptor, clock), records);
             try (var node = new ServerlessNode(nodeSettings("payload-replay-conflict"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);

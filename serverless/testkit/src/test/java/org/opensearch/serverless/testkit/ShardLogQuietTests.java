@@ -17,6 +17,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.ShardHead;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.store.WalRecord;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
@@ -25,7 +26,8 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Once a shard's head says its own write log is quiet, a node writing its node's log opens the shard without listing that
- * log; an owner that writes the shard's own log takes the head without the word, and the next owner closes that log again.
+ * log; a head taken by an earlier owner that wrote the shard's own log lacks the word, and the next owner closes that log
+ * again.
  */
 public class ShardLogQuietTests extends OpenSearchTestCase {
 
@@ -33,9 +35,8 @@ public class ShardLogQuietTests extends OpenSearchTestCase {
     private static final int SHARDS = 3;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
 
-    private Settings nodeSettings(String name, boolean nodeLog) {
+    private Settings nodeSettings(String name) {
         return Settings.builder()
-            .put("serverless.wal.node_log.enabled", nodeLog)
             .put("node.name", name)
             .put("cluster.name", "serverless-shard-log-quiet")
             .put("path.home", createTempDir())
@@ -106,7 +107,7 @@ public class ShardLogQuietTests extends OpenSearchTestCase {
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
 
         // The first owner closes the shard's log the long way, finds nothing in it, and says so in the head.
-        try (ServerlessNode first = new ServerlessNode(nodeSettings("quiet-first", true))) {
+        try (ServerlessNode first = new ServerlessNode(nodeSettings("quiet-first"))) {
             first.startup().start();
             first.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane);
@@ -119,7 +120,7 @@ public class ShardLogQuietTests extends OpenSearchTestCase {
         assertTrue("a clean release keeps the word", allQuiet(plane));
 
         // A clean takeover: nothing of the shards' own logs is listed, fenced or read.
-        final ServerlessNode second = new ServerlessNode(nodeSettings("quiet-second", true));
+        final ServerlessNode second = new ServerlessNode(nodeSettings("quiet-second"));
         try {
             second.startup().start();
             second.setMetadataPlane(plane);
@@ -134,7 +135,7 @@ public class ShardLogQuietTests extends OpenSearchTestCase {
             assertFound(second, held, "unpublished-");
             clock.addAndGet(2 * TTL);
             // The second owner dies with those writes unpublished: its node's log is what holds them.
-            try (ServerlessNode third = new ServerlessNode(nodeSettings("quiet-third", true))) {
+            try (ServerlessNode third = new ServerlessNode(nodeSettings("quiet-third"))) {
                 third.startup().start();
                 third.setMetadataPlane(plane);
                 third.leases().renewLease(plane);
@@ -156,13 +157,13 @@ public class ShardLogQuietTests extends OpenSearchTestCase {
         }
     }
 
-    public void testAnOwnerWritingTheShardsOwnLogTakesTheHeadWithoutTheWord() throws Exception {
+    public void testAHeadTakenByAnOwnerOfTheShardsOwnLogIsClosedAgain() throws Exception {
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         final CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false));
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
 
-        try (ServerlessNode first = new ServerlessNode(nodeSettings("mixed-first", true))) {
+        try (ServerlessNode first = new ServerlessNode(nodeSettings("mixed-first"))) {
             first.startup().start();
             first.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane);
@@ -173,47 +174,39 @@ public class ShardLogQuietTests extends OpenSearchTestCase {
         }
         assertTrue(allQuiet(plane));
 
-        // An owner that writes the shard's own log, and dies with writes there it never published.
-        final ServerlessNode perShard = new ServerlessNode(nodeSettings("mixed-per-shard", false));
-        try {
-            perShard.startup().start();
-            perShard.setMetadataPlane(plane);
-            final List<ShardId> held = takeAll(perShard, new BackgroundReconciler(perShard, plane), clock);
-            assertFalse("taking the head drops the word", allQuiet(plane));
-            write(perShard, held, "in-shard-log-");
-            clock.addAndGet(2 * TTL);
-
-            // The next owner writes its node's log, so closes the shard's own log the long way and replays it.
-            try (ServerlessNode next = new ServerlessNode(nodeSettings("mixed-next", true))) {
-                next.startup().start();
-                next.setMetadataPlane(plane);
-                next.leases().renewLease(plane);
-                plane.membership().refresh();
-                store.reset();
-                final BackgroundReconciler loop = new BackgroundReconciler(next, plane);
-                final List<ShardId> taken = takeAll(next, loop, clock);
-                final String where = store.byPlace();
-                assertTrue("a shard whose log is not quiet is closed by listing it\n" + where, shardLogListings(where) > 0);
-                assertFound(next, taken, "published-");
-                assertFound(next, taken, "in-shard-log-");
-                // Quiet only once a commit at the new owner's term holds what it replayed from the shard's own log.
-                for (int shard = 0; shard < SHARDS; shard++) {
-                    final ShardHead head = plane.heads().read("alpha", shard).orElseThrow();
-                    final long publishedTerm = plane.segmentPublisher("alpha", shard).readManifest().orElseThrow().term();
-                    logger.info("after takeover: {} published at term {}", head, publishedTerm);
-                    if (head.shardLogQuiet()) {
-                        assertEquals("quiet only after a publish at the owner's term: " + head, head.term(), publishedTerm);
-                    }
+        // An earlier owner that wrote the shard's own log, and died with writes there it never published.
+        for (int shard = 0; shard < SHARDS; shard++) {
+            final var earlier = plane.activate("alpha", shard, "shard-log-writer", "shard-log-writer-eph", "uuid-alpha-00000000", false);
+            assertTrue(earlier.acquired());
+            plane.walStore("alpha", "uuid-alpha-00000000", shard)
+                .append(earlier.head().term(), new WalRecord("in-shard-log-" + shard, "{\"msg\":\"in-shard-log-\",\"n\":" + shard + "}"));
+        }
+        assertFalse("taking the head drops the word", allQuiet(plane));
+        clock.addAndGet(2 * TTL);
+        // The next owner writes its node's log, so closes the shard's own log the long way and replays it.
+        try (ServerlessNode next = new ServerlessNode(nodeSettings("mixed-next"))) {
+            next.startup().start();
+            next.setMetadataPlane(plane);
+            next.leases().renewLease(plane);
+            plane.membership().refresh();
+            store.reset();
+            final BackgroundReconciler loop = new BackgroundReconciler(next, plane);
+            final List<ShardId> taken = takeAll(next, loop, clock);
+            final String where = store.byPlace();
+            assertTrue("a shard whose log is not quiet is closed by listing it\n" + where, shardLogListings(where) > 0);
+            assertFound(next, taken, "published-");
+            assertFound(next, taken, "in-shard-log-");
+            // Quiet only once a commit at the new owner's term holds what it replayed from the shard's own log.
+            for (int shard = 0; shard < SHARDS; shard++) {
+                final ShardHead head = plane.heads().read("alpha", shard).orElseThrow();
+                final long publishedTerm = plane.segmentPublisher("alpha", shard).readManifest().orElseThrow().term();
+                logger.info("after takeover: {} published at term {}", head, publishedTerm);
+                if (head.shardLogQuiet()) {
+                    assertEquals("quiet only after a publish at the owner's term: " + head, head.term(), publishedTerm);
                 }
-                loop.publishAll();
-                assertTrue("and quiet once it is published", allQuiet(plane));
             }
-        } finally {
-            try {
-                perShard.close();
-            } catch (Exception e) {
-                // It lost every shard it held.
-            }
+            loop.publishAll();
+            assertTrue("and quiet once it is published", allQuiet(plane));
         }
     }
 }

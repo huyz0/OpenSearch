@@ -17,8 +17,12 @@ import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.mapper.IdFieldMapper;
 import org.opensearch.index.mapper.Uid;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.store.CommitManifest;
+import org.opensearch.serverless.store.NodeLogBlob;
+import org.opensearch.serverless.store.NodeLogStore;
+import org.opensearch.serverless.store.NodeLogTakeover;
 import org.opensearch.serverless.store.WalRecord;
 
 import java.nio.file.Files;
@@ -43,8 +47,8 @@ import java.util.concurrent.TimeUnit;
  * later found by taking the shard and replaying it by hand. What survives a crash is the commit and the log, so that is
  * what is read, and it needs no ownership: a handover cannot hide a write from it.
  *
- * <p><b>The order is the guarantee.</b> The log is read before the commit. A publish writes its manifest before it
- * truncates the log, so a record truncated before the log was read is covered by a manifest at least as new as the one
+ * <p><b>The order is the guarantee.</b> The node logs are read before the commit. A node lets go of a shard's records
+ * only once a commit holding them is in the register, so a record truncated before the log was read is covered by a manifest at least as new as the one
  * read afterwards; a record truncated after is in the log as read. A blob that vanishes between a listing and its read
  * fails the attempt, which is retried.
  *
@@ -120,9 +124,24 @@ final class DurabilityCheck {
         final Set<String> remaining = new HashSet<>(ids);
         final List<String> read = new ArrayList<>();
 
-        // The log first, every shard: what a successor would replay.
+        // The log first, every shard: what a successor would replay, from every node log the shard's head names as
+        // holding what was not published.
         for (int shard = 0; shard < shards; shard++) {
-            final List<WalRecord> records = plane.walStore(index, uuid, shard).replayableAfterFencing();
+            final var head = plane.heads().read(index, shard);
+            final Set<String> writers = new java.util.TreeSet<>();
+            head.ifPresent(h -> {
+                writers.addAll(h.writers());
+                if (h.ownerNodeId() != null) {
+                    writers.add(h.ownerNodeId());
+                }
+            });
+            final NodeLogBlob.ShardKey key = new NodeLogBlob.ShardKey(uuid, shard, index);
+            final List<WalRecord> records = new ArrayList<>();
+            for (String writer : writers) {
+                final NodeLogTakeover.LeaseReader lease = () -> plane.membership().read(writer).map(NodeLease::nodeLog).orElse(List.of());
+                final NodeLogStore log = new NodeLogStore(plane.blobStore(), plane.basePath(), writer);
+                records.addAll(NodeLogTakeover.unfenced(log, lease.epochs(), lease).records(key));
+            }
             long minSeqNo = Long.MAX_VALUE;
             long maxSeqNo = -1L;
             final Set<Long> terms = new java.util.TreeSet<>();
@@ -141,7 +160,8 @@ final class DurabilityCheck {
                     + shard
                     + " log: "
                     + records.size()
-                    + " replayable records"
+                    + " replayable records in the node logs of "
+                    + writers
                     + (records.isEmpty() ? "" : ", seqNo " + minSeqNo + ".." + maxSeqNo + " in terms " + terms)
             );
         }

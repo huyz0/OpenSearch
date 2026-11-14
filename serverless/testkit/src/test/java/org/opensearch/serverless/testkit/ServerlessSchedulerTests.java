@@ -62,7 +62,7 @@ public class ServerlessSchedulerTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
             // Coalescing is measured against writes that land at once, not one node-log window apart.
-            .put("serverless.wal.node_log.enabled", false)
+            .put("serverless.wal.node_log.window_millis", 0)
             .build();
     }
 

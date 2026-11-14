@@ -55,8 +55,6 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            // The checks look for unpublished writes in the shard's own log, where writes go with the node log off.
-            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 
@@ -216,10 +214,13 @@ public class ServerlessIdleReleaseTests extends OpenSearchTestCase {
             loop.want("alpha", 0);
             loop.tick(clock.get());
             final ShardId shardId = node.reconciler().openShards().iterator().next();
-            final var wal = node.reconciler().wal(shardId);
+            final long term = plane.heads().read("alpha", 0).orElseThrow().term();
 
             assertEquals(201, send(node, "PUT", "/alpha/_doc/1?refresh=true", "{\"msg\":\"flushed\",\"n\":1}").status());
-            assertFalse("the write should be sitting in the log, unpublished", wal.replayable().isEmpty());
+            assertTrue(
+                "the write should be sitting in the node log, unpublished",
+                node.nodeLogWriter().forEachRecordSince(shardId, term, -1L, record -> {}) > 0
+            );
 
             clock.addAndGet(IDLE_AFTER + 1);
             assertTrue("the shard should have been released", loop.releaseIdle(clock.get()).contains(shardId));

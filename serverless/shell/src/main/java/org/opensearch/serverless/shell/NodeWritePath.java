@@ -381,12 +381,8 @@ public final class NodeWritePath {
             // share one PUT, and this caller returns only once the blob carrying its own records has
             // landed. The two lease checks around this call are unchanged and remain per-caller, so every
             // member of a group independently establishes that its record sits ahead of any seal.
-            if (node.nodeLogEnabled) {
-                // One blob per window for every shard of this node, rather than one per shard.
-                node.startup().nodeLog(node.metadataPlane).commit(shardId, shard.getOperationPrimaryTerm(), records);
-            } else {
-                node.walCommitter.commit(shardId, shard.getOperationPrimaryTerm(), records, wal::append);
-            }
+            // One blob per window for every shard of this node, rather than one per shard.
+            node.startup().nodeLog(node.metadataPlane).commit(shardId, shard.getOperationPrimaryTerm(), records);
             final long appended = System.nanoTime();
             timings.add(WriteAckTimings.Step.LOG, appended - appendStarted);
             node.writeBackpressure.onAppend(appended - appendStarted, true);

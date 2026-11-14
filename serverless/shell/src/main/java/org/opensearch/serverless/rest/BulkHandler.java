@@ -68,9 +68,9 @@ import java.util.function.Supplier;
  * <p>This paragraph said the opposite for some time after it stopped being true — the dispatch had been
  * made concurrent and the class documentation had not — and nothing asserted either version, so the code
  * and its description could have disagreed indefinitely.
- * {@code ServerlessBulkTests#testTheShardGroupsOfOneBatchRunAtTheSameTime} settles it as a rendezvous
- * rather than a stopwatch: each shard's first log append waits for the others and fails if they never come,
- * so a sequential dispatch cannot pass and a concurrent one cannot fail.
+ * {@code ServerlessBulkTests#testABatchSpanningShardsCostsOneWrite} settles it by counting rather than timing:
+ * every shard group joins one node-log window only when they run at once, since a group run after another
+ * starts only once the other's blob has landed.
  */
 public final class BulkHandler extends BaseRestHandler {
 

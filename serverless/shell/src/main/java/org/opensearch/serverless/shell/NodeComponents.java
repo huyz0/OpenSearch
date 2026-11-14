@@ -63,22 +63,6 @@ public final class NodeComponents {
     }
 
     /**
-     * Builds the committer that shares one object-store PUT between the concurrent writes to a shard.
-     *
-     * @param settings the node settings
-     * @return the group committer
-     */
-    static org.opensearch.serverless.store.WalGroupCommitter walCommitter(Settings settings) {
-        // Group commit for the log. Batching only ever happens while a PUT for the same shard is already
-        // in flight, so these bound the size of a group rather than schedule one -- there is no window to
-        // configure. Setting max_records to 1 restores one PUT per write, which is what this replaced.
-        return new org.opensearch.serverless.store.WalGroupCommitter(
-            org.opensearch.serverless.store.NodeLogSettings.GROUP_COMMIT_MAX_RECORDS.get(settings),
-            org.opensearch.serverless.store.NodeLogSettings.GROUP_COMMIT_MAX_BYTES.get(settings)
-        );
-    }
-
-    /**
      * Builds the client every REST handler is handed, wired to the shell's own operations.
      *
      * @param settings the node settings
