@@ -151,7 +151,7 @@ final class PluginClusterAnswers {
         if (descriptor.isEmpty()) {
             return Optional.empty();
         }
-        return Optional.of(descriptor.get().toIndexMetadata(Map.of()));
+        return Optional.of(ViewAliases.of(descriptor.get().toIndexMetadata(Map.of()), descriptor.get(), plane));
     }
 
     /** Health computed by core from a state in which every shard of every found index is started here. */

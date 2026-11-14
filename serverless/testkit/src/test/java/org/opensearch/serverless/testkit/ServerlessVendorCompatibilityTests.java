@@ -332,7 +332,7 @@ public class ServerlessVendorCompatibilityTests extends OpenSearchTestCase {
         }
     }
 
-    /** Alias options were dropped with an acknowledgement on all three spellings. */
+    /** Alias options were dropped with an acknowledgement on all three spellings; the ones not honoured are refused. */
     public void testAliasOptionsAreRefusedNotDropped() throws Exception {
         try (Fixture f = fixture("alias-options")) {
             final Response filtered = send(f.node(), "PUT", "/alpha/_alias/filtered", "{\"filter\":{\"term\":{\"tag\":\"a\"}}}");
@@ -344,7 +344,8 @@ public class ServerlessVendorCompatibilityTests extends OpenSearchTestCase {
                 "/_aliases",
                 "{\"actions\":[{\"add\":{\"index\":\"alpha\",\"alias\":\"w\",\"is_write_index\":true}}]}"
             );
-            assertEquals(writeIndex.body(), 501, writeIndex.status());
+            assertEquals("is_write_index is honoured: " + writeIndex.body(), 200, writeIndex.status());
+            assertTrue(send(f.node(), "GET", "/_alias/w", null).body().contains("\"is_write_index\":true"));
             // The array spellings core accepts used to resolve to the literal string "null".
             final Response arrays = send(
                 f.node(),

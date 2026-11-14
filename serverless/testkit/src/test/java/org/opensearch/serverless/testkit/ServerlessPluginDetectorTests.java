@@ -59,12 +59,6 @@ public class ServerlessPluginDetectorTests extends OpenSearchTestCase {
         loop.tick(clock.get());
     }
 
-    /** By-query walks a frozen view of what is published, as a point in time does; a refresh alone does not publish. */
-    private void publish(ServerlessNode node, String index) throws Exception {
-        final var shardId = node.reconciler().openShards().stream().filter(s -> s.getIndexName().equals(index)).findFirst().orElseThrow();
-        node.shards().publishShard(shardId, plane.heads().read(index, 0).orElseThrow().term());
-    }
-
     private ServerlessNode started(String name) throws Exception {
         return started(name, Settings.EMPTY);
     }
@@ -109,7 +103,7 @@ public class ServerlessPluginDetectorTests extends OpenSearchTestCase {
         }
     }
 
-    /** Update by query changes every matched document; delete by query removes only the matches. */
+    /** Update by query changes every matched document; delete by query removes only the matches. Refreshed is enough. */
     public void testUpdateAndDeleteByQuery() throws Exception {
         try (ServerlessNode node = started("by-query")) {
             final Client client = node.services().client();
@@ -122,7 +116,6 @@ public class ServerlessPluginDetectorTests extends OpenSearchTestCase {
                         .setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE)
                 ).actionGet();
             }
-            publish(node, ".probe-plugin-tasks");
             final BulkByScrollResponse updated = client.execute(
                 UpdateByQueryAction.INSTANCE,
                 new UpdateByQueryRequest(".probe-plugin-tasks").setQuery(QueryBuilders.termQuery("msg", "new")).setRefresh(true)
@@ -131,7 +124,6 @@ public class ServerlessPluginDetectorTests extends OpenSearchTestCase {
             assertEquals(2, updated.getStatus().getUpdated() + updated.getStatus().getNoops());
             assertTrue(updated.getBulkFailures().isEmpty());
 
-            publish(node, ".probe-plugin-tasks");
             final BulkByScrollResponse deleted = client.execute(
                 DeleteByQueryAction.INSTANCE,
                 new DeleteByQueryRequest(".probe-plugin-tasks").setQuery(QueryBuilders.termQuery("msg", "old")).setRefresh(true)

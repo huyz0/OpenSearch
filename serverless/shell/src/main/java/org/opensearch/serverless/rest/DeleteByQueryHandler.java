@@ -31,9 +31,8 @@ import java.util.function.Supplier;
  * {@code POST /{index}/_delete_by_query} — every document a query matches, removed.
  *
  * <p>Parsing and refusal only; the operation itself is {@link ShardOperations#deleteByQuery}, gated once
- * under its own action name rather than once per document — see that method's javadoc for why matching is
- * frozen and deleting is not, and why it walks one shard at a time by {@code _doc} order rather than
- * through the cross-shard {@code search_after} merge {@code _search} uses.
+ * under its own action name rather than once per document — see that method's javadoc for how it matches what a
+ * search sees when it starts, one shard at a time in sequence-number order.
  *
  * <p><b>Only {@code query}, and it is required.</b> No {@code script}: this endpoint deletes matches
  * rather than running update scripts. No {@code sort}, {@code size} or {@code aggs} — it chooses how it walks
@@ -79,7 +78,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         final String unsupportedSelection = readUnsupportedSelection(request);
         // Core's default: the first document that changed since the query was taken stops the operation.
         final String conflicts = request.param("conflicts", "abort");
-        // Hints, each with one possible answer here. The operation runs inline over a frozen view and
+        // Hints, each with one possible answer here. The operation runs inline over one-shard searches and
         // deletes through the ordinary write path: there is no scroll to size, no task to throttle or
         // slice, one copy of each shard for preference to choose between, and a conflict is a document
         // changed under a delete that reads its target once -- proceed is what happens.

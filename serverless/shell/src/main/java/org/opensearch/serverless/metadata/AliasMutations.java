@@ -89,7 +89,8 @@ final class AliasMutations {
     }
 
     /**
-     * Returns the same record naming different indices, with a data stream's fields carried through.
+     * Returns the same record naming different indices, with a data stream's fields and a still-present write member carried
+     * through.
      *
      * <p>Every alias mutation used to rebuild the record with the two-argument constructor, which made a
      * data stream a plain alias the moment anything touched it.
@@ -102,13 +103,7 @@ final class AliasMutations {
         org.opensearch.serverless.cluster.AliasRecord record,
         java.util.List<String> indices
     ) {
-        return new org.opensearch.serverless.cluster.AliasRecord(
-            record.name(),
-            indices,
-            record.dataStream(),
-            record.generation(),
-            record.timestampField()
-        );
+        return record.published().withMembers(indices);
     }
 
     /**
