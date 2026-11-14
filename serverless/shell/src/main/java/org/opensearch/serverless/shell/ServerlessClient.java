@@ -181,6 +181,12 @@ public final class ServerlessClient extends AbstractClient {
                 return PluginNodeAnswers.refresh(serving, (org.opensearch.action.admin.indices.refresh.RefreshRequest) request);
             }
         }
+        if (ServerlessPlugins.indexAdmin(serving.settings)) {
+            final ActionResponse answered = indexAdmin(action.name(), request, serving, metadata);
+            if (answered != null) {
+                return answered;
+            }
+        }
         // A plugin's own action, after the shell's allowlist and never before it: a plugin must not be able
         // to take over "indices:data/write/index" by declaring it. PluginActions refuses a duplicate among
         // plugins for the same reason, and this ordering settles the one case it cannot see.
@@ -205,11 +211,53 @@ public final class ServerlessClient extends AbstractClient {
                     ? ", indices:data/read/mget, indices:data/write/bulk, indices:data/write/update"
                     : "")
                 + (ServerlessPlugins.clusterView(serving.settings) ? ", cluster:monitor/health, cluster:monitor/state" : "")
+                + (ServerlessPlugins.indexAdmin(serving.settings)
+                    ? ", indices:admin/exists, indices:admin/get, indices:admin/mappings/get, indices:admin/settings/get,"
+                        + " indices:admin/aliases/get, indices:admin/mapping/put, indices:admin/settings/update, indices:admin/delete,"
+                        + " indices:admin/aliases, indices:admin/rollover"
+                    : "")
                 + (ServerlessPlugins.nodeAnswers(serving.settings)
                     ? ", cluster:monitor/nodes/info, cluster:monitor/nodes/stats, indices:monitor/stats, indices:admin/refresh"
                     : "")
                 + (serving.pluginActions().isEmpty() ? "" : ", plus what the plugins provide: " + serving.pluginActions().names())
         );
+    }
+
+    /** Index administration for plugins, or null when the action is not one of it; see PluginIndexAdmin. */
+    private static ActionResponse indexAdmin(String name, ActionRequest request, ServerlessNode serving, MetadataPlane metadata)
+        throws Exception {
+        final PluginIndexAdmin admin = serving.indexAdmin();
+        if (org.opensearch.action.admin.indices.exists.indices.IndicesExistsAction.NAME.equals(name)) {
+            return admin.exists(metadata, (org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.get.GetIndexAction.NAME.equals(name)) {
+            return admin.getIndex(metadata, (org.opensearch.action.admin.indices.get.GetIndexRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.mapping.get.GetMappingsAction.NAME.equals(name)) {
+            return admin.getMappings(metadata, (org.opensearch.action.admin.indices.mapping.get.GetMappingsRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.settings.get.GetSettingsAction.NAME.equals(name)) {
+            return admin.getSettings(metadata, (org.opensearch.action.admin.indices.settings.get.GetSettingsRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.alias.get.GetAliasesAction.NAME.equals(name)) {
+            return admin.getAliases(metadata, (org.opensearch.action.admin.indices.alias.get.GetAliasesRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.mapping.put.PutMappingAction.NAME.equals(name)) {
+            return admin.putMapping((org.opensearch.action.admin.indices.mapping.put.PutMappingRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.settings.put.UpdateSettingsAction.NAME.equals(name)) {
+            return admin.updateSettings((org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.delete.DeleteIndexAction.NAME.equals(name)) {
+            return admin.deleteIndex((org.opensearch.action.admin.indices.delete.DeleteIndexRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.alias.IndicesAliasesAction.NAME.equals(name)) {
+            return admin.updateAliases((org.opensearch.action.admin.indices.alias.IndicesAliasesRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.rollover.RolloverAction.NAME.equals(name)) {
+            return admin.rollover((org.opensearch.action.admin.indices.rollover.RolloverRequest) request);
+        }
+        return null;
     }
 
     /**
@@ -319,13 +367,46 @@ public final class ServerlessClient extends AbstractClient {
     }
 
     private CreateIndexResponse doCreateIndex(CreateIndexRequest request, MetadataPlane metadata) throws Exception {
+        // A date-math name, as core's create-index resolves it: the alerting plugin names its history indices
+        // <.opendistro-alerting-alert-history-{now/d}-1>, and the brackets are not a name.
+        request.index(PluginIndexAdmin.dateMath(request.index()));
         if (metadata.describe(request.index()).isPresent()) {
             throw new org.opensearch.ResourceAlreadyExistsException(request.index());
         }
+        // The shell creates an index and its aliases in two steps, because an alias is its own register. A plugin
+        // asks for both at once -- the alerting plugin creates each history index with its write alias -- so the
+        // client takes the aliases off, creates the index, then adds them through the alias path. Not atomic: an
+        // index whose alias failed is left, as a REST caller doing the two steps would leave it.
+        final java.util.List<org.opensearch.action.admin.indices.alias.Alias> aliases = ServerlessPlugins.indexAdmin(node.get().settings)
+            ? new java.util.ArrayList<>(request.aliases())
+            : java.util.List.of();
+        request.aliases().removeAll(aliases);
         try {
             org.opensearch.serverless.rest.IndexAdminHandler.createIndex(node.get(), metadata, request);
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
             throw new org.opensearch.ResourceAlreadyExistsException(request.index());
+        }
+        if (aliases.isEmpty() == false) {
+            final org.opensearch.action.admin.indices.alias.IndicesAliasesRequest add =
+                new org.opensearch.action.admin.indices.alias.IndicesAliasesRequest();
+            for (org.opensearch.action.admin.indices.alias.Alias alias : aliases) {
+                final var action = org.opensearch.action.admin.indices.alias.IndicesAliasesRequest.AliasActions.add()
+                    .index(request.index())
+                    .alias(alias.name())
+                    .writeIndex(alias.writeIndex())
+                    .isHidden(alias.isHidden());
+                if (alias.filter() != null) {
+                    action.filter(alias.filter());
+                }
+                if (alias.indexRouting() != null) {
+                    action.indexRouting(alias.indexRouting());
+                }
+                if (alias.searchRouting() != null) {
+                    action.searchRouting(alias.searchRouting());
+                }
+                add.addAliasAction(action);
+            }
+            node.get().indexAdmin().updateAliases(add);
         }
         return new CreateIndexResponse(true, true, request.index());
     }

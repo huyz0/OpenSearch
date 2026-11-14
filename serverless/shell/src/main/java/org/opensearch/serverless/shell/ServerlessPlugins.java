@@ -497,6 +497,19 @@ public final class ServerlessPlugins {
     }
 
     /**
+     * Whether the plugin client answers index administration: existence, mappings, settings and aliases, read and
+     * changed, index deletion and rollover. On by default.
+     *
+     * <p>Off, a plugin that checks or upgrades its own indices -- alerting does before running a monitor -- is refused
+     * by name, as before.
+     */
+    public static final String INDEX_ADMIN = "serverless.plugin_client.index_admin.enabled";
+
+    static boolean indexAdmin(Settings settings) {
+        return settings.getAsBoolean(INDEX_ADMIN, true);
+    }
+
+    /**
      * Whether the plugin client answers node info, node stats, indices stats and refresh: on by default.
      *
      * <p>Off, a metrics exporter and a plugin that refreshes its own index are refused by name, as before.

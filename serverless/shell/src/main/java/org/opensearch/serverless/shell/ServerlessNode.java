@@ -965,6 +965,16 @@ public final class ServerlessNode implements Closeable {
 
     private PluginNodeAnswers.Monitors monitors;
 
+    private PluginIndexAdmin indexAdmin;
+
+    /** Index administration for plugins, built the first time one asks. */
+    synchronized PluginIndexAdmin indexAdmin() {
+        if (indexAdmin == null) {
+            indexAdmin = new PluginIndexAdmin(this);
+        }
+        return indexAdmin;
+    }
+
     /** The plugins' lifecycle components and injector-built services this node started, in start order. */
     final java.util.List<org.opensearch.common.lifecycle.LifecycleComponent> pluginLifecycle =
         new java.util.concurrent.CopyOnWriteArrayList<>();
