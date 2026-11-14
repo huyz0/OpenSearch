@@ -566,6 +566,27 @@ public final class ServerlessPlugins {
     }
 
     /**
+     * Every node-scoped setting a plugin declares.
+     *
+     * @param settings the node settings, which carry {@link #EXTENSIONS}
+     * @return the settings, empty when plugin extensions are off
+     */
+    public List<org.opensearch.common.settings.Setting<?>> pluginNodeSettings(Settings settings) {
+        final List<org.opensearch.common.settings.Setting<?>> known = new ArrayList<>();
+        if (extensions(settings) == false) {
+            return known;
+        }
+        for (Plugin plugin : plugins) {
+            for (org.opensearch.common.settings.Setting<?> setting : plugin.getSettings()) {
+                if (setting.hasNodeScope()) {
+                    known.add(setting);
+                }
+            }
+        }
+        return known;
+    }
+
+    /**
      * Every index-scoped setting a plugin declares, such as k-NN's {@code index.knn}.
      *
      * @param settings the node settings, which carry {@link #EXTENSIONS}

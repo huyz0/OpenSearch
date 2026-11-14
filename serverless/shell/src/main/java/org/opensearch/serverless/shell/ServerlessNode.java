@@ -675,6 +675,7 @@ public final class ServerlessNode implements Closeable {
     void notifyPluginsStarted() {
         if (started && metadataPlane != null && pluginsNotified.compareAndSet(false, true)) {
             pluginIndices().start(metadataPlane);
+            pluginClusterSettings().start(metadataPlane);
             plugins.onNodeStarted(localNode);
         }
     }
@@ -988,6 +989,16 @@ public final class ServerlessNode implements Closeable {
         return indexAdmin;
     }
 
+    private PluginClusterSettings pluginClusterSettings;
+
+    /** The plugins' dynamic settings applied from the cluster settings register, built the first time they are asked for. */
+    public synchronized PluginClusterSettings pluginClusterSettings() {
+        if (pluginClusterSettings == null) {
+            pluginClusterSettings = new PluginClusterSettings(this, plugins.pluginNodeSettings(settings));
+        }
+        return pluginClusterSettings;
+    }
+
     private PluginIndicesView pluginIndices;
 
     /** The plugins' own indices kept in this node's view, built the first time they are asked for. */
@@ -1191,6 +1202,7 @@ public final class ServerlessNode implements Closeable {
         // test plugin holding nothing; a plugin that owns a thread pool leaks it out of every node.
         IOUtils.closeWhileHandlingException(httpServerTransport);
         pluginIndices().stop();
+        pluginClusterSettings().stop();
         // The plugins' lifecycle services before the plugins, the order a classic node stops them in.
         for (org.opensearch.common.lifecycle.LifecycleComponent service : pluginLifecycle) {
             try {
