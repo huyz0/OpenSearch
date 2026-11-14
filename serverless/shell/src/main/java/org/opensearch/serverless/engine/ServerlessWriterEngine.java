@@ -90,19 +90,6 @@ public final class ServerlessWriterEngine extends InternalEngine {
         this.replayLog = replayLog;
     }
 
-    /** The default {@link org.opensearch.serverless.engine.WriterEngineSettings#LOCAL_TRANSLOG}. */
-    public static final boolean DEFAULT_LOCAL_TRANSLOG = false;
-
-    /**
-     * Returns whether writers on a node with these settings keep a translog on local disk.
-     *
-     * @param nodeSettings the node's settings
-     * @return true to keep core's disk translog
-     */
-    public static boolean keepsLocalTranslog(org.opensearch.common.settings.Settings nodeSettings) {
-        return WriterEngineSettings.LOCAL_TRANSLOG.get(nodeSettings);
-    }
-
     @Override
     protected org.opensearch.index.translog.TranslogManager createTranslogManager(
         String translogUUID,
@@ -110,9 +97,6 @@ public final class ServerlessWriterEngine extends InternalEngine {
         org.opensearch.index.translog.listener.CompositeTranslogEventListener translogEventListener
     ) throws IOException {
         // Called from core's constructor, before this class's fields are set: decide from the configuration alone.
-        if (keepsLocalTranslog(engineConfig.getIndexSettings().getNodeSettings())) {
-            return super.createTranslogManager(translogUUID, translogDeletionPolicy, translogEventListener);
-        }
         return new DiscardingTranslogManager(
             translogUUID,
             translogDeletionPolicy,

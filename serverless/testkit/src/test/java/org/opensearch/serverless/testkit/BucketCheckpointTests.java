@@ -51,8 +51,6 @@ public class BucketCheckpointTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put("serverless.wal.node_log.enabled", true)
-            .put("serverless.wal.node_log.commits", true)
             .put("serverless.segments.node_pack.enabled", true)
             .put("serverless.buckets.enabled", true)
             .put(org.opensearch.serverless.shell.WriteSettings.NODE_LOG_PUBLISH_MAX_AGE_MILLIS.getKey(), 0L)

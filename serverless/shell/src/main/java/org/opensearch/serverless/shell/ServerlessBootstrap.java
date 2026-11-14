@@ -49,13 +49,8 @@ public final class ServerlessBootstrap implements Closeable {
 
     private static final Logger logger = LogManager.getLogger(ServerlessBootstrap.class);
 
-    /**
-     * File descriptors an open writer shard holds: Lucene's write lock, plus its local translog's file and checkpoint when
-     * {@code serverless.translog.local} keeps one.
-     */
-    static int filesPerOpenWriter(org.opensearch.common.settings.Settings nodeSettings) {
-        return org.opensearch.serverless.engine.ServerlessWriterEngine.keepsLocalTranslog(nodeSettings) ? 3 : 1;
-    }
+    /** File descriptors an open writer shard holds: Lucene's write lock; it keeps no local translog. */
+    static final int FILES_PER_OPEN_WRITER = 1;
 
     /** What a node needs open besides its writers: sockets, its own files, the JVM. */
     static final int FILES_BESIDES_WRITERS = 10_000;
@@ -66,10 +61,10 @@ public final class ServerlessBootstrap implements Closeable {
      * "Open files per node": deploy with 1,048,576.
      *
      * @param maxShards the most shards this node takes
-     * @param nodeSettings the node's settings, which say whether a writer keeps a local translog
+     * @param nodeSettings the node's settings
      */
     static void warnIfTooFewOpenFiles(int maxShards, org.opensearch.common.settings.Settings nodeSettings) {
-        final int filesPerWriter = filesPerOpenWriter(nodeSettings);
+        final int filesPerWriter = FILES_PER_OPEN_WRITER;
         final long limit = org.opensearch.monitor.process.ProcessProbe.getInstance().getMaxFileDescriptorCount();
         final long needed = (long) filesPerWriter * Math.max(0, maxShards) + FILES_BESIDES_WRITERS;
         if (limit > 0 && limit < needed) {

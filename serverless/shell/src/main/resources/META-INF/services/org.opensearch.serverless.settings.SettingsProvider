@@ -1,6 +1,5 @@
 org.opensearch.serverless.bucket.BucketSettings
 org.opensearch.serverless.cluster.ReaderPlacementSettings
-org.opensearch.serverless.engine.WriterEngineSettings
 org.opensearch.serverless.rest.BulkSettings
 org.opensearch.serverless.routing.RoutingSettings
 org.opensearch.serverless.shell.ActivationSettings

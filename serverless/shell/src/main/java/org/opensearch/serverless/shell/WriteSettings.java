@@ -76,9 +76,6 @@ public final class WriteSettings implements SettingsProvider {
         Property.NodeScope
     );
 
-    /** The {@code serverless.segments.pack.enabled} setting. */
-    public static final Setting<Boolean> SEGMENTS_PACK = Setting.boolSetting("serverless.segments.pack.enabled", true, Property.NodeScope);
-
     /** The {@code serverless.segments.node_pack.enabled} setting. */
     public static final Setting<Boolean> NODE_PACK_ENABLED = Setting.boolSetting(
         "serverless.segments.node_pack.enabled",
@@ -104,17 +101,6 @@ public final class WriteSettings implements SettingsProvider {
     public static final Setting<Long> NODE_PACK_COLLECT_INTERVAL_MILLIS = Setting.longSetting(
         "serverless.segments.node_pack.collect_interval_millis",
         NodePackWiring.DEFAULT_COLLECT_INTERVAL_MILLIS,
-        Property.NodeScope
-    );
-
-    /**
-     * Commits recorded with the node's write log: a routine publish keeps its commit on the writer and the manifest is
-     * written as a checkpoint; see {@link CommitStaging}. Part of the per-node write log, so only with it on; on by
-     * default, and switched by this setting.
-     */
-    public static final Setting<Boolean> LOG_COMMITS = Setting.boolSetting(
-        "serverless.wal.node_log.commits",
-        NodePackWiring.LOG_COMMITS_DEFAULT,
         Property.NodeScope
     );
 
@@ -175,12 +161,10 @@ public final class WriteSettings implements SettingsProvider {
             BACKPRESSURE_MIN_IN_FLIGHT,
             STRIPE_REFRESH_MIN_ASKS,
             WAIT_POOL_THREADS_PER_CORE,
-            SEGMENTS_PACK,
             NODE_PACK_ENABLED,
             NODE_PACK_MAX_BLOB_BYTES,
             NODE_PACK_LINGER_MILLIS,
             NODE_PACK_COLLECT_INTERVAL_MILLIS,
-            LOG_COMMITS,
             LOG_COMMITS_CHECKPOINT_MILLIS,
             NODE_LOG_PUBLISH_MAX_AGE_MILLIS,
             PUBLISH_DEBOUNCE_MILLIS,

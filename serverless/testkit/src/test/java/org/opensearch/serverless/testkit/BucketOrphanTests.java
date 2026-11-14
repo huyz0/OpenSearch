@@ -53,8 +53,6 @@ public class BucketOrphanTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put("serverless.wal.node_log.enabled", true)
-            .put("serverless.wal.node_log.commits", true)
             .put("serverless.segments.node_pack.enabled", true)
             .put("serverless.buckets.enabled", true)
             .build();

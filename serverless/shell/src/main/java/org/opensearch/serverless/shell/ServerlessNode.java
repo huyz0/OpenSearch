@@ -159,13 +159,6 @@ public final class ServerlessNode implements Closeable {
      */
     final boolean nodeLogEnabled;
 
-    /**
-     * Whether a publish writes the files it adds as one blob per segment rather than one blob per file:
-     * {@code serverless.segments.pack.enabled}.
-     * See {@link org.opensearch.serverless.store.SegmentPublisher#packing}.
-     */
-    final boolean packSegments;
-
     /** This node's write log when {@link #nodeLogEnabled}, started with the first metadata plane it writes through. */
     volatile NodeLogWriter nodeLogWriter;
 
@@ -399,12 +392,11 @@ public final class ServerlessNode implements Closeable {
         this.writeBackpressure = NodeComponents.writeBackpressure(settings, writeBackpressureMax);
         this.walCommitter = NodeComponents.walCommitter(settings);
         this.nodeLogEnabled = org.opensearch.serverless.store.NodeLogSettings.ENABLED.get(settings);
-        if (nodeLogEnabled && WriteSettings.LOG_COMMITS.get(settings)) {
+        if (nodeLogEnabled) {
             // Refused here, at construction, rather than on the first shard it takes.
             this.nodeLogCommitCheckpointMillis = LogCommitCheckpoint.nodeValue(settings);
             this.logCommitCheckpointMillis = nodeLogCommitCheckpointMillis;
         }
-        this.packSegments = WriteSettings.SEGMENTS_PACK.get(settings);
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
         final Environment environment = new Environment(settings, null);

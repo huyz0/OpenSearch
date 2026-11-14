@@ -43,7 +43,6 @@ public class DiscardingTranslogTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put(org.opensearch.serverless.engine.WriterEngineSettings.LOCAL_TRANSLOG.getKey(), false)
             .build();
     }
 
