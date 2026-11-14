@@ -431,6 +431,19 @@ public final class ServerlessPlugins {
      */
     public static final String EXTENSIONS = "serverless.plugin_extensions.enabled";
 
+    /**
+     * Whether plugins see a cluster they can work with: on by default, and only on a node with plugins.
+     *
+     * <p>On, the node's view names a cluster manager and the plugin client answers cluster health and cluster
+     * state. Off, a plugin that waits for health (the security plugin does, before loading its configuration)
+     * or that reads the cluster state through its client never gets an answer.
+     */
+    public static final String CLUSTER_VIEW = "serverless.plugin_cluster_view.enabled";
+
+    static boolean clusterView(Settings settings) {
+        return settings.getAsBoolean(CLUSTER_VIEW, true);
+    }
+
     private static boolean extensions(Settings settings) {
         return settings.getAsBoolean(EXTENSIONS, true);
     }

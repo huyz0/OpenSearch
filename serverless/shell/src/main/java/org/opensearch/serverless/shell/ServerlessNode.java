@@ -384,6 +384,9 @@ public final class ServerlessNode implements Closeable {
             () -> metadataPlane,
             startup::projectView
         );
+        // Only with plugins installed: the shell's own code never asks for a cluster manager, so a node without
+        // plugins keeps a view that names none.
+        this.views.namesClusterManager(ServerlessPlugins.clusterView(settings) && this.plugins.plugins().isEmpty() == false);
         // Role is a runtime attribute a node advertises, not a topology decision baked into a
         // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
         // environment variable, and role switching under load stays a policy question.
