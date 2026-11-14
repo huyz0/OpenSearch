@@ -189,7 +189,11 @@ and creates its configuration index. On a node with plugins the view names a clu
 the lowest node id, chosen from the leases every node already reads, no election -- and the plugin client answers cluster
 health (green for every index the metadata plane describes, since a dormant shard opens on demand) and cluster state (the
 node's view plus the metadata of each index the request names) (`serverless.plugin_cluster_view.enabled`, on). The
-security plugin passes its health wait and then needs multi-get from the client.
+security plugin passes its health wait. The plugin client also runs multi-get, bulk and update, item by item through
+the single-document path (`serverless.plugin_client.batches.enabled`, on), and a plugin's first write to a shard
+nobody holds waits for this node to take it, as a REST write does, instead of being refused. With these the released
+3.9 security plugin (with the rule framework and transport-grpc bundles) loads its configuration, authenticates users
+and enforces index permissions on the shell.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,

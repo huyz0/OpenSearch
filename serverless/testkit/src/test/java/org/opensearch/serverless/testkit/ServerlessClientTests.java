@@ -184,10 +184,15 @@ public class ServerlessClientTests extends OpenSearchTestCase {
 
             final var failure = expectThrows(
                 Exception.class,
-                () -> node.services().client().bulk(new org.opensearch.action.bulk.BulkRequest()).actionGet()
+                () -> node.services()
+                    .client()
+                    .admin()
+                    .cluster()
+                    .reroute(new org.opensearch.action.admin.cluster.reroute.ClusterRerouteRequest())
+                    .actionGet()
             );
             final String message = failure.getMessage() == null ? failure.toString() : failure.getMessage();
-            assertTrue("the refusal must name the action it refused: " + message, message.contains("indices:data/write/bulk"));
+            assertTrue("the refusal must name the action it refused: " + message, message.contains("cluster:admin/reroute"));
             assertTrue("and say who refused it: " + message, message.contains("serverless shell"));
         }
     }

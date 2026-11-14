@@ -140,6 +140,17 @@ public final class ServerlessClient extends AbstractClient {
         if (org.opensearch.action.search.SearchAction.INSTANCE.name().equals(action.name())) {
             return search((org.opensearch.action.search.SearchRequest) request, serving, metadata);
         }
+        if (ServerlessPlugins.documentBatches(serving.settings)) {
+            if (org.opensearch.action.get.MultiGetAction.INSTANCE.name().equals(action.name())) {
+                return PluginDocumentActions.multiGet((org.opensearch.action.get.MultiGetRequest) request, operations);
+            }
+            if (org.opensearch.action.bulk.BulkAction.INSTANCE.name().equals(action.name())) {
+                return PluginDocumentActions.bulk((org.opensearch.action.bulk.BulkRequest) request, operations);
+            }
+            if (org.opensearch.action.update.UpdateAction.INSTANCE.name().equals(action.name())) {
+                return PluginDocumentActions.update((org.opensearch.action.update.UpdateRequest) request, operations);
+            }
+        }
         if (ServerlessPlugins.clusterView(serving.settings)) {
             if (org.opensearch.action.admin.cluster.health.ClusterHealthAction.INSTANCE.name().equals(action.name())) {
                 return PluginClusterAnswers.health(
@@ -176,6 +187,9 @@ public final class ServerlessClient extends AbstractClient {
                 + CreateIndexAction.INSTANCE.name()
                 + " and "
                 + org.opensearch.action.search.SearchAction.INSTANCE.name()
+                + (ServerlessPlugins.documentBatches(serving.settings)
+                    ? ", indices:data/read/mget, indices:data/write/bulk, indices:data/write/update"
+                    : "")
                 + (ServerlessPlugins.clusterView(serving.settings) ? ", cluster:monitor/health, cluster:monitor/state" : "")
                 + (serving.pluginActions().isEmpty() ? "" : ", plus what the plugins provide: " + serving.pluginActions().names())
         );
