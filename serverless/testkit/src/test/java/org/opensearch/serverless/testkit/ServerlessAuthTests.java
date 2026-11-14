@@ -973,11 +973,18 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         return sendTo(node.boundHttpAddress().publishAddress(), method, path, authorization, body);
     }
 
-    /** Sends the same request {@code count} times at once, on one client, and waits for every answer. */
+    /**
+     * Sends the same request {@code count} times at once, on one client, and waits for every answer.
+     *
+     * <p>Each on a thread of its own with the blocking {@code send}: the client's {@code sendAsync} completes its
+     * answers through the common pool, whose threads outlive the test and fail it as a leak.
+     */
     private static List<Response> sendConcurrently(ServerlessNode node, int count, String authorization) throws Exception {
         final org.opensearch.core.common.transport.TransportAddress address = node.boundHttpAddress().publishAddress();
         try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
-            final List<java.util.concurrent.CompletableFuture<HttpResponse<String>>> inFlight = new java.util.ArrayList<>();
+            final java.util.concurrent.CountDownLatch go = new java.util.concurrent.CountDownLatch(1);
+            final List<java.util.concurrent.FutureTask<HttpResponse<String>>> inFlight = new java.util.ArrayList<>();
+            final List<Thread> senders = new java.util.ArrayList<>();
             for (int i = 0; i < count; i++) {
                 final HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create("http://" + address.getAddress() + ":" + address.getPort() + "/"))
@@ -985,12 +992,23 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
                     .header("Authorization", authorization)
                     .GET()
                     .build();
-                inFlight.add(client.sendAsync(request, HttpResponse.BodyHandlers.ofString()));
+                final java.util.concurrent.FutureTask<HttpResponse<String>> sent = new java.util.concurrent.FutureTask<>(() -> {
+                    go.await();
+                    return client.send(request, HttpResponse.BodyHandlers.ofString());
+                });
+                final Thread sender = new Thread(sent, "auth-concurrent-" + i);
+                sender.start();
+                inFlight.add(sent);
+                senders.add(sender);
             }
+            go.countDown();
             final List<Response> answers = new java.util.ArrayList<>();
-            for (java.util.concurrent.CompletableFuture<HttpResponse<String>> future : inFlight) {
+            for (java.util.concurrent.FutureTask<HttpResponse<String>> future : inFlight) {
                 final HttpResponse<String> response = future.get();
                 answers.add(new Response(response.statusCode(), response.body(), response.headers()));
+            }
+            for (Thread sender : senders) {
+                sender.join();
             }
             return answers;
         }

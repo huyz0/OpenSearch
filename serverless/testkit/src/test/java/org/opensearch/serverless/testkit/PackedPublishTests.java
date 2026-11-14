@@ -31,7 +31,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
+// The blob store under test sits on a temp directory, and ExtrasFS drops a stray file into new directories: the
+// listings these tests assert on would then name a blob no writer made. An object store never invents a key.
 /** With packing on, a publish writes the files it adds as one blob, and every reader and successor follows it there. */
+@org.apache.lucene.tests.util.LuceneTestCase.SuppressFileSystems("ExtrasFS")
 public class PackedPublishTests extends OpenSearchTestCase {
 
     private static final long TTL = 30_000L;

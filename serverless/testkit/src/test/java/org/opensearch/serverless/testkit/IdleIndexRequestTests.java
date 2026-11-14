@@ -20,6 +20,8 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicLong;
 
+// ExtrasFS may plant a stray directory among the shard containers of one run's store and not the other's: the orphan
+// sweep then visits it in place of an index, and the two hours differ by the descriptor read it did not make.
 /**
  * An index nobody uses costs nothing: once its shards are released, an hour of a node's periodic work makes the same
  * store requests whether the deployment holds a few idle indices or many.
@@ -28,6 +30,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * every periodic pass (renewal, head checks, the janitor, the orphan, reclaim and tombstone sweeps, view reaping) must
  * scale with what is held or what changed, never with how many indices exist.
  */
+@org.apache.lucene.tests.util.LuceneTestCase.SuppressFileSystems("ExtrasFS")
 public class IdleIndexRequestTests extends OpenSearchTestCase {
 
     private static final long TTL = 30_000L;

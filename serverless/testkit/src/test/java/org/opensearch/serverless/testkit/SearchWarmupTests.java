@@ -50,6 +50,26 @@ public class SearchWarmupTests extends OpenSearchTestCase {
             .build();
     }
 
+    /** Runs of consecutive block numbers within each file, among some block cache keys ({@code <file>#<block>}). */
+    private static int consecutiveRuns(List<String> keys) {
+        final java.util.Map<String, java.util.TreeSet<Long>> byFile = new java.util.HashMap<>();
+        for (String key : keys) {
+            final int hash = key.lastIndexOf('#');
+            byFile.computeIfAbsent(key.substring(0, hash), f -> new java.util.TreeSet<>()).add(Long.parseLong(key.substring(hash + 1)));
+        }
+        int runs = 0;
+        for (java.util.TreeSet<Long> blocks : byFile.values()) {
+            long previous = Long.MIN_VALUE;
+            for (long block : blocks) {
+                if (block != previous + 1) {
+                    runs++;
+                }
+                previous = block;
+            }
+        }
+        return runs;
+    }
+
     private MetadataPlane publishedIndex(AtomicLong clock, int shards, int docs) throws Exception {
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("warm", UUID, shards, MAPPING, null));
@@ -136,10 +156,21 @@ public class SearchWarmupTests extends OpenSearchTestCase {
             // As if the peer had gone before handing anything over: the cold node has the names and nothing else.
             final ShardId onCold = cold.readers().serveAsReader(plane, "warm", 0);
             final long opened = cold.blockCache().bytesFetched();
-            final long unheld = hot.stream().filter(k -> cold.blockCache().holds(k) == false).count();
+            final List<String> unheldKeys = hot.stream().filter(k -> cold.blockCache().holds(k) == false).toList();
+            final long unheld = unheldKeys.size();
+            // How many hot blocks are left, and in how many files, follows from the merged segment's layout, which
+            // varies from run to run. What does not vary is the claim: one read for each run of consecutive blocks.
+            final int runs = consecutiveRuns(unheldKeys);
             final int ranged = SearchWarmup.fetchFromStore(cold, onCold, hot);
-            logger.info("WARMUP|ranges|{} hot blocks, {} not held after the open, {} ranged reads", hot.size(), unheld, ranged);
-            assertTrue("coalesced: " + ranged + " reads for " + unheld + " blocks", ranged > 0 && ranged * 4 < unheld);
+            logger.info(
+                "WARMUP|ranges|{} hot blocks, {} not held after the open in {} runs, {} ranged reads",
+                hot.size(),
+                unheld,
+                runs,
+                ranged
+            );
+            assertTrue("the peer's hot set leaves adjacent blocks to coalesce: " + unheldKeys, runs > 0 && runs < unheld);
+            assertEquals("coalesced: one read per run of consecutive blocks, for " + unheld + " blocks", runs, ranged);
 
             final long fetched = cold.blockCache().bytesFetched();
             assertTrue(fetched > opened);

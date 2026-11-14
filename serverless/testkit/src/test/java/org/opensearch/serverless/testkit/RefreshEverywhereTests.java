@@ -30,7 +30,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.FutureTask;
 
 /**
  * In {@code everywhere} mode, a search that starts after a write answered with {@code forced_refresh:true} finds the
@@ -159,16 +159,17 @@ public class RefreshEverywhereTests extends OpenSearchTestCase {
             writer.router().injectSendFault((action, target) -> TailPushRequest.ACTION.equals(action) ? 300L : 0L);
             for (String refresh : REFRESHES) {
                 final String id = "midwait-" + refresh;
-                final CompletableFuture<Response> put = CompletableFuture.supplyAsync(() -> {
-                    try {
-                        return send(writer, "PUT", "/" + INDEX + "/_doc/" + id + "?refresh=" + refresh, doc(id));
-                    } catch (Exception e) {
-                        throw new AssertionError(e);
-                    }
-                });
+                // On a thread of its own that the test joins, not the common pool: a pool thread outlives the test and
+                // fails it as a leak.
+                final FutureTask<Response> put = new FutureTask<>(
+                    () -> send(writer, "PUT", "/" + INDEX + "/_doc/" + id + "?refresh=" + refresh, doc(id))
+                );
+                final Thread putting = new Thread(put, "everywhere-midwait-put");
+                putting.start();
                 final ServerlessNode mid = join.join("everywhere-mid-" + refresh.replace('_', '-'));
                 hits(mid, "seed");
                 final Response answered = put.get();
+                putting.join();
                 assertEquals(answered.body(), 201, answered.status());
                 if (answered.body().contains("\"forced_refresh\":true")) {
                     assertEquals("joined while it waited", 1L, hits(mid, id));
