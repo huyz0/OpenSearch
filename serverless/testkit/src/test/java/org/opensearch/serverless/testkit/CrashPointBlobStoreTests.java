@@ -27,7 +27,10 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
+// The blob store under test sits on a temp directory, and ExtrasFS drops a stray file into new directories: the
+// listings these tests assert on would then name a blob no writer made. An object store never invents a key.
 /** The crash-point store does what each fault says, and the explorer catches a writer that is not crash-safe. */
+@org.apache.lucene.tests.util.LuceneTestCase.SuppressFileSystems("ExtrasFS")
 public class CrashPointBlobStoreTests extends OpenSearchTestCase {
 
     private FsBlobStore store() throws IOException {

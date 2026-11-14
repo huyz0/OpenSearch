@@ -49,10 +49,13 @@ import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+// The blob store under test sits on a temp directory, and ExtrasFS drops a stray file into new directories: the
+// listings these tests assert on would then name a blob no writer made. An object store never invents a key.
 /**
  * A commit whose files are ranges of one pack reads as one whose files are blobs of their own, and a pack a commit
  * names is kept by the sweep.
  */
+@org.apache.lucene.tests.util.LuceneTestCase.SuppressFileSystems("ExtrasFS")
 public class PackedFileLocationTests extends OpenSearchTestCase {
 
     private static final String TERM_DIR = "t=2";
