@@ -40,10 +40,10 @@ public class NodeLogRecordsSinceTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            // A publish lets go of its records at once only when its manifest is written each time, not staged.
-            .put("serverless.wal.node_log.commits", false)
-            .put("serverless.wal.node_log.enabled", true)
             .put("serverless.wal.node_log.window_millis", 20)
+            // Published records are let go of once their commit is checkpointed, so checkpoints come soon here.
+            .put("serverless.wal.node_log.commits.checkpoint_millis", 2_000L)
+            .put("serverless.publish.min_interval_millis", 0L)
             .build();
     }
 
@@ -138,20 +138,26 @@ public class NodeLogRecordsSinceTests extends OpenSearchTestCase {
                 assertEquals("published, and still readable while pinned", written, idsSince(log, shardId, term, checkpoint));
             }
             pin.close();
-            assertEquals("closed: the published records are let go of", List.of(), idsSince(log, shardId, term, checkpoint));
-            log.renew();
+            assertBusy(() -> {
+                loop.checkpointDue();
+                log.renew();
+                assertEquals("closed: the checkpointed records are let go of", List.of(), idsSince(log, shardId, term, checkpoint));
+            });
 
             final var short_ = log.retain(shardId, 1L);
             node.writes().index(shardId, "late", "{\"msg\":\"m\",\"n\":9}");
             loop.publishAll();
-            final long until = System.nanoTime() + 50_000_000L;
-            while (System.nanoTime() < until) {
-                Thread.onSpinWait();
-            }
-            log.renew();
-            expectThrows(java.io.IOException.class, () -> idsSince(log, shardId, term, checkpoint));
+            assertBusy(() -> {
+                loop.checkpointDue();
+                log.renew();
+                expectThrows(java.io.IOException.class, () -> idsSince(log, shardId, term, checkpoint));
+            });
             short_.close();
-            assertEquals("closed after a lapse, it reads again", List.of(), idsSince(log, shardId, term, checkpoint));
+            assertBusy(() -> {
+                loop.checkpointDue();
+                log.renew();
+                assertEquals("closed after a lapse, it reads again", List.of(), idsSince(log, shardId, term, checkpoint));
+            });
         }
     }
 }

@@ -55,7 +55,6 @@ public class NodePackPublishTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put("serverless.segments.pack.enabled", true)
             // Off unless a test turns them on, so each compares with segment blobs.
             .put("serverless.segments.node_pack.enabled", false)
             .put("serverless.wal.node_log.window_millis", 20)

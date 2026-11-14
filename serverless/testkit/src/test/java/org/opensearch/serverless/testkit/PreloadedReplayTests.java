@@ -43,7 +43,6 @@ public class PreloadedReplayTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put("serverless.wal.node_log.enabled", true)
             .build();
     }
 

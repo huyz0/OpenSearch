@@ -64,7 +64,7 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
     private static final int COLD_SHARDS = 20;
     private static final int VERIFIED = 2_000;
 
-    private Settings nodeSettings(String name, String roles, boolean packs, boolean logCommits) {
+    private Settings nodeSettings(String name, String roles, boolean packs) {
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-soak")
@@ -73,9 +73,7 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put("serverless.wal.node_log.enabled", true)
             .put("serverless.wal.node_log.window_millis", 250)
-            .put("serverless.wal.node_log.commits", logCommits)
             .put("serverless.segments.node_pack.enabled", packs)
             .put("serverless.segments.node_pack.linger_millis", 250)
             .build();
@@ -218,8 +216,8 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
         }
     }
 
-    private void soak(boolean packs, boolean logCommits, int shards, long seconds) throws Exception {
-        final String mode = (packs ? "node_pack" : "segment_blob") + (logCommits ? " + log commits" : "");
+    private void soak(boolean packs, int shards, long seconds) throws Exception {
+        final String mode = packs ? "node_pack" : "segment_blob";
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         final org.opensearch.common.blobstore.BlobStore inner = MeterStores.create(createTempDir(), createTempDir());
         final LatencyInjectingBlobStore slow = new LatencyInjectingBlobStore(inner, 0);
@@ -229,10 +227,10 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
             for (int i = 0; i < shards; i++) {
                 plane.createIndex(new IndexDescriptor(name(i), "uuid-" + name(i), 1, MAPPING, null));
             }
-            final ServerlessNode first = new ServerlessNode(nodeSettings("soak-first", "ingest", packs, logCommits));
+            final ServerlessNode first = new ServerlessNode(nodeSettings("soak-first", "ingest", packs));
             try (
-                ServerlessNode second = new ServerlessNode(nodeSettings("soak-second", "ingest", packs, logCommits));
-                ServerlessNode reader = new ServerlessNode(nodeSettings("soak-reader", "search", packs, logCommits))
+                ServerlessNode second = new ServerlessNode(nodeSettings("soak-second", "ingest", packs));
+                ServerlessNode reader = new ServerlessNode(nodeSettings("soak-reader", "search", packs))
             ) {
                 first.startup().start();
                 first.setMetadataPlane(plane);
@@ -424,15 +422,15 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
         }
     }
 
-    public void testSoakEachPlacementWithAndWithoutLogCommits() throws Exception {
+    public void testSoakEachPlacement() throws Exception {
         final String secondsProperty = System.getProperty("tests.soak.seconds", "");
         assumeTrue("a soak runs only when -Dtests.soak.seconds is set", secondsProperty.isEmpty() == false);
         final long seconds = Long.parseLong(secondsProperty);
         final int shards = Integer.parseInt(System.getProperty("tests.soak.shards", "1000"));
-        final Set<String> modes = Set.of(System.getProperty("tests.soak.modes", "blob,blob+log,pack,pack+log").split(","));
-        for (String each : List.of("blob", "blob+log", "pack", "pack+log")) {
+        final Set<String> modes = Set.of(System.getProperty("tests.soak.modes", "blob,pack").split(","));
+        for (String each : List.of("blob", "pack")) {
             if (modes.contains(each)) {
-                soak(each.startsWith("pack"), each.endsWith("+log"), shards, seconds);
+                soak(each.equals("pack"), shards, seconds);
             }
         }
     }

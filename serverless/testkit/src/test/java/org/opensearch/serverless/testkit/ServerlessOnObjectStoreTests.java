@@ -81,11 +81,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
      * this suite holds open is a segment upload under {@code t=<term>}, which node packs and log commits do not make.
      */
     private static Settings perTermLayout(Settings settings) {
-        return Settings.builder()
-            .put(settings)
-            .put("serverless.segments.node_pack.enabled", false)
-            .put("serverless.wal.node_log.commits", false)
-            .build();
+        return Settings.builder().put(settings).put("serverless.segments.node_pack.enabled", false).build();
     }
 
     private String freshBucket() throws Exception {

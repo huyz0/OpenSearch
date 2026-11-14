@@ -47,9 +47,7 @@ public class LogCommitCheckpointTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put("serverless.wal.node_log.enabled", true)
             .put("serverless.wal.node_log.window_millis", 20)
-            .put("serverless.wal.node_log.commits", true)
             .put(SETTING, checkpointMillis)
             .put("serverless.publish.min_interval_millis", 0L)
             .build();

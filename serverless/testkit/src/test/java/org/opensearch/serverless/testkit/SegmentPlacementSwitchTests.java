@@ -54,7 +54,7 @@ public class SegmentPlacementSwitchTests extends OpenSearchTestCase {
     private static final int SHARDS = 2;
     private static final int ROUNDS = 8;
 
-    private Settings nodeSettings(String name, boolean logCommits) {
+    private Settings nodeSettings(String name) {
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-placement-switch")
@@ -63,9 +63,7 @@ public class SegmentPlacementSwitchTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put("serverless.wal.node_log.enabled", true)
             .put("serverless.wal.node_log.window_millis", 100)
-            .put("serverless.wal.node_log.commits", logCommits)
             .put("serverless.segments.node_pack.linger_millis", 50)
             .build();
     }
@@ -104,11 +102,11 @@ public class SegmentPlacementSwitchTests extends OpenSearchTestCase {
         return plane.segmentPublisher(shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id()).readManifest().orElseThrow();
     }
 
-    private void switchUnderWrites(boolean logCommits) throws Exception {
+    private void switchUnderWrites() throws Exception {
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         final LatencyInjectingBlobStore slow = new LatencyInjectingBlobStore(new FsBlobStore(8192, createTempDir(), false), 0);
         final MetadataPlane plane = new MetadataPlane(slow, BlobPath.cleanPath(), clock::get, TTL);
-        final ServerlessNode first = new ServerlessNode(nodeSettings("placement-first", logCommits));
+        final ServerlessNode first = new ServerlessNode(nodeSettings("placement-first"));
         final ExecutorService pool = Executors.newFixedThreadPool(3);
         final Map<String, ShardId> acked = new ConcurrentHashMap<>();
         final Set<String> placementsSeen = new HashSet<>();
@@ -170,7 +168,7 @@ public class SegmentPlacementSwitchTests extends OpenSearchTestCase {
 
             // The writer crashes with whatever it had staged; a successor restores the manifests and replays its log.
             clock.addAndGet(2 * TTL);
-            try (ServerlessNode second = new ServerlessNode(nodeSettings("placement-second", logCommits))) {
+            try (ServerlessNode second = new ServerlessNode(nodeSettings("placement-second"))) {
                 second.startup().start();
                 second.setMetadataPlane(plane);
                 final BackgroundReconciler successor = takeAll(second, plane, clock);
@@ -244,11 +242,7 @@ public class SegmentPlacementSwitchTests extends OpenSearchTestCase {
         }
     }
 
-    public void testSwitchingPlacementUnderWritesWithAManifestPerPublish() throws Exception {
-        switchUnderWrites(false);
-    }
-
-    public void testSwitchingPlacementUnderWritesWithLogCommits() throws Exception {
-        switchUnderWrites(true);
+    public void testSwitchingPlacementUnderWrites() throws Exception {
+        switchUnderWrites();
     }
 }

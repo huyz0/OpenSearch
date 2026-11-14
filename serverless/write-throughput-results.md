@@ -88,7 +88,7 @@ At 3,000 the box is CPU-bound and the oldest write passes the limiter's 1 s targ
    before the PUT. At 20,000 docs/s offered a blob held ~6,000 docs and took 263 ms against a 31 ms PUT, so log PUTs
    fell to 2.4/s and writes queued behind it. On 4 cores CPU binds first; on a bigger node this is the next ceiling
    (roughly 20-25K docs/s), and encoding the next blob while the previous PUT is in flight would lift it.
-4. **File descriptors.** 1 per open writer (Lucene's `write.lock`; 3 with `serverless.translog.local`) plus ~3.7 per
+4. **File descriptors.** 1 per open writer (Lucene's `write.lock`) plus ~3.7 per
    writer being written: 3,000 shards all taking writes need ~14,000. Set `nofile` to 65,536 or more on a node meant to hold thousands of shards. Heap is not the limit: ~400 MB
    for 3,000 idle writers.
 5. **Open time.** 30 ms a shard at 20 ms a request: a node taking 3,000 shards takes 1.5 min, and one pass of that
@@ -98,8 +98,8 @@ At 3,000 the box is CPU-bound and the oldest write passes the limiter's 1 s targ
 
 A writer's disk translog was never replayed: an acknowledged write is durable in the node log, and a shard opens from
 its published commit plus that log. It cost every open writer two descriptors (`.tlog`, `.ckp`), a 16 KB write buffer,
-and every acknowledged write a local fsync. `serverless.translog.local` (node setting, default `false`) now swaps it for
-`DiscardingTranslogManager`, which keeps nothing: locations still grow for `wait_for` refresh listeners, and a sync marks
+and every acknowledged write a local fsync. Every writer now uses
+`DiscardingTranslogManager` (the `serverless.translog.local` switch that brought the disk translog back is retired), which keeps nothing: locations still grow for `wait_for` refresh listeners, and a sync marks
 the operations added since the last one persisted, as the fsync did. A realtime get of a document not yet refreshed
 refreshes the shard instead of reading the translog (core's own fallback); a local refresh, not a publish.
 

@@ -38,12 +38,17 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
     private static final String TTL = "8000";
 
     /**
-     * The register's commit is what {@code docsInPublishedCommit} restores. With node packs and log commits, a publish is
-     * staged in the node log and reaches the register only at a checkpoint, so the zombie test pins both off to read the
-     * successor's publishes there, as it was written to.
+     * The register's commit is what {@code docsInPublishedCommit} restores. The zombie test pins node packs off, so the
+     * successor's publishes are the segment-blob commits that restore reads, as it was written to.
      */
     private static final String PACKS = "serverless.segments.node_pack.enabled";
-    private static final String LOG_COMMITS = "serverless.wal.node_log.commits";
+
+    /**
+     * A publish is staged in the node log and reaches the register only at a checkpoint, a minute by default. The zombie
+     * test checkpoints every two seconds, so both the successor's publishes and the zombie's stale one reach it in time.
+     */
+    private static final String CHECKPOINT = org.opensearch.serverless.shell.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey();
+    private static final String MIN_INTERVAL = org.opensearch.serverless.shell.WriteSettings.PUBLISH_MIN_INTERVAL_MILLIS.getKey();
 
     private Map<String, String> settings() {
         return Map.of(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), TTL);
@@ -323,15 +328,26 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
                     "10000",
                     PACKS,
                     "false",
-                    LOG_COMMITS,
-                    "false"
+                    CHECKPOINT,
+                    "2000",
+                    MIN_INTERVAL,
+                    "0"
                 )
             );
             NodeProcess b = NodeProcess.start(
                 "zombie-b",
                 store,
                 createTempDir(),
-                Map.of(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), TTL, PACKS, "false", LOG_COMMITS, "false")
+                Map.of(
+                    org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(),
+                    TTL,
+                    PACKS,
+                    "false",
+                    CHECKPOINT,
+                    "2000",
+                    MIN_INTERVAL,
+                    "0"
+                )
             )
         ) {
             assertEquals(200, send(a, "PUT", "/alpha?shards=1", MAPPING).status());

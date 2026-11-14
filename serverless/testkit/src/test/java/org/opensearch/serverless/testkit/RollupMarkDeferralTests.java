@@ -26,6 +26,7 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -52,8 +53,9 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            // Each publish writes the manifest, which is what a survivor judges a dead writer's shards by here.
-            .put("serverless.wal.node_log.commits", false)
+            // A dead writer's commits settle clean only once checkpointed; checkpoints come soon here.
+            .put("serverless.wal.node_log.commits.checkpoint_millis", 2_000L)
+            .put("serverless.publish.min_interval_millis", 0L)
             .build();
     }
 
@@ -205,6 +207,8 @@ public class RollupMarkDeferralTests extends OpenSearchTestCase {
             final RollupEntry marked = entryOf(setup, "orphaned");
             assertTrue("still marked by the writer that died", marked.states().get(0).ownerTerm() > 0L);
             assertNull("and its publishes never widened the entry", marked.states().get(0).digest());
+            // Its last commit reaches the register at a checkpoint, so a survivor finds nothing to replay.
+            assertBusy(() -> assertEquals(Set.of(shardId), dyingLoop.checkpointDue()));
 
             // The writer never lets go; its lease runs out on the shared clock.
             clock.addAndGet(2 * TTL);

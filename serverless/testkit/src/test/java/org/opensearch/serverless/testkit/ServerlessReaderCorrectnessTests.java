@@ -60,9 +60,8 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
             .put("transport.port", "0");
         if (roles != null) {
             b.put("serverless.roles", roles);
-            // Segment blobs under the shard and a manifest per publish: the per-term layout these check.
+            // Segment blobs under the shard: the per-term layout these check.
             b.put("serverless.segments.node_pack.enabled", false);
-            b.put("serverless.wal.node_log.commits", false);
         }
         return b.build();
     }
@@ -260,12 +259,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
         final MetadataPlane plane = planeOver(store, clock);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
 
-        // Each file in a blob of its own, so the fixture can fail the commit point's reads and nothing else.
-        final Settings unpacked = Settings.builder()
-            .put(nodeSettings("rc-first", "ingest"))
-            .put("serverless.segments.pack.enabled", false)
-            .build();
-        try (ServerlessNode a = new ServerlessNode(unpacked)) {
+        try (ServerlessNode a = new ServerlessNode(nodeSettings("rc-first", "ingest"))) {
             a.startup().start();
             final ShardId onA = a.activation().activateWriter(plane, "alpha", 0).orElseThrow();
             for (int i = 1; i <= 3; i++) {
@@ -439,7 +433,8 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
 
             @Override
             public InputStream readBlob(String blobName, long position, long length) throws IOException {
-                if (blobName.startsWith("segments_") && armed.get()) {
+                // The commit point, or a segment's blob, which holds the segment infos an open reads.
+                if ((blobName.startsWith("segments_") || blobName.endsWith(".seg")) && armed.get()) {
                     tripped.set(true);
                     throw new IOException("the object store answered 503 for " + blobName);
                 }

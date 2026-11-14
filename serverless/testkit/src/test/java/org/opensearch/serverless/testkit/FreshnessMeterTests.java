@@ -66,7 +66,6 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put("serverless.wal.node_log.enabled", true)
             .put("serverless.wal.node_log.window_millis", WINDOW)
             .put(extra)
             .build();
@@ -358,7 +357,6 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
             Settings.builder()
                 .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_ENABLED.getKey(), true)
                 .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
-                .put("serverless.wal.node_log.commits", true)
                 .build()
         );
     }
