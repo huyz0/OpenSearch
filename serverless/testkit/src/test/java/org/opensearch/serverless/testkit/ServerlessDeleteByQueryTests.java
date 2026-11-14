@@ -47,7 +47,7 @@ public class ServerlessDeleteByQueryTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
             // Each write here waits for the one before it, and the node log's window would add its wait to every one.
-            .put("serverless.wal.node_log.enabled", false)
+            .put("serverless.wal.node_log.window_millis", 0)
             .build();
     }
 

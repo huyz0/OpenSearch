@@ -505,10 +505,9 @@ public final class WriteFences {
                 // shard it ever held. A writer that fetched this fence and locks it after this point
                 // notices the swap in enterWritePath and starts over on the current one.
                 node.shardFences.remove(shardId, fence);
-                // And the group committer's queue for it, for the same reason and with the same safety: a
-                // flush already in flight holds its own reference and finishes, and its members are judged
-                // by the shard-identity check every caller makes after the append.
-                node.walCommitter.forget(shardId);
+                // And the node log's queue for it, for the same reason and with the same safety: a flush already
+                // in flight holds its own reference and finishes, and its members are judged by the
+                // shard-identity check every caller makes after the append.
                 final NodeLogWriter log = node.nodeLogWriter;
                 if (log != null) {
                     log.forget(shardId);

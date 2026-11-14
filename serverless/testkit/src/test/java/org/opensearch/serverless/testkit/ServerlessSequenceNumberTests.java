@@ -379,6 +379,13 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         final MetadataPlane plane = freshIndex(clock, objectStore);
         final String uuid = plane.describe("alpha").orElseThrow().uuid();
 
+        // Held first by a writer of the shard's own log, so the head does not say that log is quiet and the next open
+        // reads it.
+        final var earlier = plane.activate("alpha", 0, "shard-log-writer", "shard-log-writer-eph", uuid, false);
+        assertTrue(earlier.acquired());
+        assertEquals(1L, earlier.head().term());
+        clock.addAndGet(2 * TTL);
+
         // Sequence numbers 0 and 2, with nothing at 1: the shape a burned-but-unlogged number leaves.
         final var wal = plane.walStore("alpha", uuid, 0);
         wal.append(
@@ -389,13 +396,7 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
             )
         );
 
-        // Planted in the shard's own log before any head exists, which no writer does: a node writing its node's log
-        // would take the shard's first head as saying that log is quiet. One writing the shard's own log reads it.
-        final Settings perShardLog = Settings.builder()
-            .put(nodeSettings("gap-writer"))
-            .put("serverless.wal.node_log.enabled", false)
-            .build();
-        try (ServerlessNode writer = new ServerlessNode(perShardLog)) {
+        try (ServerlessNode writer = new ServerlessNode(nodeSettings("gap-writer"))) {
             writer.startup().start();
             final ShardId shardId = writer.activation().activateWriter(plane, "alpha", 0).orElseThrow();
 

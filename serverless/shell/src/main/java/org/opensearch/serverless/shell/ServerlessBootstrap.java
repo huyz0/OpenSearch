@@ -239,26 +239,23 @@ public final class ServerlessBootstrap implements Closeable {
 
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             openedLoop = loop;
-            final boolean nodeLog = org.opensearch.serverless.store.NodeLogSettings.ENABLED.get(complete);
             final long window = org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.get(complete);
-            if (nodeLog) {
-                if (NodeLogCommitter.ALLOWED_WINDOW_MILLIS.contains(window) == false) {
-                    throw new IllegalArgumentException(
-                        "["
-                            + org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.getKey()
-                            + "] must be one of "
-                            + new java.util.TreeSet<>(NodeLogCommitter.ALLOWED_WINDOW_MILLIS)
-                            + ", got "
-                            + window
-                    );
-                }
-                // Due times line up with the window the log ships on, so shards that come due together go out together.
-                loop.setLazyPublish(
-                    WriteSettings.NODE_LOG_PUBLISH_MAX_AGE_MILLIS.get(complete),
-                    WriteSettings.PUBLISH_MAX_UNPUBLISHED_OPERATIONS.get(complete),
-                    window
+            if (NodeLogCommitter.ALLOWED_WINDOW_MILLIS.contains(window) == false) {
+                throw new IllegalArgumentException(
+                    "["
+                        + org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.getKey()
+                        + "] must be one of "
+                        + new java.util.TreeSet<>(NodeLogCommitter.ALLOWED_WINDOW_MILLIS)
+                        + ", got "
+                        + window
                 );
             }
+            // Due times line up with the window the log ships on, so shards that come due together go out together.
+            loop.setLazyPublish(
+                WriteSettings.NODE_LOG_PUBLISH_MAX_AGE_MILLIS.get(complete),
+                WriteSettings.PUBLISH_MAX_UNPUBLISHED_OPERATIONS.get(complete),
+                window
+            );
             warnIfTooFewOpenFiles(ActivationSettings.MAX_SHARDS.get(complete), complete);
             loop.setDemandDrivenActivation(ActivationSettings.ON_DEMAND.get(complete))
                 .setMaxShardsHeld(ActivationSettings.MAX_SHARDS.get(complete))
@@ -276,12 +273,9 @@ public final class ServerlessBootstrap implements Closeable {
                 node.threadPool(),
                 plane.clock(),
                 org.opensearch.common.unit.TimeValue.timeValueMillis(Math.max(1L, ttl / ReconcileScheduler.RENEWALS_PER_TTL)),
-                // With the node log, a pass looks again every window, so a shard due at a tick is published at it.
+                // A pass looks again every node-log window, so a shard due at a tick is published at it.
                 org.opensearch.common.unit.TimeValue.timeValueMillis(
-                    complete.getAsLong(
-                        WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(),
-                        nodeLog ? window : ReconcileScheduler.DEFAULT_PUBLISH_DEBOUNCE.millis()
-                    )
+                    complete.getAsLong(WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(), window)
                 ),
                 ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
             );
