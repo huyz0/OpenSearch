@@ -137,6 +137,42 @@ public class ServerlessPluginInjectorTests extends OpenSearchTestCase {
         }
     }
 
+    public static final class StreamAction extends ActionType<EchoResponse> {
+        static final StreamAction INSTANCE = new StreamAction();
+        static final String NAME = "cluster:admin/serverless_testkit/stream";
+
+        private StreamAction() {
+            super(NAME, EchoResponse::new);
+        }
+    }
+
+    /** Takes the stream transport, as ML Commons' streamed predict does; there is none here, as on a node with streaming off. */
+    public static final class TransportStreamAction extends HandledTransportAction<EchoRequest, EchoResponse> {
+        private final org.opensearch.transport.StreamTransportService streams;
+
+        @Inject
+        public TransportStreamAction(
+            TransportService transportService,
+            ActionFilters actionFilters,
+            @org.opensearch.common.Nullable org.opensearch.transport.StreamTransportService streams
+        ) {
+            super(StreamAction.NAME, transportService, actionFilters, EchoRequest::new);
+            this.streams = streams;
+        }
+
+        @Override
+        protected void doExecute(Task task, EchoRequest request, ActionListener<EchoResponse> listener) {
+            listener.onResponse(new EchoResponse(streams == null ? "no-streams" : "streams"));
+        }
+    }
+
+    public static final class StreamPlugin extends Plugin implements ActionPlugin {
+        @Override
+        public List<ActionHandler<? extends ActionRequest, ? extends ActionResponse>> getActions() {
+            return List.of(new ActionHandler<>(StreamAction.INSTANCE, TransportStreamAction.class));
+        }
+    }
+
     private Settings nodeSettings(String name, Settings extra) {
         return Settings.builder()
             .put("node.name", name)
@@ -180,6 +216,16 @@ public class ServerlessPluginInjectorTests extends OpenSearchTestCase {
             final IllegalStateException failure = expectThrows(IllegalStateException.class, () -> node.startup().start());
             assertTrue("the missing type must be named: " + failure.getMessage(), failure.getMessage().contains("Registry"));
             assertEquals("no lifecycle service is started without the injector", "none", SERVICE_STATE.get());
+        }
+    }
+
+    /** An action asking for the stream transport is built, and gets none. */
+    public void testStreamTransportIsBoundAsAbsent() throws Exception {
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("injector-stream", Settings.EMPTY), List.of(new StreamPlugin()))) {
+            node.startup().start();
+            node.setMetadataPlane(plane());
+            final EchoResponse response = node.services().client().execute(StreamAction.INSTANCE, new EchoRequest()).actionGet();
+            assertEquals("no-streams", response.clusterName);
         }
     }
 }

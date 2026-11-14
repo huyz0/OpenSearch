@@ -502,6 +502,28 @@ public final class SearchHandler extends BaseRestHandler {
         return SearchGate.gated(serving, indices, source, partialResults, work);
     }
 
+    /**
+     * Runs filters over a native request, handing the search the request as the filters admitted it.
+     *
+     * @param serving the serving node
+     * @param nativeRequest the original native request
+     * @param indices every resolved index the search covers
+     * @param source the planned source
+     * @param work the search receiving the admitted source and request
+     * @param <T> the result type
+     * @return the filtered search result
+     * @throws IOException if the search fails
+     */
+    public static <T> T gatedRequest(
+        ServerlessNode serving,
+        org.opensearch.action.search.SearchRequest nativeRequest,
+        java.util.Collection<String> indices,
+        SearchSourceBuilder source,
+        org.opensearch.common.CheckedBiFunction<SearchSourceBuilder, org.opensearch.action.search.SearchRequest, T, Exception> work
+    ) throws IOException {
+        return SearchGate.gatedRequest(serving, nativeRequest, indices, source, null, work);
+    }
+
     static <T> T gated(
         ServerlessNode serving,
         org.opensearch.action.search.SearchRequest nativeRequest,

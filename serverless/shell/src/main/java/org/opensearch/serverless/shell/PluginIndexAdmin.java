@@ -121,6 +121,70 @@ final class PluginIndexAdmin {
         return new GetMappingsResponse(mappings);
     }
 
+    /**
+     * Field mappings, as core's field-mappings action answers them: for each index, every mapped field whose full name a requested
+     * pattern matches, with the field's own mapping under its leaf name. The anomaly-detection plugin checks a detector's time
+     * field this way. Multi-fields are named {@code parent.sub}, as in core; defaults are not filled in.
+     */
+    org.opensearch.action.admin.indices.mapping.get.GetFieldMappingsResponse getFieldMappings(
+        MetadataPlane plane,
+        org.opensearch.action.admin.indices.mapping.get.GetFieldMappingsRequest request
+    ) throws IOException {
+        final Map<String, Map<String, Object[]>> found = new LinkedHashMap<>();
+        for (Map.Entry<String, IndexMetadata> entry : collect(plane, request.indices(), request.indicesOptions()).entrySet()) {
+            final Map<String, Object[]> fields = new LinkedHashMap<>();
+            final MappingMetadata mapping = entry.getValue().mapping();
+            if (mapping != null) {
+                collectFields(mapping.sourceAsMap(), "", request.fields(), fields);
+            }
+            found.put(entry.getKey(), fields);
+        }
+        try (org.opensearch.common.io.stream.BytesStreamOutput out = new org.opensearch.common.io.stream.BytesStreamOutput()) {
+            out.writeVInt(found.size());
+            for (Map.Entry<String, Map<String, Object[]>> index : found.entrySet()) {
+                out.writeString(index.getKey());
+                out.writeVInt(index.getValue().size());
+                for (Map.Entry<String, Object[]> field : index.getValue().entrySet()) {
+                    out.writeString(field.getKey());
+                    out.writeString((String) field.getValue()[0]);
+                    out.writeBytesReference((org.opensearch.core.common.bytes.BytesReference) field.getValue()[1]);
+                }
+            }
+            // The response's map constructor is not public; its stream form is the one way in.
+            return org.opensearch.action.admin.indices.mapping.get.GetFieldMappingsAction.INSTANCE.getResponseReader()
+                .read(out.bytes().streamInput());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void collectFields(Map<String, Object> mapping, String prefix, String[] patterns, Map<String, Object[]> into)
+        throws IOException {
+        final Object properties = mapping.get("properties");
+        if (properties instanceof Map<?, ?> props) {
+            for (Map.Entry<?, ?> property : props.entrySet()) {
+                final String leaf = String.valueOf(property.getKey());
+                final Map<String, Object> config = (Map<String, Object>) property.getValue();
+                addField(prefix + leaf, leaf, config, patterns, into);
+                collectFields(config, prefix + leaf + ".", patterns, into);
+                if (config.get("fields") instanceof Map<?, ?> multi) {
+                    for (Map.Entry<?, ?> sub : multi.entrySet()) {
+                        final String subLeaf = String.valueOf(sub.getKey());
+                        addField(prefix + leaf + "." + subLeaf, subLeaf, (Map<String, Object>) sub.getValue(), patterns, into);
+                    }
+                }
+            }
+        }
+    }
+
+    private static void addField(String fullName, String leaf, Map<String, Object> config, String[] patterns, Map<String, Object[]> into)
+        throws IOException {
+        if (patterns != null && patterns.length > 0 && org.opensearch.common.regex.Regex.simpleMatch(patterns, fullName) == false) {
+            return;
+        }
+        final XContentBuilder source = JsonXContent.contentBuilder().startObject().field(leaf, config).endObject();
+        into.put(fullName, new Object[] { fullName, org.opensearch.core.common.bytes.BytesReference.bytes(source) });
+    }
+
     GetSettingsResponse getSettings(MetadataPlane plane, GetSettingsRequest request) throws IOException {
         final Map<String, Settings> settings = new LinkedHashMap<>();
         for (Map.Entry<String, IndexMetadata> entry : collect(plane, request.indices(), request.indicesOptions()).entrySet()) {

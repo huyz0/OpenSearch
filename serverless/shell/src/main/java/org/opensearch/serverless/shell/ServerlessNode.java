@@ -473,6 +473,17 @@ public final class ServerlessNode implements Closeable {
             } catch (Exception e) {
                 throw new IllegalStateException("a plugin failed to start; the node will not serve", e);
             }
+            // Each identity-aware plugin gets the subject it runs its own work as, after its components, as core does: Job
+            // Scheduler's client refuses every call without one, so a scheduled job could never read its own configuration.
+            if (ServerlessPlugins.extensions(settings)) {
+                final java.util.List<org.opensearch.plugins.IdentityAwarePlugin> identityAware = new java.util.ArrayList<>();
+                for (org.opensearch.plugins.Plugin plugin : this.plugins.plugins()) {
+                    if (plugin instanceof org.opensearch.plugins.IdentityAwarePlugin aware) {
+                        identityAware.add(aware);
+                    }
+                }
+                services.identityService().initializeIdentityAwarePlugins(identityAware);
+            }
             // Before the controller, because every handler it registers is wrapped in this.
             this.systemIndices = new org.opensearch.serverless.rest.SystemIndices(this.plugins.systemIndexPatterns(settings));
             this.restController = wiring.buildRestController(clusterSettings);
