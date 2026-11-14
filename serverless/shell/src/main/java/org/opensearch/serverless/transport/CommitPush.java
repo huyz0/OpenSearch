@@ -97,7 +97,6 @@ public final class CommitPush {
     private final AtomicLong blocksSent = new AtomicLong();
     private final AtomicLong blocksTaken = new AtomicLong();
     private final long inlineBytes;
-    private final boolean reuseDescriptor;
     /** Per shard this node writes, the files of the commit it last pushed, so the next push knows which are new. */
     private final Map<String, Set<String>> lastPushedFiles = new ConcurrentHashMap<>();
     /** Per shard this node writes, the search nodes that said at the last push that they have it open. */
@@ -108,7 +107,6 @@ public final class CommitPush {
     CommitPush(ShardRouter router) {
         this.router = router;
         this.enabled = ReaderPushSettings.COMMIT_PUSH_ENABLED.get(router.node.settings());
-        this.reuseDescriptor = ReaderPushSettings.COMMIT_PUSH_REUSE_DESCRIPTOR.get(router.node.settings());
         this.inlineBytes = Math.max(0L, ReaderPushSettings.COMMIT_PUSH_INLINE_BYTES.get(router.node.settings()).getBytes());
         this.registerLooks = new ReaderRegisterLooks(router.node, router.plane, router.node.settings());
     }
@@ -371,8 +369,8 @@ public final class CommitPush {
                         shardId.id(),
                         shardId.getIndex().getUUID(),
                         had,
-                        reuseDescriptor ? latest.mappingVersion() : -1L,
-                        reuseDescriptor ? latest.settingsVersion() : -1L
+                        latest.mappingVersion(),
+                        latest.settingsVersion()
                     );
                 reopened.incrementAndGet();
             }

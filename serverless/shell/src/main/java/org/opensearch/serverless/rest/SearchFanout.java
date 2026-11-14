@@ -514,8 +514,7 @@ public final class SearchFanout {
         java.util.Set<String> judged
     ) throws IOException {
         final java.util.Set<Target> pruned = java.util.concurrent.ConcurrentHashMap.newKeySet();
-        if (serving.searchSettings().searchPruning() == false
-            || candidates.size() < 2
+        if (candidates.size() < 2
             || org.opensearch.serverless.store.PruningDigest.mayPrune(source.query()) == false
             || source.suggest() != null
             || hasGlobalAggregation(source)) {

@@ -239,7 +239,7 @@ final class NodeWiring {
         final java.util.List<org.opensearch.plugins.ActionPlugin> actionPlugins = node.plugins.filter(
             org.opensearch.plugins.ActionPlugin.class
         );
-        final boolean inject = PluginInjector.enabled(node.settings) && node.plugins.plugins().isEmpty() == false;
+        final boolean inject = node.plugins.plugins().isEmpty() == false;
         if (actionPlugins.isEmpty() && inject == false) {
             return PluginActions.none();
         }

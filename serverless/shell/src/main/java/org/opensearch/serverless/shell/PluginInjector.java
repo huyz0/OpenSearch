@@ -16,7 +16,6 @@ import org.opensearch.common.inject.ModulesBuilder;
 import org.opensearch.common.inject.spi.Element;
 import org.opensearch.common.inject.spi.Elements;
 import org.opensearch.common.lifecycle.LifecycleComponent;
-import org.opensearch.common.settings.Settings;
 import org.opensearch.plugins.ActionPlugin;
 import org.opensearch.plugins.Plugin;
 
@@ -73,10 +72,6 @@ final class PluginInjector {
         this.injector = injector;
         this.bound = bound;
         this.services = services;
-    }
-
-    static boolean enabled(Settings settings) {
-        return PluginSettings.INJECTOR.get(settings);
     }
 
     /**

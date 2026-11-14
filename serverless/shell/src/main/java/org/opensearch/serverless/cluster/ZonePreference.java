@@ -39,7 +39,6 @@ public final class ZonePreference {
     static final double DEFAULT_MIN_PER_SECOND = 1.0;
     static final int DEFAULT_SPILL_IN_FLIGHT = 8;
 
-    private final boolean enabled;
     private final double minPerSecond;
     private final int spillInFlight;
 
@@ -66,7 +65,6 @@ public final class ZonePreference {
      */
     public ZonePreference(Settings settings) {
         this(
-            ReaderPlacementSettings.ZONE_LOCAL_ENABLED.get(settings),
             ReaderPlacementSettings.ZONE_LOCAL_MIN_PER_SECOND.get(settings),
             ReaderPlacementSettings.ZONE_LOCAL_SPILL_IN_FLIGHT.get(settings)
         );
@@ -75,15 +73,13 @@ public final class ZonePreference {
     /**
      * Builds a preference.
      *
-     * @param enabled whether it applies at all
      * @param minPerSecond the rate above which a shard counts as hot; zero makes every shard hot
      * @param spillInFlight the in-flight margin before a zone's reader gives way
      */
-    public ZonePreference(boolean enabled, double minPerSecond, int spillInFlight) {
+    public ZonePreference(double minPerSecond, int spillInFlight) {
         if (minPerSecond < 0.0 || spillInFlight < 0) {
             throw new IllegalArgumentException("invalid zone preference [" + minPerSecond + "][" + spillInFlight + "]");
         }
-        this.enabled = enabled;
         this.minPerSecond = minPerSecond;
         this.spillInFlight = spillInFlight;
     }
@@ -109,7 +105,7 @@ public final class ZonePreference {
         String localZone,
         HotShardSpread spread
     ) {
-        if (enabled == false || localZone == null || ordered.isEmpty() || spread.perSecond(index, shard) < minPerSecond) {
+        if (localZone == null || ordered.isEmpty() || spread.perSecond(index, shard) < minPerSecond) {
             return ordered;
         }
         if (Zones.same(localZone, Zones.zoneOf(members, ordered.get(0)))) {

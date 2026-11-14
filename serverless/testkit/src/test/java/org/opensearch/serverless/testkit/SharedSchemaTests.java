@@ -62,7 +62,7 @@ public class SharedSchemaTests extends OpenSearchTestCase {
     private final AtomicLong clock = new AtomicLong(1_000L);
     private MetadataPlane plane;
 
-    private ServerlessNode node(boolean sharing) throws Exception {
+    private ServerlessNode node() throws Exception {
         plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         final ServerlessNode node = new ServerlessNode(
             Settings.builder()
@@ -73,7 +73,6 @@ public class SharedSchemaTests extends OpenSearchTestCase {
                 .put("http.port", "0")
                 .put("transport.port", "0")
                 .put("serverless.roles", "ingest")
-                .put("serverless.schema.sharing.enabled", sharing)
                 .build()
         );
         node.startup().start();
@@ -119,7 +118,7 @@ public class SharedSchemaTests extends OpenSearchTestCase {
     }
 
     public void testIndicesWithOneMappingShareOneParsedCopy() throws Exception {
-        try (ServerlessNode node = node(true)) {
+        try (ServerlessNode node = node()) {
             create(node, "a", "", MAPPING);
             create(node, "b", "", MAPPING);
             assertSame("same mapping and settings: one parsed copy", mapping(node, "a"), mapping(node, "b"));
@@ -133,17 +132,8 @@ public class SharedSchemaTests extends OpenSearchTestCase {
         }
     }
 
-    public void testWithSharingOffEveryIndexParsesItsOwn() throws Exception {
-        try (ServerlessNode node = node(false)) {
-            create(node, "a", "", MAPPING);
-            create(node, "b", "", MAPPING);
-            assertNotSame(mapping(node, "a"), mapping(node, "b"));
-            assertWritesAndFinds(node, "b");
-        }
-    }
-
     public void testADynamicFieldGivesOnlyThatIndexAMappingOfItsOwn() throws Exception {
-        try (ServerlessNode node = node(true)) {
+        try (ServerlessNode node = node()) {
             create(node, "a", "", MAPPING);
             create(node, "b", "", MAPPING);
             create(node, "c", "", MAPPING);
@@ -163,7 +153,7 @@ public class SharedSchemaTests extends OpenSearchTestCase {
     }
 
     public void testIndicesThatAddTheSameFieldsShareAgain() throws Exception {
-        try (ServerlessNode node = node(true)) {
+        try (ServerlessNode node = node()) {
             create(node, "a", "", MAPPING);
             create(node, "b", "", MAPPING);
             create(node, "c", "", MAPPING);
@@ -182,7 +172,7 @@ public class SharedSchemaTests extends OpenSearchTestCase {
     }
 
     public void testAPutMappingChangesOnlyItsIndex() throws Exception {
-        try (ServerlessNode node = node(true)) {
+        try (ServerlessNode node = node()) {
             create(node, "a", "", MAPPING);
             create(node, "b", "", MAPPING);
             final Answer put = call(node, "PUT", "/a/_mapping", "{\"properties\":{\"added\":{\"type\":\"keyword\"}}}");
@@ -197,7 +187,7 @@ public class SharedSchemaTests extends OpenSearchTestCase {
     }
 
     public void testDeletingOneIndexLeavesTheOthersAnalyzersWorking() throws Exception {
-        try (ServerlessNode node = node(true)) {
+        try (ServerlessNode node = node()) {
             create(node, "a", "", MAPPING);
             create(node, "b", "", MAPPING);
             assertWritesAndFinds(node, "a");
@@ -217,7 +207,7 @@ public class SharedSchemaTests extends OpenSearchTestCase {
     }
 
     public void testDifferentAnalysisSettingsDoNotShare() throws Exception {
-        try (ServerlessNode node = node(true)) {
+        try (ServerlessNode node = node()) {
             create(node, "plain", "", MAPPING);
             create(node, "custom", ",\"analysis\":{\"analyzer\":{\"default\":{\"type\":\"standard\",\"stopwords\":[\"fox\"]}}}", MAPPING);
             assertNotSame(mapping(node, "plain"), mapping(node, "custom"));

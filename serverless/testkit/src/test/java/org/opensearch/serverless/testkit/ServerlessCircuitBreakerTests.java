@@ -285,7 +285,7 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
 
     /**
      * A batch is charged what it will hold before its body is parsed: refused while unparsed, even when its body would
-     * not parse, and charged its length alone once the switch is off.
+     * not parse.
      */
     public void testABatchIsChargedWhatItWillHoldBeforeItIsParsed() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -297,30 +297,22 @@ public class ServerlessCircuitBreakerTests extends OpenSearchTestCase {
         }
         // About 300 bytes: within a 1,000-byte budget once, past it four times over.
         assertTrue(batch.length() > 250 && batch.length() < 1000 / 2);
-        for (boolean charged : new boolean[] { true, false }) {
-            final Settings settings = Settings.builder()
-                .put(nodeSettings("charged-" + charged, null))
-                .put("indexing_pressure.memory.limit", "1000b")
-                .put(org.opensearch.serverless.rest.BulkSettings.CHARGE_BEFORE_PARSE.getKey(), charged)
-                .build();
-            try (ServerlessNode node = new ServerlessNode(settings)) {
-                node.startup().start();
-                node.setMetadataPlane(plane);
-                final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
-                loop.want("charged", 0);
-                loop.tick(clock.get());
+        final Settings settings = Settings.builder()
+            .put(nodeSettings("charged", null))
+            .put("indexing_pressure.memory.limit", "1000b")
+            .build();
+        try (ServerlessNode node = new ServerlessNode(settings)) {
+            node.startup().start();
+            node.setMetadataPlane(plane);
+            final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
+            loop.want("charged", 0);
+            loop.tick(clock.get());
 
-                final Response bulk = send(node, "POST", "/_bulk?refresh=true", batch.toString());
-                final Response garbage = send(node, "POST", "/_bulk", "x".repeat(batch.length()));
-                if (charged) {
-                    assertEquals("four times its length is past the budget: " + bulk.body(), 429, bulk.status());
-                    assertEquals("refused before it is parsed: " + garbage.body(), 429, garbage.status());
-                } else {
-                    assertEquals("its length alone fits: " + bulk.body(), 200, bulk.status());
-                    assertEquals("parsed first, so a bad body is a 400: " + garbage.body(), 400, garbage.status());
-                }
-                assertEquals("nothing is left charged", 0L, node.services().indexingPressure().stats().getCurrentCoordinatingBytes());
-            }
+            final Response bulk = send(node, "POST", "/_bulk?refresh=true", batch.toString());
+            final Response garbage = send(node, "POST", "/_bulk", "x".repeat(batch.length()));
+            assertEquals("four times its length is past the budget: " + bulk.body(), 429, bulk.status());
+            assertEquals("refused before it is parsed: " + garbage.body(), 429, garbage.status());
+            assertEquals("nothing is left charged", 0L, node.services().indexingPressure().stats().getCurrentCoordinatingBytes());
         }
     }
 

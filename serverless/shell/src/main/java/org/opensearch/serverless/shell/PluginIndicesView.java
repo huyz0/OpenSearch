@@ -97,7 +97,7 @@ final class PluginIndicesView {
     }
 
     private boolean active() {
-        return PluginSettings.INDICES_VIEW.get(node.settings) && node.systemIndices != null && node.systemIndices.isEmpty() == false;
+        return node.systemIndices != null && node.systemIndices.isEmpty() == false;
     }
 
     /**

@@ -388,7 +388,7 @@ public final class ServerlessNode implements Closeable {
         // Only with plugins installed: the shell's own code never asks for a cluster manager, so a node without
         // plugins keeps a view that names none.
         this.views.decorateWith(view -> pluginIndices().withOwners(view));
-        this.views.namesClusterManager(ServerlessPlugins.clusterView(settings) && this.plugins.plugins().isEmpty() == false);
+        this.views.namesClusterManager(this.plugins.plugins().isEmpty() == false);
         // Role is a runtime attribute a node advertises, not a topology decision baked into a
         // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
         // environment variable, and role switching under load stays a policy question.
@@ -408,7 +408,7 @@ public final class ServerlessNode implements Closeable {
         // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
         // below.
         final Environment environment = new Environment(settings, null);
-        final ClusterSettings clusterSettings = new ClusterSettings(settings, this.plugins.clusterSettings(settings));
+        final ClusterSettings clusterSettings = new ClusterSettings(settings, this.plugins.clusterSettings());
 
         // A pool of its own for fanned-out shard work. The coordinator of a search waits on GENERIC for
         // its shard tasks; when those tasks also ran on GENERIC, enough concurrent searches parked every
@@ -427,9 +427,7 @@ public final class ServerlessNode implements Closeable {
         this.readerValidation.setLiveOwnerCheckMillis(SearchSettings.READER_CHECK_LIVE_OWNER_MILLIS.get(settings));
         // An open fetches the blocks it will read concurrently rather than one round trip at a time, on GENERIC as
         // the log replay's reads do; the opening thread reads too, so a busy pool costs width only.
-        if (org.opensearch.serverless.store.CacheSettings.PREFETCH_ON_OPEN.get(settings)) {
-            blockCache.prefetchingWith(threadPool.generic());
-        }
+        blockCache.prefetchingWith(threadPool.generic());
         boolean success = false;
         NodeEnvironment openedEnvironment = null;
         try {
@@ -453,7 +451,7 @@ public final class ServerlessNode implements Closeable {
                 storage.engineFactoryProviders(),
                 storage.directoryFactories()
             );
-            org.opensearch.serverless.schema.SharedAnalysis.install(settings, indicesService);
+            org.opensearch.serverless.schema.SharedAnalysis.install(indicesService);
             this.searchService = services.buildSearchService(clusterSettings, clusterService, indicesService);
 
             this.nodeClient = NodeComponents.nodeClient(settings, threadPool, services);
@@ -471,15 +469,13 @@ public final class ServerlessNode implements Closeable {
             }
             // Each identity-aware plugin gets the subject it runs its own work as, after its components, as core does: Job
             // Scheduler's client refuses every call without one, so a scheduled job could never read its own configuration.
-            if (ServerlessPlugins.extensions(settings)) {
-                final java.util.List<org.opensearch.plugins.IdentityAwarePlugin> identityAware = new java.util.ArrayList<>();
-                for (org.opensearch.plugins.Plugin plugin : this.plugins.plugins()) {
-                    if (plugin instanceof org.opensearch.plugins.IdentityAwarePlugin aware) {
-                        identityAware.add(aware);
-                    }
+            final java.util.List<org.opensearch.plugins.IdentityAwarePlugin> identityAware = new java.util.ArrayList<>();
+            for (org.opensearch.plugins.Plugin plugin : this.plugins.plugins()) {
+                if (plugin instanceof org.opensearch.plugins.IdentityAwarePlugin aware) {
+                    identityAware.add(aware);
                 }
-                services.identityService().initializeIdentityAwarePlugins(identityAware);
             }
+            services.identityService().initializeIdentityAwarePlugins(identityAware);
             // Before the controller, because every handler it registers is wrapped in this.
             this.systemIndices = new org.opensearch.serverless.rest.SystemIndices(this.plugins.systemIndexPatterns(settings));
             this.restController = wiring.buildRestController(clusterSettings);
@@ -619,7 +615,6 @@ public final class ServerlessNode implements Closeable {
             // on which head owns an index could both take it.
             plane.bucketHeads().register(localNode.getId(), () -> reconciler().openShards());
             plane.buckets().configure(settings);
-            plane.membership().reportRenewalsAsChanges(NodeSettings.MEMBERSHIP_RENEWALS_AS_CHANGES.get(settings));
             try {
                 // Publish the lease immediately. It is this node's entry in the address book that peers
                 // use to forward writes here, so a node that has not renewed yet is not merely invisible
@@ -965,7 +960,7 @@ public final class ServerlessNode implements Closeable {
     /** The plugins' dynamic settings applied from the cluster settings register, built the first time they are asked for. */
     public synchronized PluginClusterSettings pluginClusterSettings() {
         if (pluginClusterSettings == null) {
-            pluginClusterSettings = new PluginClusterSettings(this, plugins.pluginNodeSettings(settings));
+            pluginClusterSettings = new PluginClusterSettings(this, plugins.pluginNodeSettings());
         }
         return pluginClusterSettings;
     }

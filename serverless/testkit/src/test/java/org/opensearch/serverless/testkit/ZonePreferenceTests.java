@@ -57,7 +57,7 @@ public class ZonePreferenceTests extends OpenSearchTestCase {
     public void testAHotShardGoesToAReaderInTheCoordinatorsZoneFirst() {
         final List<NodeLease> members = fleet();
         final HotShardSpread spread = spread();
-        final ZonePreference preference = new ZonePreference(true, 1.0, 8);
+        final ZonePreference preference = new ZonePreference(1.0, 8);
         final int shard = shardRankedOutside(members, "zone-a");
         final List<String> global = ReaderPlacement.candidatesFor("idx", shard, members, ROLE, 4);
         List<String> ordered = null;
@@ -75,7 +75,7 @@ public class ZonePreferenceTests extends OpenSearchTestCase {
     public void testAColdShardKeepsPlacementsReader() {
         final List<NodeLease> members = fleet();
         final HotShardSpread spread = spread();
-        final ZonePreference preference = new ZonePreference(true, 1.0, 8);
+        final ZonePreference preference = new ZonePreference(1.0, 8);
         final int shard = shardRankedOutside(members, "zone-a");
         final List<String> global = ReaderPlacement.candidatesFor("idx", shard, members, ROLE, 4);
         // One search, ten seconds after the last: well under a search a second.
@@ -92,19 +92,18 @@ public class ZonePreferenceTests extends OpenSearchTestCase {
         for (int i = 0; i < 20; i++) {
             spread.order("idx", shard, global);
         }
-        assertEquals(global, new ZonePreference(true, 0.0, 8).order("idx", shard, global, members, ROLE, null, spread));
-        assertEquals(global, new ZonePreference(false, 0.0, 8).order("idx", shard, global, members, ROLE, "zone-a", spread));
+        assertEquals(global, new ZonePreference(0.0, 8).order("idx", shard, global, members, ROLE, null, spread));
         assertEquals(
             "a zone with no readers",
             global,
-            new ZonePreference(true, 0.0, 8).order("idx", shard, global, members, ROLE, "zone-z", spread)
+            new ZonePreference(0.0, 8).order("idx", shard, global, members, ROLE, "zone-z", spread)
         );
     }
 
     public void testABusyZoneReaderGivesWay() {
         final List<NodeLease> members = fleet();
         final HotShardSpread spread = spread();
-        final ZonePreference preference = new ZonePreference(true, 0.0, 2);
+        final ZonePreference preference = new ZonePreference(0.0, 2);
         final int shard = shardRankedOutside(members, "zone-a");
         final List<String> global = ReaderPlacement.candidatesFor("idx", shard, members, ROLE, 4);
         final List<String> inZone = preference.order("idx", shard, global, members, ROLE, "zone-a", spread);

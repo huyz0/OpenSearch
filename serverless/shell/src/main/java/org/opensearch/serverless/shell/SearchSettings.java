@@ -35,13 +35,6 @@ public final class SearchSettings implements SettingsProvider {
         Property.NodeScope
     );
 
-    /** The {@code serverless.search.resolve_from_rollups} setting. */
-    public static final Setting<Boolean> RESOLVE_FROM_ROLLUPS = Setting.boolSetting(
-        "serverless.search.resolve_from_rollups",
-        true,
-        Property.NodeScope
-    );
-
     /** The {@code serverless.search.rollup.cache_millis} setting. */
     public static final Setting<Long> ROLLUP_CACHE_MILLIS = Setting.longSetting(
         "serverless.search.rollup.cache_millis",
@@ -62,9 +55,6 @@ public final class SearchSettings implements SettingsProvider {
         SearchSettings.DEFAULT_SEARCH_ACTIVATION_BUDGET,
         Property.NodeScope
     );
-
-    /** The {@code serverless.search.prune} setting. */
-    public static final Setting<Boolean> PRUNE = Setting.boolSetting("serverless.search.prune", true, Property.NodeScope);
 
     /** Whether a search node joins unready and turns ready only once it has warmed. */
     public static final Setting<Boolean> WARM_ON_JOIN = Setting.boolSetting("serverless.search.warm_on_join", false, Property.NodeScope);
@@ -160,17 +150,6 @@ public final class SearchSettings implements SettingsProvider {
     public static final int DEFAULT_ROLLUP_MIN_INDICES = 32;
 
     /**
-     * Whether a prefix pattern long enough to name one rollup group is resolved from the group's entries rather
-     * than by listing every name under the prefix. On by default: a listing costs a page per thousand names, and a
-     * store holding a million under one prefix times out before the first page.
-     *
-     * @return true to resolve from the rollups
-     */
-    public boolean resolveFromRollups() {
-        return SearchSettings.RESOLVE_FROM_ROLLUPS.get(settings);
-    }
-
-    /**
      * How old this node's copy of a rollup group may be and still resolve a pattern. Zero by default -- the group
      * is read for every search -- because a copy that predates an index's activation leaves the index off the
      * search, and a search on its owner would otherwise have seen its refreshed documents. A deployment that
@@ -208,26 +187,14 @@ public final class SearchSettings implements SettingsProvider {
         return Math.max(1, SearchSettings.MAX_ACTIVATIONS_PER_QUERY.get(settings));
     }
 
-    /**
-     * Whether a search skips the shards whose pruning digest rules the query out. On unless
-     * {@code serverless.search.prune} says otherwise, which exists to measure what pruning saves.
-     *
-     * @return true when pruning is on
-     */
-    public boolean searchPruning() {
-        return SearchSettings.PRUNE.get(settings);
-    }
-
     @Override
     public List<Setting<?>> settings() {
         return List.of(
             PATTERN_MAX_INDICES,
             FANOUT_CONCURRENCY,
-            RESOLVE_FROM_ROLLUPS,
             ROLLUP_CACHE_MILLIS,
             ROLLUP_MIN_INDICES,
             MAX_ACTIVATIONS_PER_QUERY,
-            PRUNE,
             WARM_ON_JOIN,
             WARM_ON_JOIN_MAX_WAIT,
             WARM_ON_JOIN_READY_FRACTION,

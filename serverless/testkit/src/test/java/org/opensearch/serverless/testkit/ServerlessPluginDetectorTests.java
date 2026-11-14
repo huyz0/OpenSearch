@@ -211,21 +211,4 @@ public class ServerlessPluginDetectorTests extends OpenSearchTestCase {
             expectThrows(UnsupportedOperationException.class, () -> resolver.concreteIndexNames(state, strict, "t*-logs"));
         }
     }
-
-    /** With the switch off, a tenant name is refused as before. */
-    public void testNameResolutionSwitchRefusesTenantNames() throws Exception {
-        try (
-            ServerlessNode node = started(
-                "resolver-off",
-                Settings.builder().put("serverless.plugin_name_resolution.enabled", false).build()
-            )
-        ) {
-            node.services().client().admin().indices().create(new CreateIndexRequest("tenant-logs").mapping(MAPPING)).actionGet();
-            final IndexNameExpressionResolver resolver = node.services().indexNameExpressionResolver();
-            expectThrows(
-                UnsupportedOperationException.class,
-                () -> resolver.concreteIndexNames(node.clusterService().state(), IndicesOptions.strictExpandOpen(), "tenant-logs")
-            );
-        }
-    }
 }

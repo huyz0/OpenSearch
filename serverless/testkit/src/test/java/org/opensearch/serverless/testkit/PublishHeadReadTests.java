@@ -32,7 +32,7 @@ public class PublishHeadReadTests extends OpenSearchTestCase {
     private static final long TTL = 30_000L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"keyword\"}}}";
 
-    private Settings nodeSettings(String name, boolean trust) {
+    private Settings nodeSettings(String name) {
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-publish-head")
@@ -41,17 +41,16 @@ public class PublishHeadReadTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put("serverless.publish.trust_own_head", trust)
             .build();
     }
 
     /** Head reads by publishes over ten publishes, each a renewal and a half after the last. */
-    private long headReadsByPublish(boolean trust) throws Exception {
+    private long headReadsByPublish() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000_000L);
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("heads", "uuid-heads", 1, MAPPING, null));
-            try (ServerlessNode node = new ServerlessNode(nodeSettings("publish-head-" + trust, trust))) {
+            try (ServerlessNode node = new ServerlessNode(nodeSettings("publish-head"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
                 node.leases().renewLease(plane);
@@ -75,15 +74,14 @@ public class PublishHeadReadTests extends OpenSearchTestCase {
                         reads += Long.parseLong(line.trim().split(" ")[0]);
                     }
                 }
-                logger.info("trust_own_head={}: {} head reads by 10 publishes\n{}", trust, reads, store.byCaller());
+                logger.info("{} head reads by 10 publishes\n{}", reads, store.byCaller());
                 return reads;
             }
         }
     }
 
-    public void testAPublishReadsTheHeadOnlyWhenItCannotTrustItsOwnSighting() throws Exception {
-        assertEquals("one publish in ten reads its head without trust", 10L, headReadsByPublish(false));
-        assertTrue("with trust only the first publish may read it", headReadsByPublish(true) <= 1L);
+    public void testAPublishTrustsItsOwnSightingWhileItsLeaseHolds() throws Exception {
+        assertTrue("only the first publish may read the head", headReadsByPublish() <= 1L);
     }
 
     /** A node whose lease lapsed reads the head again, and a takeover it missed fences its publish. */
@@ -92,7 +90,7 @@ public class PublishHeadReadTests extends OpenSearchTestCase {
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
             plane.createIndex(new IndexDescriptor("lapsed", "uuid-lapsed", 1, MAPPING, null));
-            try (ServerlessNode node = new ServerlessNode(nodeSettings("publish-lapse", true))) {
+            try (ServerlessNode node = new ServerlessNode(nodeSettings("publish-lapse"))) {
                 node.startup().start();
                 node.setMetadataPlane(plane);
                 node.leases().renewLease(plane);
@@ -112,7 +110,7 @@ public class PublishHeadReadTests extends OpenSearchTestCase {
 
                 // A successor takes the shard at a newer term while this node is paused, and publishes.
                 final MetadataPlane otherPlane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
-                try (ServerlessNode successor = new ServerlessNode(nodeSettings("publish-successor", true))) {
+                try (ServerlessNode successor = new ServerlessNode(nodeSettings("publish-successor"))) {
                     successor.startup().start();
                     successor.setMetadataPlane(otherPlane);
                     successor.leases().renewLease(otherPlane);

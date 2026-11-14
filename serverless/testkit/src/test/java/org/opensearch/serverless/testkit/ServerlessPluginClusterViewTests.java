@@ -83,21 +83,13 @@ public class ServerlessPluginClusterViewTests extends OpenSearchTestCase {
         }
     }
 
-    /** A node without plugins, or with the switch off, names no cluster manager: its own code never asks. */
-    public void testNoClusterManagerWithoutPluginsOrWithTheSwitchOff() throws Exception {
-        try (
-            ServerlessNode bare = new ServerlessNode(nodeSettings("view-bare", Settings.EMPTY));
-            ServerlessNode off = new ServerlessNode(
-                nodeSettings("view-off", Settings.builder().put("serverless.plugin_cluster_view.enabled", false).build()),
-                List.of(new AnyPlugin())
-            )
-        ) {
-            for (ServerlessNode node : List.of(bare, off)) {
-                node.startup().start();
-                node.setMetadataPlane(plane());
-                reapply(node);
-                assertNull(node.clusterService().state().nodes().getClusterManagerNodeId());
-            }
+    /** A node without plugins names no cluster manager: its own code never asks. */
+    public void testNoClusterManagerWithoutPlugins() throws Exception {
+        try (ServerlessNode bare = new ServerlessNode(nodeSettings("view-bare", Settings.EMPTY))) {
+            bare.startup().start();
+            bare.setMetadataPlane(plane());
+            reapply(bare);
+            assertNull(bare.clusterService().state().nodes().getClusterManagerNodeId());
         }
     }
 

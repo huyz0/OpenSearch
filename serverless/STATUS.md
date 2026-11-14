@@ -174,14 +174,13 @@ constructor against what the node can supply, since Guice is not on offer here â
 from the plugin's REST handler, from its own code through the client, and from another node. The `Client` and the `NodeClient` a handler receives are the same allowlist.
 Plugins are hosted in core's order: `createComponents` (all three overloads core calls, with a component registry and
 no-op telemetry) runs while the node is constructed, before the REST layer and the transport ask them for handlers, a
-request wrapper or interceptors; their node and index settings are registered and their thread pools built
-(`serverless.plugin_extensions.enabled`, on); `client.type` is `node`; and an action's constructor may take the
+request wrapper or interceptors; their node and index settings are registered and their thread pools built; `client.type` is `node`; and an action's constructor may take the
 `NodeClient`, core services such as `PluginsService` or `AnalysisRegistry`, and any class whose constructor is marked
 `@Inject`, built on demand as Guice would. Checked against the released 3.9 plugins: Job Scheduler, Index State
 Management (policy create/get on its own system index), Query Insights, custom codecs, system templates and Flow
 Framework start. Most of the rest stop on jar hell, because the shell's classpath carries the module and S3 jars a
 classic node keeps in their own class loaders; see the plugin compatibility work.
-Plugin objects are built by core's own injector (`serverless.plugin_injector.enabled`, on): a plugin's Guice modules,
+Plugin objects are built by core's own injector: a plugin's Guice modules,
 `Provider` parameters and `getGuiceServiceClasses()` lifecycle services work as on a classic node, actions are eager
 singletons, and the node's services are bound by their class and supertypes. Core services the shell does not run
 (repositories, point-in-time transport, extensions) are bound as empty stand-ins. Plugins hear `onNodeStarted` once the
@@ -189,9 +188,9 @@ node is started and has its metadata plane. With this, the security plugin (with
 and creates its configuration index. On a node with plugins the view names a cluster manager -- the live member with
 the lowest node id, chosen from the leases every node already reads, no election -- and the plugin client answers cluster
 health (green for every index the metadata plane describes, since a dormant shard opens on demand) and cluster state (the
-node's view plus the metadata of each index the request names) (`serverless.plugin_cluster_view.enabled`, on). The
+node's view plus the metadata of each index the request names). The
 security plugin passes its health wait. The plugin client also runs multi-get, bulk and update, item by item through
-the single-document path (`serverless.plugin_client.batches.enabled`, on), and a plugin's first write to a shard
+the single-document path, and a plugin's first write to a shard
 nobody holds waits for this node to take it, as a REST write does, instead of being refused. With these the released
 3.9 security plugin (with the rule framework and transport-grpc bundles) loads its configuration, authenticates users
 and enforces index permissions on the shell. A cluster-state request that names indices returns only those, as core
@@ -202,26 +201,24 @@ settings are accepted at creation, on update and in templates, and a route the s
 registers it. With these, k-NN (with the painless and transport-grpc bundles) creates `index.knn` indices and answers
 `knn` queries and `knn_score` scripts on the Lucene engine. The faiss and nmslib engines need k-NN's native libraries on
 `java.library.path`, which the plugin zip does not carry and the stock tarball does.
-The plugin client also answers node info, node stats, indices stats and refresh
-(`serverless.plugin_client.node_answers.enabled`, on), each for this node only: a request naming another node gets a
+The plugin client also answers node info, node stats, indices stats and refresh, each for this node only: a request naming another node gets a
 failure saying to ask that node, and index statistics and refresh cover the shards open here, so the cost is bounded by
 what the node serves. With this the Prometheus exporter serves node, JVM, OS, filesystem, thread-pool, indexing and
 cluster-health series. Its per-index series (`prometheus.indices`) are off by default on the shell, since a node can
 serve thousands of small indices; an operator can turn them on.
 Plugins' named objects (`getNamedXContent`) are in the registry REST bodies are parsed with, and their named
 writeables in the node's registry; plugin components that are lifecycle components are started with the node and
-stopped with it (`serverless.plugin_components.lifecycle.enabled`, on); and a search of a shard nothing was ever written
+stopped with it; and a search of a shard nothing was ever written
 to -- no head and no published commit, so it never had a writer -- answers empty, as core answers a just-created index,
 instead of "no shard could answer". With these the alerting plugin creates monitors and the anomaly-detection plugin
 creates detectors.
-The plugin client also answers index administration (`serverless.plugin_client.index_admin.enabled`, on): existence,
+The plugin client also answers index administration: existence,
 get index, mappings, settings and aliases are read from the descriptors, with alias and date-math names resolved; mapping
 and settings updates, alias changes, index deletion and rollover run through the shell's own REST handlers in process, so
 they keep the same validation and refusals, and fail with the core exception a plugin catches. An index created through
 the client with aliases is created, then aliased (two steps, as the shell keeps an alias in its own register), and a
 plugin may alias its own system indices. Write aliases stay refused, as for REST callers.
-Every node's local view also holds the plugins' own indices and their aliases (`serverless.plugin_indices_view.enabled`,
-on): the indices plugins declare as system indices -- dozens, never the tenants' -- are listed once per declared prefix at
+Every node's local view also holds the plugins' own indices and their aliases: the indices plugins declare as system indices -- dozens, never the tenants' -- are listed once per declared prefix at
 start, a plugin's own changes through its client are in the view when the call returns, and changes made on other nodes
 are followed through the change stripes every `serverless.plugin_indices_view.refresh_interval` (30 s; no listing). Each
 of their shards is shown started where it is written, and otherwise on one owner every node computes the same from the
@@ -242,7 +239,7 @@ indices), Index Management moves an index through its policy states (`min_index_
 and rollover through an `is_write_index` alias: the local view carries
 each served index's aliases), and ML Commons trains, predicts, creates connectors, and
 registers and deploys remote models. A plugin's dynamic setting changed through `/_cluster/settings` reaches the running
-plugin (`serverless.plugin_cluster_settings.enabled`, on): a value the setting refuses is refused at the write; the node
+plugin: a value the setting refuses is refused at the write; the node
 that served the write applies it when the write returns, and every other node within
 `serverless.plugin_cluster_settings.refresh_interval` (30 s, one register read per node, only where plugins declare dynamic
 settings); a removed key returns to the node's value or the default. Core's own dynamic settings are not applied this way.
@@ -874,7 +871,7 @@ so `BlockCacheDirectory` now fetches them before handing the directory out: the 
 one wave, the compound sub-files' in a second, 16 reads at a time with the opening thread reading too.
 Adjacent blocks of one file share a ranged read. The blocks are the ones the open reads anyway, so the request
 count stays about the same. A cache too small to keep them until they are read is not prefetched into, and a
-file held locally is not fetched. `serverless.block_cache.prefetch_on_open=false` turns it off.
+file held locally is not fetched.
 
 | measurement | before | after |
 | --- | --- | --- |
