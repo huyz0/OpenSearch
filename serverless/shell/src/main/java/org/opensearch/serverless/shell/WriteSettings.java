@@ -1,0 +1,222 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.serverless.shell;
+
+import org.opensearch.common.settings.Setting;
+import org.opensearch.common.settings.Setting.Property;
+import org.opensearch.core.common.unit.ByteSizeValue;
+import org.opensearch.serverless.reconcile.ReconcileScheduler;
+import org.opensearch.serverless.settings.SettingsProvider;
+import org.opensearch.serverless.store.CommitStaging;
+
+import java.util.List;
+
+/**
+ * Settings of the write path: back-pressure, fences, pools, segment packing and publishing.
+ *
+ * <p>Each setting is defined here once, with its type and default, and found through {@link SettingsProvider}.
+ */
+public final class WriteSettings implements SettingsProvider {
+
+    /** The {@code serverless.write.backpressure.target_millis} setting. */
+    public static final Setting<Long> BACKPRESSURE_TARGET_MILLIS = Setting.longSetting(
+        "serverless.write.backpressure.target_millis",
+        1_000L,
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.write.backpressure.budget_millis} setting. */
+    public static final Setting<Long> BACKPRESSURE_BUDGET_MILLIS = Setting.longSetting(
+        "serverless.write.backpressure.budget_millis",
+        5_000L,
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.write.backpressure.min_in_flight} setting. */
+    public static final Setting<Integer> BACKPRESSURE_MIN_IN_FLIGHT = Setting.intSetting(
+        "serverless.write.backpressure.min_in_flight",
+        4,
+        Property.NodeScope
+    );
+
+    /**
+     * Whether a write may confirm its index's incarnation by the index's change stripe instead of its descriptor, when
+     * the stripe names no change to it since its descriptor was last read here. Node setting {@code serverless.write.confirm_incarnation_by_stripe}.
+     *
+     * <p><b>What it saves.</b> A descriptor read per index per fence window, which for an index written less often than
+     * that is a GET on nearly every write, before the engine runs. A stripe is shared by every index hashing to it, and
+     * while writes to it keep arriving it is read in the background about twice a window, so a write finds a stripe read
+     * already in hand and reads nothing. A node writing many indices reads at most {@value
+     * org.opensearch.serverless.metadata.ChangeStripes#STRIPES} stripes twice a window rather than one descriptor per
+     * index.
+     *
+     * <p><b>What it keeps.</b> The fence: a write is acknowledged only after a read that began within the window, of the
+     * stripe or of the descriptor, showed its incarnation live and unchanged; a delete bumps the stripe before it applies
+     * and after it, and answers only after the settle wait. And the freshness: a stripe that names any change to the
+     * index, a mapping or settings update included, sends the write to read the descriptor and apply it, as before.
+     */
+    public static final Setting<Boolean> CONFIRM_INCARNATION_BY_STRIPE = Setting.boolSetting(
+        "serverless.write.confirm_incarnation_by_stripe",
+        true,
+        Property.NodeScope
+    );
+
+    /**
+     * How many writes must have asked for a stripe within its last two background periods (about four fifths of a fence
+     * window) for the background to keep reading it; node setting, default 2. Below that, a write reads its stripe itself
+     * when its last read is older than the window, which a stripe written that rarely needed anyway: a read the
+     * background made for a lone write was never used by another one, and a lone write cost five reads that way rather
+     * than one. 0 keeps every stripe asked within two windows read in the background, as before.
+     */
+    public static final Setting<Integer> STRIPE_REFRESH_MIN_ASKS = Setting.intSetting(
+        "serverless.write.stripe_refresh_min_asks",
+        2,
+        Property.NodeScope
+    );
+
+    /** Whether document writes run on {@link WritePools#POOL} and forwarded writes on a pool of the same size, with the apply gate. */
+    public static final Setting<Boolean> WAIT_POOL_ENABLED = Setting.boolSetting(
+        "serverless.write.wait_pool.enabled",
+        WritePools.DEFAULT_ENABLED,
+        Property.NodeScope
+    );
+
+    /** Threads per core of {@link WritePools#POOL}, and of the forwarded-write pool, when {@link #WAIT_POOL_ENABLED} is on. */
+    public static final Setting<Integer> WAIT_POOL_THREADS_PER_CORE = Setting.intSetting(
+        "serverless.write.wait_pool.threads_per_core",
+        WritePools.DEFAULT_THREADS_PER_CORE,
+        Property.NodeScope
+    );
+
+    /**
+     * Writes a node admits at once before it pushes back; by default sized from the write pools. Declared after the
+     * wait-pool settings because its default reads them.
+     */
+    public static final Setting<Integer> BACKPRESSURE_MAX_IN_FLIGHT = new Setting<>(
+        "serverless.write.backpressure.max_in_flight",
+        s -> Integer.toString(WritePools.defaultMaxInFlight(s)),
+        s -> Setting.parseInt(s, Integer.MIN_VALUE, "serverless.write.backpressure.max_in_flight"),
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.segments.pack.enabled} setting. */
+    public static final Setting<Boolean> SEGMENTS_PACK = Setting.boolSetting("serverless.segments.pack.enabled", true, Property.NodeScope);
+
+    /** The {@code serverless.segments.node_pack.enabled} setting. */
+    public static final Setting<Boolean> NODE_PACK_ENABLED = Setting.boolSetting(
+        "serverless.segments.node_pack.enabled",
+        NodePackWiring.ENABLED_DEFAULT,
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.segments.node_pack.max_blob_bytes} setting. */
+    public static final Setting<ByteSizeValue> NODE_PACK_MAX_BLOB_BYTES = Setting.byteSizeSetting(
+        "serverless.segments.node_pack.max_blob_bytes",
+        new ByteSizeValue(NodePackWiring.DEFAULT_MAX_BLOB_BYTES),
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.segments.node_pack.linger_millis} setting. */
+    public static final Setting<Long> NODE_PACK_LINGER_MILLIS = Setting.longSetting(
+        "serverless.segments.node_pack.linger_millis",
+        NodePackWiring.DEFAULT_LINGER_MILLIS,
+        Property.NodeScope
+    );
+
+    /** The {@code serverless.segments.node_pack.collect_interval_millis} setting. */
+    public static final Setting<Long> NODE_PACK_COLLECT_INTERVAL_MILLIS = Setting.longSetting(
+        "serverless.segments.node_pack.collect_interval_millis",
+        NodePackWiring.DEFAULT_COLLECT_INTERVAL_MILLIS,
+        Property.NodeScope
+    );
+
+    /**
+     * Commits recorded with the node's write log: a routine publish keeps its commit on the writer and the manifest is
+     * written as a checkpoint; see {@link CommitStaging}. Part of the per-node write log, so only with it on; on by
+     * default, and switched by this setting.
+     */
+    public static final Setting<Boolean> LOG_COMMITS = Setting.boolSetting(
+        "serverless.wal.node_log.commits",
+        NodePackWiring.LOG_COMMITS_DEFAULT,
+        Property.NodeScope
+    );
+
+    /** The setting, on the node and in the cluster's config register. */
+    public static final Setting<Long> LOG_COMMITS_CHECKPOINT_MILLIS = Setting.longSetting(
+        "serverless.wal.node_log.commits.checkpoint_millis",
+        CommitStaging.DEFAULT_MAX_STAGED_MILLIS,
+        Property.NodeScope
+    );
+
+    /**
+     * With one write log per node, how long a write may wait to be published: the longest a write takes to be
+     * searchable, and what bounds how much of the log is kept. Zero publishes as without the log. See
+     * {@link org.opensearch.serverless.reconcile.BackgroundReconciler#setLazyPublish}.
+     */
+    public static final Setting<Long> NODE_LOG_PUBLISH_MAX_AGE_MILLIS = Setting.longSetting(
+        "serverless.wal.node_log.publish_max_age_millis",
+        ServerlessBootstrap.DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS,
+        Property.NodeScope
+    );
+
+    /** How long a publish waits for more writes; by default the node log's window when the node log is on. */
+    public static final Setting<String> PUBLISH_DEBOUNCE_MILLIS = Setting.simpleString(
+        "serverless.publish.debounce_millis",
+        Property.NodeScope
+    );
+
+    /**
+     * The least time between two write-triggered publishes of one shard. Each publish of a small commit costs five or
+     * more PUTs, so this is the knob that decides how much a busy shard spends on publishing; zero or less publishes
+     * every debounce window. See {@link ReconcileScheduler#DEFAULT_PUBLISH_MIN_INTERVAL}.
+     */
+    public static final Setting<Long> PUBLISH_MIN_INTERVAL_MILLIS = Setting.longSetting(
+        "serverless.publish.min_interval_millis",
+        ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL.millis(),
+        Property.NodeScope
+    );
+
+    /**
+     * How many operations beyond its last publish make a shard due for a publish inside the minimum interval; zero
+     * for never early. Bounds what a successor replays.
+     */
+    public static final Setting<Long> PUBLISH_MAX_UNPUBLISHED_OPERATIONS = Setting.longSetting(
+        "serverless.publish.max_unpublished_operations",
+        ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS,
+        Property.NodeScope
+    );
+
+    /** Used by {@link java.util.ServiceLoader}. */
+    public WriteSettings() {}
+
+    @Override
+    public List<Setting<?>> settings() {
+        return List.of(
+            BACKPRESSURE_MAX_IN_FLIGHT,
+            BACKPRESSURE_TARGET_MILLIS,
+            BACKPRESSURE_BUDGET_MILLIS,
+            BACKPRESSURE_MIN_IN_FLIGHT,
+            CONFIRM_INCARNATION_BY_STRIPE,
+            STRIPE_REFRESH_MIN_ASKS,
+            WAIT_POOL_ENABLED,
+            WAIT_POOL_THREADS_PER_CORE,
+            SEGMENTS_PACK,
+            NODE_PACK_ENABLED,
+            NODE_PACK_MAX_BLOB_BYTES,
+            NODE_PACK_LINGER_MILLIS,
+            NODE_PACK_COLLECT_INTERVAL_MILLIS,
+            LOG_COMMITS,
+            LOG_COMMITS_CHECKPOINT_MILLIS,
+            NODE_LOG_PUBLISH_MAX_AGE_MILLIS,
+            PUBLISH_DEBOUNCE_MILLIS,
+            PUBLISH_MIN_INTERVAL_MILLIS,
+            PUBLISH_MAX_UNPUBLISHED_OPERATIONS
+        );
+    }
+}

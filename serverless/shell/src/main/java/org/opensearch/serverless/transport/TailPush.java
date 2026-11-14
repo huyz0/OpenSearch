@@ -68,9 +68,6 @@ public final class TailPush {
     /** How long acknowledged records wait for others to share a message, by default. */
     static final long LINGER_MILLIS = 2L;
 
-    /** The node setting for how long acknowledged records wait for others to share a message. */
-    public static final String LINGER_SETTING = "serverless.search.tail_overlay.push_linger_millis";
-
     /** How long a push or a fetch waits for its answer. */
     static final TimeValue SEND_TIMEOUT = TimeValue.timeValueMillis(500);
 
@@ -241,7 +238,7 @@ public final class TailPush {
 
     TailPush(ShardRouter router) {
         this.router = router;
-        this.lingerMillis = Math.max(0L, router.node.settings().getAsLong(LINGER_SETTING, LINGER_MILLIS));
+        this.lingerMillis = Math.max(0L, ReaderPushSettings.TAIL_OVERLAY_PUSH_LINGER_MILLIS.get(router.node.settings()));
     }
 
     /** Registers the handler that answers search nodes' fetches. Called once, at startup, after the router's own. */

@@ -19,12 +19,6 @@ import java.util.Set;
  */
 final class DirtyPublishing {
 
-    /**
-     * Whether a publish trusts a head it saw naming this node, of any age, while this node's own lease has held since,
-     * rather than reading the head again once the sighting is a renewal old. True by default.
-     */
-    public static final String TRUST_OWN_HEAD = "serverless.publish.trust_own_head";
-
     private final BackgroundReconciler reconciler;
     /** Null until first asked: the reconciler's node is set after this is built. */
     private volatile Boolean trustOwnHead;
@@ -36,7 +30,7 @@ final class DirtyPublishing {
     private boolean trustsOwnHead() {
         Boolean on = trustOwnHead;
         if (on == null) {
-            on = reconciler.node.settings() == null || reconciler.node.settings().getAsBoolean(TRUST_OWN_HEAD, true);
+            on = reconciler.node.settings() == null || ReconcileSettings.TRUST_OWN_HEAD.get(reconciler.node.settings());
             trustOwnHead = on;
         }
         return on;

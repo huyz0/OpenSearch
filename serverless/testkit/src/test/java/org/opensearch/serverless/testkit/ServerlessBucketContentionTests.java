@@ -12,8 +12,6 @@ import com.carrotsearch.randomizedtesting.annotations.ThreadLeakScope;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessBootstrap;
-import org.opensearch.serverless.store.ObjectStores;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.net.URI;
@@ -84,17 +82,17 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
     /** Settings that send a forked node's data to a bucket instead of a directory. */
     private Map<String, String> bucketSettings(String bucket) {
         return Map.of(
-            ServerlessBootstrap.LEASE_TTL,
+            org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(),
             TTL,
-            ObjectStores.TYPE,
+            org.opensearch.serverless.store.ObjectStoreSettings.TYPE.getKey(),
             "s3",
-            ObjectStores.BUCKET,
+            org.opensearch.serverless.store.ObjectStoreSettings.BUCKET.getKey(),
             bucket,
-            ObjectStores.ENDPOINT,
+            org.opensearch.serverless.store.ObjectStoreSettings.ENDPOINT.getKey(),
             endpoint(),
-            ObjectStores.PATH_STYLE,
+            org.opensearch.serverless.store.ObjectStoreSettings.PATH_STYLE_ACCESS.getKey(),
             "true",
-            ObjectStores.REGION,
+            org.opensearch.serverless.store.ObjectStoreSettings.REGION.getKey(),
             "us-east-1"
         );
     }
@@ -237,7 +235,7 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
                     )
                 );
                 final Map<String, String> settings = new java.util.LinkedHashMap<>(bucketSettings(bucket));
-                settings.put(ServerlessBootstrap.MAX_SHARDS, "2");
+                settings.put(org.opensearch.serverless.shell.ActivationSettings.MAX_SHARDS.getKey(), "2");
                 fleet.add(NodeProcess.start(name, null, home, settings));
             }
 

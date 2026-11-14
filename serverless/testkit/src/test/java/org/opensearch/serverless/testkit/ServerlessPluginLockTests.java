@@ -35,7 +35,7 @@ public class ServerlessPluginLockTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put(ServerlessBootstrap.STORE_PATH, createTempDir().toString())
+            .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), createTempDir().toString())
             .build();
     }
 

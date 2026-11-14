@@ -19,7 +19,6 @@ import org.opensearch.serverless.reconcile.ReconcileScheduler;
 import org.opensearch.serverless.shard.ShardReconciler;
 import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.transport.CommitPush;
 import org.opensearch.serverless.transport.RefreshVisibility;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -69,7 +68,7 @@ public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
             .put("serverless.roles", roles)
             .put("serverless.wal.node_log.enabled", true)
             .put("serverless.wal.node_log.window_millis", WINDOW)
-            .put(CommitPush.ENABLED, true)
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
             .build();
     }
 
@@ -125,7 +124,9 @@ public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
     }
 
     private static void setMode(RefreshVisibility.Mode mode, ServerlessNode... nodes) {
-        final Settings cluster = Settings.builder().put(RefreshVisibility.CLUSTER_SETTING, mode.settingValue()).build();
+        final Settings cluster = Settings.builder()
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.REFRESH_VISIBILITY_CLUSTER.getKey(), mode.settingValue())
+            .build();
         for (ServerlessNode node : nodes) {
             node.router().refreshVisibility().applyCluster(cluster);
         }

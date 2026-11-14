@@ -29,26 +29,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * warm cache from its peers, opens those shards as readers, reads from the object store what no peer could hand over,
  * then marks it ready and renews its lease at once so that coordinators start ranking it.
  *
- * <p>It turns ready once it holds {@value #READY_FRACTION} of the blocks its peers named (nine tenths by default),
+ * <p>It turns ready once it holds {@code serverless.search.warm_on_join.ready_fraction} of the blocks its peers named (nine tenths by default),
  * opening its shards then; the rest of the copy, and the reads of what no peer had, go on after.
  *
- * <p>Bounded by {@value #MAX_WAIT}. A node is never held out of searches longer than that, whatever its peers are
+ * <p>Bounded by {@code serverless.search.warm_on_join.max_wait}. A node is never held out of searches longer than that, whatever its peers are
  * doing: past it, the node turns ready and the rest of its cache fills from searches as it would have without warm-up.
  * A shard that fails to open is left to open on its first search, for the same reason.
  */
 public final class SearchWarmup {
 
     private static final Logger LOG = LogManager.getLogger(SearchWarmup.class);
-
-    /** The longest a joining node stays warming before it turns ready regardless. */
-    public static final String MAX_WAIT = "serverless.search.warm_on_join.max_wait";
-
-    /**
-     * The share of its peers' named warm blocks a joiner holds before it turns ready, from 0 to 1. The rest keeps
-     * copying after: the coldest tenth of a hot set is worth less than the minutes it can take, especially from a slow
-     * peer.
-     */
-    public static final String READY_FRACTION = "serverless.search.warm_on_join.ready_fraction";
 
     /** The default share: nine tenths. */
     static final double DEFAULT_READY_FRACTION = 0.9;
@@ -72,7 +62,7 @@ public final class SearchWarmup {
     private SearchWarmup() {}
 
     /**
-     * Warms a node that joined to warm, in the background, and marks it ready when done or at {@value #MAX_WAIT}.
+     * Warms a node that joined to warm, in the background, and marks it ready when done or at {@code serverless.search.warm_on_join.max_wait}.
      * Does nothing for a node that is not warming.
      *
      * @param node the node
@@ -84,7 +74,7 @@ public final class SearchWarmup {
             return;
         }
         final AtomicBoolean done = new AtomicBoolean();
-        final TimeValue maxWait = node.settings().getAsTime(MAX_WAIT, DEFAULT_MAX_WAIT);
+        final TimeValue maxWait = SearchSettings.WARM_ON_JOIN_MAX_WAIT.get(node.settings());
         node.threadPool().schedule(() -> {
             if (done.compareAndSet(false, true)) {
                 LOG.warn("search warm-up did not finish within [{}]; serving searches with the cache it has", maxWait);
@@ -118,7 +108,7 @@ public final class SearchWarmup {
 
     private static Outcome warm(ServerlessNode node, MetadataPlane plane, AtomicBoolean done) throws java.io.IOException {
         final long started = System.nanoTime();
-        final double fraction = node.settings().getAsDouble(READY_FRACTION, DEFAULT_READY_FRACTION);
+        final double fraction = SearchSettings.WARM_ON_JOIN_READY_FRACTION.get(node.settings());
         final Opening opening = new Opening(node, plane);
         // At the share: open what is held so far and turn ready; the copy goes on underneath for the rest.
         final CacheWarmCopy.Outcome copy = CacheWarmCopy.of(node).copyFromPeers(fraction, shards -> {

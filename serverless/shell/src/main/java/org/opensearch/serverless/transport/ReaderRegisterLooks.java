@@ -45,17 +45,11 @@ import java.util.function.Supplier;
  * <p><b>What it does not change.</b> The check a search makes before a reader answers ({@code ReaderValidation}) is
  * untouched: a reader whose writer died is still refused until a successor has replayed and published. A pushed commit
  * still moves a reader at once, and a write answered as refreshed is still made visible through the tail overlay. On
- * unless {@value #ENABLED} is set to false.
+ * unless {@code serverless.search.commit_push.trust} is set to false.
  */
 public final class ReaderRegisterLooks {
 
-    /** Whether a search node skips the periodic register look for readers its live writer pushes. */
-    public static final String ENABLED = "serverless.search.commit_push.trust";
-
-    /** The longest a reader goes without a register look while it is skipped, in milliseconds. */
-    public static final String BACKSTOP = "serverless.search.commit_push.trust_backstop_millis";
-
-    /** The default of {@value #BACKSTOP}: two minutes, against twenty seconds between looks without pushes. */
+    /** The default of {@code serverless.search.commit_push.trust_backstop_millis}: two minutes, against twenty seconds between looks without pushes. */
     public static final long BACKSTOP_MILLIS = 120_000L;
 
     /** How many shards' last looks are kept before those past the backstop are dropped. */
@@ -75,8 +69,10 @@ public final class ReaderRegisterLooks {
     ReaderRegisterLooks(ServerlessNode node, Supplier<MetadataPlane> plane, Settings settings) {
         this.node = node;
         this.plane = plane;
-        this.enabled = settings.getAsBoolean(ENABLED, true);
-        this.backstopNanos = TimeUnit.MILLISECONDS.toNanos(Math.max(0L, settings.getAsLong(BACKSTOP, BACKSTOP_MILLIS)));
+        this.enabled = ReaderPushSettings.COMMIT_PUSH_TRUST.get(settings);
+        this.backstopNanos = TimeUnit.MILLISECONDS.toNanos(
+            Math.max(0L, ReaderPushSettings.COMMIT_PUSH_TRUST_BACKSTOP_MILLIS.get(settings))
+        );
     }
 
     /** @return whether looks are skipped at all on this node */

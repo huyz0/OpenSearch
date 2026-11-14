@@ -2,5 +2,5 @@
 # shorten it after a fix, never lengthen it. See serverless/structure-rules.gradle.
 metadata 54
 rest 70
-shell 65
+shell 64
 transport 43

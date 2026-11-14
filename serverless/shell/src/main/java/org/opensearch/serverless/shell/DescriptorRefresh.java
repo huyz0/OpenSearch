@@ -84,8 +84,8 @@ final class DescriptorRefresh {
         }
         try {
             final org.opensearch.common.settings.Settings cluster = plane.clusterConfig().read().settings();
-            node.clusterSegmentPlacement = cluster.get(SegmentPlacement.CLUSTER_SETTING);
-            node.clusterBucketPolicy = cluster.get(org.opensearch.serverless.bucket.BucketPolicy.CLUSTER_SETTING);
+            node.clusterSegmentPlacement = cluster.get(NodeSettings.SEGMENT_PLACEMENT_CLUSTER.getKey());
+            node.clusterBucketPolicy = cluster.get(org.opensearch.serverless.bucket.BucketSettings.CLUSTER_POLICY.getKey());
             // The checkpoint age for log commits rides on the same read.
             LogCommitCheckpoint.applyCluster(node, cluster);
             // And whether writes are searched before they are published.

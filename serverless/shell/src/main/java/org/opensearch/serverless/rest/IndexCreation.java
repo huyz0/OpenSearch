@@ -345,7 +345,7 @@ final class IndexCreation {
             throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
         }
         // So is the bucket policy.
-        final String bucketPolicy = given.get(org.opensearch.serverless.bucket.BucketPolicy.INDEX_SETTING);
+        final String bucketPolicy = given.get(org.opensearch.serverless.bucket.BucketSettings.INDEX_POLICY.getKey());
         if (bucketPolicy != null) {
             try {
                 org.opensearch.serverless.bucket.BucketPolicy.check(bucketPolicy);
@@ -354,7 +354,7 @@ final class IndexCreation {
             }
         }
         // So is the segment placement.
-        final String placement = given.get(org.opensearch.serverless.shell.SegmentPlacement.INDEX_SETTING);
+        final String placement = given.get(org.opensearch.serverless.shell.NodeSettings.SEGMENT_PLACEMENT_INDEX.getKey());
         if (placement != null) {
             try {
                 org.opensearch.serverless.shell.SegmentPlacement.check(placement);
@@ -362,7 +362,7 @@ final class IndexCreation {
                 throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
             }
         }
-        final String overlay = given.get(org.opensearch.serverless.transport.TailOverlays.INDEX_SETTING);
+        final String overlay = given.get(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey());
         if (overlay != null) {
             try {
                 org.opensearch.serverless.transport.TailOverlays.check(overlay);
@@ -371,10 +371,10 @@ final class IndexCreation {
             }
         }
         final Settings settings = org.opensearch.serverless.routing.ShardMode.without(given)
-            .filter(key -> org.opensearch.serverless.shell.SegmentPlacement.INDEX_SETTING.equals(key) == false)
-            .filter(key -> org.opensearch.serverless.transport.TailOverlays.INDEX_SETTING.equals(key) == false)
-            .filter(key -> org.opensearch.serverless.bucket.BucketPolicy.INDEX_SETTING.equals(key) == false)
-            .filter(key -> org.opensearch.serverless.bucket.BucketPolicy.GROUP_SETTING.equals(key) == false);
+            .filter(key -> org.opensearch.serverless.shell.NodeSettings.SEGMENT_PLACEMENT_INDEX.getKey().equals(key) == false)
+            .filter(key -> org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey().equals(key) == false)
+            .filter(key -> org.opensearch.serverless.bucket.BucketSettings.INDEX_POLICY.getKey().equals(key) == false)
+            .filter(key -> org.opensearch.serverless.bucket.BucketSettings.GROUP.getKey().equals(key) == false);
         final String unsupported = unsupportedIndexSetting(settings);
         if (unsupported != null) {
             throw new IndexAdminHandler.RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_setting", unsupported);

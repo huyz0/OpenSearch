@@ -20,8 +20,6 @@ import org.opensearch.serverless.reconcile.ReconcileScheduler;
 import org.opensearch.serverless.shard.ShardReconciler;
 import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.transport.CommitPush;
-import org.opensearch.serverless.transport.TailOverlays;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
@@ -334,17 +332,32 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
     public void testWriteToSearchableDelayByPath() throws Exception {
         final String which = System.getProperty("tests.meter.freshness", "");
         assumeTrue("a freshness meter runs only when -Dtests.meter.freshness is set", which.isEmpty() == false);
-        final Settings commitOnly = Settings.builder().put(TailOverlays.ENABLED, false).put(CommitPush.ENABLED, false).build();
+        final Settings commitOnly = Settings.builder()
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_ENABLED.getKey(), false)
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), false)
+            .build();
         if ("push".equals(which) == false) {
             measure("commit only (no push, no overlay)", commitOnly);
-            measure("commit push, no overlay", Settings.builder().put(commitOnly).put(CommitPush.ENABLED, true).build());
+            measure(
+                "commit push, no overlay",
+                Settings.builder()
+                    .put(commitOnly)
+                    .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
+                    .build()
+            );
         }
-        measure("overlay + commit push", Settings.builder().put(TailOverlays.ENABLED, true).put(CommitPush.ENABLED, true).build());
+        measure(
+            "overlay + commit push",
+            Settings.builder()
+                .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_ENABLED.getKey(), true)
+                .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
+                .build()
+        );
         measure(
             "overlay + commit push + log commits",
             Settings.builder()
-                .put(TailOverlays.ENABLED, true)
-                .put(CommitPush.ENABLED, true)
+                .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_ENABLED.getKey(), true)
+                .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
                 .put("serverless.wal.node_log.commits", true)
                 .build()
         );
@@ -360,8 +373,14 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
             "a freshness meter runs only when -Dtests.meter.freshness is set",
             System.getProperty("tests.meter.freshness", "").isEmpty() == false
         );
-        busy("overlay off", Settings.builder().put(TailOverlays.ENABLED, false).build());
-        busy("overlay on", Settings.builder().put(TailOverlays.ENABLED, true).build());
+        busy(
+            "overlay off",
+            Settings.builder().put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_ENABLED.getKey(), false).build()
+        );
+        busy(
+            "overlay on",
+            Settings.builder().put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_ENABLED.getKey(), true).build()
+        );
     }
 
     private static final int BUSY_SHARDS = 8;

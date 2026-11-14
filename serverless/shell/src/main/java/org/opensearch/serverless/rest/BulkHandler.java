@@ -105,22 +105,10 @@ public final class BulkHandler extends BaseRestHandler {
         );
     }
 
-    /**
-     * Whether a batch's memory is charged to indexing pressure before its body is copied and parsed, at
-     * {@link #MEMORY_FACTOR_SETTING} times its length; off, it is charged its length once, after parsing, as before.
-     */
-    public static final String CHARGE_BEFORE_PARSE_SETTING = "serverless.write.bulk.charge_before_parse";
-
-    /** The default {@link #CHARGE_BEFORE_PARSE_SETTING}. */
+    /** The default {@link org.opensearch.serverless.rest.BulkSettings#CHARGE_BEFORE_PARSE}. */
     public static final boolean DEFAULT_CHARGE_BEFORE_PARSE = true;
 
-    /**
-     * How many times its length a batch is charged when {@link #CHARGE_BEFORE_PARSE_SETTING} is on: what a node holds of
-     * it at once, the body, each source as a string, the bytes the engine parses and the node-log blob carrying it.
-     */
-    public static final String MEMORY_FACTOR_SETTING = "serverless.write.bulk.memory_factor";
-
-    /** The default {@link #MEMORY_FACTOR_SETTING}. */
+    /** The default {@link org.opensearch.serverless.rest.BulkSettings#MEMORY_FACTOR}. */
     public static final double DEFAULT_MEMORY_FACTOR = 4.0;
 
     /**
@@ -131,7 +119,7 @@ public final class BulkHandler extends BaseRestHandler {
      * @return the charge
      */
     static long upFrontCharge(long contentLength, org.opensearch.common.settings.Settings settings) {
-        final double factor = Math.max(1.0, settings.getAsDouble(MEMORY_FACTOR_SETTING, DEFAULT_MEMORY_FACTOR));
+        final double factor = Math.max(1.0, BulkSettings.MEMORY_FACTOR.get(settings));
         return (long) Math.min(Long.MAX_VALUE / 2.0, contentLength * factor);
     }
 
@@ -154,31 +142,13 @@ public final class BulkHandler extends BaseRestHandler {
         }
     }
 
-    /**
-     * Whether {@code _bulk} bodies are streamed: read as they arrive, a slice at a time, with memory per request bounded
-     * whatever the body's size ({@link BulkStream}). Needs the streaming HTTP transport, which the same setting selects.
-     */
-    public static final String STREAMING_SETTING = "serverless.http.streaming";
-
-    /** The default {@link #STREAMING_SETTING}. */
+    /** The default {@link org.opensearch.serverless.rest.BulkSettings#STREAMING}. */
     public static final boolean DEFAULT_STREAMING = true;
 
-    /** How much of a streamed body is parsed and applied at once. */
-    public static final String SLICE_BYTES_SETTING = "serverless.write.bulk.slice_bytes";
-
-    /** The default {@link #SLICE_BYTES_SETTING}: one node-log blob's worth. */
+    /** The default {@link org.opensearch.serverless.rest.BulkSettings#SLICE_BYTES}: one node-log blob's worth. */
     public static final long DEFAULT_SLICE_BYTES = 8L * 1024 * 1024;
 
-    /** The heap all streamed batches on a node may hold at once while being applied. */
-    public static final String BUDGET_SETTING = "serverless.write.bulk.memory_budget";
-
-    /** How long a streamed slice waits for its share of the budget before its request is refused with a 429. */
-    public static final String WAIT_SETTING = "serverless.write.bulk.max_wait";
-
-    /** How many streamed slices a node applies at once, across all batches; the node's cores by default. */
-    public static final String MAX_APPLYING_SETTING = "serverless.write.bulk.max_applying_slices";
-
-    /** The default {@link #WAIT_SETTING}. */
+    /** The default {@link org.opensearch.serverless.rest.BulkSettings#MAX_WAIT}. */
     public static final org.opensearch.common.unit.TimeValue DEFAULT_WAIT = org.opensearch.common.unit.TimeValue.timeValueMinutes(2);
 
     private volatile BulkMemoryBudget budget;
@@ -190,7 +160,7 @@ public final class BulkHandler extends BaseRestHandler {
      * @return true to stream
      */
     public static boolean streams(org.opensearch.common.settings.Settings settings) {
-        return settings.getAsBoolean(STREAMING_SETTING, DEFAULT_STREAMING);
+        return BulkSettings.STREAMING.get(settings);
     }
 
     @Override
@@ -211,14 +181,10 @@ public final class BulkHandler extends BaseRestHandler {
                 if (budget == null) {
                     budget = new BulkMemoryBudget(
                         org.opensearch.common.unit.MemorySizeValue.parseBytesSizeValueOrHeapRatio(
-                            serving.settings().get(BUDGET_SETTING, "10%"),
-                            BUDGET_SETTING
+                            BulkSettings.MEMORY_BUDGET.get(serving.settings()),
+                            BulkSettings.MEMORY_BUDGET.getKey()
                         ).getBytes(),
-                        serving.settings()
-                            .getAsInt(
-                                MAX_APPLYING_SETTING,
-                                org.opensearch.common.util.concurrent.OpenSearchExecutors.allocatedProcessors(serving.settings())
-                            ),
+                        BulkSettings.MAX_APPLYING_SLICES.get(serving.settings()),
                         serving.threadPool()
                     );
                 }
@@ -276,14 +242,10 @@ public final class BulkHandler extends BaseRestHandler {
                 metadata,
                 new BulkStream.Request(defaultIndex, routing, defaultPipeline, refreshPolicy != WriteRequest.RefreshPolicy.NONE),
                 budget(serving),
-                Math.max(
-                    64 * 1024,
-                    settings.getAsBytesSize(SLICE_BYTES_SETTING, new org.opensearch.core.common.unit.ByteSizeValue(DEFAULT_SLICE_BYTES))
-                        .getBytes()
-                ),
+                Math.max(64 * 1024, BulkSettings.SLICE_BYTES.get(settings).getBytes()),
                 org.opensearch.http.HttpTransportSettings.SETTING_HTTP_MAX_CONTENT_LENGTH.get(settings).getBytes(),
-                Math.max(1.0, settings.getAsDouble(MEMORY_FACTOR_SETTING, DEFAULT_MEMORY_FACTOR)),
-                settings.getAsTime(WAIT_SETTING, DEFAULT_WAIT)
+                Math.max(1.0, BulkSettings.MEMORY_FACTOR.get(settings)),
+                BulkSettings.MAX_WAIT.get(settings)
             ).start();
         };
     }
@@ -299,9 +261,7 @@ public final class BulkHandler extends BaseRestHandler {
 
     /** Takes the body whole: charged up front, then parsed and applied. */
     private RestChannelConsumer prepareWhole(RestRequest request, ServerlessNode serving) throws IOException {
-        if (serving == null
-            || request.hasContent() == false
-            || serving.settings().getAsBoolean(CHARGE_BEFORE_PARSE_SETTING, DEFAULT_CHARGE_BEFORE_PARSE) == false) {
+        if (serving == null || request.hasContent() == false || BulkSettings.CHARGE_BEFORE_PARSE.get(serving.settings()) == false) {
             return prepareCharged(request, null);
         }
         // Charged before the body is copied or parsed, so a node at its limit refuses a large batch before holding any

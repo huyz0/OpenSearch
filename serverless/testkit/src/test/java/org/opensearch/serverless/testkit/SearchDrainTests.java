@@ -43,7 +43,7 @@ public class SearchDrainTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", roles)
             .put("serverless.block_cache.block_size", 4096)
-            .put(SearchDrain.SETTLE, "0ms")
+            .put(org.opensearch.serverless.shell.SearchSettings.DRAIN_SETTLE.getKey(), "0ms")
             .build();
     }
 

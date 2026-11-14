@@ -42,9 +42,9 @@ public class LocalSegmentMemoryTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put(LocalSegmentTier.ENABLED_SETTING, true)
-            .put(LocalSegmentTier.MAX_BYTES_SETTING, "96kb")
-            .put(LocalSegmentTier.MAX_FILE_BYTES_SETTING, "8kb")
+            .put(org.opensearch.serverless.store.CacheSettings.LOCAL_MEMORY_ENABLED.getKey(), true)
+            .put(org.opensearch.serverless.store.CacheSettings.LOCAL_MEMORY_MAX_BYTES.getKey(), "96kb")
+            .put(org.opensearch.serverless.store.CacheSettings.LOCAL_MEMORY_MAX_FILE_BYTES.getKey(), "8kb")
             .build();
     }
 

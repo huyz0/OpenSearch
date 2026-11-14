@@ -16,7 +16,6 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.CommitManifest;
-import org.opensearch.serverless.transport.CommitPush;
 import org.opensearch.serverless.transport.TailOverlays;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -43,7 +42,7 @@ public class TailOverlayTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put(CommitPush.ENABLED, true)
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
             .build();
     }
 
@@ -156,21 +155,28 @@ public class TailOverlayTests extends OpenSearchTestCase {
     }
 
     public void testOffForAnIndexTheReaderServesItsCommitOnly() throws Exception {
-        withNodes(Settings.builder().put(TailOverlays.INDEX_SETTING, "false").build(), (plane, store, writer, reader, shardId, term) -> {
-            writer.writes().index(shardId, "a", "{\"msg\":\"published\",\"n\":1}");
-            writer.shards().publishShard(shardId, term);
-            assertEquals(1L, hits(reader, plane, "msg", "published"));
-            writer.writes().index(shardId, "b", "{\"msg\":\"unpublished\",\"n\":2}");
-            Thread.sleep(500);
-            assertEquals(0L, hits(reader, plane, "msg", "unpublished"));
-            assertEquals(0L, writer.router().tailPush().counts()[0]);
-            assertTrue(writer.router().tailPush().subscribersOf(shardId).isEmpty());
-        });
+        withNodes(
+            Settings.builder().put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey(), "false").build(),
+            (plane, store, writer, reader, shardId, term) -> {
+                writer.writes().index(shardId, "a", "{\"msg\":\"published\",\"n\":1}");
+                writer.shards().publishShard(shardId, term);
+                assertEquals(1L, hits(reader, plane, "msg", "published"));
+                writer.writes().index(shardId, "b", "{\"msg\":\"unpublished\",\"n\":2}");
+                Thread.sleep(500);
+                assertEquals(0L, hits(reader, plane, "msg", "unpublished"));
+                assertEquals(0L, writer.router().tailPush().counts()[0]);
+                assertTrue(writer.router().tailPush().subscribersOf(shardId).isEmpty());
+            }
+        );
     }
 
     public void testTheIndexSettingWinsOverTheClusterAndTheClusterOverTheNode() {
-        final Settings on = Settings.builder().put(TailOverlays.INDEX_SETTING, "true").build();
-        final Settings off = Settings.builder().put(TailOverlays.INDEX_SETTING, "false").build();
+        final Settings on = Settings.builder()
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey(), "true")
+            .build();
+        final Settings off = Settings.builder()
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey(), "false")
+            .build();
         assertTrue(TailOverlays.on(on, "false", false));
         assertFalse(TailOverlays.on(off, "true", true));
         assertFalse(TailOverlays.on(Settings.EMPTY, "false", true));

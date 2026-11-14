@@ -198,7 +198,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
     private static String unknownSettings(Settings requested, IndexScopedSettings scoped) {
         final TreeSet<String> unknown = new TreeSet<>();
         for (String key : requested.keySet()) {
-            if (org.opensearch.serverless.bucket.BucketPolicy.INDEX_SETTING.equals(key)) {
+            if (org.opensearch.serverless.bucket.BucketSettings.INDEX_POLICY.getKey().equals(key)) {
                 // Ours, and dynamic: it decides where the index lives from its next bucket checkpoint on.
                 try {
                     org.opensearch.serverless.bucket.BucketPolicy.check(requested.get(key));
@@ -207,7 +207,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
                 }
                 continue;
             }
-            if (org.opensearch.serverless.shell.SegmentPlacement.INDEX_SETTING.equals(key)) {
+            if (org.opensearch.serverless.shell.NodeSettings.SEGMENT_PLACEMENT_INDEX.getKey().equals(key)) {
                 // Ours, and dynamic: it applies to each shard's next publish.
                 try {
                     org.opensearch.serverless.shell.SegmentPlacement.check(requested.get(key));
@@ -216,7 +216,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
                 }
                 continue;
             }
-            if (org.opensearch.serverless.transport.TailOverlays.INDEX_SETTING.equals(key)) {
+            if (org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey().equals(key)) {
                 // Ours, and dynamic: it applies to the shard's next acknowledged write.
                 try {
                     org.opensearch.serverless.transport.TailOverlays.check(requested.get(key));
@@ -225,7 +225,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
                 }
                 continue;
             }
-            if (scoped.get(key) == null && org.opensearch.serverless.routing.ShardMode.SETTING.equals(key) == false) {
+            if (scoped.get(key) == null && org.opensearch.serverless.routing.RoutingSettings.SHARD_MODE.getKey().equals(key) == false) {
                 unknown.add(key);
             }
         }
@@ -233,8 +233,8 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
     }
 
     private static String refuse(Settings requested, IndexScopedSettings scoped) {
-        if (requested.get(org.opensearch.serverless.routing.ShardMode.SETTING) != null) {
-            return org.opensearch.serverless.routing.ShardMode.SETTING
+        if (requested.get(org.opensearch.serverless.routing.RoutingSettings.SHARD_MODE.getKey()) != null) {
+            return org.opensearch.serverless.routing.RoutingSettings.SHARD_MODE.getKey()
                 + " is chosen when an index is created and cannot be changed: it decides how the index's units "
                 + "start, and the units an index already has stay as they are";
         }

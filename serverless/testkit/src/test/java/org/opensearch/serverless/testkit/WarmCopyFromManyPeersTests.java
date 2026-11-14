@@ -14,7 +14,6 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.SearchReadiness;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.transport.CacheWarmCopy;
 import org.opensearch.test.OpenSearchTestCase;
@@ -85,7 +84,10 @@ public class WarmCopyFromManyPeersTests extends OpenSearchTestCase {
                     nodeSettings(
                         "many-joiner",
                         "search",
-                        Settings.builder().put(SearchReadiness.WARM_ON_JOIN, true).put(CacheWarmCopy.BATCH_BLOCKS, 1).build()
+                        Settings.builder()
+                            .put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), true)
+                            .put(org.opensearch.serverless.transport.WarmCopySettings.BATCH_BLOCKS.getKey(), 1)
+                            .build()
                     )
                 ),
                 plane

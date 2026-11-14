@@ -63,44 +63,14 @@ public final class NodeLogCommitter {
      * short enough that a write is acknowledged within a quarter of a second.
      */
     public static final java.util.Set<Long> ALLOWED_WINDOW_MILLIS = java.util.Set.of(100L, 200L, 250L);
-    /**
-     * How long a window's PUT may go unanswered before it is sent again, in milliseconds; zero or less never sends a
-     * second. See {@link #hedgeAppends}.
-     */
-    public static final String HEDGE_AFTER_SETTING = "serverless.wal.node_log.hedge_after_millis";
-
-    /** Whether a record that finds the log quiet for a window is written at once; see {@link #flushWhenIdle}. */
-    public static final String IDLE_FLUSH_SETTING = "serverless.wal.node_log.idle_flush";
-
-    /** Whether writers that join a window someone already drives wait for it without the lock; see {@link #followUnlocked}. */
-    public static final String FOLLOW_UNLOCKED_SETTING = "serverless.wal.node_log.follow_unlocked";
-
-    /** The default for {@link #FOLLOW_UNLOCKED_SETTING}. */
+    /** The default for {@link org.opensearch.serverless.store.NodeLogSettings#FOLLOW_UNLOCKED}. */
     public static final boolean DEFAULT_FOLLOW_UNLOCKED = true;
 
-    /**
-     * How many shards new to an epoch are checked at once before the window carrying their first records is written; one
-     * checks them one after another. See {@link #admitConcurrently}.
-     */
-    public static final String ADMISSION_CONCURRENCY_SETTING = "serverless.wal.node_log.admission_concurrency";
-
-    /** The default {@link #ADMISSION_CONCURRENCY_SETTING}. */
+    /** The default {@link org.opensearch.serverless.store.NodeLogSettings#ADMISSION_CONCURRENCY}. */
     public static final int DEFAULT_ADMISSION_CONCURRENCY = 32;
 
-    /** The default of {@link #HEDGE_AFTER_SETTING}. */
+    /** The default of {@link org.opensearch.serverless.store.NodeLogSettings#HEDGE_AFTER_MILLIS}. */
     public static final long DEFAULT_HEDGE_AFTER_MILLIS = 60L;
-
-    /**
-     * Whether one shard's records that would carry a window past its byte or record bound are split across consecutive
-     * windows, so that no blob grows far past the bound; off, they join one window whole, however many there are.
-     */
-    public static final String SPLIT_SETTING = "serverless.wal.node_log.split_large_batches";
-
-    /**
-     * Whether a window's hedge waits longer in proportion to how much larger its blob is than the recent ones; off, every
-     * blob waits the same, and a blob many times the usual size is nearly always sent twice.
-     */
-    public static final String HEDGE_BY_SIZE_SETTING = "serverless.wal.node_log.hedge_by_size";
 
     /** Roughly the most bytes of id and source one window takes before the next arrival opens another. */
     public static final long DEFAULT_MAX_BYTES = 8L * 1024 * 1024;
@@ -1086,7 +1056,7 @@ public final class NodeLogCommitter {
 
     /** The most recent PUT durations, for the hedge delay; guarded by itself. */
     private final long[] recentPutNanos = new long[RECENT_PUTS];
-    /** The sizes of the same PUTs, for {@link #HEDGE_BY_SIZE_SETTING}; guarded by {@link #recentPutNanos}. */
+    /** The sizes of the same PUTs, for {@link org.opensearch.serverless.store.NodeLogSettings#HEDGE_BY_SIZE}; guarded by {@link #recentPutNanos}. */
     private final long[] recentPutBytes = new long[RECENT_PUTS];
     private int recentPuts;
     private static final int RECENT_PUTS = 128;
@@ -1111,7 +1081,7 @@ public final class NodeLogCommitter {
 
     /**
      * How long a PUT of this many bytes waits before it is sent again: {@link #hedgeDelayNanos()}, scaled up by how many
-     * times the median of the recent PUTs' sizes it is when {@link #HEDGE_BY_SIZE_SETTING} is on. A blob ten times the
+     * times the median of the recent PUTs' sizes it is when {@link org.opensearch.serverless.store.NodeLogSettings#HEDGE_BY_SIZE} is on. A blob ten times the
      * usual size takes about ten times as long to send; hedged on the usual PUTs' tail, it was nearly always sent twice.
      *
      * @param blobBytes the blob's size; zero or less scales nothing
@@ -1145,7 +1115,7 @@ public final class NodeLogCommitter {
     }
 
     /**
-     * Sets {@link #SPLIT_SETTING} and {@link #HEDGE_BY_SIZE_SETTING}.
+     * Sets {@link org.opensearch.serverless.store.NodeLogSettings#SPLIT_LARGE_BATCHES} and {@link org.opensearch.serverless.store.NodeLogSettings#HEDGE_BY_SIZE}.
      *
      * @param split whether a shard's records that would carry a window past its bounds are split across windows
      * @param bySize whether a larger blob waits longer before it is hedged

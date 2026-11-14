@@ -43,12 +43,8 @@ import java.util.function.Function;
  */
 final class NodePackWiring {
 
-    static final String ENABLED = "serverless.segments.node_pack.enabled";
     /** On: a 1K-shard soak measured a third of the PUTs, a faster first search and a takeover within a tenth. */
     static final boolean ENABLED_DEFAULT = true;
-    static final String MAX_BLOB_BYTES = "serverless.segments.node_pack.max_blob_bytes";
-    static final String LINGER_MILLIS = "serverless.segments.node_pack.linger_millis";
-    static final String COLLECT_INTERVAL_MILLIS = "serverless.segments.node_pack.collect_interval_millis";
     static final long DEFAULT_COLLECT_INTERVAL_MILLIS = 60_000L;
     static final long DEFAULT_MAX_BLOB_BYTES = 8L * 1024 * 1024;
     static final long DEFAULT_LINGER_MILLIS = 50L;
@@ -72,7 +68,7 @@ final class NodePackWiring {
         if (node.packSegments == false) {
             return id -> staging(plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id()).packing(false), node, staged);
         }
-        final boolean enabled = node.settings.getAsBoolean(ENABLED, ENABLED_DEFAULT);
+        final boolean enabled = WriteSettings.NODE_PACK_ENABLED.get(node.settings);
         if (enabled == false) {
             collectEarlierPacks(node, plane);
         }
@@ -113,20 +109,12 @@ final class NodePackWiring {
         }
     }
 
-    /**
-     * Commits recorded with the node's write log: a routine publish keeps its commit on the writer and the manifest is
-     * written as a checkpoint; see {@link CommitStaging}. Part of the per-node write log, so only with it on; on by
-     * default, and switched by this setting.
-     */
-    static final String LOG_COMMITS = "serverless.wal.node_log.commits";
     /** On, with node packs: together they cut a publish's PUTs to a third. */
     static final boolean LOG_COMMITS_DEFAULT = true;
-    /** How old a staged commit gets before its manifest is written; see {@link LogCommitCheckpoint}. */
-    static final String LOG_COMMITS_CHECKPOINT_MILLIS = LogCommitCheckpoint.SETTING;
 
     /** Whether a node's shards stage their commits; the age, checked when the node was made, is the node's. */
     static boolean logCommitsStage(ServerlessNode node) {
-        return node.nodeLogEnabled && node.settings.getAsBoolean(LOG_COMMITS, LOG_COMMITS_DEFAULT);
+        return node.nodeLogEnabled && WriteSettings.LOG_COMMITS.get(node.settings);
     }
 
     private static SegmentPublisher staging(SegmentPublisher publisher, ServerlessNode node, boolean stages) {
@@ -134,8 +122,7 @@ final class NodePackWiring {
     }
 
     static long maxBlobBytes(Settings settings) {
-        return settings.getAsBytesSize(MAX_BLOB_BYTES, new org.opensearch.core.common.unit.ByteSizeValue(DEFAULT_MAX_BLOB_BYTES))
-            .getBytes();
+        return WriteSettings.NODE_PACK_MAX_BLOB_BYTES.get(settings).getBytes();
     }
 
     private static NodePackWriter writer(ServerlessNode node, MetadataPlane plane) {
@@ -149,7 +136,7 @@ final class NodePackWiring {
             final NodePackStore store = new NodePackStore(plane.blobStore(), plane.basePath(), nodeId);
             final NodePackLedger ledger = new NodePackLedger(plane.blobStore(), plane.basePath(), nodeId);
             final long epoch = nextEpoch();
-            final long linger = node.settings.getAsLong(LINGER_MILLIS, DEFAULT_LINGER_MILLIS);
+            final long linger = WriteSettings.NODE_PACK_LINGER_MILLIS.get(node.settings);
             final NodePackWriter writer = new NodePackWriter(store, epoch, linger, MAX_PACK_BYTES);
             writer.recordIn(ledger);
             final NodePackCollector collector = new NodePackCollector(
@@ -160,7 +147,7 @@ final class NodePackWiring {
                 GarbageCollector.DEFAULT_MINIMUM_UNREFERENCED_MILLIS
             );
             collector.follow(writer);
-            final long interval = node.settings.getAsLong(COLLECT_INTERVAL_MILLIS, DEFAULT_COLLECT_INTERVAL_MILLIS);
+            final long interval = WriteSettings.NODE_PACK_COLLECT_INTERVAL_MILLIS.get(node.settings);
             if (interval > 0L) {
                 node.threadPool()
                     .scheduleWithFixedDelay(collector::runQuietly, TimeValue.timeValueMillis(interval), ThreadPool.Names.GENERIC);

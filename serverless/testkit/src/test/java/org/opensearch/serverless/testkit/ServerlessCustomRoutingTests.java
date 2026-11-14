@@ -19,7 +19,6 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.ReconcileScheduler;
 import org.opensearch.serverless.rest.DocumentRouting;
-import org.opensearch.serverless.routing.ShardMode;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.split.UnitSplitMover;
 import org.opensearch.serverless.store.WalRecord;
@@ -68,7 +67,9 @@ public class ServerlessCustomRoutingTests extends OpenSearchTestCase {
     }
 
     private static String create(int shards, String mode, String extraMappings) {
-        final String modeSetting = mode == null ? "" : ",\"" + ShardMode.SETTING + "\":\"" + mode + "\"";
+        final String modeSetting = mode == null
+            ? ""
+            : ",\"" + org.opensearch.serverless.routing.RoutingSettings.SHARD_MODE.getKey() + "\":\"" + mode + "\"";
         final String mappings = extraMappings == null
             ? MAPPINGS
             : "\"mappings\":{" + extraMappings + ",\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";

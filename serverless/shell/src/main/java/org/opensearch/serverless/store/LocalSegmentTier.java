@@ -43,22 +43,16 @@ import java.util.function.Supplier;
  * and replays the log for the rest. A commit point is never moved to disk on its own, so a local commit can never name a
  * file that went with the memory.
  *
- * <p>On by default ({@link #ENABLED_SETTING}); the byte counts are kept either way, so the disk writes a node makes without
+ * <p>On by default ({@link org.opensearch.serverless.store.CacheSettings#LOCAL_MEMORY_ENABLED}); the byte counts are kept either way, so the disk writes a node makes without
  * it can be measured with it off.
  */
 public final class LocalSegmentTier {
 
-    /** Whether writers hold freshly written segment files in memory. */
-    public static final String ENABLED_SETTING = "serverless.local_segments.memory.enabled";
-    /** The default {@link #ENABLED_SETTING}. */
+    /** The default {@link org.opensearch.serverless.store.CacheSettings#LOCAL_MEMORY_ENABLED}. */
     public static final boolean DEFAULT_ENABLED = true;
-    /** The node's budget for them, in bytes or as a share of the heap. */
-    public static final String MAX_BYTES_SETTING = "serverless.local_segments.memory.max_bytes";
-    /** The default {@link #MAX_BYTES_SETTING}. */
+    /** The default {@link org.opensearch.serverless.store.CacheSettings#LOCAL_MEMORY_MAX_BYTES}. */
     public static final String DEFAULT_MAX_BYTES = "5%";
-    /** The largest file held in memory; a bigger one moves to disk as it passes this. */
-    public static final String MAX_FILE_BYTES_SETTING = "serverless.local_segments.memory.max_file_bytes";
-    /** The default {@link #MAX_FILE_BYTES_SETTING}. */
+    /** The default {@link org.opensearch.serverless.store.CacheSettings#LOCAL_MEMORY_MAX_FILE_BYTES}. */
     public static final String DEFAULT_MAX_FILE_BYTES = "16mb";
 
     /** Memory is taken in steps of this much, so a writer is not charged on every byte. */
@@ -125,14 +119,11 @@ public final class LocalSegmentTier {
      */
     public static LocalSegmentTier fromSettings(Settings settings, Supplier<Executor> evictionExecutor) {
         final long max = MemorySizeValue.parseBytesSizeValueOrHeapRatio(
-            settings.get(MAX_BYTES_SETTING, DEFAULT_MAX_BYTES),
-            MAX_BYTES_SETTING
+            CacheSettings.LOCAL_MEMORY_MAX_BYTES.get(settings),
+            CacheSettings.LOCAL_MEMORY_MAX_BYTES.getKey()
         ).getBytes();
-        final long maxFile = settings.getAsBytesSize(
-            MAX_FILE_BYTES_SETTING,
-            org.opensearch.core.common.unit.ByteSizeValue.parseBytesSizeValue(DEFAULT_MAX_FILE_BYTES, MAX_FILE_BYTES_SETTING)
-        ).getBytes();
-        return new LocalSegmentTier(settings.getAsBoolean(ENABLED_SETTING, DEFAULT_ENABLED), max, maxFile, evictionExecutor);
+        final long maxFile = CacheSettings.LOCAL_MEMORY_MAX_FILE_BYTES.get(settings).getBytes();
+        return new LocalSegmentTier(CacheSettings.LOCAL_MEMORY_ENABLED.get(settings), max, maxFile, evictionExecutor);
     }
 
     private static LongAdder[] adders() {

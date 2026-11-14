@@ -13,7 +13,6 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
-import org.opensearch.serverless.engine.ServerlessWriterEngine;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
@@ -44,7 +43,7 @@ public class DiscardingTranslogTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put(ServerlessWriterEngine.LOCAL_TRANSLOG_SETTING, false)
+            .put(org.opensearch.serverless.engine.WriterEngineSettings.LOCAL_TRANSLOG.getKey(), false)
             .build();
     }
 

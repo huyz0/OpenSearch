@@ -13,7 +13,6 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.cluster.ReaderPlacement;
-import org.opensearch.serverless.cluster.ZonePreference;
 import org.opensearch.serverless.cluster.Zones;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
@@ -153,7 +152,7 @@ public class ZoneTrafficTests extends OpenSearchTestCase {
                 // Every shard counts as hot here, so the first search already prefers the zone.
                 final Settings hot = Settings.builder()
                     .put(settings(node[0], "search", node[1]))
-                    .put(ZonePreference.MIN_PER_SECOND, 0.0)
+                    .put(org.opensearch.serverless.cluster.ReaderPlacementSettings.ZONE_LOCAL_MIN_PER_SECOND.getKey(), 0.0)
                     .build();
                 final ServerlessNode searcher = new ServerlessNode(hot);
                 searchers.add(searcher);

@@ -27,8 +27,8 @@ import java.util.function.LongSupplier;
  * with queued on that node while the rest of the fleet sat idle.
  *
  * <p>Each coordinator now counts how often it searches each shard, as a decaying rate. A shard searched more than
- * {@link #TARGET_PER_SECOND} times a second here is spread over as many of its top-ranked readers as that rate needs,
- * up to {@link #MAX_READERS}. Because every coordinator ranks the same way, their spreads nest: the readers of a shard
+ * {@link org.opensearch.serverless.cluster.ReaderPlacementSettings#SPREAD_TARGET_PER_SECOND} times a second here is spread over as many of its top-ranked readers as that rate needs,
+ * up to {@link org.opensearch.serverless.cluster.ReaderPlacementSettings#SPREAD_MAX_READERS}. Because every coordinator ranks the same way, their spreads nest: the readers of a shard
  * searched a little are a subset of the readers of the same shard searched a lot, so a wider spread opens a reader on
  * the next node in line rather than anywhere. Among the readers in the spread a search goes to the less busy of two
  * picked at random, judged by the searches this coordinator has in flight to each, which keeps a slow reader from
@@ -40,10 +40,6 @@ import java.util.function.LongSupplier;
  */
 public final class HotShardSpread {
 
-    /** Searches a second, from one coordinator, that one reader of a shard is expected to absorb. */
-    public static final String TARGET_PER_SECOND = "serverless.search.reader_spread.target_per_second";
-    /** The most readers one shard's searches are spread over. */
-    public static final String MAX_READERS = "serverless.search.reader_spread.max_readers";
     static final double DEFAULT_TARGET_PER_SECOND = 50.0;
     static final int DEFAULT_MAX_READERS = 4;
     /** How quickly a shard's rate forgets: about this long after its searches stop, it narrows again. */
@@ -83,8 +79,8 @@ public final class HotShardSpread {
      */
     public HotShardSpread(Settings settings, LongSupplier nanos) {
         this(
-            settings.getAsDouble(TARGET_PER_SECOND, DEFAULT_TARGET_PER_SECOND),
-            settings.getAsInt(MAX_READERS, DEFAULT_MAX_READERS),
+            ReaderPlacementSettings.SPREAD_TARGET_PER_SECOND.get(settings),
+            ReaderPlacementSettings.SPREAD_MAX_READERS.get(settings),
             nanos
         );
     }

@@ -116,13 +116,13 @@ final class NodeProcess implements Closeable {
         settings.put("serverless.roles", "ingest");
         settings.put("path.conf", home.resolve("config").toString());
         if (store != null) {
-            settings.put(ServerlessBootstrap.STORE_PATH, store.toString());
+            settings.put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), store.toString());
         }
         final Path readyFile = home.resolve("ready");
         // A restart reuses the home, and the previous process's file names the ports it had: waiting on that one
         // returned at once, with a node that was not up at an address nobody was listening on.
         java.nio.file.Files.deleteIfExists(readyFile);
-        settings.put(ServerlessBootstrap.READY_FILE, readyFile.toString());
+        settings.put(org.opensearch.serverless.shell.NodeSettings.READY_FILE_PROPERTY, readyFile.toString());
         settings.putAll(extra);
         settings.forEach((k, v) -> command.add("-D" + k + "=" + v));
 

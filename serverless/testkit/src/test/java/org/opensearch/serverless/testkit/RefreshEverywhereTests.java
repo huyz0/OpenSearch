@@ -15,10 +15,7 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.transport.CommitPush;
 import org.opensearch.serverless.transport.RefreshVisibility;
-import org.opensearch.serverless.transport.TailOverlays;
-import org.opensearch.serverless.transport.TailPush;
 import org.opensearch.serverless.transport.TailPushRequest;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -58,9 +55,12 @@ public class RefreshEverywhereTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
-            .put(CommitPush.ENABLED, true)
-            .put(TailPush.LINGER_SETTING, 1_000L)
-            .put(RefreshVisibility.NODE_SETTING, RefreshVisibility.Mode.EVERYWHERE.settingValue())
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_PUSH_LINGER_MILLIS.getKey(), 1_000L)
+            .put(
+                org.opensearch.serverless.transport.ReaderPushSettings.REFRESH_VISIBILITY.getKey(),
+                RefreshVisibility.Mode.EVERYWHERE.settingValue()
+            )
             .build();
     }
 
@@ -229,16 +229,19 @@ public class RefreshEverywhereTests extends OpenSearchTestCase {
     }
 
     public void testWithoutTheOverlayAWriteIsNotClaimed() throws Exception {
-        withNodes(Settings.builder().put(TailOverlays.INDEX_SETTING, "false").build(), (plane, writer, reader, join) -> {
-            for (String refresh : REFRESHES) {
-                final String id = "commit-only-" + refresh;
-                final Response put = send(writer, "PUT", "/" + INDEX + "/_doc/" + id + "?refresh=" + refresh, doc(id));
-                assertEquals(201, put.status());
-                assertFalse("search nodes see only commits: " + put.body(), put.body().contains("\"forced_refresh\":true"));
-                // Nothing was claimed, so the reader answers from its commit, which may not hold it yet.
-                assertTrue(hits(reader, id) <= 1L);
+        withNodes(
+            Settings.builder().put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey(), "false").build(),
+            (plane, writer, reader, join) -> {
+                for (String refresh : REFRESHES) {
+                    final String id = "commit-only-" + refresh;
+                    final Response put = send(writer, "PUT", "/" + INDEX + "/_doc/" + id + "?refresh=" + refresh, doc(id));
+                    assertEquals(201, put.status());
+                    assertFalse("search nodes see only commits: " + put.body(), put.body().contains("\"forced_refresh\":true"));
+                    // Nothing was claimed, so the reader answers from its commit, which may not hold it yet.
+                    assertTrue(hits(reader, id) <= 1L);
+                }
             }
-        });
+        );
     }
 
     public void testWritesAnsweredRefreshedAreNeverMissed() throws Exception {

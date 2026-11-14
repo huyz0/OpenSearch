@@ -61,7 +61,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * <p><b>What it costs.</b> One listing per declared name prefix at start (prefixes covered by a shorter one are listed once).
  * After that nothing is listed: a change this node's plugins make through their client is applied at once, and a change
  * made elsewhere is learned from the change stripes every descriptor change already bumps, read every
- * {@value #REFRESH_INTERVAL} (sixteen small reads, shared with the reads writes make of them). A stripe that dropped entries
+ * {@code serverless.plugin_indices_view.refresh_interval} (sixteen small reads, shared with the reads writes make of them). A stripe that dropped entries
  * since the last read, or moved to a new epoch, sends the node back to listing.
  *
  * <p><b>What it does not follow.</b> An alias removed from a plugin index on another node, with no other change to that
@@ -80,12 +80,6 @@ final class PluginIndicesView {
 
     private static final Logger logger = LogManager.getLogger(PluginIndicesView.class);
 
-    /** Whether the view holds the plugins' indices: on by default, and only on a node whose plugins declare any. */
-    static final String ENABLED = "serverless.plugin_indices_view.enabled";
-
-    /** How often changes made by other nodes are looked for; 0 to look only at start. Default 30 seconds. */
-    static final String REFRESH_INTERVAL = "serverless.plugin_indices_view.refresh_interval";
-
     private static final int LIST_CAP = 10_000;
 
     private record Held(IndexDescriptor descriptor, List<AliasMetadata> aliases) {
@@ -103,7 +97,7 @@ final class PluginIndicesView {
     }
 
     private boolean active() {
-        return node.settings.getAsBoolean(ENABLED, true) && node.systemIndices != null && node.systemIndices.isEmpty() == false;
+        return PluginSettings.INDICES_VIEW.get(node.settings) && node.systemIndices != null && node.systemIndices.isEmpty() == false;
     }
 
     /**
@@ -123,7 +117,7 @@ final class PluginIndicesView {
         } catch (Exception e) {
             logger.warn("could not load the plugins' indices into the local view; plugins will not find them there", e);
         }
-        final TimeValue every = node.settings.getAsTime(REFRESH_INTERVAL, TimeValue.timeValueSeconds(30));
+        final TimeValue every = PluginSettings.INDICES_VIEW_REFRESH_INTERVAL.get(node.settings);
         if (every.millis() > 0) {
             try {
                 refresher = node.threadPool().scheduleWithFixedDelay(() -> refresh(plane, every), every, ThreadPool.Names.GENERIC);

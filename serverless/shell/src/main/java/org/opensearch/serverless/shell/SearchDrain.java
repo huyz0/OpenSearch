@@ -28,25 +28,16 @@ import java.util.concurrent.TimeUnit;
  *       stops sending it requests, and its lease is renewed without the search role, so coordinators stop ranking it.</li>
  *   <li>It asks each search peer to take over its share ({@link SearchWarmup#takeOverFrom}): each copies the warm
  *       blocks of the shards it now ranks first for, from this node, and opens them.</li>
- *   <li>It waits {@value #SETTLE}, about as long as a coordinator takes to see the role gone, still answering any
+ *   <li>It waits {@code serverless.search.drain.settle}, about as long as a coordinator takes to see the role gone, still answering any
  *       search that reaches it meanwhile.</li>
  * </ol>
  *
- * <p>All of it within {@value #MAX_WAIT}: a peer that is slow to take over is not waited on past it, and its shards
+ * <p>All of it within {@code serverless.search.drain.max_wait}: a peer that is slow to take over is not waited on past it, and its shards
  * warm from searches as they would have without a drain. The lease is released afterwards, by shutdown, as always.
  */
 public final class SearchDrain {
 
     private static final Logger LOG = LogManager.getLogger(SearchDrain.class);
-
-    /** The longest a drain waits for its peers to take over. */
-    public static final String MAX_WAIT = "serverless.search.drain.max_wait";
-
-    /** How long a drained node keeps answering after its peers have taken over. Defaults to two thirds of the lease TTL. */
-    public static final String SETTLE = "serverless.search.drain.settle";
-
-    /** Whether shutting down drains first. Defaults to {@link SearchReadiness#WARM_ON_JOIN}: the same deployments want both. */
-    public static final String ON_SHUTDOWN = "serverless.search.drain.on_shutdown";
 
     static final TimeValue DEFAULT_MAX_WAIT = TimeValue.timeValueMinutes(2);
 
@@ -71,8 +62,7 @@ public final class SearchDrain {
      * @return true if it serves searches and is configured to
      */
     public static boolean onShutdown(ServerlessNode node) {
-        return SearchReadiness.of(node).servesSearches()
-            && node.settings().getAsBoolean(ON_SHUTDOWN, node.settings().getAsBoolean(SearchReadiness.WARM_ON_JOIN, false));
+        return SearchReadiness.of(node).servesSearches() && SearchSettings.DRAIN_ON_SHUTDOWN.get(node.settings());
     }
 
     /**
@@ -108,7 +98,7 @@ public final class SearchDrain {
             LOG.warn("could not read the members to hand this node's shards to; they warm from searches instead", e);
         }
         peers.sort(null);
-        final long deadline = System.nanoTime() + node.settings().getAsTime(MAX_WAIT, DEFAULT_MAX_WAIT).nanos();
+        final long deadline = System.nanoTime() + SearchSettings.DRAIN_MAX_WAIT.get(node.settings()).nanos();
         int failed = 0;
         int shards = 0;
         long blocks = 0;
@@ -132,7 +122,8 @@ public final class SearchDrain {
             }
         }
         if (peers.isEmpty() == false) {
-            final TimeValue settle = node.settings().getAsTime(SETTLE, TimeValue.timeValueMillis(plane.leaseTtlMillis() * 2 / 3));
+            final TimeValue settle = node.settings()
+                .getAsTime(SearchSettings.DRAIN_SETTLE.getKey(), TimeValue.timeValueMillis(plane.leaseTtlMillis() * 2 / 3));
             try {
                 Thread.sleep(settle.millis());
             } catch (InterruptedException e) {

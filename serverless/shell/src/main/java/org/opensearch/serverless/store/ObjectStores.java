@@ -40,24 +40,6 @@ import java.nio.file.Path;
  */
 public final class ObjectStores {
 
-    /** Which implementation backs the store: {@code fs} or {@code s3}. */
-    public static final String TYPE = "serverless.store.type";
-
-    /** For {@code s3}: the bucket. */
-    public static final String BUCKET = "serverless.store.bucket";
-
-    /** For {@code s3}: an endpoint override, for S3-compatible services. Optional. */
-    public static final String ENDPOINT = "serverless.store.endpoint";
-
-    /** For {@code s3}: the region. */
-    public static final String REGION = "serverless.store.region";
-
-    /**
-     * For {@code s3}: address the bucket by path rather than by hostname. Required by most S3-compatible
-     * services, which do not have a wildcard DNS entry per bucket.
-     */
-    public static final String PATH_STYLE = "serverless.store.path_style_access";
-
     private ObjectStores() {}
 
     /**
@@ -70,31 +52,33 @@ public final class ObjectStores {
      * @throws Exception if the store cannot be opened
      */
     public static ObjectStoreHandle create(Settings settings, ClusterService clusterService, Path configPath) throws Exception {
-        final String type = settings.get(TYPE, "fs");
+        final String type = ObjectStoreSettings.TYPE.get(settings);
         if ("fs".equals(type)) {
-            final String path = settings.get("serverless.store.path");
+            final String path = settings.get(ObjectStoreSettings.PATH.getKey());
             if (path == null || path.isBlank()) {
                 throw new IllegalArgumentException("serverless.store.path is required for a filesystem store");
             }
             return new ObjectStoreHandle(new MeteredBlobStore(new FsBlobStore(8192, Path.of(path), false)), null);
         }
         if ("s3".equals(type) == false) {
-            throw new IllegalArgumentException("unknown " + TYPE + ": " + type + "; expected fs or s3");
+            throw new IllegalArgumentException("unknown " + ObjectStoreSettings.TYPE.getKey() + ": " + type + "; expected fs or s3");
         }
 
-        final String bucket = settings.get(BUCKET);
+        final String bucket = settings.get(ObjectStoreSettings.BUCKET.getKey());
         if (bucket == null || bucket.isBlank()) {
-            throw new IllegalArgumentException(BUCKET + " is required for an s3 store");
+            throw new IllegalArgumentException(ObjectStoreSettings.BUCKET.getKey() + " is required for an s3 store");
         }
 
         // Credentials come from the node's keystore under s3.client.default.*, which is where the s3
         // plugin already looks. Deliberately not a serverless.* setting: a second way to spell an access
         // key is a second thing to leak.
-        final Settings.Builder repository = Settings.builder().put("bucket", bucket).put("region", settings.get(REGION, "us-east-1"));
-        if (settings.get(ENDPOINT) != null) {
-            repository.put("endpoint", settings.get(ENDPOINT));
+        final Settings.Builder repository = Settings.builder()
+            .put("bucket", bucket)
+            .put("region", ObjectStoreSettings.REGION.get(settings));
+        if (settings.get(ObjectStoreSettings.ENDPOINT.getKey()) != null) {
+            repository.put("endpoint", settings.get(ObjectStoreSettings.ENDPOINT.getKey()));
         }
-        repository.put("path_style_access", settings.getAsBoolean(PATH_STYLE, false));
+        repository.put("path_style_access", ObjectStoreSettings.PATH_STYLE_ACCESS.get(settings));
 
         final S3RepositoryPlugin plugin = new S3RepositoryPlugin(settings, configPath);
 

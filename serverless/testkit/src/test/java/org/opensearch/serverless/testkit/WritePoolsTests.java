@@ -27,7 +27,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class WritePoolsTests extends OpenSearchTestCase {
 
     private static Settings cores(int processors, boolean enabled) {
-        return Settings.builder().put("node.processors", processors).put(WritePools.ENABLED, enabled).build();
+        return Settings.builder()
+            .put("node.processors", processors)
+            .put(org.opensearch.serverless.shell.WriteSettings.WAIT_POOL_ENABLED.getKey(), enabled)
+            .build();
     }
 
     public void testSizesGrowWithCoresWhenOn() {

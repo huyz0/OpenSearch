@@ -46,7 +46,7 @@ public class SearchWarmupTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", roles)
             .put("serverless.block_cache.block_size", 4096)
-            .put(SearchReadiness.WARM_ON_JOIN, warmOnJoin)
+            .put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), warmOnJoin)
             .build();
     }
 

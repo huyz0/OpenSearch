@@ -18,8 +18,11 @@
  *                 alike). Every package must be given a layer here.
  *   Setting keys  A "serverless.*" or "index.serverless.*" string literal belongs in a *Settings class, so every
  *                 setting has one definition that can be listed and validated.
+ *   Providers     Every class that implements SettingsProvider is listed in its services file, and every listed
+ *                 class exists, so no package's settings go missing from the registry. Not baselined.
  *   Class size    No main source file over 1,000 lines. Listed files may shrink but not grow.
- *   Package size  No package over 40 files. Listed packages may shrink but not grow.
+ *   Package size  No package over 40 files, not counting its SettingsProvider classes, which only define settings.
+ *                 Listed packages may shrink but not grow.
  */
 
 def structureSourceRoot = file('src/main/java/org/opensearch/serverless')
@@ -27,16 +30,17 @@ def structureBaselineDir = file("${rootDir}/serverless/structure-baseline")
 
 // Lowest first. A package may reference any package in a strictly lower layer.
 def structureLayers = [
-  store: 0, routing: 0, schema: 0, pipeline: 0,
-  ingest: 1, membership: 1,
-  cluster: 2,
-  metadata: 3,
-  engine: 4, script: 4,
-  shard: 5,
-  reconcile: 6, split: 6, bucket: 6,
-  transport: 7,
-  rest: 8,
-  shell: 9
+  settings: 0,
+  store: 1, routing: 1, schema: 1, pipeline: 1,
+  ingest: 2, membership: 2,
+  cluster: 3,
+  metadata: 4,
+  engine: 5, script: 5,
+  shard: 6,
+  reconcile: 7, split: 7, bucket: 7,
+  transport: 8,
+  rest: 9,
+  shell: 10
 ]
 def maxClassLines = 1000
 def maxPackageFiles = 40
@@ -86,7 +90,8 @@ def structureFindings = {
     if (lines > maxClassLines) {
       classSizes[path] = lines
     }
-    if (f.name != 'package-info.java') {
+    // A SettingsProvider only defines settings -- the setting-key rule requires one -- so it is not counted.
+    if (f.name != 'package-info.java' && (text =~ /\bimplements\s+([\w.]+\s*,\s*)*SettingsProvider\b/).find() == false) {
       packageSizes[from] = (packageSizes[from] ?: 0) + 1
     }
   }
@@ -134,6 +139,25 @@ def checkStructure = tasks.register('checkServerlessStructure') {
     if (found.unknownPackages.isEmpty() == false) {
       problems << 'Packages with no layer (add them to structureLayers in serverless/structure-rules.gradle):\n  ' +
         found.unknownPackages.join('\n  ')
+    }
+    def servicesFile = file('src/main/resources/META-INF/services/org.opensearch.serverless.settings.SettingsProvider')
+    def listedProviders = servicesFile.exists()
+      ? servicesFile.readLines('UTF-8').collect { it.trim() }.findAll { it && it.startsWith('#') == false } as Set
+      : [] as Set
+    def implementedProviders = new TreeSet<String>()
+    structureSourceRoot.eachFileRecurse(groovy.io.FileType.FILES) { f ->
+      if (f.name.endsWith('.java') && f.getText('UTF-8') =~ /\bimplements\s+([\w.]+\s*,\s*)*SettingsProvider\b/) {
+        def path = structureSourceRoot.toPath().relativize(f.toPath()).toString().replace('\\', '/')
+        implementedProviders << 'org.opensearch.serverless.' + path.replace('/', '.').replaceAll(/\.java$/, '')
+      }
+    }
+    def unlisted = implementedProviders.findAll { listedProviders.contains(it) == false }
+    def missing = listedProviders.findAll { implementedProviders.contains(it) == false }
+    if (unlisted) {
+      problems << "Providers: implement SettingsProvider but are not listed in ${servicesFile.name}:\n  " + unlisted.join('\n  ')
+    }
+    if (missing) {
+      problems << "Providers: listed in ${servicesFile.name} but not found as SettingsProvider classes:\n  " + missing.join('\n  ')
     }
     def compareSets = { String rule, String file, Set<String> current, String advice ->
       def listed = readBaseline(file) as Set
