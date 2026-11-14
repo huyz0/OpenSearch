@@ -444,6 +444,18 @@ public final class ServerlessPlugins {
         return settings.getAsBoolean(CLUSTER_VIEW, true);
     }
 
+    /**
+     * Whether the plugin client runs multi-get, bulk and update: on by default.
+     *
+     * <p>Off, a plugin that loads its state with a multi-get or writes it with a bulk -- the security plugin does
+     * both -- is refused by name, as before.
+     */
+    public static final String DOCUMENT_BATCHES = "serverless.plugin_client.batches.enabled";
+
+    static boolean documentBatches(Settings settings) {
+        return settings.getAsBoolean(DOCUMENT_BATCHES, true);
+    }
+
     private static boolean extensions(Settings settings) {
         return settings.getAsBoolean(EXTENSIONS, true);
     }
