@@ -171,9 +171,14 @@ public final class NodeServices implements Closeable {
      *
      * @return the settings
      */
-    org.opensearch.common.settings.IndexScopedSettings indexScopedSettings() {
-        return builders.indexScopedSettings();
+    synchronized org.opensearch.common.settings.IndexScopedSettings indexScopedSettings() {
+        if (indexScopedSettings == null) {
+            indexScopedSettings = builders.indexScopedSettings();
+        }
+        return indexScopedSettings;
     }
+
+    private org.opensearch.common.settings.IndexScopedSettings indexScopedSettings;
 
     volatile org.opensearch.search.SearchModule searchModule;
 
@@ -271,21 +276,50 @@ public final class NodeServices implements Closeable {
             // service compiles nothing, so every script in a query, an aggregation or an update failed with
             // "cannot execute [painless] scripts" -- which reads as a configuration problem and is really an
             // absent capability.
-            final org.opensearch.script.ScriptEngine painless = new org.opensearch.painless.PainlessModulePlugin().getScriptEngine(
-                settings,
-                org.opensearch.script.ScriptModule.CORE_CONTEXTS.values()
+            //
+            // A plugin's engine comes first, and a plugin's contexts are registered, as core's ScriptModule does:
+            // the painless module loaded as a bundle carries the allowlists of the plugins that extend it (k-NN's
+            // scoring functions), and hands its engine to its own transport actions. The shell's built-in
+            // engines fill in only the languages no plugin provides.
+            final Map<String, org.opensearch.script.ScriptContext<?>> contexts = new java.util.HashMap<>(
+                org.opensearch.script.ScriptModule.CORE_CONTEXTS
             );
+            final java.util.List<org.opensearch.plugins.ScriptPlugin> scriptPlugins = plugins.filter(
+                org.opensearch.plugins.ScriptPlugin.class
+            );
+            for (org.opensearch.plugins.ScriptPlugin plugin : scriptPlugins) {
+                for (org.opensearch.script.ScriptContext<?> context : plugin.getContexts()) {
+                    if (contexts.put(context.name, context) != null) {
+                        throw new IllegalArgumentException("a script context named [" + context.name + "] is registered twice");
+                    }
+                }
+            }
+            final Map<String, org.opensearch.script.ScriptEngine> engines = new java.util.HashMap<>();
+            for (org.opensearch.plugins.ScriptPlugin plugin : scriptPlugins) {
+                final org.opensearch.script.ScriptEngine engine = plugin.getScriptEngine(settings, contexts.values());
+                if (engine != null && engines.put(engine.getType(), engine) != null) {
+                    throw new IllegalArgumentException("two plugins provide the script language [" + engine.getType() + "]");
+                }
+            }
+            if (engines.containsKey("painless") == false) {
+                final org.opensearch.script.ScriptEngine painless = new org.opensearch.painless.PainlessModulePlugin().getScriptEngine(
+                    settings,
+                    contexts.values()
+                );
+                engines.put(painless.getType(), painless);
+            }
             // Mustache too, chosen the same way: search templates and rank-eval templates render through
             // it, and it is the one engine core registers for the template context.
-            final org.opensearch.script.ScriptEngine mustache = new org.opensearch.script.mustache.MustacheModulePlugin().getScriptEngine(
-                settings,
-                org.opensearch.script.ScriptModule.CORE_CONTEXTS.values()
-            );
+            if (engines.containsKey("mustache") == false) {
+                final org.opensearch.script.ScriptEngine mustache = new org.opensearch.script.mustache.MustacheModulePlugin()
+                    .getScriptEngine(settings, contexts.values());
+                engines.put(mustache.getType(), mustache);
+            }
             // Stored scripts come from a register rather than from cluster state; see StoredScripts.
             scriptService = new org.opensearch.serverless.script.ServerlessScriptService(
                 settings,
-                Map.of(painless.getType(), painless, mustache.getType(), mustache),
-                org.opensearch.script.ScriptModule.CORE_CONTEXTS,
+                Map.copyOf(engines),
+                Map.copyOf(contexts),
                 new org.opensearch.serverless.script.StoredScripts(metadataPlane)
             );
         }

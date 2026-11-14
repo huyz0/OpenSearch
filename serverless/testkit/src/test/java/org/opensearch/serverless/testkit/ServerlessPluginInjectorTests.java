@@ -79,7 +79,10 @@ public class ServerlessPluginInjectorTests extends OpenSearchTestCase {
             TransportService transportService,
             ActionFilters actionFilters,
             Registry registry,
-            Provider<ClusterService> clusterService
+            Provider<ClusterService> clusterService,
+            // Core's two registries, taken by type as index management's actions take them.
+            org.opensearch.core.xcontent.NamedXContentRegistry xContentRegistry,
+            org.opensearch.core.common.io.stream.NamedWriteableRegistry writeableRegistry
         ) {
             super(RegistryAction.NAME, transportService, actionFilters, EchoRequest::new);
             this.registry = registry;
