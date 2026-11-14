@@ -61,7 +61,99 @@ public final class RefusingIndexNameExpressionResolver extends IndexNameExpressi
      * @param threadContext the node thread context, which the superclass needs
      */
     public RefusingIndexNameExpressionResolver(ThreadContext threadContext) {
+        this(threadContext, name -> false);
+    }
+
+    private final java.util.function.Predicate<String> inView;
+
+    /**
+     * Creates the resolver, answering for the names a node's view holds in full.
+     *
+     * <p>The plugins' own indices and their aliases are in every node's view (see {@code PluginIndicesView}), so a name or
+     * pattern that only a plugin's indices can match resolves against the view as core resolves it, and is the whole answer:
+     * the anomaly-detection plugin resolves its result alias this way before writing a result. Any other name is refused as
+     * before.
+     *
+     * @param threadContext the node thread context, which the superclass needs
+     * @param inView whether a name or pattern can match only indices the view holds in full
+     */
+    public RefusingIndexNameExpressionResolver(ThreadContext threadContext, java.util.function.Predicate<String> inView) {
+        this(threadContext, inView, name -> null);
+    }
+
+    private final java.util.function.Function<String, List<Index>> fromPlane;
+
+    /**
+     * Creates the resolver, also answering for names the metadata plane can resolve one at a time.
+     *
+     * <p>A plugin names tenant indices too: an anomaly detector checks its source index for blocks before every run. A
+     * concrete name, an alias or a trailing wildcard is looked up in the metadata plane -- one descriptor read per name, a
+     * capped prefix listing per wildcard -- so the answer is the deployment's, not the subset this node has open. Anything
+     * the plane cannot answer that way ({@code _all}, exclusions, inner wildcards, data streams) is still refused.
+     *
+     * @param threadContext the node thread context, which the superclass needs
+     * @param inView whether a name or pattern can match only indices the view holds in full
+     * @param fromPlane the indices a name or trailing wildcard names in the metadata plane, empty if none, or null when
+     *                  it cannot be answered there
+     */
+    public RefusingIndexNameExpressionResolver(
+        ThreadContext threadContext,
+        java.util.function.Predicate<String> inView,
+        java.util.function.Function<String, List<Index>> fromPlane
+    ) {
         super(threadContext);
+        this.inView = inView;
+        this.fromPlane = fromPlane;
+    }
+
+    /** The indices the expressions name, from the view or the metadata plane, or null when some cannot be answered. */
+    private Index[] resolved(ClusterState state, IndicesOptions options, boolean includeDataStreams, String... expressions) {
+        if (expressions == null || expressions.length == 0) {
+            return null;
+        }
+        final java.util.LinkedHashSet<Index> found = new java.util.LinkedHashSet<>();
+        for (String expression : expressions) {
+            if (expression == null || expression.isEmpty() || "_all".equals(expression) || expression.startsWith("-")) {
+                return null;
+            }
+            if (inView.test(expression)) {
+                found.addAll(List.of(super.concreteIndices(state, options, includeDataStreams, expression)));
+                continue;
+            }
+            final String name = resolveDateMathExpression(expression);
+            final boolean wildcard = name.endsWith("*");
+            if (name.indexOf('*') != (wildcard ? name.length() - 1 : -1)) {
+                return null;
+            }
+            final List<Index> named = fromPlane.apply(name);
+            if (named == null) {
+                return null;
+            }
+            if (named.isEmpty() && wildcard == false && options.ignoreUnavailable() == false) {
+                throw new org.opensearch.index.IndexNotFoundException(name);
+            }
+            found.addAll(named);
+        }
+        if (found.isEmpty() && options.allowNoIndices() == false) {
+            throw new org.opensearch.index.IndexNotFoundException(String.join(",", expressions));
+        }
+        return found.toArray(Index[]::new);
+    }
+
+    private static String[] names(Index[] indices) {
+        return java.util.Arrays.stream(indices).map(Index::getName).toArray(String[]::new);
+    }
+
+    private boolean allInView(String... expressions) {
+        if (expressions == null || expressions.length == 0) {
+            return false;
+        }
+        for (String expression : expressions) {
+            if (expression == null || expression.isEmpty() || "_all".equals(expression) || inView.test(expression) == false) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static UnsupportedOperationException refuse(String method) {
@@ -76,6 +168,13 @@ public final class RefusingIndexNameExpressionResolver extends IndexNameExpressi
 
     @Override
     public String[] concreteIndexNames(ClusterState state, IndicesRequest request) {
+        if (allInView(request.indices())) {
+            return super.concreteIndexNames(state, request);
+        }
+        final Index[] found = resolved(state, request.indicesOptions(), request.includeDataStreams(), request.indices());
+        if (found != null) {
+            return names(found);
+        }
         throw refuse("concreteIndexNames");
     }
 
@@ -91,21 +190,49 @@ public final class RefusingIndexNameExpressionResolver extends IndexNameExpressi
 
     @Override
     public Index[] concreteIndices(ClusterState state, IndicesRequest request) {
+        if (allInView(request.indices())) {
+            return super.concreteIndices(state, request);
+        }
+        final Index[] found = resolved(state, request.indicesOptions(), request.includeDataStreams(), request.indices());
+        if (found != null) {
+            return found;
+        }
         throw refuse("concreteIndices");
     }
 
     @Override
     public String[] concreteIndexNames(ClusterState state, IndicesOptions options, String... indexExpressions) {
+        if (allInView(indexExpressions)) {
+            return super.concreteIndexNames(state, options, indexExpressions);
+        }
+        final Index[] found = resolved(state, options, false, indexExpressions);
+        if (found != null) {
+            return names(found);
+        }
         throw refuse("concreteIndexNames");
     }
 
     @Override
     public String[] concreteIndexNames(ClusterState state, IndicesOptions options, boolean includeDataStreams, String... expressions) {
+        if (allInView(expressions)) {
+            return super.concreteIndexNames(state, options, includeDataStreams, expressions);
+        }
+        final Index[] found = resolved(state, options, includeDataStreams, expressions);
+        if (found != null) {
+            return names(found);
+        }
         throw refuse("concreteIndexNames");
     }
 
     @Override
     public String[] concreteIndexNames(ClusterState state, IndicesOptions options, IndicesRequest request) {
+        if (allInView(request.indices())) {
+            return super.concreteIndexNames(state, options, request);
+        }
+        final Index[] found = resolved(state, options, request.includeDataStreams(), request.indices());
+        if (found != null) {
+            return names(found);
+        }
         throw refuse("concreteIndexNames");
     }
 
@@ -131,11 +258,25 @@ public final class RefusingIndexNameExpressionResolver extends IndexNameExpressi
 
     @Override
     public Index[] concreteIndices(ClusterState state, IndicesOptions options, String... indexExpressions) {
+        if (allInView(indexExpressions)) {
+            return super.concreteIndices(state, options, indexExpressions);
+        }
+        final Index[] found = resolved(state, options, false, indexExpressions);
+        if (found != null) {
+            return found;
+        }
         throw refuse("concreteIndices");
     }
 
     @Override
     public Index[] concreteIndices(ClusterState state, IndicesOptions options, boolean includeDataStreams, String... expressions) {
+        if (allInView(expressions)) {
+            return super.concreteIndices(state, options, includeDataStreams, expressions);
+        }
+        final Index[] found = resolved(state, options, includeDataStreams, expressions);
+        if (found != null) {
+            return found;
+        }
         throw refuse("concreteIndices");
     }
 
@@ -166,6 +307,15 @@ public final class RefusingIndexNameExpressionResolver extends IndexNameExpressi
 
     @Override
     public boolean hasIndexAbstraction(String indexAbstraction, ClusterState state) {
+        if (allInView(indexAbstraction)) {
+            return super.hasIndexAbstraction(indexAbstraction, state);
+        }
+        if (indexAbstraction != null && indexAbstraction.contains("*") == false) {
+            final List<Index> named = fromPlane.apply(resolveDateMathExpression(indexAbstraction));
+            if (named != null) {
+                return named.isEmpty() == false;
+            }
+        }
         throw refuse("hasIndexAbstraction");
     }
 

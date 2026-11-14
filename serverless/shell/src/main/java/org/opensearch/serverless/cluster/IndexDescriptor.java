@@ -600,6 +600,13 @@ public final class IndexDescriptor {
                     // No replicas: durability comes from the object store, not from copies on peers.
                     .put(IndexMetadata.SETTING_NUMBER_OF_REPLICAS, 0)
                     .put(IndexMetadata.SETTING_REPLICATION_TYPE, ReplicationType.DOCUMENT)
+                    // Read by plugins that age indices: index management's min_index_age is never met on an index
+                    // with no creation date. An index created before creation times were recorded has none.
+                    .put(
+                        createdAtMillis != 0L
+                            ? Settings.builder().put(IndexMetadata.SETTING_CREATION_DATE, createdAtMillis).build()
+                            : Settings.EMPTY
+                    )
                     .build()
             );
         if (mapping != null) {

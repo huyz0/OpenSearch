@@ -79,8 +79,14 @@ public class SearchExecutionOptionsTests extends OpenSearchTestCase {
         assertNativeRefused(ask().pipeline("required-policy"));
     }
 
-    public void testNativeShardPreferenceIsNotDroppedBeforeAdmission() throws Exception {
-        assertNativeRefused(ask().preference("_shards:0"));
+    /** A plugin's {@code _shards:} preference searches the shards it names, as core does, rather than every shard. */
+    public void testNativeShardPreferenceSearchesTheNamedShard() throws Exception {
+        withNode(new org.opensearch.plugins.Plugin() {
+        }, node -> {
+            final var selected = node.services().client().search(ask().preference("_shards:0")).actionGet();
+            assertEquals(1, selected.getTotalShards());
+            assertEquals(1L, selected.getHits().getTotalHits().value());
+        });
     }
 
     public void testNativeInlinePipelineIsNotSilentlyOmitted() throws Exception {
