@@ -196,7 +196,7 @@ final class IndexCreation {
         // Parsed and validated before the descriptor exists, not by the first shard to open it. A value
         // core cannot parse used to land in the register and fail every node that later built
         // IndexSettings from it, with a 400 to the caller that read like a refusal.
-        validateIndexSettings(settings == null ? Settings.EMPTY : settings, true);
+        validateIndexSettings(settings == null ? Settings.EMPTY : settings, true, scopedFor(serving));
         final int declaredShards = IndexCreateRequest.shardsWith(create.shards, create.explicitShards, inherited);
         IndexDescriptor descriptor = new IndexDescriptor(
             index,
@@ -324,6 +324,20 @@ final class IndexCreation {
      * @throws IndexAdminHandler.RefusedException with the status and words the caller should see
      */
     static void validateIndexSettings(Settings given, boolean atCreation) throws IndexAdminHandler.RefusedException {
+        validateIndexSettings(given, atCreation, org.opensearch.common.settings.IndexScopedSettings.DEFAULT_SCOPED_SETTINGS);
+    }
+
+    /**
+     * Validates index settings against a node's index settings, which include those its plugins declare: k-NN's
+     * {@code index.knn} is refused as unknown by core's built-in registry alone.
+     *
+     * @param given normalised ({@code index.}-prefixed) settings
+     * @param atCreation whether this is a create
+     * @param scoped the index settings to validate against
+     * @throws IndexAdminHandler.RefusedException with the status and words the caller should see
+     */
+    static void validateIndexSettings(Settings given, boolean atCreation, org.opensearch.common.settings.IndexScopedSettings scoped)
+        throws IndexAdminHandler.RefusedException {
         // The shard mode is the shell's, not core's: checked here, and left out of what core validates.
         try {
             org.opensearch.serverless.routing.ShardMode.requested(given);
@@ -365,7 +379,6 @@ final class IndexCreation {
         if (unsupported != null) {
             throw new IndexAdminHandler.RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_setting", unsupported);
         }
-        final var scoped = org.opensearch.common.settings.IndexScopedSettings.DEFAULT_SCOPED_SETTINGS;
         for (String key : settings.keySet()) {
             final var setting = scoped.get(key);
             if (scoped.isPrivateSetting(key) || (setting != null && setting.isPrivateIndex())) {
@@ -382,5 +395,10 @@ final class IndexCreation {
         } catch (IllegalArgumentException e) {
             throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
         }
+    }
+
+    /** The index settings a node validates against: core's plus its plugins', or core's alone without a node. */
+    static org.opensearch.common.settings.IndexScopedSettings scopedFor(org.opensearch.serverless.shell.ServerlessNode serving) {
+        return serving == null ? org.opensearch.common.settings.IndexScopedSettings.DEFAULT_SCOPED_SETTINGS : serving.indexScopedSettings();
     }
 }

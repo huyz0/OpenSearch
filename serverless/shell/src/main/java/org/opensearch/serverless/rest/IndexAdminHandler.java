@@ -493,6 +493,11 @@ public final class IndexAdminHandler extends BaseRestHandler {
         IndexCreation.validateIndexSettings(settings, atCreation);
     }
 
+    static void validateIndexSettings(Settings settings, boolean atCreation, org.opensearch.serverless.shell.ServerlessNode serving)
+        throws RefusedException {
+        IndexCreation.validateIndexSettings(settings, atCreation, IndexCreation.scopedFor(serving));
+    }
+
     /**
      * Reads every parameter a request carries, so a refusal made before a handler got to them all renders
      * as itself rather than as BaseRestHandler's "unrecognized parameter" about whichever one it had not

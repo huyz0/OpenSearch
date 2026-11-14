@@ -135,7 +135,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
             );
         }
 
-        final String unknown = unknownSettings(requested);
+        final String unknown = unknownSettings(requested, IndexCreation.scopedFor(node.get()));
         if (unknown != null) {
             // A typo, not a capability this deployment lacks. 400 with core's own vocabulary, because the
             // fix is in the caller's request; the refusals below are 501 because the fix is not.
@@ -143,7 +143,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", unknown)
             );
         }
-        final String refusal = refuse(requested);
+        final String refusal = refuse(requested, IndexCreation.scopedFor(node.get()));
         if (refusal != null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_setting", refusal)
@@ -155,7 +155,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
             // "banana" for refresh_interval was committed to the descriptor, rendered by GET _settings,
             // and failed every node that next opened a shard of the index -- with a 400 to the caller that
             // read as if it had been refused.
-            IndexAdminHandler.validateIndexSettings(requested, false);
+            IndexAdminHandler.validateIndexSettings(requested, false, node.get());
         } catch (IndexAdminHandler.RefusedException e) {
             return channel -> channel.sendResponse(IndexAdminHandler.error(channel, e.status, e.type, e.getMessage()));
         }
@@ -195,8 +195,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
      * @param requested the normalised settings
      * @return a refusal, or null when all of them may change
      */
-    private static String unknownSettings(Settings requested) {
-        final IndexScopedSettings scoped = IndexScopedSettings.DEFAULT_SCOPED_SETTINGS;
+    private static String unknownSettings(Settings requested, IndexScopedSettings scoped) {
         final TreeSet<String> unknown = new TreeSet<>();
         for (String key : requested.keySet()) {
             if (org.opensearch.serverless.bucket.BucketPolicy.INDEX_SETTING.equals(key)) {
@@ -233,7 +232,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
         return unknown.isEmpty() ? null : "unknown index setting" + (unknown.size() > 1 ? "s " : " ") + unknown;
     }
 
-    private static String refuse(Settings requested) {
+    private static String refuse(Settings requested, IndexScopedSettings scoped) {
         if (requested.get(org.opensearch.serverless.routing.ShardMode.SETTING) != null) {
             return org.opensearch.serverless.routing.ShardMode.SETTING
                 + " is chosen when an index is created and cannot be changed: it decides how the index's units "
@@ -261,7 +260,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
 
         // Core's own registry decides what is dynamic. Keeping a list here would be a second account of it,
         // and a second account of a registry that grows with every release is one that will drift from it.
-        final IndexScopedSettings scoped = IndexScopedSettings.DEFAULT_SCOPED_SETTINGS;
+        // The node's registry also holds the plugins' index settings.
         final TreeSet<String> statics = new TreeSet<>();
         for (String key : requested.keySet()) {
             if (IndexMetadata.SETTING_NUMBER_OF_REPLICAS.equals(key)) {

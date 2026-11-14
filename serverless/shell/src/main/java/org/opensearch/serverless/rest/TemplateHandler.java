@@ -362,7 +362,7 @@ public final class TemplateHandler extends BaseRestHandler {
                 );
             }
             try {
-                IndexAdminHandler.validateIndexSettings(settings, false);
+                IndexAdminHandler.validateIndexSettings(settings, false, node.get());
             } catch (IndexAdminHandler.RefusedException e) {
                 throw new IndexAdminHandler.RefusedException(e.status, e.type, e.getMessage());
             }
