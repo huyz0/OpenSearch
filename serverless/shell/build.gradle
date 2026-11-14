@@ -88,3 +88,4 @@ tasks.register('checkServerDoesNotReferenceServerless') {
 tasks.named('check').configure { dependsOn 'checkServerDoesNotReferenceServerless' }
 
 apply from: "${rootDir}/serverless/forbidden-references.gradle"
+apply from: "${rootDir}/serverless/structure-rules.gradle"

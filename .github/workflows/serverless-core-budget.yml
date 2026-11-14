@@ -1,0 +1,36 @@
+name: Serverless core patch budget
+# Fails a pull request into the serverless branch when it changes more lines in upstream OpenSearch files than the
+# budget below. Those lines are what an upstream rebase can conflict on, so growth should be a decision, not drift.
+# Light on purpose: a git diff, no Gradle build, so it stays within the fork's Actions limits.
+on:
+  pull_request:
+    branches: [ feature/serverlessshell ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Lines added plus removed in upstream files, as dev-tools/core-diff.sh counts them. Lower it when a change
+  # shrinks the core patch; raise it only in a pull request that says which core change needs the room.
+  CORE_BUDGET_LINES: 2050
+
+jobs:
+  core-budget:
+    if: github.repository == 'huyz0/OpenSearch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - name: Fetch upstream main
+        run: |
+          git remote add upstream https://github.com/opensearch-project/OpenSearch.git
+          git fetch --filter=blob:none upstream main
+      - name: Check the core patch against its budget
+        run: bash dev-tools/core-diff.sh --budget "$CORE_BUDGET_LINES"
