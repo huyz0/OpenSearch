@@ -520,7 +520,20 @@ public final class ServerlessPlugins {
         return settings.getAsBoolean(NODE_ANSWERS, true);
     }
 
-    private static boolean extensions(Settings settings) {
+    /**
+     * Whether the index-name resolver plugins are given answers for tenant names from the metadata plane: a concrete
+     * name, an alias or a trailing wildcard, one read each. On by default.
+     *
+     * <p>Off, a plugin resolving a tenant index -- the anomaly-detection plugin checks a detector's source index before
+     * each run -- is refused by name, as before.
+     */
+    public static final String NAME_RESOLUTION = "serverless.plugin_name_resolution.enabled";
+
+    static boolean nameResolution(Settings settings) {
+        return settings.getAsBoolean(NAME_RESOLUTION, true);
+    }
+
+    static boolean extensions(Settings settings) {
         return settings.getAsBoolean(EXTENSIONS, true);
     }
 

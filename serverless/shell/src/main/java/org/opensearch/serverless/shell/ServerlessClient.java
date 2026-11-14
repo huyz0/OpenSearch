@@ -125,6 +125,7 @@ public final class ServerlessClient extends AbstractClient {
     private ActionResponse dispatch(ActionType<?> action, ActionRequest request, ServerlessNode serving, MetadataPlane metadata)
         throws Exception {
         final ShardOperations operations = new ShardOperations(serving, metadata);
+        PluginWriteAliases.resolve(serving, metadata, request);
         if (IndexAction.INSTANCE.name().equals(action.name())) {
             return index((IndexRequest) request, operations, metadata);
         }
@@ -149,6 +150,12 @@ public final class ServerlessClient extends AbstractClient {
             }
             if (org.opensearch.action.update.UpdateAction.INSTANCE.name().equals(action.name())) {
                 return PluginDocumentActions.update((org.opensearch.action.update.UpdateRequest) request, operations);
+            }
+            if (org.opensearch.index.reindex.UpdateByQueryAction.NAME.equals(action.name())) {
+                return operations.updateByQuery((org.opensearch.index.reindex.UpdateByQueryRequest) request);
+            }
+            if (org.opensearch.index.reindex.DeleteByQueryAction.NAME.equals(action.name())) {
+                return PluginDocumentActions.deleteByQuery((org.opensearch.index.reindex.DeleteByQueryRequest) request, operations);
             }
         }
         if (ServerlessPlugins.clusterView(serving.settings)) {
@@ -209,11 +216,13 @@ public final class ServerlessClient extends AbstractClient {
                 + " and "
                 + org.opensearch.action.search.SearchAction.INSTANCE.name()
                 + (ServerlessPlugins.documentBatches(serving.settings)
-                    ? ", indices:data/read/mget, indices:data/write/bulk, indices:data/write/update"
+                    ? ", indices:data/read/mget, indices:data/write/bulk, indices:data/write/update,"
+                        + " indices:data/write/update/byquery, indices:data/write/delete/byquery"
                     : "")
                 + (ServerlessPlugins.clusterView(serving.settings) ? ", cluster:monitor/health, cluster:monitor/state" : "")
                 + (ServerlessPlugins.indexAdmin(serving.settings)
-                    ? ", indices:admin/exists, indices:admin/get, indices:admin/mappings/get, indices:admin/settings/get,"
+                    ? ", indices:admin/exists, indices:admin/get, indices:admin/mappings/get, indices:admin/mappings/fields/get,"
+                        + " indices:admin/settings/get,"
                         + " indices:admin/aliases/get, indices:admin/mapping/put, indices:admin/settings/update, indices:admin/delete,"
                         + " indices:admin/aliases, indices:admin/rollover"
                     : "")
@@ -236,6 +245,9 @@ public final class ServerlessClient extends AbstractClient {
         }
         if (org.opensearch.action.admin.indices.mapping.get.GetMappingsAction.NAME.equals(name)) {
             return admin.getMappings(metadata, (org.opensearch.action.admin.indices.mapping.get.GetMappingsRequest) request);
+        }
+        if (org.opensearch.action.admin.indices.mapping.get.GetFieldMappingsAction.NAME.equals(name)) {
+            return admin.getFieldMappings(metadata, (org.opensearch.action.admin.indices.mapping.get.GetFieldMappingsRequest) request);
         }
         if (org.opensearch.action.admin.indices.settings.get.GetSettingsAction.NAME.equals(name)) {
             return admin.getSettings(metadata, (org.opensearch.action.admin.indices.settings.get.GetSettingsRequest) request);
@@ -370,19 +382,19 @@ public final class ServerlessClient extends AbstractClient {
             throw new org.opensearch.OpenSearchStatusException(found.reason(), found.status());
         }
         final long startNanos = System.nanoTime();
-        final var outcome = org.opensearch.serverless.rest.SearchHandler.gated(
+        final var outcome = org.opensearch.serverless.rest.SearchHandler.gatedRequest(
             serving,
             request,
             found.indices().keySet(),
             source,
-            admitted -> org.opensearch.serverless.rest.SearchFanout.run(
+            (admitted, admittedRequest) -> org.opensearch.serverless.rest.SearchFanout.run(
                 serving,
                 metadata,
                 found.indices(),
                 admitted,
                 org.opensearch.serverless.rest.SearchFanout.Options.DEFAULT.withRouting(
                     org.opensearch.serverless.rest.DocumentRouting.searchRoutings(request.routing())
-                ).withOnlyShards(selectedShards(request.preference()))
+                ).withOnlyShards(selectedShards(admittedRequest.preference()))
             )
         );
         // The same response a REST caller gets, built by the same code, so a plugin reading

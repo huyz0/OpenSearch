@@ -213,6 +213,22 @@ final class BulkDispatch {
         return refreshed.get();
     }
 
+    /** How long a batch for a shard nobody holds waits for this node to take it; the single-document path waits as long. */
+    private static final long ACTIVATION_WAIT_MILLIS = 30_000L;
+
+    /** Takes a shard nobody holds for a batch that needs it; true if this node now writes it. */
+    private static boolean takenHere(ServerlessNode serving, String index, String uuid, int shard) {
+        try {
+            serving.signals().activate(index, shard).get(ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
+        } catch (java.util.concurrent.TimeoutException | java.util.concurrent.ExecutionException e) {
+            return false;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+        return serving.reconciler().writerShard(new ShardId(index, uuid, shard)) != null;
+    }
+
     /**
      * Applies one shard's group.
      *
@@ -285,6 +301,11 @@ final class BulkDispatch {
             // Nobody owns it and this node cannot take it: a search node, or one that only coordinates. The batch goes
             // to the writer member every such node ranks first for the shard, marked to be taken there.
             return steerGroup(serving, group, index, uuid, shard, operations, refresh);
+        }
+        if (owner == null && takenHere(serving, index, uuid, shard)) {
+            // Nobody owned it, and this node took it for this batch, as the single-document path takes a shard for its
+            // write: a bulk sent straight after creating an index used to be refused with every item a 421.
+            return applyGroup(serving, group, refresh);
         }
         if (owner == null) {
             // Nobody owns it, and the only reason anyone would activate it is that a write arrived --

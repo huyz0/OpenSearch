@@ -91,6 +91,26 @@ final class PluginDocumentActions {
         return operations.update(request).response();
     }
 
+    /** A plugin's delete-by-query on one index, through the same frozen walk a REST caller's takes. */
+    static org.opensearch.index.reindex.BulkByScrollResponse deleteByQuery(
+        org.opensearch.index.reindex.DeleteByQueryRequest request,
+        ShardOperations operations
+    ) throws Exception {
+        if (request.indices().length != 1) {
+            throw new UnsupportedOperationException("delete-by-query requires one concrete index");
+        }
+        final var source = request.getSearchRequest().source();
+        return operations.deleteByQuery(
+            request.indices()[0],
+            source == null || source.query() == null ? org.opensearch.index.query.QueryBuilders.matchAllQuery() : source.query(),
+            request.getMaxDocs() == org.opensearch.index.reindex.AbstractBulkByScrollRequest.MAX_DOCS_ALL_MATCHES
+                ? Long.MAX_VALUE
+                : request.getMaxDocs(),
+            request.isRefresh(),
+            request.isAbortOnVersionConflict()
+        ).response();
+    }
+
     private static <R extends WriteRequest<R>> R withRefresh(R item, BulkRequest bulk) {
         if (bulk.getRefreshPolicy() != WriteRequest.RefreshPolicy.NONE) {
             item.setRefreshPolicy(bulk.getRefreshPolicy());

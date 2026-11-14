@@ -98,7 +98,8 @@ final class PluginNodeAnswers {
                     metrics.contains(NodesInfoRequest.Metric.HTTP.metricName()) && node.httpServerTransport != null
                         ? node.httpServerTransport.info()
                         : null,
-                    null,
+                    // The plugins this node runs: the anomaly-detection plugin places models only on nodes that report it.
+                    metrics.contains(NodesInfoRequest.Metric.PLUGINS.metricName()) ? node.pluginsService.info() : null,
                     null,
                     null,
                     null,

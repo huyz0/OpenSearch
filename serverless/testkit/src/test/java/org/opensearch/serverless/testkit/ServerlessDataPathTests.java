@@ -143,8 +143,15 @@ public class ServerlessDataPathTests extends OpenSearchTestCase {
             final TransportAddress http = node.boundHttpAddress().publishAddress();
 
             assertEquals(200, send(http, "PUT", "/wide?shards=3", MAPPING).status());
-            // Only one of the three shards is held here.
+            // Only one of the three shards is held here. The other two were taken by a node that is gone: a shard
+            // nothing was ever written to answers empty, as a just-created index does, so it would not show a gap.
             node.activation().activateWriter(plane, "wide", 0);
+            try (ServerlessNode gone = new ServerlessNode(nodeSettings("m11-gone"))) {
+                gone.startup().start();
+                gone.setMetadataPlane(plane);
+                gone.activation().activateWriter(plane, "wide", 1);
+                gone.activation().activateWriter(plane, "wide", 2);
+            }
 
             final Response partial = send(http, "GET", "/wide/_search?q=msg:anything", null);
             assertEquals(200, partial.status());

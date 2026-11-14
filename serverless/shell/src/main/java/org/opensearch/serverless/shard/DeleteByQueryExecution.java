@@ -44,12 +44,54 @@ final class DeleteByQueryExecution {
     /** How long the frozen view a delete-by-query takes is held. Bounded, not indefinite. */
     static final long DELETE_BY_QUERY_KEEP_ALIVE_MILLIS = 3_600_000L;
 
+    /** What a walk does to one matched document: true if it changed it, false if it left it as it was. */
+    @FunctionalInterface
+    interface HitChange {
+        boolean apply(String id, long seqNo, long primaryTerm, boolean refresh) throws java.io.IOException;
+    }
+
+    /** What a walk did: documents visited, changed and left alone, conflicts, and the conflict that stopped it, if one did. */
+    record Walk(long visited, long changed, long noops, long conflicts, String abortedOn,
+        org.opensearch.index.engine.VersionConflictEngineException conflict, int batches) {
+    }
+
     DeleteByQueryOutcome doDeleteByQuery(
         String index,
         org.opensearch.index.query.QueryBuilder query,
         long maxDocs,
         boolean refresh,
         boolean abortOnConflict
+    ) throws Exception {
+        final Walk walk = walk(
+            index,
+            query,
+            maxDocs,
+            refresh,
+            abortOnConflict,
+            (id, seqNo, primaryTerm, refreshNow) -> writes.doDeleteIfUnchanged(index, id, refreshNow, seqNo, primaryTerm)
+        );
+        return new DeleteByQueryOutcome(
+            walk.visited(),
+            walk.changed(),
+            walk.conflicts(),
+            walk.abortedOn(),
+            null,
+            walk.conflict(),
+            walk.batches()
+        );
+    }
+
+    /**
+     * Freezes a view of the index, pages through each shard's matches, and applies a change to each one, conditional on the
+     * sequence identity the view saw: a document rewritten after the view was taken is a conflict, never overwritten.
+     */
+    Walk walk(
+        String index,
+        org.opensearch.index.query.QueryBuilder query,
+        long maxDocs,
+        boolean refresh,
+        boolean abortOnConflict,
+        HitChange change
     ) throws Exception {
         if (refuseSystemIndices && node.isSystemIndex(index)) {
             throw new SystemIndexException(index);
@@ -79,7 +121,7 @@ final class DeleteByQueryExecution {
         if (shards.isEmpty()) {
             // Nothing to freeze, so the marker must not be left pinning the index's sweep.
             plane.releasePointInTime(pitId);
-            return new DeleteByQueryOutcome(0, 0);
+            return new Walk(0, 0, 0, 0, null, null, 0);
         }
 
         final var pit = new org.opensearch.serverless.metadata.PointInTime(pitId, index, descriptor.uuid(), expiresAt, shards);
@@ -87,6 +129,7 @@ final class DeleteByQueryExecution {
         try {
             long visited = 0;
             long deleted = 0;
+            long noops = 0;
             long conflicts = 0;
             int batches = 0;
             for (Integer shard : shards.keySet()) {
@@ -129,15 +172,17 @@ final class DeleteByQueryExecution {
                             // of once for the whole operation.
                             final boolean isLastOfShard = refresh && lastPageOfShard && i == hits.size() - 1;
                             try {
-                                if (writes.doDeleteIfUnchanged(index, hit.getId(), isLastOfShard, hit.getSeqNo(), hit.getPrimaryTerm())) {
+                                if (change.apply(hit.getId(), hit.getSeqNo(), hit.getPrimaryTerm(), isLastOfShard)) {
                                     deleted++;
+                                } else {
+                                    noops++;
                                 }
                             } catch (org.opensearch.index.engine.VersionConflictEngineException e) {
                                 // Rewritten -- or already removed -- after the view was taken. Left alone,
                                 // and counted, rather than deleted regardless.
                                 conflicts++;
                                 if (abortOnConflict) {
-                                    return new DeleteByQueryOutcome(visited, deleted, conflicts, hit.getId(), null, e, batches);
+                                    return new Walk(visited, deleted, noops, conflicts, hit.getId(), e, batches);
                                 }
                             }
                         }
@@ -153,7 +198,7 @@ final class DeleteByQueryExecution {
                 // A shard with no match never entered the loop above, so it never issued a delete and
                 // never needed a refresh -- correctly, since nothing changed on it to make visible.
             }
-            return new DeleteByQueryOutcome(visited, deleted, conflicts, null, null, null, batches);
+            return new Walk(visited, deleted, noops, conflicts, null, null, batches);
         } finally {
             // Local shards first, then the record -- the same order _pit's own release does, so this node
             // is never left holding open frozen shards for a view no longer recorded anywhere.

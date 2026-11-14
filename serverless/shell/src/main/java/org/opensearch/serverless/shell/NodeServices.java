@@ -435,10 +435,56 @@ public final class NodeServices implements Closeable {
      */
     public synchronized org.opensearch.cluster.metadata.IndexNameExpressionResolver indexNameExpressionResolver() {
         if (indexNameExpressionResolver == null) {
-            indexNameExpressionResolver = new RefusingIndexNameExpressionResolver(threadPool.getThreadContext());
+            indexNameExpressionResolver = new RefusingIndexNameExpressionResolver(
+                threadPool.getThreadContext(),
+                name -> settings.getAsBoolean(PluginIndicesView.ENABLED, true) && node.get().isSystemIndex(name),
+                this::indicesFromPlane
+            );
         }
         return indexNameExpressionResolver;
     }
+
+    /**
+     * The indices a name or a trailing wildcard names in the metadata plane, for the plugins' resolver: an index, an alias's
+     * members, or the indices a prefix lists (capped). Null when the switch is off, there is no plane yet, or the name is a
+     * data stream, so the resolver refuses as before.
+     */
+    private java.util.List<org.opensearch.core.index.Index> indicesFromPlane(String name) {
+        final ServerlessNode serving = node.get();
+        final org.opensearch.serverless.metadata.MetadataPlane plane = serving == null ? null : serving.metadataPlane;
+        if (plane == null || ServerlessPlugins.nameResolution(settings) == false) {
+            return null;
+        }
+        try {
+            final java.util.List<org.opensearch.core.index.Index> found = new java.util.ArrayList<>();
+            if (name.endsWith("*")) {
+                for (String match : plane.namesWithPrefix(name.substring(0, name.length() - 1), NAME_RESOLUTION_CAP)) {
+                    plane.describeForRouting(match).ifPresent(d -> found.add(new org.opensearch.core.index.Index(match, d.uuid())));
+                }
+                return found;
+            }
+            final var descriptor = plane.describeForRouting(name);
+            if (descriptor.isPresent()) {
+                return java.util.List.of(new org.opensearch.core.index.Index(name, descriptor.get().uuid()));
+            }
+            final var alias = plane.aliasWithGeneration(name);
+            if (alias.isEmpty()) {
+                return java.util.List.of();
+            }
+            if (alias.get().alias().dataStream()) {
+                return null;
+            }
+            for (String member : alias.get().alias().indices()) {
+                plane.describeForRouting(member).ifPresent(d -> found.add(new org.opensearch.core.index.Index(member, d.uuid())));
+            }
+            return found;
+        } catch (java.io.IOException e) {
+            throw new java.io.UncheckedIOException("cannot resolve [" + name + "] in the metadata plane", e);
+        }
+    }
+
+    /** At most this many indices answer one trailing wildcard, as the plugin client's other wildcard answers. */
+    static final int NAME_RESOLUTION_CAP = 10_000;
 
     volatile ActionGate actionGate;
 

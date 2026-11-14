@@ -103,6 +103,21 @@ final class SearchGate {
         Boolean partialResults,
         org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
     ) throws IOException {
+        return gatedRequest(serving, nativeRequest, indices, source, partialResults, (accepted, request) -> work.apply(accepted));
+    }
+
+    /**
+     * As {@link #gated}, handing the work the request as the filters left it too, so options a filter may remove -- a
+     * plugin's shard selection -- are read from what was admitted rather than from what was asked.
+     */
+    static <T> T gatedRequest(
+        ServerlessNode serving,
+        org.opensearch.action.search.SearchRequest nativeRequest,
+        java.util.Collection<String> indices,
+        SearchSourceBuilder source,
+        Boolean partialResults,
+        org.opensearch.common.CheckedBiFunction<SearchSourceBuilder, org.opensearch.action.search.SearchRequest, T, Exception> work
+    ) throws IOException {
         final var gate = serving.services().actionGate();
         final java.util.Set<String> resolvedScope = gate.isEmpty() ? null : java.util.Set.copyOf(indices);
         final var visible = nativeRequest == null
@@ -158,7 +173,7 @@ final class SearchGate {
                     if (rewritten.allowPartialSearchResults() == null) {
                         rewritten.allowPartialSearchResults(serving.searchService().defaultAllowPartialSearchResults());
                     }
-                    final T result = work.apply(accepted);
+                    final T result = work.apply(accepted, rewritten);
                     if (result instanceof org.opensearch.serverless.shard.SearchOutcome outcome) {
                         if (Boolean.FALSE.equals(rewritten.allowPartialSearchResults()) && outcome.failures().isEmpty() == false) {
                             final Throwable cause = outcome.failures().get(0).getCause();

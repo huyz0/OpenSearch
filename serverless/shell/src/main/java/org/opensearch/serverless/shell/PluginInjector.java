@@ -152,6 +152,12 @@ final class PluginInjector {
                     b.bind(service).asEagerSingleton();
                 }
             }
+            // No stream transport here: core binds it as null when streaming is off, and plugins' stream actions
+            // (ML Commons' streamed predict) are built to take that.
+            if (claim(org.opensearch.transport.StreamTransportService.class, claimed, bound)) {
+                b.bind(org.opensearch.transport.StreamTransportService.class)
+                    .toProvider(org.opensearch.common.inject.util.Providers.of(null));
+            }
         });
         final Injector injector;
         try {

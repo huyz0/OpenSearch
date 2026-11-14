@@ -230,6 +230,18 @@ where a plugin depends on it: a `_shards:` preference searches the named shards,
 empty when the request allows no indices; and an update that asks for its source gets the document as it left it (the
 alerting plugin's lock release asks, and was refused). With these the alerting plugin runs monitors, on demand and on schedule, and
 records their alerts.
+The plugin client also answers field mappings (leaf fields and multi-fields, from the descriptor), update-by-query
+and delete-by-query on one index (over the same frozen view of what is published that `_delete_by_query` walks, so a
+document written but not yet published is not matched), and a write to a plugin's own alias goes to the index the alias
+writes to, or its only index. Plugins that need the identity service's plugin subject (Job Scheduler) get it at start;
+node info lists the installed plugins when asked; a plugin action asking for the stream transport gets none, as on a
+node with streaming off; a bulk to a shard nobody holds yet waits for this node to take it, as a single write does; and
+every index carries its creation date. With these the anomaly-detection plugin creates and starts detectors and runs
+their schedule (it cannot yet read the tenant index a detector watches: the plugin's name resolver answers only plugin
+indices), Index Management moves an index through its policy states (`min_index_age` transitions, read-only, delete;
+rollover still needs a write alias, which the shell refuses), and ML Commons trains, predicts, creates connectors, and
+registers and deploys remote models. A dynamic plugin setting changed through `/_cluster/settings` is stored but not
+applied to the running plugin (the register is a store, not a settings service); set it in the node's settings.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,

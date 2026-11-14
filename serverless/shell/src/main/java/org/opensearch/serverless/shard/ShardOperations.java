@@ -555,6 +555,18 @@ public final class ShardOperations {
     }
 
     /**
+     * Updates every document a query matches, in place, by the request's script; see {@link UpdateByQueryExecution}.
+     *
+     * @param request the native request
+     * @return core's response, with conflicts and no-ops counted
+     * @throws IOException if the query, an update, or the point-in-time machinery fails
+     */
+    public org.opensearch.index.reindex.BulkByScrollResponse updateByQuery(org.opensearch.index.reindex.UpdateByQueryRequest request)
+        throws IOException {
+        return UpdateByQueryExecution.run(this, request);
+    }
+
+    /**
      * Reads a document, merges a partial update into it, and writes the result back.
      *
      * <p>The read and write use the document's sequence identity as a compare-and-swap. A concurrent
