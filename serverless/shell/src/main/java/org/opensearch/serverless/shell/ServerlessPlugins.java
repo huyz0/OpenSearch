@@ -483,6 +483,20 @@ public final class ServerlessPlugins {
     }
 
     /**
+     * Whether plugin components that are lifecycle components are started with the node and stopped with it: on by
+     * default.
+     *
+     * <p>Core starts every component a plugin's {@code createComponents} returns that is a lifecycle component. The
+     * alerting plugin's monitor runner builds its state in {@code doStart}; never started, every monitor run failed on
+     * an uninitialised field. Off, they are left as they were built, as before.
+     */
+    public static final String COMPONENT_LIFECYCLE = "serverless.plugin_components.lifecycle.enabled";
+
+    static boolean componentLifecycle(Settings settings) {
+        return settings.getAsBoolean(COMPONENT_LIFECYCLE, true);
+    }
+
+    /**
      * Whether the plugin client answers node info, node stats, indices stats and refresh: on by default.
      *
      * <p>Off, a metrics exporter and a plugin that refreshes its own index are refused by name, as before.

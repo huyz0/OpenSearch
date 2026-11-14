@@ -199,17 +199,27 @@ public final class NodeServices implements Closeable {
     }
 
     /**
-     * The registry that can read a search body.
+     * The registry that can read a search body, and the named objects plugins register.
      *
      * <p>Separate from the node's other registry, which is deliberately empty: nothing else in the shell
      * parses user-supplied structured content, and an empty registry is the honest default for a surface
      * that is an allowlist. A search body is the one place that needs the full set.
      *
-     * @return a registry containing the search parsers
+     * <p>A plugin's {@code getNamedXContent()} entries are added, as core adds them to its one registry: the
+     * alerting plugin reads a monitor's inputs as named objects, and it reads them with the registry its REST
+     * requests carry, which is this one.
+     *
+     * @return a registry containing the search parsers and the plugins' named objects
      */
     public synchronized org.opensearch.core.xcontent.NamedXContentRegistry searchXContentRegistry() {
         if (searchRegistry == null) {
-            searchRegistry = new org.opensearch.core.xcontent.NamedXContentRegistry(searchModule().getNamedXContents());
+            final java.util.List<org.opensearch.core.xcontent.NamedXContentRegistry.Entry> entries = new java.util.ArrayList<>(
+                searchModule().getNamedXContents()
+            );
+            for (org.opensearch.plugins.Plugin plugin : plugins.filter(org.opensearch.plugins.Plugin.class)) {
+                entries.addAll(plugin.getNamedXContent());
+            }
+            searchRegistry = new org.opensearch.core.xcontent.NamedXContentRegistry(entries);
         }
         return searchRegistry;
     }
@@ -402,9 +412,20 @@ public final class NodeServices implements Closeable {
      *
      * @return the registry
      */
-    public NamedWriteableRegistry namedWriteableRegistry() {
-        return new NamedWriteableRegistry(searchModule().getNamedWriteables());
+    public synchronized NamedWriteableRegistry namedWriteableRegistry() {
+        if (writeableRegistry == null) {
+            // A plugin's named writeables too, as core's node registry holds them: a plugin action whose request
+            // carries one (an alerting monitor's inputs and triggers) is read back with this on the far node.
+            final java.util.List<NamedWriteableRegistry.Entry> entries = new java.util.ArrayList<>(searchModule().getNamedWriteables());
+            for (org.opensearch.plugins.Plugin plugin : plugins.filter(org.opensearch.plugins.Plugin.class)) {
+                entries.addAll(plugin.getNamedWriteables());
+            }
+            writeableRegistry = new NamedWriteableRegistry(entries);
+        }
+        return writeableRegistry;
     }
+
+    private NamedWriteableRegistry writeableRegistry;
 
     /**
      * The index-name resolver a plugin is given, which refuses rather than answering wrongly.

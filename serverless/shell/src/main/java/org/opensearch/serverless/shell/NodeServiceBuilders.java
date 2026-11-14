@@ -23,7 +23,6 @@ import org.opensearch.common.settings.IndexScopedSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.PageCacheRecycler;
 import org.opensearch.common.util.concurrent.ThreadContext;
-import org.opensearch.core.common.io.stream.NamedWriteableRegistry;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
@@ -349,8 +348,11 @@ final class NodeServiceBuilders {
             // empty registry reads it back as "Unknown NamedWriteable category [QueryBuilder]" on the
             // receiving node. Local shards answered fine and remote ones silently dropped out of the
             // coverage count, which is the shape of failure this design reports rather than hides.
-            new NamedWriteableRegistry(services.searchModule().getNamedWriteables()),
-            new NamedXContentRegistry(Collections.emptyList()),
+            services.namedWriteableRegistry(),
+            // What a REST request's content parser reads named objects with. Empty, a plugin's REST handler
+            // that parses a query or its own named objects from the body failed with "named objects are not
+            // supported for this parser"; the alerting plugin's monitor API is the one that found it.
+            services.searchXContentRegistry(),
             new NetworkService(Collections.emptyList()),
             restController,
             clusterSettings,
