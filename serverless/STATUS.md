@@ -201,6 +201,12 @@ settings are accepted at creation, on update and in templates, and a route the s
 registers it. With these, k-NN (with the painless and transport-grpc bundles) creates `index.knn` indices and answers
 `knn` queries and `knn_score` scripts on the Lucene engine. The faiss and nmslib engines need k-NN's native libraries on
 `java.library.path`, which the plugin zip does not carry and the stock tarball does.
+The plugin client also answers node info, node stats, indices stats and refresh
+(`serverless.plugin_client.node_answers.enabled`, on), each for this node only: a request naming another node gets a
+failure saying to ask that node, and index statistics and refresh cover the shards open here, so the cost is bounded by
+what the node serves. With this the Prometheus exporter serves node, JVM, OS, filesystem, thread-pool, indexing and
+cluster-health series. Its per-index series (`prometheus.indices`) are off by default on the shell, since a node can
+serve thousands of small indices; an operator can turn them on.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,

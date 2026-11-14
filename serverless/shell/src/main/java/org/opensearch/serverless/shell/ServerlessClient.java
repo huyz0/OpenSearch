@@ -167,6 +167,20 @@ public final class ServerlessClient extends AbstractClient {
                 );
             }
         }
+        if (ServerlessPlugins.nodeAnswers(serving.settings)) {
+            if (org.opensearch.action.admin.cluster.node.info.NodesInfoAction.INSTANCE.name().equals(action.name())) {
+                return PluginNodeAnswers.nodesInfo(serving, (org.opensearch.action.admin.cluster.node.info.NodesInfoRequest) request);
+            }
+            if (org.opensearch.action.admin.cluster.node.stats.NodesStatsAction.INSTANCE.name().equals(action.name())) {
+                return PluginNodeAnswers.nodesStats(serving, (org.opensearch.action.admin.cluster.node.stats.NodesStatsRequest) request);
+            }
+            if (org.opensearch.action.admin.indices.stats.IndicesStatsAction.INSTANCE.name().equals(action.name())) {
+                return PluginNodeAnswers.indicesStats(serving, (org.opensearch.action.admin.indices.stats.IndicesStatsRequest) request);
+            }
+            if (org.opensearch.action.admin.indices.refresh.RefreshAction.INSTANCE.name().equals(action.name())) {
+                return PluginNodeAnswers.refresh(serving, (org.opensearch.action.admin.indices.refresh.RefreshRequest) request);
+            }
+        }
         // A plugin's own action, after the shell's allowlist and never before it: a plugin must not be able
         // to take over "indices:data/write/index" by declaring it. PluginActions refuses a duplicate among
         // plugins for the same reason, and this ordering settles the one case it cannot see.
@@ -191,6 +205,9 @@ public final class ServerlessClient extends AbstractClient {
                     ? ", indices:data/read/mget, indices:data/write/bulk, indices:data/write/update"
                     : "")
                 + (ServerlessPlugins.clusterView(serving.settings) ? ", cluster:monitor/health, cluster:monitor/state" : "")
+                + (ServerlessPlugins.nodeAnswers(serving.settings)
+                    ? ", cluster:monitor/nodes/info, cluster:monitor/nodes/stats, indices:monitor/stats, indices:admin/refresh"
+                    : "")
                 + (serving.pluginActions().isEmpty() ? "" : ", plus what the plugins provide: " + serving.pluginActions().names())
         );
     }

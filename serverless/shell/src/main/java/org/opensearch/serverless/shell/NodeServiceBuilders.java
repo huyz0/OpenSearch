@@ -237,7 +237,9 @@ final class NodeServiceBuilders {
             emptyMap(),                             // store factories
             null,                                   // remote directory factory — serverless supplies its own
             () -> null,                             // RepositoriesService
-            null,                                   // SearchRequestStats
+            // Node stats read it. It counts coordinator-level search phases, which the shell's search path does
+            // not report into, so it stays at zero; the per-shard search statistics beside it are real.
+            new org.opensearch.action.search.SearchRequestStats(clusterSettings),
             null,                                   // RemoteStoreStatsTrackerFactory
             emptyMap(),                             // ingestion consumer factories
             org.opensearch.indices.pollingingest.IngestionPayloadDecoderRegistry.builder().build(),
