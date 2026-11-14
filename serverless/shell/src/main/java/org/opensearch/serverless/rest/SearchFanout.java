@@ -382,6 +382,8 @@ public final class SearchFanout {
         // the loop was the only reason. Each task answers for exactly one shard and swallows nothing: a
         // shard that cannot be reached comes back null and shows up in the coverage this already reports.
         final SearchMerge.Charged charged = new SearchMerge.Charged(serving);
+        // Shards that no copy could serve because nothing was ever written to them; see neverWritten.
+        final java.util.Set<Target> neverWritten = java.util.concurrent.ConcurrentHashMap.newKeySet();
         final List<java.util.concurrent.Callable<ShardAnswer>> tasks = new ArrayList<>();
         for (Target target : searched) {
             final int number = target.shard();
@@ -390,6 +392,10 @@ public final class SearchFanout {
             tasks.add(() -> {
                 try {
                     final ShardAnswer answer = SearchShardCalls.askOneShard(serving, metadata, descriptor, number, perShard, nowInMillis);
+                    if (answer == null && neverWritten(metadata, descriptor, number)) {
+                        neverWritten.add(target);
+                        return null;
+                    }
                     if (answer == null) {
                         failures.add(
                             failure(
@@ -405,6 +411,10 @@ public final class SearchFanout {
                     }
                     return charged.admit(answer);
                 } catch (Exception e) {
+                    if (e instanceof RuntimeException == false && neverWritten(metadata, descriptor, number)) {
+                        neverWritten.add(target);
+                        return null;
+                    }
                     firstFailure.compareAndSet(null, e);
                     failures.add(failure(name, number, e));
                     throw e;
@@ -432,7 +442,8 @@ public final class SearchFanout {
 
         final SearchMerge.Merged merged = SearchMerge.merge(serving, answers, source);
         try {
-            if (merged.answered == 0 && searched.isEmpty() == false) {
+            final boolean shapeOnly = source.aggregations() == null && source.suggest() == null;
+            if (merged.answered == 0 && searched.isEmpty() == false && (neverWritten.size() < searched.size() || shapeOnly == false)) {
                 final Exception cause = firstFailure.get();
                 if (cause instanceof RuntimeException runtime) {
                     // Rethrown as itself, so a circuit-breaking exception still answers 429 and a security
@@ -445,10 +456,31 @@ public final class SearchFanout {
                 throw new IOException("no shard of " + indices.keySet() + " could answer this search; no node is serving them");
             }
             // A pruned shard is a successful one, as core counts a skipped shard.
-            merged.answered += pruned.size() + options.preSkippedShards();
-            return merged.outcome(serving, source, shards, from, size, failures).withSkipped(pruned.size() + options.preSkippedShards());
+            // So is a shard nothing was ever written to: it provably holds no document.
+            merged.answered += pruned.size() + neverWritten.size() + options.preSkippedShards();
+            return merged.outcome(serving, source, shards, from, size, failures)
+                .withSkipped(pruned.size() + neverWritten.size() + options.preSkippedShards());
         } finally {
             merged.release(serving);
+        }
+    }
+
+    /**
+     * Whether nothing was ever written to the shard: no commit was ever published for it, and no node ever held it.
+     *
+     * <p>A reader refuses such a shard rather than answer empty, because to a reader an unpublished shard might be
+     * one whose writer holds documents not yet published. Every write takes the shard's head first, so a shard with no
+     * head at all and no published commit has never had a writer, and it holds no document: core answers a search of a
+     * just-created index with no hits, and so does this. A plugin searching the system index it just created -- the
+     * alerting plugin does, before its first monitor -- used to get "no shard could answer". Read only on the failure
+     * path, so a search that is answered pays nothing for it.
+     */
+    static boolean neverWritten(MetadataPlane metadata, org.opensearch.serverless.cluster.IndexDescriptor descriptor, int shard) {
+        try {
+            return metadata.heads().read(descriptor.name(), shard).isEmpty()
+                && metadata.segmentPublisher(descriptor.name(), descriptor.uuid(), shard).readManifest().isEmpty();
+        } catch (IOException e) {
+            return false;
         }
     }
 

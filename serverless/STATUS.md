@@ -207,6 +207,12 @@ failure saying to ask that node, and index statistics and refresh cover the shar
 what the node serves. With this the Prometheus exporter serves node, JVM, OS, filesystem, thread-pool, indexing and
 cluster-health series. Its per-index series (`prometheus.indices`) are off by default on the shell, since a node can
 serve thousands of small indices; an operator can turn them on.
+Plugins' named objects (`getNamedXContent`) are in the registry REST bodies are parsed with, and their named
+writeables in the node's registry; plugin components that are lifecycle components are started with the node and
+stopped with it (`serverless.plugin_components.lifecycle.enabled`, on); and a search of a shard nothing was ever written
+to -- no head and no published commit, so it never had a writer -- answers empty, as core answers a just-created index,
+instead of "no shard could answer". With these the alerting plugin creates monitors and the anomaly-detection plugin
+creates detectors.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,

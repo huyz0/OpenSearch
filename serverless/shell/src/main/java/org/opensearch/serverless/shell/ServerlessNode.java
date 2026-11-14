@@ -965,6 +965,10 @@ public final class ServerlessNode implements Closeable {
 
     private PluginNodeAnswers.Monitors monitors;
 
+    /** The plugins' lifecycle components and injector-built services this node started, in start order. */
+    final java.util.List<org.opensearch.common.lifecycle.LifecycleComponent> pluginLifecycle =
+        new java.util.concurrent.CopyOnWriteArrayList<>();
+
     /** The monitoring services plugins read node statistics from, built the first time one asks. */
     synchronized PluginNodeAnswers.Monitors monitors() throws java.io.IOException {
         if (monitors == null) {
@@ -1154,15 +1158,13 @@ public final class ServerlessNode implements Closeable {
         // test plugin holding nothing; a plugin that owns a thread pool leaks it out of every node.
         IOUtils.closeWhileHandlingException(httpServerTransport);
         // The plugins' lifecycle services before the plugins, the order a classic node stops them in.
-        if (pluginInjector != null) {
-            for (org.opensearch.common.lifecycle.LifecycleComponent service : pluginInjector.services()) {
-                try {
-                    service.stop();
-                } catch (RuntimeException e) {
-                    logger.warn("a plugin service failed to stop: " + service.getClass().getName(), e);
-                }
-                IOUtils.closeWhileHandlingException(service);
+        for (org.opensearch.common.lifecycle.LifecycleComponent service : pluginLifecycle) {
+            try {
+                service.stop();
+            } catch (RuntimeException e) {
+                logger.warn("a plugin service failed to stop: " + service.getClass().getName(), e);
             }
+            IOUtils.closeWhileHandlingException(service);
         }
         ServerlessPlugins.closeAll(plugins.plugins());
         // After the plugins, because they were given these and may use them on the way out.
