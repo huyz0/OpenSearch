@@ -307,7 +307,8 @@ final class SearchPlanner {
             resolved.refused() ? 0 : resolved.prunedShards(),
             nowMillis,
             resolved.refused() ? java.util.Set.of() : resolved.judged(),
-            fanoutOptions.routing()
+            fanoutOptions.routing(),
+            java.util.Set.of()
         );
         if (resolved.refused()) {
             return channel -> channel.sendResponse(IndexAdminHandler.error(channel, resolved.status(), resolved.type(), resolved.reason()));

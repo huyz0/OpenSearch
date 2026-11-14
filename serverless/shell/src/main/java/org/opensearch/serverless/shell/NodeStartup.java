@@ -259,6 +259,9 @@ public final class NodeStartup {
         for (IndexDescriptor descriptor : node.hosted.values()) {
             descriptors.merge(descriptor.name(), descriptor, ServerlessNode::newerOf);
         }
+        for (IndexDescriptor descriptor : node.pluginIndices().descriptors()) {
+            descriptors.merge(descriptor.name(), descriptor, ServerlessNode::newerOf);
+        }
         for (IndexDescriptor descriptor : extra) {
             descriptors.put(descriptor.name(), descriptor);
         }
@@ -287,6 +290,6 @@ public final class NodeStartup {
         for (ShardAssignment assignment : opening) {
             assignments.put(ServerlessNode.shardKey(assignment.indexName(), assignment.shardId()), assignment);
         }
-        return node.projector.project(descriptors.values(), assignments.values());
+        return node.pluginIndices().withAliases(node.projector.project(descriptors.values(), assignments.values()));
     }
 }

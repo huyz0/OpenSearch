@@ -394,7 +394,7 @@ final class PluginIndexAdmin {
         return result;
     }
 
-    private static AliasMetadata aliasMetadata(AliasRecord alias, String index) {
+    static AliasMetadata aliasMetadata(AliasRecord alias, String index) {
         final String writeIndex = alias.writeIndex();
         return AliasMetadata.builder(alias.name()).writeIndex(writeIndex == null ? null : writeIndex.equals(index)).build();
     }
