@@ -58,8 +58,6 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             .put("serverless.roles", "ingest")
             // Segment blobs under the shard: the per-term layout these check.
             .put("serverless.segments.node_pack.enabled", false)
-            // The sweep is checked against records in the shard's own log, where writes go with the node log off.
-            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 
@@ -460,20 +458,16 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             // containers become collectable and the log is at its most vulnerable.
             loopB.tick(clock.get() + 1_000);
 
-            // Two records, both of which must survive, and they are here for different reasons.
-            //
-            // The first is under the successor's own term: without it the log is legitimately empty by
-            // now, because a publish at a higher term reclaims every older term, and "the log is empty"
-            // would satisfy any assertion about the sweep sparing it.
+            // A write under the successor's own term, which lands in its node log, outside the shard: the sweep must
+            // leave the shard's documents whole.
             b.writes().index(b.reconciler().openShards().iterator().next(), "postsweep", "{\"msg\":\"postsweep\",\"n\":3}");
-            // The second is under the DEAD writer's term, appended after the successor published --
-            // what a zombie that has not noticed it lost the shard would write. It is the only kind of
-            // log record the sweep's term guard would let it reach at all, so it is the only one that
-            // can distinguish a sweep that stays out of wal/ from one that does not.
+            // And a record in the shard's own log under the DEAD writer's term -- the only kind of log record the
+            // sweep's term guard would let it reach at all, so the one that can tell a sweep that stays out of wal/
+            // from one that does not.
             plane.walStore("alpha", 0).append(1, new org.opensearch.serverless.store.WalRecord("zombie", "{\"msg\":\"zombie\"}"));
 
             final long recordsBefore = walRecords(store, plane);
-            assertEquals("the log should hold one live and one stale record before the sweep", 2, recordsBefore);
+            assertEquals("the shard's own log should hold the stale record before the sweep", 1, recordsBefore);
 
             final var collected = gc.collectShard(plane, "alpha", 0);
             logger.info("wal + gc: swept {} blobs after failover", collected.size());

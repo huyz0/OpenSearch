@@ -33,8 +33,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * <p><b>The window.</b> The first record to arrive opens a window, and every record that arrives before it closes rides
  * the same blob, whichever shard it is for. A window closes when its time is up or when it is full, and the caller whose
  * records are in it returns once the blob has landed, so a write is durable before it is acknowledged, as before. A
- * window of zero writes as soon as nothing else is in flight, which is the group commit {@link WalGroupCommitter} does
- * per shard.
+ * window of zero writes as soon as nothing else is in flight.
  *
  * <p><b>One blob in flight.</b> Ordinals have no gaps, which is what lets a successor fence by taking the first free
  * slot. So the next window is written only once the last has landed, and records keep joining it meanwhile.

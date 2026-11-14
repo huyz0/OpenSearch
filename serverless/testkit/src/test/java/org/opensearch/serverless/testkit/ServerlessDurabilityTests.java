@@ -45,8 +45,6 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            // These check how the shard's own log is reclaimed, which only holds writes with the node log off.
-            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 
@@ -171,131 +169,14 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         }
     }
 
-    /** Truncation drops a full cycle behind, never what the current publish saw. */
-    public void testTruncationLagsOnePublishCycle() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final MetadataPlane plane = freshIndex(clock, createTempDir());
-
-        try (ServerlessNode a = new ServerlessNode(nodeSettings("m10-trunc"))) {
-            a.startup().start();
-            final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
-            loop.want("alpha", 0);
-            loop.tick(clock.get());
-            final ShardId shardId = a.reconciler().openShards().iterator().next();
-            final var wal = a.reconciler().wal(shardId);
-
-            a.writes().index(shardId, "1", "{\"msg\":\"cycle\",\"n\":1}");
-            loop.tick(clock.get() + 1_000);
-            assertEquals("the first publish must retain what it just saw", 1, wal.replayable().size());
-
-            a.writes().index(shardId, "2", "{\"msg\":\"cycle\",\"n\":2}");
-            loop.tick(clock.get() + 2_000);
-            assertEquals("the second publish should drop the first cycle and keep its own", 1, wal.replayable().size());
-        }
-    }
-
     /**
-     * Where the WAL's records actually are, by term, read off the filesystem rather than through the API.
-     *
-     * <p>{@code replayable()} cannot answer this: it returns records with no term attached, so it cannot
-     * distinguish "the predecessor's log was reclaimed" from "the predecessor's log was replayed and its
-     * documents rewritten under a new term". Deleting blobs leaves the container behind, so a term that
-     * has been reclaimed shows up here as present with zero records -- which is the distinction that
-     * matters, and is why this counts files instead of directories.
-     */
-    private static long sizeOf(java.nio.file.Path path) {
-        try {
-            return java.nio.file.Files.size(path);
-        } catch (java.io.IOException e) {
-            return 0L;
-        }
-    }
-
-    private static java.util.SortedMap<Long, Integer> walRecordsByTerm(java.nio.file.Path objectStore) throws Exception {
-        final java.util.SortedMap<Long, Integer> byTerm = new java.util.TreeMap<>();
-        final java.util.List<java.nio.file.Path> termDirs;
-        try (var tree = java.nio.file.Files.walk(objectStore)) {
-            termDirs = tree.filter(java.nio.file.Files::isDirectory)
-                // Segments live under t=N too, one level up; only the ones inside wal/ are records.
-                .filter(p -> p.getFileName().toString().startsWith("t="))
-                .filter(p -> p.getParent() != null && p.getParent().getFileName().toString().equals("wal"))
-                .collect(java.util.stream.Collectors.toList());
-        }
-        for (java.nio.file.Path dir : termDirs) {
-            try (var files = java.nio.file.Files.list(dir)) {
-                // A blob of no bytes is a fence, not a record.
-                final int records = (int) files.filter(p -> p.getFileName().toString().matches("\\d{20}") && sizeOf(p) > 0).count();
-                byTerm.put(Long.parseLong(dir.getFileName().toString().substring(2)), records);
-            }
-        }
-        return byTerm;
-    }
-
-    /**
-     * A publish at a higher term reclaims the log of the writer that died holding a lower one.
-     *
-     * <p>Same-term truncation trims only the publishing writer's own container, so before this a dead
-     * predecessor's records were trimmed by nobody: every successor replayed them, forever, and the log
-     * only grew. Harmless for correctness and unbounded all the same.
-     */
-    public void testASuccessorsPublishReclaimsTheDeadPredecessorsLog() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final java.nio.file.Path objectStore = createTempDir();
-        final MetadataPlane plane = freshIndex(clock, objectStore);
-
-        final ServerlessNode a = new ServerlessNode(nodeSettings("m15-reclaim-a"));
-        a.startup().start();
-        final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
-        loopA.want("alpha", 0);
-        loopA.tick(clock.get());
-        final ShardId onA = a.reconciler().openShards().iterator().next();
-        for (int i = 1; i <= 3; i++) {
-            a.writes().index(onA, String.valueOf(i), "{\"msg\":\"reclaim\",\"n\":" + i + "}");
-        }
-        a.close(); // dies with three records and no publication behind them
-
-        final var stranded = walRecordsByTerm(objectStore);
-        assertEquals("the dead writer should have left exactly one term of records: " + stranded, 1, stranded.size());
-        final long deadTerm = stranded.firstKey();
-        assertEquals("the dead writer's records should still be on disk", 3, (int) stranded.get(deadTerm));
-
-        clock.set(1_000L + TTL);
-        try (ServerlessNode b = new ServerlessNode(nodeSettings("m15-reclaim-b"))) {
-            b.startup().start();
-            final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
-            loopB.want("alpha", 0);
-            loopB.tick(clock.get());
-            final ShardId onB = b.reconciler().openShards().iterator().next();
-            assertEquals("the successor did not replay", 3L, ShardOps.hits(b.searchService(), onB, "msg", "reclaim"));
-
-            b.writes().index(onB, "4", "{\"msg\":\"reclaim\",\"n\":4}");
-            assertEquals("nothing published, so nothing could be reclaimed", 1, loopB.tick(clock.get() + 1_000).published().size());
-
-            final var afterPublish = walRecordsByTerm(objectStore);
-            assertEquals(
-                "the predecessor's records survived a publish at a higher term: " + afterPublish,
-                0,
-                (int) afterPublish.get(deadTerm)
-            );
-            // And the successor's own term is NOT reclaimed by its own publish -- the conservative
-            // same-term rule still lags a cycle. Reclaiming across terms must not have widened it.
-            assertTrue(
-                "the publishing writer trimmed its own term, which the one-cycle lag forbids: " + afterPublish,
-                afterPublish.entrySet().stream().anyMatch(e -> e.getKey() > deadTerm && e.getValue() > 0)
-            );
-        }
-    }
-
-    /**
-     * The records reclaimed across terms were in somebody's commit, proved by recovering after they are gone.
+     * The records a log lets go of were in somebody's commit, proved by recovering after it.
      *
      * <p>Three failovers deep, and the middle two activate without publishing -- {@code activateWriter}
      * rather than a reconcile tick, because a tick publishes in the same pass it activates in. So after
-     * A and B die, <em>nothing</em> has been reclaimed: reclamation is a consequence of publishing, not
-     * of replaying, and a successor that tidied up the log it had just read would strand A's writes right
-     * here. C then publishes, which drops both older terms, writes once more and dies. D can obtain A's
-     * and B's documents only from C's commit, so if the drop had run against records that were not yet
-     * durable, D would come up short.
+     * A and B die, their writes are in their node logs alone. C replays both, publishes, writes once more
+     * and dies. D needs C's commit and C's log together, so a log that let go of records no commit held
+     * would leave D short.
      */
     public void testReclaimedRecordsAreAlreadyInACommit() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -319,32 +200,16 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
         b.writes().index(onB, "5", "{\"msg\":\"chain\",\"n\":5}");
         b.close();
 
-        final var beforeAnyPublish = walRecordsByTerm(objectStore);
-        assertEquals("both dead writers' terms should hold records: " + beforeAnyPublish, 2, beforeAnyPublish.size());
-        assertEquals(
-            "a replay must not reclaim the log it replayed -- only a publish may: " + beforeAnyPublish,
-            5,
-            beforeAnyPublish.values().stream().mapToInt(Integer::intValue).sum()
-        );
-
         clock.set(1_000L + 2 * TTL);
         final ServerlessNode c = new ServerlessNode(nodeSettings("m15-chain-c"));
         c.startup().start();
         final BackgroundReconciler loopC = new BackgroundReconciler(c, plane);
         loopC.want("alpha", 0);
-        // Activates, replaying both older terms, and publishes in the same pass.
-        assertEquals(1, loopC.tick(clock.get()).published().size());
+        // Activates, replaying both older terms, then publishes.
+        loopC.tick(clock.get());
+        loopC.publishAll();
         final ShardId onC = c.reconciler().openShards().iterator().next();
         assertEquals("the third writer did not replay both older terms", 5L, ShardOps.hits(c.searchService(), onC, "msg", "chain"));
-
-        final var afterPublish = walRecordsByTerm(objectStore);
-        for (long olderTerm : beforeAnyPublish.keySet()) {
-            assertEquals(
-                "term " + olderTerm + " was not reclaimed by the publish above it: " + afterPublish,
-                0,
-                (int) afterPublish.getOrDefault(olderTerm, 0)
-            );
-        }
 
         // One more write that no publication will ever cover, so the last failover has to combine a
         // commit with a log rather than reading either one alone.

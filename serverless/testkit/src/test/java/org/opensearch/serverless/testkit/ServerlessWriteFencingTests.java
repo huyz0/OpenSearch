@@ -61,8 +61,6 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            // The checks look for landed records in the shard's own log, where writes go with the node log off.
-            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 
@@ -281,8 +279,8 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
      *
      * <p><b>And now the store refuses it.</b> The seal is a fence -- the predecessor's next slot, occupied -- so an
      * append after it is not merely left out of replay but refused. An append between the swap and the fence is
-     * the other half, and is acknowledged and replayed: see
-     * {@link #testAZombieAppendingBetweenTheSwapAndTheFenceIsAcknowledgedAndReplayed}.
+     * the other half, acknowledged and replayed, held for the node log by
+     * {@code NodeLogNodeFaultTestCase#testALapsedWriterRacingItsSuccessorLosesNoAcknowledgedWrite}.
      *
      * <p>Runs against {@code FsBlobContainer} only.
      */
@@ -342,63 +340,6 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
             assertFalse(
                 "a record appended between the swap and the open must not be replayed as acknowledged history",
                 b.reads().get(onB, "zombie").found()
-            );
-        }
-    }
-
-    /**
-     * The case the open item named, closed: a predecessor appending after the swap that moved ownership and
-     * before the successor's fence. Its record lands ahead of the fence, so its append returns -- it is
-     * acknowledged -- and the successor replays it. It used to be replayed while its writer refused it.
-     *
-     * <p>Runs against {@code FsBlobContainer} only.
-     */
-    public void testAZombieAppendingBetweenTheSwapAndTheFenceIsAcknowledgedAndReplayed() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final Path objectStore = createTempDir();
-        final MetadataPlane setup = freshIndex(clock, objectStore);
-
-        final ServerlessNode a = new ServerlessNode(nodeSettings("swap-a"));
-        a.startup().start();
-        final BackgroundReconciler loopA = new BackgroundReconciler(a, setup);
-        loopA.want("alpha", 0);
-        loopA.tick(clock.get());
-        final ShardId onA = a.reconciler().openShards().iterator().next();
-        a.writes().index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
-        final long zombieTerm = a.reads().get(onA, "legitimate").primaryTerm();
-        final WalStore zombieLog = a.reconciler().wal(onA);
-        a.close();
-        clock.set(clock.get() + TTL + 1);
-
-        // The moment the successor's swap of the head lands -- before it fences -- the predecessor appends.
-        final AtomicBoolean acknowledged = new AtomicBoolean();
-        final BlobStore hooked = new HeadSwapHookingBlobStore(new FsBlobStore(1024, objectStore, false), () -> {
-            if (acknowledged.get() == false) {
-                try {
-                    zombieLog.append(
-                        zombieTerm,
-                        List.of(new WalRecord("inside", "{\"msg\":\"appended between the swap and the fence\"}", 99L, zombieTerm, 1L))
-                    );
-                    acknowledged.set(true);
-                } catch (IOException e) {
-                    throw new java.io.UncheckedIOException("an append ahead of the fence must land", e);
-                }
-            }
-        });
-        final MetadataPlane plane = new MetadataPlane(hooked, BlobPath.cleanPath(), clock::get, TTL);
-
-        try (ServerlessNode b = new ServerlessNode(nodeSettings("swap-b"))) {
-            b.startup().start();
-            final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
-            loopB.want("alpha", 0);
-            loopB.tick(clock.get());
-            assertTrue("the append between the swap and the fence must have been acknowledged", acknowledged.get());
-
-            final ShardId onB = b.reconciler().openShards().iterator().next();
-            assertTrue("history written before the takeover must survive", b.reads().get(onB, "legitimate").found());
-            assertTrue(
-                "and an acknowledged append from inside the window must be replayed, not lost",
-                b.reads().get(onB, "inside").found()
             );
         }
     }
@@ -493,7 +434,7 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
         @Override
         public BlobContainer blobContainer(BlobPath path) {
             final BlobContainer honest = delegate.blobContainer(path);
-            if (path.buildAsString().contains("/wal/t=") == false) {
+            if (path.buildAsString().startsWith("nodelog/") == false) {
                 return honest;
             }
             return new DelegatingBlobContainer(honest) {
@@ -509,50 +450,6 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
                             Thread.currentThread().interrupt();
                         }
                     }
-                }
-            };
-        }
-
-        @Override
-        public void close() throws IOException {
-            delegate.close();
-        }
-    }
-
-    /** Fires a hook right after a compare-and-swap of a shard head lands: after the swap, before the fence. */
-    private static final class HeadSwapHookingBlobStore implements BlobStore {
-
-        private final BlobStore delegate;
-        private final Runnable afterSwap;
-
-        HeadSwapHookingBlobStore(BlobStore delegate, Runnable afterSwap) {
-            this.delegate = delegate;
-            this.afterSwap = afterSwap;
-        }
-
-        @Override
-        public void validateKey(BlobPath path, String blobName) {
-            delegate.validateKey(path, blobName);
-        }
-
-        @Override
-        public BlobContainer blobContainer(BlobPath path) {
-            final BlobContainer honest = delegate.blobContainer(path);
-            if (path.buildAsString().startsWith("shards/") == false) {
-                return honest;
-            }
-            return new DelegatingBlobContainer(honest) {
-                @Override
-                public org.opensearch.common.blobstore.BlobRegisterCasResult compareAndSwapRegister(
-                    String blobName,
-                    long expectedGeneration,
-                    org.opensearch.core.common.bytes.BytesReference newValue
-                ) throws IOException {
-                    final var result = super.compareAndSwapRegister(blobName, expectedGeneration, newValue);
-                    if (result.applied()) {
-                        afterSwap.run();
-                    }
-                    return result;
                 }
             };
         }

@@ -76,7 +76,7 @@ final class NodePackWiring {
                 .nodePackSource(() -> writer(node, plane), id.getIndexName(), id.getIndex().getUUID(), id.id(), maxBlobBytes);
             publisher.useNodePacks(enabled);
             // Commits are recorded with the node log, so a shard stages them whenever its node writes one.
-            return node.nodeLogEnabled ? publisher.staging(new CommitStaging(() -> node.logCommitCheckpointMillis)) : publisher;
+            return publisher.staging(new CommitStaging(() -> node.logCommitCheckpointMillis));
         };
     }
 

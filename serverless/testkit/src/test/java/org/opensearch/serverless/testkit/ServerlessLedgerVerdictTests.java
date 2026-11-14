@@ -54,8 +54,6 @@ public class ServerlessLedgerVerdictTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            // The durability check reads the shard's own log, where writes go with the node log off.
-            .put("serverless.wal.node_log.enabled", false)
             .build();
     }
 
@@ -100,7 +98,7 @@ public class ServerlessLedgerVerdictTests extends OpenSearchTestCase {
             // After it was acknowledged, its record goes: the loss the ledger exists to catch.
             int removed = 0;
             try (Stream<Path> files = Files.walk(dir)) {
-                for (Path file : files.filter(Files::isRegularFile).filter(p -> p.toString().contains("wal")).toList()) {
+                for (Path file : files.filter(Files::isRegularFile).filter(p -> p.toString().contains("nodelog")).toList()) {
                     if (new String(Files.readAllBytes(file), StandardCharsets.ISO_8859_1).contains("planted-loss-xyzzy")) {
                         Files.delete(file);
                         removed++;
@@ -132,7 +130,7 @@ public class ServerlessLedgerVerdictTests extends OpenSearchTestCase {
             node.shards().publishShard(shardId, plane.heads().read("alpha", 0).orElseThrow().term());
             // What truncation leaves once a publish covers the records: none of them in the log.
             try (Stream<Path> files = Files.walk(dir)) {
-                for (Path file : files.filter(Files::isRegularFile).filter(p -> p.toString().contains("wal")).toList()) {
+                for (Path file : files.filter(Files::isRegularFile).filter(p -> p.toString().contains("nodelog")).toList()) {
                     if (new String(Files.readAllBytes(file), StandardCharsets.ISO_8859_1).contains("published-")) {
                         Files.delete(file);
                     }
@@ -205,12 +203,13 @@ public class ServerlessLedgerVerdictTests extends OpenSearchTestCase {
         final List<String> ids = ids("unreached", 5);
         try (ServerlessNode node = new ServerlessNode(nodeSettings("verdict-unreached"))) {
             writeAcknowledged(node, plane, ids);
-            store.failListingsUnder("/wal/");
+            // The node log is found through its writer's lease, so a lease that cannot be read is a log that cannot be.
+            store.failRegisterReadsUnder("cluster/members/");
             final Map<String, DurabilityCheck.Finding> findings = new DurabilityCheck(plane, createTempDir()).check("alpha", ids, 2_000L);
             for (String id : ids) {
                 assertEquals(findings.get(id).toString(), DurabilityCheck.Status.UNREACHED, findings.get(id).status());
             }
-            store.failListingsUnder(null);
+            store.failRegisterReadsUnder(null);
         }
     }
 }
