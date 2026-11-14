@@ -341,6 +341,28 @@ public final class WriteFences {
         }
     }
 
+    /**
+     * A read of one change stripe no older than {@code maxAgeNanos}: the newest one writes made if it is fresh enough, otherwise
+     * a new read, which writes then share. Lets another reader of the stripes follow them without reading them twice.
+     *
+     * @param plane the metadata plane
+     * @param stripe the stripe
+     * @param maxAgeNanos how old a read may be
+     * @return the read
+     * @throws java.io.IOException if the stripe cannot be read
+     */
+    org.opensearch.serverless.metadata.ChangeStripes.Snapshot stripeNoOlderThan(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        int stripe,
+        long maxAgeNanos
+    ) throws java.io.IOException {
+        final org.opensearch.serverless.metadata.ChangeStripes.Snapshot known = stripeReads.get(stripe);
+        if (known != null && System.nanoTime() - known.readStartedNanos() <= maxAgeNanos) {
+            return known;
+        }
+        return keepNewest(stripe, plane.changeStripes().read(stripe));
+    }
+
     private org.opensearch.serverless.metadata.ChangeStripes.Snapshot keepNewest(
         int stripe,
         org.opensearch.serverless.metadata.ChangeStripes.Snapshot read

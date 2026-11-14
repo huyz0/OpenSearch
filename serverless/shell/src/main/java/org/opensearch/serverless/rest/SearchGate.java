@@ -136,7 +136,9 @@ final class SearchGate {
                         || java.util.Objects.equals(rewritten.routing(), visible.routing()) == false
                         || rewritten.scroll() != null
                         || rewritten.pipeline() != null
-                        || selectsShards(rewritten.preference())) {
+                    // Shards a plugin selected itself are searched as it asked; a filter may not select them.
+                        || (selectsShards(rewritten.preference())
+                            && java.util.Objects.equals(rewritten.preference(), visible.preference()) == false)) {
                         throw new org.opensearch.OpenSearchStatusException(
                             "the search requests unsupported execution options",
                             RestStatus.NOT_IMPLEMENTED

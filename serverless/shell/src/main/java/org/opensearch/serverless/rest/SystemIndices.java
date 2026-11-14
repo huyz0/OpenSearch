@@ -66,6 +66,15 @@ public final class SystemIndices {
     }
 
     /**
+     * Returns the declared patterns.
+     *
+     * @return the patterns, in declaration order
+     */
+    public List<String> patterns() {
+        return patterns;
+    }
+
+    /**
      * Reports whether any plugin declared a system index at all.
      *
      * @return true when there is nothing to guard

@@ -218,9 +218,18 @@ get index, mappings, settings and aliases are read from the descriptors, with al
 and settings updates, alias changes, index deletion and rollover run through the shell's own REST handlers in process, so
 they keep the same validation and refusals, and fail with the core exception a plugin catches. An index created through
 the client with aliases is created, then aliased (two steps, as the shell keeps an alias in its own register), and a
-plugin may alias its own system indices. Write aliases stay refused, as for REST callers. The alerting plugin's monitor
-run gets past all of these and then stops where it reads its new history index and alias from the node's local cluster
-state, which holds only the indices the node serves.
+plugin may alias its own system indices. Write aliases stay refused, as for REST callers.
+Every node's local view also holds the plugins' own indices and their aliases (`serverless.plugin_indices_view.enabled`,
+on): the indices plugins declare as system indices -- dozens, never the tenants' -- are listed once per declared prefix at
+start, a plugin's own changes through its client are in the view when the call returns, and changes made on other nodes
+are followed through the change stripes every `serverless.plugin_indices_view.refresh_interval` (30 s; no listing). Each
+of their shards is shown started where it is written, and otherwise on one owner every node computes the same from the
+members, so a plugin that sweeps the shards on its node finds each one swept (by two nodes for a moment while a writer
+and the computed owner differ; plugins guard that work with their own locks). The plugin client also follows core
+where a plugin depends on it: a `_shards:` preference searches the named shards, and a pattern matching nothing answers
+empty when the request allows no indices; and an update that asks for its source gets the document as it left it (the
+alerting plugin's lock release asks, and was refused). With these the alerting plugin runs monitors, on demand and on schedule, and
+records their alerts.
 
 **Authentication and authorization.** The shell's own authentication is a plugin, depending on `:server`
 and not on the shell. HTTP Basic at the request seam, accounts in a system index unreachable over REST,

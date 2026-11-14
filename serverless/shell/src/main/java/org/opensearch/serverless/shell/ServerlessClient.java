@@ -184,6 +184,7 @@ public final class ServerlessClient extends AbstractClient {
         if (ServerlessPlugins.indexAdmin(serving.settings)) {
             final ActionResponse answered = indexAdmin(action.name(), request, serving, metadata);
             if (answered != null) {
+                serving.pluginIndices().changed(PluginIndicesView.touchedBy(request, answered));
                 return answered;
             }
         }
@@ -320,29 +321,68 @@ public final class ServerlessClient extends AbstractClient {
         if (unsupported != null) {
             throw new UnsupportedOperationException(unsupported);
         }
-        final String names = request.indices().length == 0 ? "*" : String.join(",", request.indices());
-        final org.opensearch.serverless.rest.SearchHandler.Resolution resolved = org.opensearch.serverless.rest.SearchHandler
-            .resolveIndices(metadata, serving, names, request.indicesOptions().ignoreUnavailable(), false);
-        if (resolved.refused()) {
-            if (resolved.status() == org.opensearch.core.rest.RestStatus.NOT_FOUND) {
+        String names = request.indices().length == 0 ? "*" : String.join(",", request.indices());
+        org.opensearch.serverless.rest.SearchHandler.Resolution resolved = org.opensearch.serverless.rest.SearchHandler.resolveIndices(
+            metadata,
+            serving,
+            names,
+            request.indicesOptions().ignoreUnavailable(),
+            false
+        );
+        // A pattern that matches nothing is a search over nothing for a plugin, as in core when the request allows no
+        // indices (a search's default): alerting searches its comments indices before the first comment creates one.
+        // The REST surface refuses it unless asked, and the plugin client answers as core does.
+        while (resolved.refused() && request.indicesOptions().allowNoIndices()) {
+            final String unmatched = unmatchedPattern(resolved);
+            if (unmatched == null) {
+                break;
+            }
+            final java.util.List<String> rest = new java.util.ArrayList<>(java.util.Arrays.asList(names.split(",")));
+            if (rest.remove(unmatched) == false) {
+                break;
+            }
+            if (rest.isEmpty()) {
+                return new org.opensearch.action.search.SearchResponse(
+                    org.opensearch.search.internal.InternalSearchResponse.empty(),
+                    null,
+                    0,
+                    0,
+                    0,
+                    0,
+                    org.opensearch.action.search.ShardSearchFailure.EMPTY_ARRAY,
+                    org.opensearch.action.search.SearchResponse.Clusters.EMPTY
+                );
+            }
+            names = String.join(",", rest);
+            resolved = org.opensearch.serverless.rest.SearchHandler.resolveIndices(
+                metadata,
+                serving,
+                names,
+                request.indicesOptions().ignoreUnavailable(),
+                false
+            );
+        }
+        final org.opensearch.serverless.rest.SearchHandler.Resolution found = resolved;
+        if (found.refused()) {
+            if (found.status() == org.opensearch.core.rest.RestStatus.NOT_FOUND) {
                 throw new org.opensearch.index.IndexNotFoundException(names);
             }
-            throw new org.opensearch.OpenSearchStatusException(resolved.reason(), resolved.status());
+            throw new org.opensearch.OpenSearchStatusException(found.reason(), found.status());
         }
         final long startNanos = System.nanoTime();
         final var outcome = org.opensearch.serverless.rest.SearchHandler.gated(
             serving,
             request,
-            resolved.indices().keySet(),
+            found.indices().keySet(),
             source,
             admitted -> org.opensearch.serverless.rest.SearchFanout.run(
                 serving,
                 metadata,
-                resolved.indices(),
+                found.indices(),
                 admitted,
                 org.opensearch.serverless.rest.SearchFanout.Options.DEFAULT.withRouting(
                     org.opensearch.serverless.rest.DocumentRouting.searchRoutings(request.routing())
-                )
+                ).withOnlyShards(selectedShards(request.preference()))
             )
         );
         // The same response a REST caller gets, built by the same code, so a plugin reading
@@ -353,6 +393,35 @@ public final class ServerlessClient extends AbstractClient {
             java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos),
             null
         );
+    }
+
+    /**
+     * The shard numbers a {@code _shards:} preference names, as core reads it: {@code _shards:0,2} optionally followed by
+     * {@code |} and another preference, which a search here has no use for. Empty for any other preference.
+     */
+    static java.util.Set<Integer> selectedShards(String preference) {
+        if (preference == null || preference.startsWith("_shards:") == false) {
+            return java.util.Set.of();
+        }
+        final int bar = preference.indexOf('|');
+        final String list = preference.substring("_shards:".length(), bar < 0 ? preference.length() : bar);
+        final java.util.Set<Integer> shards = new java.util.TreeSet<>();
+        for (String shard : org.opensearch.core.common.Strings.splitStringByCommaToArray(list)) {
+            shards.add(Integer.parseInt(shard.trim()));
+        }
+        return shards;
+    }
+
+    /** The pattern a resolution found no index for, or null when it was refused for another reason. */
+    private static String unmatchedPattern(org.opensearch.serverless.rest.SearchHandler.Resolution resolved) {
+        final String prefix = "no index matches [";
+        if (resolved.status() != org.opensearch.core.rest.RestStatus.NOT_FOUND
+            || resolved.reason() == null
+            || resolved.reason().startsWith(prefix) == false
+            || resolved.reason().endsWith("]") == false) {
+            return null;
+        }
+        return resolved.reason().substring(prefix.length(), resolved.reason().length() - 1);
     }
 
     private CreateIndexResponse createIndex(CreateIndexRequest request, MetadataPlane metadata) throws Exception {
@@ -408,6 +477,7 @@ public final class ServerlessClient extends AbstractClient {
             }
             node.get().indexAdmin().updateAliases(add);
         }
+        node.get().pluginIndices().changed(java.util.List.of(request.index()));
         return new CreateIndexResponse(true, true, request.index());
     }
 

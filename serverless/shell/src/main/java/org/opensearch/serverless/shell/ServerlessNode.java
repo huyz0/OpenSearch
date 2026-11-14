@@ -386,6 +386,7 @@ public final class ServerlessNode implements Closeable {
         );
         // Only with plugins installed: the shell's own code never asks for a cluster manager, so a node without
         // plugins keeps a view that names none.
+        this.views.decorateWith(view -> pluginIndices().withOwners(view));
         this.views.namesClusterManager(ServerlessPlugins.clusterView(settings) && this.plugins.plugins().isEmpty() == false);
         // Role is a runtime attribute a node advertises, not a topology decision baked into a
         // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
@@ -662,6 +663,7 @@ public final class ServerlessNode implements Closeable {
      */
     void notifyPluginsStarted() {
         if (started && metadataPlane != null && pluginsNotified.compareAndSet(false, true)) {
+            pluginIndices().start(metadataPlane);
             plugins.onNodeStarted(localNode);
         }
     }
@@ -975,6 +977,16 @@ public final class ServerlessNode implements Closeable {
         return indexAdmin;
     }
 
+    private PluginIndicesView pluginIndices;
+
+    /** The plugins' own indices kept in this node's view, built the first time they are asked for. */
+    synchronized PluginIndicesView pluginIndices() {
+        if (pluginIndices == null) {
+            pluginIndices = new PluginIndicesView(this);
+        }
+        return pluginIndices;
+    }
+
     /** The plugins' lifecycle components and injector-built services this node started, in start order. */
     final java.util.List<org.opensearch.common.lifecycle.LifecycleComponent> pluginLifecycle =
         new java.util.concurrent.CopyOnWriteArrayList<>();
@@ -1167,6 +1179,7 @@ public final class ServerlessNode implements Closeable {
         // ServerlessPlugins#closeAll must be invoked here. Skipping it is invisible while every plugin is a
         // test plugin holding nothing; a plugin that owns a thread pool leaks it out of every node.
         IOUtils.closeWhileHandlingException(httpServerTransport);
+        pluginIndices().stop();
         // The plugins' lifecycle services before the plugins, the order a classic node stops them in.
         for (org.opensearch.common.lifecycle.LifecycleComponent service : pluginLifecycle) {
             try {

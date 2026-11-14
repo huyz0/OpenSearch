@@ -144,11 +144,9 @@ final class DocumentUpdates {
             if (selected.scriptedUpsert() && selected.script() == null) {
                 throw new IllegalArgumentException("scripted_upsert was given without a script");
             }
-            if (selected.isRequireAlias()
-                || selected.waitForActiveShards().validate(0) == false
-                || (selected.fetchSource() != null && selected.fetchSource().fetchSource())) {
+            if (selected.isRequireAlias() || selected.waitForActiveShards().validate(0) == false) {
                 throw new org.opensearch.OpenSearchStatusException(
-                    "require_alias, source fetching and active-shard counts above one are not supported on updates",
+                    "require_alias and active-shard counts above one are not supported on updates",
                     org.opensearch.core.rest.RestStatus.NOT_IMPLEMENTED
                 );
             }
@@ -165,19 +163,22 @@ final class DocumentUpdates {
             final long attempts = 1L + selected.retryOnConflict();
             for (long attempt = 0L;; attempt++) {
                 try {
-                    return executeAcceptedUpdate(
-                        selected.index(),
-                        selected.id(),
-                        selected.routing(),
-                        doc,
-                        upsert,
-                        selected.docAsUpsert(),
-                        selected.detectNoop(),
-                        refresh,
-                        selected.ifSeqNo(),
-                        selected.ifPrimaryTerm(),
-                        selected.script(),
-                        selected.scriptedUpsert()
+                    return withFetchedSource(
+                        selected,
+                        executeAcceptedUpdate(
+                            selected.index(),
+                            selected.id(),
+                            selected.routing(),
+                            doc,
+                            upsert,
+                            selected.docAsUpsert(),
+                            selected.detectNoop(),
+                            refresh,
+                            selected.ifSeqNo(),
+                            selected.ifPrimaryTerm(),
+                            selected.script(),
+                            selected.scriptedUpsert()
+                        )
                     );
                 } catch (org.opensearch.index.engine.VersionConflictEngineException e) {
                     if (attempt >= attempts - 1L) {
@@ -198,6 +199,43 @@ final class DocumentUpdates {
                     : new UpdateOutcome((org.opensearch.action.update.UpdateResponse) response, null);
             }
         });
+    }
+
+    /**
+     * Adds the document as the update left it when the request asked for its source, as core's update does: a plugin
+     * keeping a lock document asks for it on every release. Read back realtime from the shard, and attached only when the read
+     * is this update's own result (same sequence number); a write that landed in between leaves the response without one
+     * rather than with someone else's document.
+     */
+    private UpdateOutcome withFetchedSource(org.opensearch.action.update.UpdateRequest request, UpdateOutcome outcome) throws Exception {
+        if (request.fetchSource() == null || request.fetchSource().fetchSource() == false) {
+            return outcome;
+        }
+        final org.opensearch.action.update.UpdateResponse response = outcome.response();
+        if (response.getResult() == org.opensearch.action.DocWriteResponse.Result.DELETED
+            || response.getResult() == org.opensearch.action.DocWriteResponse.Result.NOT_FOUND) {
+            return outcome;
+        }
+        final org.opensearch.action.get.GetRequest get = new org.opensearch.action.get.GetRequest(response.getIndex(), response.getId())
+            .routing(request.routing());
+        final org.opensearch.action.get.GetResponse read = (org.opensearch.action.get.GetResponse) DocumentReads.getView(
+            response.getIndex()
+        ).show(operations.reads.readAcceptedGet(get));
+        if (read.isExists() && read.getSeqNo() == response.getSeqNo() && read.getPrimaryTerm() == response.getPrimaryTerm()) {
+            response.setGetResult(
+                org.opensearch.action.update.UpdateHelper.extractGetResult(
+                    request,
+                    response.getIndex(),
+                    read.getSeqNo(),
+                    read.getPrimaryTerm(),
+                    read.getVersion(),
+                    read.getSourceAsMap(),
+                    org.opensearch.common.xcontent.XContentType.JSON,
+                    read.getSourceAsBytesRef()
+                )
+            );
+        }
+        return outcome;
     }
 
     /** Applies one read/compare-and-swap attempt without invoking a nested action filter chain. */

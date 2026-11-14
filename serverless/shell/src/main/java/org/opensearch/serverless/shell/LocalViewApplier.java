@@ -205,7 +205,7 @@ final class LocalViewApplier {
      * @throws Exception if application fails or times out
      */
     void applyLocalView(ClusterState state, TimeValueLike timeout) throws Exception {
-        final ClusterState toApply = withPeers(state);
+        final ClusterState toApply = decorate.apply(withPeers(state));
         final CountDownLatch latch = new CountDownLatch(1);
         final AtomicReference<Exception> failure = new AtomicReference<>();
         clusterService.get()
@@ -266,6 +266,17 @@ final class LocalViewApplier {
     }
 
     private volatile boolean namesClusterManager;
+
+    private volatile java.util.function.UnaryOperator<ClusterState> decorate = java.util.function.UnaryOperator.identity();
+
+    /**
+     * Sets what is added to every view once its peers are in it.
+     *
+     * @param decorate the addition
+     */
+    void decorateWith(java.util.function.UnaryOperator<ClusterState> decorate) {
+        this.decorate = decorate;
+    }
 
     /**
      * Whether the view names a cluster manager: set when plugins are installed and the plugin cluster view is on.

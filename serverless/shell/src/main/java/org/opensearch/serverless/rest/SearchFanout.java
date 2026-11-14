@@ -189,15 +189,17 @@ public final class SearchFanout {
      * @param nowMillis the request's single now, or zero to take one here
      * @param judged indices the rollups already settled may match, whose shards are not checked again
      * @param routing the search's custom routing values; when any are given, only the shards they route to are searched
+     * @param onlyShards shard numbers a {@code _shards:} preference named; when any are given, only those shards are searched
      */
     public record Options(boolean allowPartialActivation, int preSkippedShards, long nowMillis, java.util.Set<String> judged, java.util.Set<
-        String> routing) {
+        String> routing, java.util.Set<Integer> onlyShards) {
         /** Refuse past the budget; nothing skipped before the fan-out; the fan-out's own clock. */
         public static final Options DEFAULT = new Options(false, 0, 0L, java.util.Set.of());
 
         /** Validates and copies. */
         public Options {
             routing = routing == null ? java.util.Set.of() : java.util.Set.copyOf(routing);
+            onlyShards = onlyShards == null ? java.util.Set.of() : java.util.Set.copyOf(onlyShards);
         }
 
         /**
@@ -209,7 +211,7 @@ public final class SearchFanout {
          * @param judged indices the rollups already settled may match
          */
         public Options(boolean allowPartialActivation, int preSkippedShards, long nowMillis, java.util.Set<String> judged) {
-            this(allowPartialActivation, preSkippedShards, nowMillis, judged, java.util.Set.of());
+            this(allowPartialActivation, preSkippedShards, nowMillis, judged, java.util.Set.of(), java.util.Set.of());
         }
 
         /**
@@ -219,7 +221,17 @@ public final class SearchFanout {
          * @return the options
          */
         public Options withRouting(java.util.Set<String> values) {
-            return new Options(allowPartialActivation, preSkippedShards, nowMillis, judged, values);
+            return new Options(allowPartialActivation, preSkippedShards, nowMillis, judged, values, onlyShards);
+        }
+
+        /**
+         * Returns these options narrowed to the named shard numbers, as core's {@code _shards:} preference narrows a search.
+         *
+         * @param shards the shard numbers, or an empty set for every shard
+         * @return the options
+         */
+        public Options withOnlyShards(java.util.Set<Integer> shards) {
+            return new Options(allowPartialActivation, preSkippedShards, nowMillis, judged, routing, shards);
         }
 
         /**
@@ -228,8 +240,16 @@ public final class SearchFanout {
          * @param allowPartialActivation whether to answer from the shards within the budget
          */
         public Options(boolean allowPartialActivation) {
-            this(allowPartialActivation, 0, 0L, java.util.Set.of(), java.util.Set.of());
+            this(allowPartialActivation, 0, 0L, java.util.Set.of(), java.util.Set.of(), java.util.Set.of());
         }
+    }
+
+    private static java.util.List<Integer> boxed(int[] ids) {
+        final java.util.List<Integer> boxed = new ArrayList<>(ids.length);
+        for (int id : ids) {
+            boxed.add(id);
+        }
+        return boxed;
     }
 
     /** One shard of one index, as the fan-out addresses it. */
@@ -296,14 +316,11 @@ public final class SearchFanout {
             final java.util.Collection<Integer> routed = options.routing().isEmpty()
                 ? null
                 : DocumentRouting.shardsForSearch(descriptor, options.routing());
-            if (routed != null) {
-                for (int shard : routed) {
+            final java.util.Collection<Integer> candidates = routed != null ? routed : boxed(descriptor.unitIds());
+            for (int shard : candidates) {
+                if (options.onlyShards().isEmpty() || options.onlyShards().contains(shard)) {
                     everyShard.add(new Target(descriptor, shard));
                 }
-                continue;
-            }
-            for (int shard : descriptor.unitIds()) {
-                everyShard.add(new Target(descriptor, shard));
             }
         }
         final int shards = everyShard.size() + options.preSkippedShards();
