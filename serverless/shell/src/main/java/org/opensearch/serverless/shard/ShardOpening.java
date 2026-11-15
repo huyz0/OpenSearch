@@ -282,7 +282,7 @@ final class ShardOpening {
                     if (restoring
                         && shard.seqNoStats().getMaxSeqNo() <= restoredCheckpoint
                         && published.get().walOrdinal() >= 0L
-                        && published.get().digest().isEmpty() == false) {
+                        && recordsItsDigest(shard, published.get())) {
                         // Nothing was replayed past the published commit, so that commit already holds every
                         // operation this shard has. Recorded so the first publish is not one that says so again.
                         // Not for a commit published before commits recorded their log position and digest: the
@@ -423,6 +423,26 @@ final class ShardOpening {
             reconciler.closeIndexIfUnused(shardId.getIndex(), "activation failed: " + cause.getMessage(), false);
         } catch (Exception e) {
             cause.addSuppressed(e);
+        }
+    }
+
+    /**
+     * Whether a published commit carries the pruning digest its publish would record now.
+     *
+     * <p>An empty digest was read as a commit published before commits carried one, so every take of a shard with nothing
+     * a digest describes -- text and keywords, no numbers or dates -- published the same operations again: a new commit,
+     * a manifest swap and the sweep after it. The digest of the commit just opened is computed from its segments, which
+     * the open has read already; empty as well, the publish would record nothing new.
+     */
+    static boolean recordsItsDigest(IndexShard shard, CommitManifest published) {
+        if (published.digest().isEmpty() == false) {
+            return true;
+        }
+        try (var commit = shard.acquireLastIndexCommit(false)) {
+            return ShardPublishing.digestOf(shard, commit.get()).isEmpty();
+        } catch (Exception e) {
+            // Unknown: published again, as before.
+            return false;
         }
     }
 

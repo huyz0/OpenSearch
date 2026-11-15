@@ -341,7 +341,11 @@ public final class ShardHeadStore {
                 && expectedEphemeralId.equals(current.ownerEphemeralId()) == false)) {
             return false;
         }
-        final ShardHead released = ref.stored(current.term(), null, null, 0L, null).withWriters(current.writers()).withWriter(lastWriter);
+        // A bucket head names the logs of every member: one member published through all it holds says nothing of the
+        // others, so the node giving it back is named even when the caller found its own member fully published.
+        final ShardHead released = ref.stored(current.term(), null, null, 0L, null)
+            .withWriters(current.writers())
+            .withWriter(lastWriter == null ? nodeId : lastWriter);
         return container.compareAndSwapRegister(ref.name(), existing.get().generation(), released.toBytes()).applied();
     }
 
@@ -496,7 +500,8 @@ public final class ShardHeadStore {
      * @param expectedIndexUuid the index incarnation, or null for legacy callers
      * @param expectedEphemeralId the process incarnation, or null for legacy callers
      * @param lastWriter the node whose log may hold unpublished records: the releasing node, or for an open that failed
-     *     before it published, the node it was taking the shard from; null for none
+     *     before it published, the node it was taking the shard from; null for none, when the register holds everything
+     *     the releasing node had. A bucket member's release names the releasing node whatever this says
      * @return whether this writer released its own head
      * @throws IOException if the backing store fails
      */

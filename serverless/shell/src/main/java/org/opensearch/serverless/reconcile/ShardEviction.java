@@ -312,10 +312,19 @@ final class ShardEviction {
         // rebuilds it from the log, which is the state the caller was told about.
         // Unchanged only if the last publish's commit covered every operation this shard has: see #publish.
         final boolean unchanged = maxSeqNo < 0 || maxSeqNo <= reconciler.lastPublishedMaxSeqNo.getOrDefault(shardId, -1L);
-        if (unchanged == false && reconciler.node.fences().isWriteFenced(shardId) == false) {
+        final boolean writeFenced = reconciler.node.fences().isWriteFenced(shardId);
+        // Whether the register holds every operation this shard has once the publish below is done: then this node's log
+        // holds nothing of it that a successor or a reader would need, and the head given back does not name it.
+        boolean publishedThrough = unchanged && writeFenced == false;
+        if (unchanged == false && writeFenced == false) {
+            // Under the fence nothing is in flight: what is processed is everything, and the publish covers what is processed.
+            final long covered = shard.seqNoStats().getLocalCheckpoint();
+            final org.opensearch.serverless.store.CommitManifest published;
             synchronized (reconciler.publishLock(shardId)) {
-                reconciler.lastManifests.put(shardId, reconciler.node.shards().publishShard(shardId, head.get().term()));
+                published = reconciler.node.shards().publishShard(shardId, head.get().term());
+                reconciler.lastManifests.put(shardId, published);
             }
+            publishedThrough = published != null && covered >= maxSeqNo;
         } else {
             // A staged commit is written before the head is let go, so the successor restores it rather than replaying.
             synchronized (reconciler.publishLock(shardId)) {
@@ -327,6 +336,9 @@ final class ShardEviction {
         }
         // As a writer going to sleep does: the next open of this commit on this node reads its small files from memory.
         ShardHibernation.warm(shard, reconciler.lastManifests.get(shardId));
+        // A head given back used to name this node's log whatever the publish had covered. Every reader opened on the shard
+        // afterwards then read this node's lease and probed its log, three reads and three round trips, to find nothing;
+        // the next owner did the same and then swapped the head once more to stop it naming the log.
         if (reconciler.plane.heads()
             .release(
                 shardId.getIndexName(),
@@ -334,7 +346,8 @@ final class ShardEviction {
                 reconciler.node.localNode().getId(),
                 ownedTerm,
                 shardId.getIndex().getUUID(),
-                reconciler.node.localNode().getEphemeralId()
+                reconciler.node.localNode().getEphemeralId(),
+                publishedThrough ? null : reconciler.node.localNode().getId()
             ) == false) {
             // Somebody else's head now, or the swap lost. Keep the shard and try again next pass;
             // closing it while the head still points here is the one outcome to avoid.

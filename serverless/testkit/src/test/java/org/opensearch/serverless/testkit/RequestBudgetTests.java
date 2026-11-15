@@ -91,6 +91,7 @@ public class RequestBudgetTests extends OpenSearchTestCase {
             counts.reset();
             counts.traceCallers(5);
             depth.reset(roundTripMillis);
+            depth.record(RequestBudgets.recording());
             usageAtReset = snapshot();
         }
 
@@ -126,7 +127,7 @@ public class RequestBudgetTests extends OpenSearchTestCase {
         }
 
         String detail() {
-            return counts.breakdown() + "\nby caller:\n" + counts.byCaller();
+            return counts.breakdown() + "\nby caller:\n" + counts.byCaller() + "\nin order:\n" + depth.sequence();
         }
     }
 

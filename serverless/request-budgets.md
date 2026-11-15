@@ -30,7 +30,7 @@ Run the gates with the rest of the testkit suite, or alone:
   sent together overlap.
 
 To see where a count's requests go, record instead of checking; the tests then log each measurement with a by-caller
-breakdown:
+breakdown, and the requests in the order they were sent, each with its round and who sent it:
 
 ```
 ./gradlew :serverless:testkit:test --tests '*RequestBudgetTests' -Dtests.request_budgets.record=true -Dtests.output=true
@@ -52,10 +52,10 @@ The lifecycle cases run on one writer holding four one-shard indices, then one s
 | `held_idle.node_requests_per_hour` | The same hour: requests charged to the node (lease renewal, stored-script marker, sweeps) | 1227 | exact | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
 | `held_idle.index_requests_target` | An idle held index makes no periodic request | 0 | exact | blocked | Head verification reads each held shard's head every 5 minutes (12 per shard-hour), the 5-minute descriptor refresh backstop reads each descriptor (12 an hour in service; the simulated hour sees one, because the backstop skips a descriptor read recently by the wall clock), and the orphan sweep reads each descriptor about 3 times an hour. Zero needs head checks carried by the lease or a change feed, and the backstop replaced by the change stripes |
 | `release.requests` | Releasing the four idle shards | 43 | exact | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
-| `take.released.requests` | Taking one shard its writer released cleanly | 25 | exact | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
-| `take.released.round_trips` | Round trips that take waits through | 24 | max | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
-| `search.cold.requests` | A search node opens a shard it never served and runs one search | 16 | exact | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
-| `search.cold.round_trips` | Round trips that open and first search wait through | 12 | max | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
+| `take.released.requests` | Taking one shard its writer released cleanly | 13 | exact | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
+| `take.released.round_trips` | Round trips the reconcile pass that takes it waits through: ten for the take, the rest its own lease renewal and stored-script check | 13 | max | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
+| `search.cold.requests` | A search node opens a shard it never served and runs one search | 7 | exact | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
+| `search.cold.round_trips` | Round trips that open and first search wait through | 3 | max | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
 | `search.warm.requests` | The next search on that shard | 0 | exact | enforced | `RequestBudgetTests#testIndexLifecycleBudgets` |
 | `search.held_idle.index_requests_target` | An idle shard a search node holds open makes no periodic request | 0 | exact | blocked | Not measured: a search node's reader checks run on its own wall-clock timers, which the simulated clock does not drive. Needs a reader-side meter on the simulated clock |
 | `idle_released.node_requests_per_hour` | An hour of a writer's periodic work once four written indices were released | 1168 | exact | enforced | `IdleIndexRequestTests#testIdleIndicesMakeNoPeriodicRequests` |
