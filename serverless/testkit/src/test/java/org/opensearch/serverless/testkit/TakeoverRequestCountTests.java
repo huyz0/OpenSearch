@@ -34,6 +34,7 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
     private static final long TTL = 30_000L;
     private static final int SHARDS = 3;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"},\"n\":{\"type\":\"long\"}}}";
+    private static final String TEXT_ONLY_MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"}}}";
 
     private Settings nodeSettings(String name) {
         return Settings.builder()
@@ -48,6 +49,15 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
     }
 
     private static List<ShardId> holdAndWrite(ServerlessNode node, BackgroundReconciler loop, AtomicLong clock) throws Exception {
+        return holdAndWrite(node, loop, clock, i -> "{\"msg\":\"first\",\"n\":" + i + "}");
+    }
+
+    private static List<ShardId> holdAndWrite(
+        ServerlessNode node,
+        BackgroundReconciler loop,
+        AtomicLong clock,
+        java.util.function.IntFunction<String> doc
+    ) throws Exception {
         for (int shard = 0; shard < SHARDS; shard++) {
             loop.want("alpha", shard);
         }
@@ -55,7 +65,7 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
         final List<ShardId> held = new ArrayList<>(node.reconciler().openShards());
         assertEquals(SHARDS, held.size());
         for (int i = 0; i < 30; i++) {
-            node.writes().index(held.get(i % SHARDS), "first-" + i, "{\"msg\":\"first\",\"n\":" + i + "}");
+            node.writes().index(held.get(i % SHARDS), "first-" + i, doc.apply(i));
         }
         loop.publishAll();
         return held;
@@ -119,20 +129,36 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
     }
 
     public void testTakingShardsLetGoOfCleanly() throws Exception {
+        takeShardsLetGoOfCleanly(MAPPING, i -> "{\"msg\":\"first\",\"n\":" + i + "}");
+    }
+
+    /**
+     * The same with nothing a pruning digest describes: a commit of text alone publishes an empty digest, which is
+     * what the commit holds rather than a sign it was published before commits carried digests.
+     */
+    public void testTakingTextOnlyShardsLetGoOfCleanly() throws Exception {
+        takeShardsLetGoOfCleanly(TEXT_ONLY_MAPPING, i -> "{\"msg\":\"first\"}");
+    }
+
+    private void takeShardsLetGoOfCleanly(String mapping, java.util.function.IntFunction<String> doc) throws Exception {
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         final CountingBlobStore store = store();
         final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
-        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, mapping, null));
         try (ServerlessNode first = new ServerlessNode(nodeSettings("released-first"))) {
             first.startup().start();
             first.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(first, plane);
-            holdAndWrite(first, loop, clock);
+            holdAndWrite(first, loop, clock, doc);
             loop.setIdleAfterMillis(1);
             for (int shard = 0; shard < SHARDS; shard++) {
                 loop.stopWanting("alpha", shard);
             }
             loop.releaseIdle(System.currentTimeMillis() + 60_000L);
+        }
+        for (int shard = 0; shard < SHARDS; shard++) {
+            // Published through everything it held: its log holds nothing of the shard, so the head given back names none.
+            assertEquals("a head let go of cleanly names no log", List.of(), plane.heads().read("alpha", shard).orElseThrow().writers());
         }
         try (ServerlessNode second = new ServerlessNode(nodeSettings("released-second"))) {
             second.startup().start();
@@ -145,6 +171,9 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
             assertFalse("nor is its manifest swapped\n" + where, where.contains("REGISTER_CAS segments/"));
             // Marks of shards of one index share a register, and are written together.
             assertTrue("a swap of the rollup per shard at most\n" + where, rollupSwaps(where) <= SHARDS);
+            // Nor is the releaser's log read, fenced, or cleared from the head afterwards.
+            assertFalse("the releaser's log is not read\n" + where, where.contains("nodelog/"));
+            assertEquals("one swap of each head, the take's own\n" + where, SHARDS, count(where, "REGISTER_CAS shards/"));
         }
     }
 
