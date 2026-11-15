@@ -73,7 +73,10 @@ public class ServerlessSettingsTests extends OpenSearchTestCase {
                     "index.serverless.bucket",
                     "index.serverless.bucket_group",
                     "index.serverless.segment_placement",
-                    "index.serverless.tail_overlay"
+                    "index.serverless.tail_overlay",
+                    "index.serverless.cost.guardrails",
+                    "index.serverless.cost.tier",
+                    "index.serverless.cost.budget"
                 )
             ),
             keys

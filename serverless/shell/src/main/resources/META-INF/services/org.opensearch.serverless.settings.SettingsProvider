@@ -13,3 +13,4 @@ org.opensearch.serverless.store.ObjectStoreSettings
 org.opensearch.serverless.transport.ReaderPushSettings
 org.opensearch.serverless.transport.ShardRouterSettings
 org.opensearch.serverless.transport.WarmCopySettings
+org.opensearch.serverless.usage.UsageSettings

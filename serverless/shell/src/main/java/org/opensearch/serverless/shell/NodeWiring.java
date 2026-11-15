@@ -177,6 +177,15 @@ final class NodeWiring {
             )
         );
 
+        final org.opensearch.serverless.usage.Guardrails guardrails = node.part(org.opensearch.serverless.usage.Guardrails.class);
+        controller.registerHandler(
+            new org.opensearch.serverless.rest.UsageHandler(
+                () -> guardrails,
+                () -> guardrails == null ? null : guardrails.usage(),
+                node.nodeEnvironment()::nodeId,
+                System.currentTimeMillis()
+            )
+        );
         controller.registerHandler(
             new org.opensearch.serverless.rest.ServerlessReadyHandler(() -> node.isStarted(), () -> SearchReadiness.of(node))
         );

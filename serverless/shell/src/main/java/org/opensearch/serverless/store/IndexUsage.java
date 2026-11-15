@@ -22,7 +22,10 @@ import java.util.concurrent.atomic.AtomicLongArray;
  */
 public final class IndexUsage {
 
-    /** What is counted. The request kinds match {@link MeteredBlobStore}'s own counters, one for one. */
+    /**
+     * What is counted. The request kinds match {@link MeteredBlobStore}'s own counters, one for one; the last four count
+     * work that is not a store request.
+     */
     public enum Kind {
         /** A register read: a GET. */
         REGISTER_READ,
@@ -39,7 +42,15 @@ public final class IndexUsage {
         /** Bytes pulled through reads. */
         BYTES_READ,
         /** Bytes sent by writes. */
-        BYTES_WRITTEN;
+        BYTES_WRITTEN,
+        /** Documents written or deleted on this node, counted at the writer. */
+        DOCS,
+        /** Searches coordinated on this node. */
+        QUERIES,
+        /** Time searches coordinated on this node took, in nanoseconds. */
+        SEARCH_NANOS,
+        /** Bytes of written records kept for pushing to search nodes, once per record whatever the readers. */
+        PUSH_BYTES;
 
         /**
          * Whether this kind counts requests, in thousandths, rather than bytes.
@@ -47,7 +58,7 @@ public final class IndexUsage {
          * @return true for a request kind
          */
         public boolean isRequest() {
-            return this != BYTES_READ && this != BYTES_WRITTEN;
+            return ordinal() <= DELETE.ordinal();
         }
     }
 

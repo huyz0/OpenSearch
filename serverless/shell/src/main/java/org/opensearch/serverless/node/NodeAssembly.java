@@ -81,7 +81,14 @@ final class NodeAssembly {
         node.roles = rolesFrom(settings);
         node.blockCache = NodeComponents.blockCache(settings);
         node.writes.writeBackpressureMax = WriteSettings.BACKPRESSURE_MAX_IN_FLIGHT.get(settings);
-        node.writes.writePools = WritePools.of(settings);
+        final org.opensearch.serverless.usage.Guardrails guardrails = new org.opensearch.serverless.usage.Guardrails(
+            settings,
+            org.opensearch.serverless.bucket.BucketSettings.GROUP::get,
+            () -> usageOf(node.metadataPlane),
+            System::currentTimeMillis
+        );
+        node.attach(org.opensearch.serverless.usage.Guardrails.class, guardrails);
+        node.writes.writePools = WritePools.of(settings, guardrails);
         node.writes.writeBackpressure = NodeComponents.writeBackpressure(settings, node.writes.writeBackpressureMax);
         // Refused here, at construction, rather than on the first shard it takes.
         node.nodeLogCommitCheckpointMillis = LogCommitCheckpoint.nodeValue(settings);
@@ -184,5 +191,11 @@ final class NodeAssembly {
             roles.add(trimmed);
         }
         return Set.copyOf(roles);
+    }
+
+    private static org.opensearch.serverless.store.StoreUsage usageOf(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        return plane != null && plane.blobStore() instanceof org.opensearch.serverless.store.MeteredBlobStore metered
+            ? metered.usage()
+            : null;
     }
 }
