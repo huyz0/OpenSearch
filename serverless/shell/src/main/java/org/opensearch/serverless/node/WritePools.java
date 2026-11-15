@@ -13,8 +13,11 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.serverless.usage.Guardrails;
+import org.opensearch.serverless.usage.UsageSettings;
 
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Where document writes run, and how many apply to the engine at once.
@@ -54,10 +57,15 @@ public final class WritePools {
 
     private final Semaphore gate;
     private final Guardrails guardrails;
+    private final int indexCap;
+    private final long maxWaitMillis;
+    private final ConcurrentHashMap<String, int[]> heldByIndex = new ConcurrentHashMap<>();
 
-    private WritePools(Semaphore gate, Guardrails guardrails) {
+    private WritePools(Semaphore gate, Guardrails guardrails, int indexCap, long maxWaitMillis) {
         this.gate = gate;
         this.guardrails = guardrails;
+        this.indexCap = indexCap;
+        this.maxWaitMillis = maxWaitMillis;
     }
 
     /**
@@ -80,7 +88,14 @@ public final class WritePools {
     public static WritePools of(Settings settings, Guardrails guardrails) {
         // Not fair: a fair gate hands each released permit to the longest waiter, a thread switch per apply, and with
         // thousands of writers queued that handing-over, not CPU, was what bounded a node's bulk rate.
-        return new WritePools(new Semaphore(applyPermits(settings), false), guardrails);
+        final int permits = applyPermits(settings);
+        final double share = UsageSettings.WRITE_INDEX_SHARE.get(settings);
+        return new WritePools(
+            new Semaphore(permits, false),
+            guardrails,
+            share <= 0 ? 0 : Math.max(1, (int) (permits * share)),
+            UsageSettings.MAX_WAIT_MILLIS.get(settings)
+        );
     }
 
     /**
@@ -123,8 +138,84 @@ public final class WritePools {
      * @throws java.io.IOException if interrupted while waiting, before anything was applied
      */
     public Releasable enterApply(IndexShard shard, int docs) throws java.io.IOException {
+        pace(shard, docs);
         wrote(shard, docs);
-        return enterApply();
+        return enterApply(shard.shardId().getIndexName());
+    }
+
+    /**
+     * Takes a permit to apply to an index, waiting first, while every permit is taken, if the index already holds its
+     * share of them.
+     *
+     * @param index the index
+     * @return gives the permit back
+     * @throws java.io.IOException if interrupted while waiting, before anything was applied
+     */
+    public Releasable enterApply(String index) throws java.io.IOException {
+        final Releasable share = takeShare(index);
+        try {
+            final Releasable permit = enterApply();
+            return () -> {
+                permit.close();
+                share.close();
+            };
+        } catch (java.io.IOException | RuntimeException e) {
+            share.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Waits, while every permit is taken and the index already holds its share of them, for one of its own to be given
+     * back, so another index's apply takes the next permit. Bounded by the longest wait; it orders applies and never
+     * refuses one.
+     */
+    private Releasable takeShare(String index) throws java.io.IOException {
+        if (indexCap <= 0) {
+            return () -> {};
+        }
+        final int[] held = heldByIndex.computeIfAbsent(index, ignored -> new int[1]);
+        synchronized (held) {
+            final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxWaitMillis);
+            // Also while another apply is queued for the gate: the next permit given back is its, not this index's again.
+            while (held[0] >= indexCap && (gate.availablePermits() == 0 || gate.hasQueuedThreads())) {
+                final long left = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                if (left <= 0) {
+                    break;
+                }
+                try {
+                    // Timed: a permit another index gives back does not wake this, and should let it through.
+                    held.wait(Math.min(left, 5L));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new java.io.IOException("interrupted waiting to apply a write; nothing was applied", e);
+                }
+            }
+            held[0]++;
+        }
+        return () -> {
+            synchronized (held) {
+                held[0]--;
+                held.notifyAll();
+            }
+        };
+    }
+
+    /**
+     * Holds documents for a shard until they fit its tenant's cost budget, when the guardrails pace it, before anything
+     * is applied.
+     *
+     * @param shard the shard
+     * @param docs how many documents are about to be written
+     * @throws org.opensearch.core.concurrency.OpenSearchRejectedExecutionException a 429, if they would be held too long
+     * @throws java.io.IOException if interrupted while held
+     */
+    public void pace(IndexShard shard, int docs) throws java.io.IOException {
+        if (guardrails != null) {
+            final String index = shard.shardId().getIndexName();
+            guardrails.note(index, shard.indexSettings().getSettings());
+            guardrails.paceWrite(index, docs);
+        }
     }
 
     /**
