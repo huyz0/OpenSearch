@@ -185,6 +185,18 @@ public final class ReaderValidation {
      * reader costs nothing while nobody dies.
      */
     void validateReader(MetadataPlane plane, String indexName, int shardNumber, ShardId shardId) throws java.io.IOException {
+        validateReader(plane, indexName, shardNumber, shardId, null);
+    }
+
+    /**
+     * As {@link #validateReader(MetadataPlane, String, int, ShardId)}, for the check that follows an open: the head the
+     * open read beside its descriptor stands in for the head read here, and the register it read after that head for the
+     * register read here, when the reader is serving that very commit. Both were read in the order this check reads them.
+     *
+     * @param ahead what the open read, or null to read both here
+     */
+    void validateReader(MetadataPlane plane, String indexName, int shardNumber, ShardId shardId, ReadAhead ahead)
+        throws java.io.IOException {
         watchDepartures(plane);
         final String key = NodeContext.shardKey(indexName, shardNumber);
         final CommitManifest commit = reconciler.get().readerCommit(shardId).orElse(null);
@@ -194,13 +206,13 @@ public final class ReaderValidation {
         }
         final ReaderCheck last = readerChecks.get(key);
         final long departed = departures.get();
-        final long now = System.nanoTime();
+        final long nowAtCheck = System.nanoTime();
         final boolean sameCheck = last != null && last.commit() == commit && last.departures() == departed;
         final long liveOwnerWindow = readerCheckMillis == 0L ? 0L : Math.max(readerCheckMillis, liveOwnerCheckMillis);
         if (last != null
             && last.owner() != null
             && (last.commit() == commit || (commit.term() == last.headTerm() && last.owner().equals(commit.writer())))
-            && now - last.checkedAtNanos() < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(liveOwnerWindow)
+            && nowAtCheck - last.checkedAtNanos() < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(liveOwnerWindow)
             && ownerHeldThroughout(plane, last)) {
             // The writer the last check found has held its lease throughout: see LIVE_OWNER_CHECK_MILLIS. Not tied to the
             // departure count, which moves whenever the snapshot re-reads any peer's lease. A newer commit that same writer
@@ -209,11 +221,15 @@ public final class ReaderValidation {
             return;
         }
         if (sameCheck
-            && now - last.checkedAtNanos() < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(readerCheckMillis)
+            && nowAtCheck - last.checkedAtNanos() < java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(readerCheckMillis)
             && (last.owner() == null || liveLease(plane, last.owner()))) {
             return;
         }
-        final var head = plane.heads().read(indexName, shardNumber);
+        final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> readAhead = last == null && ahead != null
+            ? ahead.headIfRead()
+            : null;
+        final long now = readAhead != null ? ahead.headReadAtNanos() : nowAtCheck;
+        final var head = readAhead != null ? readAhead : plane.heads().read(indexName, shardNumber);
         final String owner = head.map(org.opensearch.serverless.metadata.ShardHead::ownerNodeId).orElse(null);
         final long headTerm = head.map(org.opensearch.serverless.metadata.ShardHead::term).orElse(0L);
         if (sameCheck && last.headTerm() == headTerm && java.util.Objects.equals(last.owner(), owner)) {
@@ -249,7 +265,10 @@ public final class ReaderValidation {
         // published one first: a writer that replayed the log and published replaced it, and let go of the log behind
         // its own commit, so the log holds nothing past this one and it would be served one write short. A fleet
         // run found exactly that, answered complete.
-        final var published = plane.segmentPublisher(indexName, shardId.getIndex().getUUID(), shardNumber).readManifest();
+        final CommitManifest openedRegister = readAhead == null ? null : ahead.register();
+        final var published = openedRegister != null && sameCommit(commit, openedRegister)
+            ? java.util.Optional.of(openedRegister)
+            : plane.segmentPublisher(indexName, shardId.getIndex().getUUID(), shardNumber).readManifest();
         // A commit its writer staged after the register is not superseded by it: the writer is gone and had published it.
         if (published.isPresent() && sameCommit(commit, published.get()) == false && commit.stagedAfter(published.get()) == false) {
             readerChecks.remove(key);
@@ -348,6 +367,124 @@ public final class ReaderValidation {
                 .orElse(false);
         } catch (java.io.IOException e) {
             return false;
+        }
+    }
+
+    /**
+     * The shard head a reader open reads alongside its descriptor, and the register it reads after that head.
+     *
+     * <p>A reader's first check needs the head, then a register read made after it: a commit published between a register
+     * read and a later head read could be one the log behind it was trimmed past. The open used to read the descriptor, then
+     * the register, and the check then read the head and the register again: four reads, one after another. The head needs no
+     * descriptor, so it is read beside it, and the register the open reads once the head is in is the one the check needs.
+     * Two reads in two round trips, and the head also says whether anyone writes the shard, which decides whether the open
+     * asks a writer for its acknowledged tail at all.
+     *
+     * <p>The head is read on another pool. If that pool has not started it when the open needs it, the open reads it itself:
+     * an open never waits on a queue, so a saturated pool cannot stall one.
+     */
+    static final class ReadAhead {
+
+        private final MetadataPlane plane;
+        private final String indexName;
+        private final int shardNumber;
+        private final AtomicBoolean claimed = new AtomicBoolean();
+        private final java.util.concurrent.CompletableFuture<java.util.Optional<org.opensearch.serverless.metadata.ShardHead>> head =
+            new java.util.concurrent.CompletableFuture<>();
+        private volatile long headReadAtNanos;
+        private volatile CommitManifest register;
+
+        private ReadAhead(MetadataPlane plane, String indexName, int shardNumber) {
+            this.plane = plane;
+            this.indexName = indexName;
+            this.shardNumber = shardNumber;
+        }
+
+        /**
+         * Starts reading a shard's head.
+         *
+         * @param plane the metadata plane
+         * @param indexName the index
+         * @param shardNumber the shard
+         * @param executor where the read runs; null, or a refusal, leaves it to the open
+         * @return the read under way
+         */
+        static ReadAhead start(MetadataPlane plane, String indexName, int shardNumber, java.util.concurrent.Executor executor) {
+            final ReadAhead ahead = new ReadAhead(plane, indexName, shardNumber);
+            if (executor != null) {
+                try {
+                    executor.execute(ahead::readIfUnclaimed);
+                } catch (RuntimeException refused) {
+                    // Read by the open instead.
+                }
+            }
+            return ahead;
+        }
+
+        private void readIfUnclaimed() {
+            if (claimed.compareAndSet(false, true) == false) {
+                return;
+            }
+            final long startedAt = System.nanoTime();
+            try {
+                final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> read = plane.heads().read(indexName, shardNumber);
+                headReadAtNanos = startedAt;
+                head.complete(read);
+            } catch (Exception e) {
+                head.completeExceptionally(e);
+            }
+        }
+
+        /**
+         * Returns the head, reading it here if nobody has started to.
+         *
+         * @return the head, or empty if the shard has none
+         * @throws java.io.IOException if the read failed
+         */
+        java.util.Optional<org.opensearch.serverless.metadata.ShardHead> head() throws java.io.IOException {
+            readIfUnclaimed();
+            try {
+                return head.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new java.io.IOException("interrupted waiting for the head of " + indexName + "[" + shardNumber + "]", e);
+            } catch (java.util.concurrent.ExecutionException e) {
+                throw e.getCause() instanceof java.io.IOException io ? io : new java.io.IOException(e.getCause());
+            }
+        }
+
+        /** @return the head if its read has finished and succeeded, without waiting; null otherwise */
+        java.util.Optional<org.opensearch.serverless.metadata.ShardHead> headIfRead() {
+            return head.isDone() && head.isCompletedExceptionally() == false ? head.join() : null;
+        }
+
+        /** @return when the head read was sent, on the nano clock */
+        long headReadAtNanos() {
+            return headReadAtNanos;
+        }
+
+        /**
+         * Records the register the open read after {@link #head()} returned, and opened.
+         *
+         * @param manifest the register's commit
+         */
+        void openedFromRegister(CommitManifest manifest) {
+            this.register = manifest;
+        }
+
+        /** @return the register read after the head that the open opened, or null if it opened something else */
+        CommitManifest register() {
+            return register;
+        }
+
+        /**
+         * Whether the head says nobody writes the shard: no head, or one given back.
+         *
+         * @return true if the head was read and names no owner
+         */
+        boolean unowned() {
+            final java.util.Optional<org.opensearch.serverless.metadata.ShardHead> read = headIfRead();
+            return read != null && (read.isEmpty() || read.get().ownerNodeId() == null);
         }
     }
 }
