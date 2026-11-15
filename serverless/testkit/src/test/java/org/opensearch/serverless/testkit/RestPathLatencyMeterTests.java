@@ -24,7 +24,7 @@ import java.util.List;
 import java.util.Locale;
 
 /**
- * Small requests over HTTP with and without {@link org.opensearch.serverless.rest.BulkSettings#STREAMING}: single-document writes, small bulks
+ * Small requests over HTTP with and without {@link org.opensearch.serverless.node.BulkSettings#STREAMING}: single-document writes, small bulks
  * and searches, closed loop, each mode run twice in alternation, with the object-store requests each mode made. Off
  * unless {@code -Dtests.restlat.requests} is set:
  *
@@ -55,7 +55,7 @@ public class RestPathLatencyMeterTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "ingest")
-            .put(org.opensearch.serverless.rest.BulkSettings.STREAMING.getKey(), streaming)
+            .put(org.opensearch.serverless.node.BulkSettings.STREAMING.getKey(), streaming)
             .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), createTempDir().toString())
             .build();
         try (

@@ -17,7 +17,6 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
-import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -159,8 +158,8 @@ public class ServerlessScaleMeasurementTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("scale-" + population))) {
             node.startup().start();
             node.setMetadataPlane(plane);
-            node.setHeadVerifyIntervalMillis(ServerlessBootstrap.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS);
-            node.setDescriptorRefreshIntervalMillis(ServerlessBootstrap.DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS);
+            node.setHeadVerifyIntervalMillis(org.opensearch.serverless.node.NodeSettings.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS);
+            node.setDescriptorRefreshIntervalMillis(org.opensearch.serverless.node.NodeSettings.DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             for (int i = 0; i < HOT_INDICES; i++) {
                 loop.want("hot-" + i, 0);

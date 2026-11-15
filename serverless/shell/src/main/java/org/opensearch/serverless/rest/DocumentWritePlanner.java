@@ -12,11 +12,12 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.WriteTarget;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.ForwardFailed;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteRefusal;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteResult;
-import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.shell.WriteOutcome;
+import org.opensearch.serverless.write.WriteOutcome;
 
 import java.io.IOException;
 import java.util.Optional;
@@ -31,17 +32,17 @@ final class DocumentWritePlanner {
     /** The handler's own logger, so moving the planning here changes no logger name. */
     private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(DocumentHandler.class);
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
-    DocumentWritePlanner(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    DocumentWritePlanner(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
 
     void planAcceptedWrite(
         MetadataPlane metadata,
-        ServerlessNode serving,
+        NodeContext serving,
         boolean deletion,
         org.opensearch.action.ActionRequest admitted,
         org.opensearch.core.action.ActionListener<WriteResult> listener
@@ -111,7 +112,7 @@ final class DocumentWritePlanner {
 
     void planWrite(
         MetadataPlane metadata,
-        ServerlessNode serving,
+        NodeContext serving,
         String index,
         String id,
         String routing,
@@ -197,7 +198,7 @@ final class DocumentWritePlanner {
                 }
                 listener.onResponse(WriteResult.written(into, id, serving.localNode().getId(), deletion, outcome, refreshed));
             } catch (Exception e) {
-                if (org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.serverless.shell.StaleIncarnationException.class) != null) {
+                if (org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.serverless.write.StaleIncarnationException.class) != null) {
                     metadata.forgetRouting(index);
                 }
                 listener.onFailure(e);
@@ -242,7 +243,7 @@ final class DocumentWritePlanner {
                 // Forward rather than refuse. The client should not have to know which node owns which
                 // shard; that is exactly the knowledge the shard-head exists to hold.
                 final String indexUuid = descriptor.get().uuid();
-                serving.threadPool().executor(org.opensearch.serverless.shell.WritePools.POOL).execute(() -> {
+                serving.threadPool().executor(org.opensearch.serverless.node.WritePools.POOL).execute(() -> {
                     // Accounted on this node for as long as the forward is in flight, exactly as a local
                     // write is: the bytes are held here until the owner answers, whichever node applies them.
                     try (
@@ -276,8 +277,7 @@ final class DocumentWritePlanner {
                             // same way until it restarted -- while the same write through _bulk, which
                             // reads the register each time, succeeded.
                             serving.sightings().forgetOwner(writtenIndex, shard);
-                            if (org.opensearch.serverless.transport.ForwardFailure.classify(first.getCause())
-                                .mayRetryElsewhere() == false) {
+                            if (org.opensearch.serverless.write.ForwardFailure.classify(first.getCause()).mayRetryElsewhere() == false) {
                                 // Applied, possibly applied, or answered: not sent anywhere else.
                                 throw first;
                             }
@@ -343,7 +343,7 @@ final class DocumentWritePlanner {
                                             );
                                             return;
                                         } catch (ForwardFailed routed) {
-                                            if (org.opensearch.serverless.transport.ForwardFailure.classify(routed.getCause())
+                                            if (org.opensearch.serverless.write.ForwardFailure.classify(routed.getCause())
                                                 .mayRetryElsewhere() == false) {
                                                 throw routed;
                                             }
@@ -412,7 +412,7 @@ final class DocumentWritePlanner {
             // Anything that went wrong before the member could have applied it falls back to taking it here.
             final Optional<String> roomy = serving.nodeCapacity().writerForUnheld(metadata, descriptor.get(), shard);
             if (roomy.isPresent()) {
-                serving.threadPool().executor(org.opensearch.serverless.shell.WritePools.POOL).execute(() -> {
+                serving.threadPool().executor(org.opensearch.serverless.node.WritePools.POOL).execute(() -> {
                     try (
                         org.opensearch.common.lease.Releasable forwarded = serving.services()
                             .indexingPressure()
@@ -446,7 +446,7 @@ final class DocumentWritePlanner {
                             )
                         );
                     } catch (ForwardFailed failed) {
-                        if (org.opensearch.serverless.transport.ForwardFailure.classify(failed.getCause()).mayRetryElsewhere() == false) {
+                        if (org.opensearch.serverless.write.ForwardFailure.classify(failed.getCause()).mayRetryElsewhere() == false) {
                             // Applied, possibly applied, or answered: not written anywhere else.
                             answer.onFailure(
                                 DocumentWriteOutcomes.classifyForwardFailure(
@@ -477,7 +477,7 @@ final class DocumentWritePlanner {
 
         // Off the HTTP thread: a WAL append is an object-store write, and blocking the thread that
         // should be reading the next request on remote IO is how a node stops answering under load.
-        serving.threadPool().executor(org.opensearch.serverless.shell.WritePools.POOL).execute(() -> writeHere.accept(answer, shardId));
+        serving.threadPool().executor(org.opensearch.serverless.node.WritePools.POOL).execute(() -> writeHere.accept(answer, shardId));
         return;
     }
 
@@ -496,7 +496,7 @@ final class DocumentWritePlanner {
      */
     void writeOnceActivated(
         org.opensearch.core.action.ActionListener<WriteResult> answer,
-        ServerlessNode serving,
+        NodeContext serving,
         String writtenIndex,
         String indexUuid,
         int shard,

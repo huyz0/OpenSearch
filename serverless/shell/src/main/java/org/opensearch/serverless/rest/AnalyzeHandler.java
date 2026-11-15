@@ -53,7 +53,7 @@ import java.util.function.Supplier;
 public final class AnalyzeHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    private final Supplier<org.opensearch.serverless.node.NodeContext> node;
 
     /**
      * Creates the handler.
@@ -61,7 +61,7 @@ public final class AnalyzeHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the serving node
      */
-    public AnalyzeHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public AnalyzeHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -257,7 +257,7 @@ public final class AnalyzeHandler extends BaseRestHandler {
     private void answer(
         org.opensearch.rest.RestChannel channel,
         MetadataPlane metadata,
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         String index,
         Ask ask
     ) throws Exception {

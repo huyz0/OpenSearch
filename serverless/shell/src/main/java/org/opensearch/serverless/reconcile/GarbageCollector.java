@@ -67,18 +67,6 @@ public final class GarbageCollector {
 
     private static final Logger logger = LogManager.getLogger(GarbageCollector.class);
 
-    /**
-     * The floor a production sweep should set: a blob first seen unreferenced less than this long ago is
-     * kept whatever the pass count says.
-     *
-     * <p>The two-sweep grace is counted in passes, and a pass is however long the loop takes to come
-     * round -- under a burst of publishes, two passes can be a second apart. Freezing a view reads one
-     * manifest per shard and then writes the record; a two-hundred-shard freeze on a slow store takes
-     * longer than that, and the files its first shards froze were swept before the record existed. A
-     * floor in wall-clock time is what makes "two sweeps" mean "long enough".
-     */
-    public static final long DEFAULT_MINIMUM_UNREFERENCED_MILLIS = 60_000L;
-
     private final BlobStore blobStore;
     private final org.opensearch.common.blobstore.BlobPath base;
     /** Per logical shard, the incarnation and when each candidate was first seen, in the plane's clock. */
@@ -111,7 +99,7 @@ public final class GarbageCollector {
      * so a caller that wants it must keep one collector across passes rather than build one per pass; a
      * fresh collector has never seen anything and would start every clock again.
      *
-     * @param millis the floor; see {@link #DEFAULT_MINIMUM_UNREFERENCED_MILLIS}
+     * @param millis the floor; see {@link org.opensearch.serverless.node.NodePackCollector#DEFAULT_MINIMUM_UNREFERENCED_MILLIS}
      * @return this, for chaining
      */
     public GarbageCollector setMinimumUnreferencedMillis(long millis) {

@@ -16,10 +16,10 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.ShardOperations;
 import org.opensearch.serverless.shard.DeleteByQueryOutcome;
 import org.opensearch.serverless.shard.NoSuchIndexException;
-import org.opensearch.serverless.shard.ShardOperations;
-import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -41,7 +41,7 @@ import java.util.function.Supplier;
  */
 public final class DeleteByQueryHandler extends BaseRestHandler {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
     /**
@@ -50,7 +50,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
      * @param node supplies the node
      * @param plane supplies the metadata plane
      */
-    public DeleteByQueryHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public DeleteByQueryHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -158,7 +158,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
             );
         }
         final boolean abortOnConflict = "abort".equals(conflicts);
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (request.hasContent() == false && urlQuery == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(
@@ -216,7 +216,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
 
     private void run(
         org.opensearch.rest.RestChannel channel,
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         String index,
         org.opensearch.index.query.QueryBuilder query,

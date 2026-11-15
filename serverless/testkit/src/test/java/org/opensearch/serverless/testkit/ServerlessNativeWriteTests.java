@@ -328,7 +328,7 @@ public class ServerlessNativeWriteTests extends OpenSearchTestCase {
             final var cached = node.services().client().get(new org.opensearch.action.get.GetRequest("alpha", "cached")).actionGet();
             assertEquals("cached", cached.getSourceAsMap().get("msg"));
             assertEquals(7L, cached.getVersion());
-            final var operations = new org.opensearch.serverless.shard.ShardOperations(node, plane);
+            final var operations = new org.opensearch.serverless.ops.ShardOperations(node, plane);
             assertEquals("public", operations.get("alpha", "redirect").document().id());
             assertEquals(7L, operations.get("alpha", "cached").document().version());
             final var address = node.boundHttpAddress().publishAddress();

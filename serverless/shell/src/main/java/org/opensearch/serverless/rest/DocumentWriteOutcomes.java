@@ -9,8 +9,8 @@ package org.opensearch.serverless.rest;
 
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.shell.WriteOutcome;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.write.WriteOutcome;
 
 /**
  * What a single-document write produced or why it was refused: the result with its routing facts, the typed
@@ -132,8 +132,8 @@ final class DocumentWriteOutcomes {
         }
     }
 
-    static org.opensearch.serverless.shell.ActionGate.ResponseView<WriteResult> writeView(boolean deletion) {
-        return new org.opensearch.serverless.shell.ActionGate.ResponseView<>() {
+    static org.opensearch.serverless.action.ActionGate.ResponseView<WriteResult> writeView(boolean deletion) {
+        return new org.opensearch.serverless.action.ActionGate.ResponseView<>() {
             @Override
             public org.opensearch.core.action.ActionResponse show(WriteResult result) {
                 return result.nativeResponse();
@@ -180,8 +180,8 @@ final class DocumentWriteOutcomes {
         );
     }
 
-    static Exception classifyForwardFailure(ServerlessNode serving, String index, int shard, String owner, Throwable cause) {
-        final var kind = org.opensearch.serverless.transport.ForwardFailure.classify(cause);
+    static Exception classifyForwardFailure(NodeContext serving, String index, int shard, String owner, Throwable cause) {
+        final var kind = org.opensearch.serverless.write.ForwardFailure.classify(cause);
         if (kind.castsDoubtOnOwnership()) {
             serving.signals().ownershipDoubted(index, shard);
         }
@@ -192,19 +192,19 @@ final class DocumentWriteOutcomes {
             case REJECTED -> asException(
                 org.opensearch.ExceptionsHelper.unwrap(cause, org.opensearch.core.concurrency.OpenSearchRejectedExecutionException.class)
             );
-            case REMOTE -> org.opensearch.serverless.transport.ForwardFailure.isClientStatus(cause)
-                ? asException(org.opensearch.serverless.transport.ForwardFailure.answer(cause))
+            case REMOTE -> org.opensearch.serverless.write.ForwardFailure.isClientStatus(cause)
+                ? asException(org.opensearch.serverless.write.ForwardFailure.answer(cause))
                 : new WriteRefusal(
                     RestStatus.SERVICE_UNAVAILABLE,
                     "forward_failed",
-                    org.opensearch.serverless.transport.ForwardFailure.describe(owner, cause)
+                    org.opensearch.serverless.write.ForwardFailure.describe(owner, cause)
                 );
-            default -> cause instanceof org.opensearch.serverless.transport.OwnerUnreachableException
+            default -> cause instanceof org.opensearch.serverless.write.OwnerUnreachableException
                 ? new WriteRefusal(RestStatus.SERVICE_UNAVAILABLE, "owner_unreachable", cause.getMessage())
                 : new WriteRefusal(
                     RestStatus.SERVICE_UNAVAILABLE,
                     "forward_failed",
-                    org.opensearch.serverless.transport.ForwardFailure.describe(owner, cause)
+                    org.opensearch.serverless.write.ForwardFailure.describe(owner, cause)
                 );
         };
     }
@@ -232,7 +232,7 @@ final class DocumentWriteOutcomes {
     /**
      * Whether a forward failed because the node it reached does not hold the shard as its writer.
      *
-     * <p>Typed, not phrased: the check is {@link org.opensearch.serverless.transport.NotShardOwnerException},
+     * <p>Typed, not phrased: the check is {@link org.opensearch.serverless.write.NotShardOwnerException},
      * which the owner throws and which carries a token no other message does. This used to search every
      * cause's message for "does not own", so a security plugin refusing with "user does not own index
      * alpha" re-routed the write instead of reaching the caller as a 403.
@@ -241,7 +241,7 @@ final class DocumentWriteOutcomes {
      * @return true for the owner's own refusal
      */
     public static boolean refusedAsNotOwner(Exception e) {
-        return org.opensearch.serverless.transport.NotShardOwnerException.describes(e);
+        return org.opensearch.serverless.write.NotShardOwnerException.describes(e);
     }
 
     static Exception asException(Throwable failure) {

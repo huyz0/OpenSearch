@@ -14,10 +14,11 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteRefusal;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteResult;
-import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.shell.WriteOutcome;
+import org.opensearch.serverless.write.WriteOutcome;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -46,7 +47,7 @@ import java.util.function.Supplier;
  */
 public final class DocumentHandler extends BaseRestHandler {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
     private final DocumentWritePlanner writes;
 
@@ -56,7 +57,7 @@ public final class DocumentHandler extends BaseRestHandler {
      * @param node supplies the node serving the request
      * @param plane supplies the metadata plane
      */
-    public DocumentHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public DocumentHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
         this.writes = new DocumentWritePlanner(node, plane);
@@ -193,7 +194,7 @@ public final class DocumentHandler extends BaseRestHandler {
             );
         }
 
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_not_ready", "no node is serving requests yet")
@@ -230,7 +231,7 @@ public final class DocumentHandler extends BaseRestHandler {
     private void startWrite(
         org.opensearch.rest.RestChannel channel,
         MetadataPlane metadata,
-        ServerlessNode serving,
+        NodeContext serving,
         String index,
         String id,
         String routing,
@@ -433,7 +434,7 @@ public final class DocumentHandler extends BaseRestHandler {
     /**
      * Whether a forward failed because the node it reached does not hold the shard as its writer.
      *
-     * <p>Typed, not phrased: the check is {@link org.opensearch.serverless.transport.NotShardOwnerException},
+     * <p>Typed, not phrased: the check is {@link org.opensearch.serverless.write.NotShardOwnerException},
      * which the owner throws and which carries a token no other message does. This used to search every
      * cause's message for "does not own", so a security plugin refusing with "user does not own index
      * alpha" re-routed the write instead of reaching the caller as a 403.

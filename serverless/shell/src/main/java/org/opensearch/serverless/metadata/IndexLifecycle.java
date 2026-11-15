@@ -88,7 +88,7 @@ final class IndexLifecycle {
      *
      * <p>The check costs one listing of every live snapshot in the deployment, done once per delete rather
      * than once per shard, and only when at least one snapshot exists anywhere — the same conditional cost
-     * {@link org.opensearch.serverless.reconcile.GarbageCollector} already pays for the identical reason.
+     * {@code GarbageCollector} already pays for the identical reason.
      * A shard this skips is not leaked forever: it becomes ordinary orphaned storage the moment its last
      * pinning snapshot is deleted, reclaimable the same way any other orphan is (see "the whole-deployment
      * orphan sweep" in {@code serverless-status.md}'s open items).

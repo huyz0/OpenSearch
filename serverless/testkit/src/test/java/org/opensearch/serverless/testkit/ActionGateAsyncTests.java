@@ -11,7 +11,7 @@ import org.opensearch.action.get.GetRequest;
 import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.action.support.clustermanager.AcknowledgedResponse;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.serverless.shell.ActionGate;
+import org.opensearch.serverless.action.ActionGate;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;

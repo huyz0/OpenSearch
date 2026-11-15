@@ -14,7 +14,7 @@ import org.opensearch.serverless.cluster.HotShardSpread;
 import org.opensearch.serverless.cluster.ReaderPlacement;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.store.CommitManifest;
 
 import java.util.List;
@@ -55,7 +55,7 @@ public final class ReaderRegisterLooks {
     /** How many shards' last looks are kept before those past the backstop are dropped. */
     static final int MAX_TRACKED = 65_536;
 
-    private final ServerlessNode node;
+    private final NodeContext node;
     private final Supplier<MetadataPlane> plane;
     private final boolean enabled;
     private final long backstopNanos;
@@ -66,7 +66,7 @@ public final class ReaderRegisterLooks {
     private final AtomicLong skipped = new AtomicLong();
     private final AtomicLong looked = new AtomicLong();
 
-    ReaderRegisterLooks(ServerlessNode node, Supplier<MetadataPlane> plane, Settings settings) {
+    ReaderRegisterLooks(NodeContext node, Supplier<MetadataPlane> plane, Settings settings) {
         this.node = node;
         this.plane = plane;
         this.enabled = ReaderPushSettings.COMMIT_PUSH_TRUST.get(settings);
@@ -154,7 +154,7 @@ public final class ReaderRegisterLooks {
             shardId.getIndexName(),
             shardId.id(),
             members,
-            ServerlessNode.ROLE_SEARCH,
+            NodeContext.ROLE_SEARCH,
             Math.max(2, spread.maxReaders())
         );
         if (targets.contains(node.localNode().getId()) == false) {

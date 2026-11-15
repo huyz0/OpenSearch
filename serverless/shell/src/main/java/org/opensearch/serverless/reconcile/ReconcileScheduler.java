@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.serverless.node.ReconcileSignals;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -101,22 +102,6 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
 
     /** How long writes are gathered before one publish covers them all. */
     public static final TimeValue DEFAULT_PUBLISH_DEBOUNCE = TimeValue.timeValueMillis(500);
-
-    /**
-     * The least time between two publishes of one shard that a node started by {@code ServerlessBootstrap} keeps.
-     *
-     * <p>A publish of a commit that adds one small segment costs five or more PUTs. Readers look for a new commit
-     * only every {@link #READER_REFRESH_EVERY_RENEWALS} renewals, so publishing a busy shard more often than every
-     * few seconds pays those PUTs for freshness no reader sees. A shard left alone for longer than this is still
-     * published one debounce window after its next write.
-     */
-    public static final TimeValue DEFAULT_PUBLISH_MIN_INTERVAL = TimeValue.timeValueSeconds(5);
-
-    /**
-     * How many operations a shard may hold beyond its last publish before it is published inside the minimum
-     * interval, which bounds what a successor replays from the log at any write rate.
-     */
-    public static final long DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS = 10_000L;
 
     /** How many distinct doubted shards are remembered between activation passes. */
     public static final int MAX_PENDING_DOUBTS = 1024;
@@ -251,7 +236,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      * @return the started scheduler
      */
     public static ReconcileScheduler startFor(
-        org.opensearch.serverless.shell.ServerlessNode node,
+        org.opensearch.serverless.node.NodeContext node,
         org.opensearch.serverless.metadata.MetadataPlane plane,
         BackgroundReconciler loop
     ) {
@@ -311,7 +296,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
      *
      * <p>Off unless set: a scheduler built directly publishes every marked shard on every pass, which is what a
      * test that drives passes and then reads a commit expects. {@code ServerlessBootstrap} sets
-     * {@link #DEFAULT_PUBLISH_MIN_INTERVAL} and {@link #DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS}. The backstop
+     * {@link org.opensearch.serverless.node.WriteSettings#DEFAULT_PUBLISH_MIN_INTERVAL} and {@link org.opensearch.serverless.node.WriteSettings#DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS}. The backstop
      * and an idle release publish regardless.
      *
      * @param minInterval the least time between two edge-triggered publishes of one shard; zero to publish
@@ -429,7 +414,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             renewalTask = threadPool.schedule(
                 this::runRenewal,
                 nextRenewalDelay(),
-                org.opensearch.serverless.shell.NodeThreadPools.LEASE_POOL
+                org.opensearch.serverless.node.NodeThreadPools.LEASE_POOL
             );
         }
     }

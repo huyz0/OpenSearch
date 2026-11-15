@@ -13,6 +13,7 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.ops.Fanout;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -54,7 +55,7 @@ import java.util.function.Supplier;
 public final class ListIndicesHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    private final Supplier<org.opensearch.serverless.node.NodeContext> node;
 
     /**
      * Creates the handler.
@@ -62,7 +63,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the serving node
      */
-    public ListIndicesHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public ListIndicesHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -182,7 +183,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
         org.opensearch.rest.RestChannel channel,
         RestRequest request,
         MetadataPlane metadata,
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         String index,
         boolean asPage
     ) throws Exception {
@@ -222,7 +223,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
         org.opensearch.rest.RestChannel channel,
         RestRequest request,
         MetadataPlane metadata,
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         Paging paging
     ) throws Exception {
         final java.util.concurrent.Executor pool = serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC);

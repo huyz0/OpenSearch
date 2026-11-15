@@ -41,6 +41,9 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 public final class BlockCache {
 
+    /** The index store type a shard reading through the block cache is opened with. */
+    public static final String STORE_TYPE = "serverless_block_cache";
+
     /** Default block size. Large enough to amortise a request, small enough that a miss is cheap. */
     public static final int DEFAULT_BLOCK_SIZE = 64 * 1024;
 

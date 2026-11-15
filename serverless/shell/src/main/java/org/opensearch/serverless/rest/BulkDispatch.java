@@ -11,9 +11,11 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.WriteTarget;
-import org.opensearch.serverless.shell.BulkOperation;
-import org.opensearch.serverless.shell.BulkOutcome;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.DocumentRouting;
+import org.opensearch.serverless.ops.Fanout;
+import org.opensearch.serverless.write.BulkOperation;
+import org.opensearch.serverless.write.BulkOutcome;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -30,10 +32,10 @@ import java.util.function.Supplier;
  */
 final class BulkDispatch {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
-    BulkDispatch(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    BulkDispatch(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -41,7 +43,7 @@ final class BulkDispatch {
     /**
      * Decides, per item, which shard it belongs to and who owns it — or records why it cannot be placed.
      */
-    void route(ServerlessNode serving, MetadataPlane metadata, List<BulkHandler.Item> items) throws IOException {
+    void route(NodeContext serving, MetadataPlane metadata, List<BulkHandler.Item> items) throws IOException {
         final Map<String, Optional<WriteTarget>> targets = new HashMap<>();
         final java.util.Set<String> failures = new java.util.HashSet<>();
         for (BulkHandler.Item item : items) {
@@ -127,7 +129,7 @@ final class BulkDispatch {
      * pipeline does not run over a document nobody will store. Compiled once per distinct pipeline per
      * batch, which now matters more: a default pipeline is by definition the same one for every item.
      */
-    void shape(ServerlessNode serving, MetadataPlane metadata, List<BulkHandler.Item> items) {
+    void shape(NodeContext serving, MetadataPlane metadata, List<BulkHandler.Item> items) {
         final Map<String, org.opensearch.ingest.Pipeline> compiled = new HashMap<>();
         for (BulkHandler.Item item : items) {
             if (item.failed() || item.pipelines.isEmpty() || item.operation.isDeletion()) {
@@ -176,7 +178,7 @@ final class BulkDispatch {
     /** The error type of a group refused for back-pressure before anything was applied, so safe to send again. */
     static final String THROTTLED = "throttled";
 
-    boolean dispatch(ServerlessNode serving, List<BulkHandler.Item> items, boolean refresh) throws IOException {
+    boolean dispatch(NodeContext serving, List<BulkHandler.Item> items, boolean refresh) throws IOException {
         final Map<String, List<BulkHandler.Item>> groups = new LinkedHashMap<>();
         for (BulkHandler.Item item : items) {
             if (item.failed() == false && item.status == null) {
@@ -194,7 +196,7 @@ final class BulkDispatch {
             });
         }
         try {
-            Fanout.run(serving.threadPool().executor(org.opensearch.serverless.shell.WritePools.POOL), Fanout.DEFAULT_CONCURRENCY, tasks);
+            Fanout.run(serving.threadPool().executor(org.opensearch.serverless.node.WritePools.POOL), Fanout.DEFAULT_CONCURRENCY, tasks);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("interrupted while writing a batch", e);
@@ -213,7 +215,7 @@ final class BulkDispatch {
     private static final long ACTIVATION_WAIT_MILLIS = 30_000L;
 
     /** Takes a shard nobody holds for a batch that needs it; true if this node now writes it. */
-    private static boolean takenHere(ServerlessNode serving, String index, String uuid, int shard) {
+    private static boolean takenHere(NodeContext serving, String index, String uuid, int shard) {
         try {
             serving.signals().activate(index, shard).get(ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.TimeoutException | java.util.concurrent.ExecutionException e) {
@@ -231,7 +233,7 @@ final class BulkDispatch {
      * @return false if a refresh was asked for and what the group applied is not visible as far as it promises; true
      *     otherwise, a failed group included, since it applied nothing to make visible
      */
-    boolean applyGroup(ServerlessNode serving, List<BulkHandler.Item> group, boolean refresh) throws IOException {
+    boolean applyGroup(NodeContext serving, List<BulkHandler.Item> group, boolean refresh) throws IOException {
         final String index = group.get(0).writtenIndex;
         final String uuid = group.get(0).writtenUuid;
         final int shard = group.get(0).shard;
@@ -249,7 +251,7 @@ final class BulkDispatch {
 
         if (local != null) {
             try {
-                final List<org.opensearch.serverless.shell.BulkOutcome> outcomes = serving.writes().bulkOperations(local, operations);
+                final List<org.opensearch.serverless.write.BulkOutcome> outcomes = serving.writes().bulkOperations(local, operations);
                 record(group, outcomes, serving.localNode().getId());
                 if (refresh) {
                     return serving.writes().refreshWritten(local, outcomes, "serverless-bulk-refresh");
@@ -270,7 +272,7 @@ final class BulkDispatch {
                 // to escape into the fan-out, which swallowed it, and every item answered 500 "the writer
                 // returned no outcome". The reason and the right status: the shard is moving, retry.
                 serving.signals().ownershipDoubted(index, shard);
-                if (org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.serverless.shell.StaleIncarnationException.class) != null) {
+                if (org.opensearch.ExceptionsHelper.unwrap(e, org.opensearch.serverless.write.StaleIncarnationException.class) != null) {
                     // Both the name the client wrote to and the index it resolved to, which differ for a data stream.
                     plane.get().forgetRouting(group.get(0).index);
                     plane.get().forgetRouting(index);
@@ -324,7 +326,7 @@ final class BulkDispatch {
             return true;
         }
         try {
-            final var peer = serving.router().peer(owner);
+            final var peer = org.opensearch.serverless.transport.ShardRouter.of(serving).peer(owner);
             if (peer.isEmpty()) {
                 // The head names an owner holding no live lease -- a dead writer nobody has noticed, and
                 // this batch is the first thing in the system to prove it.
@@ -337,7 +339,7 @@ final class BulkDispatch {
                 );
                 return true;
             }
-            final var response = serving.router()
+            final var response = org.opensearch.serverless.transport.ShardRouter.of(serving)
                 .forwardBulk(
                     peer.get(),
                     org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh)
@@ -356,7 +358,7 @@ final class BulkDispatch {
      * @return as {@link #applyGroup}
      */
     boolean steerGroup(
-        ServerlessNode serving,
+        NodeContext serving,
         List<BulkHandler.Item> group,
         String index,
         String uuid,
@@ -388,7 +390,7 @@ final class BulkDispatch {
             return true;
         }
         try {
-            final var peer = serving.router().peer(target.get());
+            final var peer = org.opensearch.serverless.transport.ShardRouter.of(serving).peer(target.get());
             if (peer.isEmpty()) {
                 failGroup(
                     group,
@@ -398,7 +400,7 @@ final class BulkDispatch {
                 );
                 return true;
             }
-            final var response = serving.router()
+            final var response = org.opensearch.serverless.transport.ShardRouter.of(serving)
                 .forwardBulk(
                     peer.get(),
                     org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh).steered()
@@ -420,8 +422,8 @@ final class BulkDispatch {
      * indexing-pressure limit told a local batch 429 and a forwarded one 503; a deadline was worded as
      * "stale routing, retry", which for a batch of auto-id documents is an invitation to write them twice.
      */
-    void failForwarded(ServerlessNode serving, List<BulkHandler.Item> group, String index, int shard, String owner, Exception e) {
-        final org.opensearch.serverless.transport.ForwardFailure kind = org.opensearch.serverless.transport.ForwardFailure.classify(e);
+    void failForwarded(NodeContext serving, List<BulkHandler.Item> group, String index, int shard, String owner, Exception e) {
+        final org.opensearch.serverless.write.ForwardFailure kind = org.opensearch.serverless.write.ForwardFailure.classify(e);
         if (kind.castsDoubtOnOwnership()) {
             serving.signals().ownershipDoubted(index, shard);
         }
@@ -443,9 +445,9 @@ final class BulkDispatch {
                 return;
             }
             case REMOTE: {
-                if (org.opensearch.serverless.transport.ForwardFailure.isClientStatus(e)) {
+                if (org.opensearch.serverless.write.ForwardFailure.isClientStatus(e)) {
                     // The owner's own answer, with the owner's own status and core's own type name.
-                    final Throwable answer = org.opensearch.serverless.transport.ForwardFailure.answer(e);
+                    final Throwable answer = org.opensearch.serverless.write.ForwardFailure.answer(e);
                     failGroup(
                         group,
                         org.opensearch.ExceptionsHelper.status(answer),
@@ -458,7 +460,7 @@ final class BulkDispatch {
                     group,
                     RestStatus.SERVICE_UNAVAILABLE,
                     "forward_failed",
-                    org.opensearch.serverless.transport.ForwardFailure.describe(owner, e)
+                    org.opensearch.serverless.write.ForwardFailure.describe(owner, e)
                 );
                 return;
             }
@@ -470,7 +472,7 @@ final class BulkDispatch {
                     group,
                     RestStatus.SERVICE_UNAVAILABLE,
                     "forward_failed",
-                    org.opensearch.serverless.transport.ForwardFailure.describe(owner, e)
+                    org.opensearch.serverless.write.ForwardFailure.describe(owner, e)
                 );
             }
         }

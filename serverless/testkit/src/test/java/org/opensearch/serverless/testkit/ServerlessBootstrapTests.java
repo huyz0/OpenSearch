@@ -45,7 +45,7 @@ public class ServerlessBootstrapTests extends OpenSearchTestCase {
             .put("serverless.roles", "ingest")
             .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), store.toString())
             // Short, so the renewal timer demonstrably fires inside the test rather than being trusted.
-            .put(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), 600L)
+            .put(org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(), 600L)
             .build();
     }
 
@@ -63,14 +63,14 @@ public class ServerlessBootstrapTests extends OpenSearchTestCase {
         for (long ttl : new long[] { 0L, -1L, Long.MIN_VALUE }) {
             final Settings settings = Settings.builder()
                 .put(bootSettings("invalid-lease-ttl", createTempDir()))
-                .put(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), ttl)
+                .put(org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(), ttl)
                 // No node may start: the network setting would fail first if TTL validation were late.
                 .put("network.host", "invalid.invalid")
                 .build();
             final var failure = expectThrows(IllegalArgumentException.class, () -> ServerlessBootstrap.start(settings));
             assertTrue(
                 failure.getMessage(),
-                failure.getMessage().contains(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey())
+                failure.getMessage().contains(org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey())
             );
         }
     }
@@ -93,13 +93,13 @@ public class ServerlessBootstrapTests extends OpenSearchTestCase {
         final var directory = createTempDir();
         final Settings settings = Settings.builder()
             .put(bootSettings("failed-late-start", directory))
-            .put(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), 600_000L)
-            .put(org.opensearch.serverless.shell.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(), "not-a-number")
+            .put(org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(), 600_000L)
+            .put(org.opensearch.serverless.node.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(), "not-a-number")
             .build();
         final var failure = expectThrows(Exception.class, () -> ServerlessBootstrap.start(settings));
         assertTrue(
             failure.toString(),
-            failure.getMessage().contains(org.opensearch.serverless.shell.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey())
+            failure.getMessage().contains(org.opensearch.serverless.node.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey())
         );
         try (var store = new org.opensearch.common.blobstore.fs.FsBlobStore(1024, directory, false)) {
             final var plane = new org.opensearch.serverless.metadata.MetadataPlane(
@@ -112,7 +112,7 @@ public class ServerlessBootstrapTests extends OpenSearchTestCase {
         }
         final Settings corrected = Settings.builder()
             .put(settings)
-            .put(org.opensearch.serverless.shell.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(), 10L)
+            .put(org.opensearch.serverless.node.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(), 10L)
             .build();
         try (var restarted = ServerlessBootstrap.start(corrected)) {
             assertTrue(restarted.node().isStarted());
@@ -177,7 +177,7 @@ public class ServerlessBootstrapTests extends OpenSearchTestCase {
         final java.nio.file.Path store = createTempDir();
         final Settings settings = Settings.builder()
             .put(bootSettings("m13-boot-off", store))
-            .put(org.opensearch.serverless.shell.ActivationSettings.ON_DEMAND.getKey(), false)
+            .put(org.opensearch.serverless.node.ActivationSettings.ON_DEMAND.getKey(), false)
             .build();
 
         try (ServerlessBootstrap boot = ServerlessBootstrap.start(settings)) {

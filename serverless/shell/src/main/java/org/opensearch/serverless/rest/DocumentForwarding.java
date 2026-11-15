@@ -7,8 +7,8 @@
  */
 package org.opensearch.serverless.rest;
 
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.rest.DocumentWriteOutcomes.ForwardFailed;
-import org.opensearch.serverless.shell.ServerlessNode;
 
 import java.util.Optional;
 
@@ -21,7 +21,7 @@ final class DocumentForwarding {
     private DocumentForwarding() {}
 
     static org.opensearch.serverless.transport.ForwardedIndexResponse forwardTo(
-        ServerlessNode serving,
+        NodeContext serving,
         String owner,
         String writtenIndex,
         String indexUuid,
@@ -54,7 +54,7 @@ final class DocumentForwarding {
     }
 
     static org.opensearch.serverless.transport.ForwardedIndexResponse forwardTo(
-        ServerlessNode serving,
+        NodeContext serving,
         String owner,
         String writtenIndex,
         String indexUuid,
@@ -71,7 +71,7 @@ final class DocumentForwarding {
     ) throws Exception {
         final Optional<org.opensearch.cluster.node.DiscoveryNode> peer;
         try {
-            peer = serving.router().peer(owner);
+            peer = org.opensearch.serverless.transport.ShardRouter.of(serving).peer(owner);
         } catch (Exception e) {
             // Resolving the peer connects to it, so this fails as readily as the forward itself does, and
             // means the same thing.
@@ -82,7 +82,7 @@ final class DocumentForwarding {
             // has noticed yet, and this request is the first thing in the system to prove it.
             throw new ForwardFailed(
                 owner,
-                new org.opensearch.serverless.transport.OwnerUnreachableException(
+                new org.opensearch.serverless.write.OwnerUnreachableException(
                     "shard " + shard + " is owned by " + owner + ", which has no reachable lease"
                 )
             );
@@ -100,7 +100,8 @@ final class DocumentForwarding {
                 ifPrimaryTerm,
                 requireAbsent
             ).routing(routing);
-            return serving.router().forwardIndex(peer.get(), steered ? request.steered() : request);
+            return org.opensearch.serverless.transport.ShardRouter.of(serving)
+                .forwardIndex(peer.get(), steered ? request.steered() : request);
         } catch (Exception e) {
             throw new ForwardFailed(owner, e);
         }

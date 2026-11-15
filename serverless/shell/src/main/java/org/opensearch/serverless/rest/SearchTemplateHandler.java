@@ -27,7 +27,7 @@ import org.opensearch.script.mustache.RestMultiSearchTemplateAction;
 import org.opensearch.script.mustache.SearchTemplateRequest;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -48,7 +48,7 @@ import java.util.function.Supplier;
  */
 public final class SearchTemplateHandler extends BaseRestHandler {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
     private final SearchHandler search;
     private final MultiSearchHandler multiSearch;
@@ -59,7 +59,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
      * @param node supplies the node
      * @param plane supplies the metadata plane
      */
-    public SearchTemplateHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public SearchTemplateHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
         this.search = new SearchHandler(node, plane);
@@ -107,7 +107,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final MetadataPlane metadata = plane.get();
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             IndexAdminHandler.consumeAllParams(request);
             return channel -> channel.sendResponse(
@@ -124,7 +124,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
         return single(request, serving);
     }
 
-    private RestChannelConsumer render(RestRequest request, ServerlessNode serving) throws IOException {
+    private RestChannelConsumer render(RestRequest request, NodeContext serving) throws IOException {
         final String id = request.param("id");
         final SearchTemplateRequest template;
         try (XContentParser parser = request.contentOrSourceParamParser()) {
@@ -160,7 +160,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
         }
     }
 
-    private RestChannelConsumer single(RestRequest request, ServerlessNode serving) throws IOException {
+    private RestChannelConsumer single(RestRequest request, NodeContext serving) throws IOException {
         // The same URL parameters a plain search takes, parsed by core into the same request.
         final SearchRequest searchRequest = new SearchRequest();
         final SearchSourceBuilder source = new SearchSourceBuilder();
@@ -210,7 +210,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
         });
     }
 
-    private RestChannelConsumer multi(RestRequest request, ServerlessNode serving, MetadataPlane metadata) throws IOException {
+    private RestChannelConsumer multi(RestRequest request, NodeContext serving, MetadataPlane metadata) throws IOException {
         request.param("max_concurrent_searches");
         final MultiSearchTemplateRequest batch;
         try {
@@ -285,7 +285,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
     }
 
     /** Renders the template through the script service, as the module's transport action does. */
-    private static String render(ServerlessNode serving, SearchTemplateRequest template) {
+    private static String render(NodeContext serving, SearchTemplateRequest template) {
         final Map<String, Object> params = template.getScriptParams() == null ? Map.of() : template.getScriptParams();
         final Script script = new Script(
             template.getScriptType(),
@@ -296,7 +296,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
         return serving.services().scriptService().compile(script, TemplateScript.CONTEXT).newInstance(params).execute();
     }
 
-    private static SearchSourceBuilder parse(ServerlessNode serving, String rendered, SearchTemplateRequest template) throws IOException {
+    private static SearchSourceBuilder parse(NodeContext serving, String rendered, SearchTemplateRequest template) throws IOException {
         try (
             XContentParser parser = XContentType.JSON.xContent()
                 .createParser(serving.services().searchXContentRegistry(), LoggingDeprecationHandler.INSTANCE, rendered)

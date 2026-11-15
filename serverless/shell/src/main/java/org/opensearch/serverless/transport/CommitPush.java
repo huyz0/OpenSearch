@@ -18,8 +18,8 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.HotShardSpread;
 import org.opensearch.serverless.cluster.ReaderPlacement;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.shard.ShardReconciler;
-import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportChannel;
@@ -257,7 +257,7 @@ public final class CommitPush {
                 shardId.getIndexName(),
                 shardId.id(),
                 plane.membership().current(),
-                ServerlessNode.ROLE_SEARCH,
+                NodeContext.ROLE_SEARCH,
                 Math.max(2, spread.maxReaders())
             );
             final String self = router.node.localNode().getId();

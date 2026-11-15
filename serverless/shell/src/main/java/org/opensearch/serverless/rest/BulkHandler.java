@@ -29,11 +29,13 @@ import org.opensearch.index.VersionType;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.serverless.action.ActionGate;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ActionGate;
-import org.opensearch.serverless.shell.BulkOutcome;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.BulkSettings;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.write.BulkOutcome;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -74,7 +76,7 @@ import java.util.function.Supplier;
  */
 public final class BulkHandler extends BaseRestHandler {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
     private final BulkDispatch dispatcher;
 
@@ -84,7 +86,7 @@ public final class BulkHandler extends BaseRestHandler {
      * @param node supplies the node serving the request
      * @param plane supplies the metadata plane
      */
-    public BulkHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public BulkHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
         this.dispatcher = new BulkDispatch(node, plane);
@@ -104,9 +106,6 @@ public final class BulkHandler extends BaseRestHandler {
             new Route(RestRequest.Method.PUT, "/{index}/_bulk")
         );
     }
-
-    /** The default {@link org.opensearch.serverless.rest.BulkSettings#MEMORY_FACTOR}. */
-    public static final double DEFAULT_MEMORY_FACTOR = 4.0;
 
     /**
      * The bytes a batch of this length is charged up front.
@@ -139,15 +138,6 @@ public final class BulkHandler extends BaseRestHandler {
         }
     }
 
-    /** The default {@link org.opensearch.serverless.rest.BulkSettings#STREAMING}. */
-    public static final boolean DEFAULT_STREAMING = true;
-
-    /** The default {@link org.opensearch.serverless.rest.BulkSettings#SLICE_BYTES}: one node-log blob's worth. */
-    public static final long DEFAULT_SLICE_BYTES = 8L * 1024 * 1024;
-
-    /** The default {@link org.opensearch.serverless.rest.BulkSettings#MAX_WAIT}. */
-    public static final org.opensearch.common.unit.TimeValue DEFAULT_WAIT = org.opensearch.common.unit.TimeValue.timeValueMinutes(2);
-
     private volatile BulkMemoryBudget budget;
 
     /**
@@ -162,7 +152,7 @@ public final class BulkHandler extends BaseRestHandler {
 
     @Override
     public boolean supportsStreaming() {
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         // A node with action filters runs every batch through them whole, so it takes the body whole.
         return serving != null && streams(serving.settings()) && serving.services().actionGate().isEmpty();
     }
@@ -171,7 +161,7 @@ public final class BulkHandler extends BaseRestHandler {
         return dispatcher;
     }
 
-    private BulkMemoryBudget budget(ServerlessNode serving) {
+    private BulkMemoryBudget budget(NodeContext serving) {
         BulkMemoryBudget current = budget;
         if (current == null) {
             synchronized (this) {
@@ -191,7 +181,7 @@ public final class BulkHandler extends BaseRestHandler {
         return current;
     }
 
-    private RestChannelConsumer prepareStreaming(RestRequest request, ServerlessNode serving) {
+    private RestChannelConsumer prepareStreaming(RestRequest request, NodeContext serving) {
         final String defaultIndex = request.param("index");
         final var refreshPolicy = WriteRequest.RefreshPolicy.parse(request.param("refresh", "false"));
         final String defaultPipeline = request.param("pipeline");
@@ -249,7 +239,7 @@ public final class BulkHandler extends BaseRestHandler {
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (supportsStreaming()) {
             return prepareStreaming(request, serving);
         }
@@ -257,7 +247,7 @@ public final class BulkHandler extends BaseRestHandler {
     }
 
     /** Takes the body whole: charged up front, then parsed and applied. */
-    private RestChannelConsumer prepareWhole(RestRequest request, ServerlessNode serving) throws IOException {
+    private RestChannelConsumer prepareWhole(RestRequest request, NodeContext serving) throws IOException {
         if (serving == null || request.hasContent() == false) {
             return prepareCharged(request, null);
         }
@@ -365,7 +355,7 @@ public final class BulkHandler extends BaseRestHandler {
                 item.pipeline = defaultPipeline;
             }
         }
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         // The coordinator runs on GENERIC and the per-shard groups run on WRITE. It used to be the other
         // way round for a moment, with both on WRITE, which is a deadlock waiting for enough concurrent
         // bulk requests: every request thread would be holding a WRITE slot while waiting for group tasks
@@ -405,7 +395,7 @@ public final class BulkHandler extends BaseRestHandler {
 
     private void runBatch(
         org.opensearch.rest.RestChannel channel,
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         List<Item> items,
         boolean refresh,

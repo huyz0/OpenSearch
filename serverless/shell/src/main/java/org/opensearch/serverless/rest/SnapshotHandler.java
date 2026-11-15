@@ -15,7 +15,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.RepositoryDescriptor;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -53,7 +53,7 @@ import java.util.function.Supplier;
 public final class SnapshotHandler extends BaseRestHandler {
 
     final Supplier<MetadataPlane> plane;
-    final Supplier<ServerlessNode> node;
+    final Supplier<NodeContext> node;
     /** Runs the snapshot requests this handler parsed. */
     final SnapshotOperations operations = new SnapshotOperations(this);
 
@@ -63,7 +63,7 @@ public final class SnapshotHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the node, whose action gate the plugins' filters live behind
      */
-    public SnapshotHandler(Supplier<MetadataPlane> plane, Supplier<ServerlessNode> node) {
+    public SnapshotHandler(Supplier<MetadataPlane> plane, Supplier<NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }

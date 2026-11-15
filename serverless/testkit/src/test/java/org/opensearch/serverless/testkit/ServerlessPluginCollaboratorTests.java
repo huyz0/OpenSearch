@@ -19,7 +19,7 @@ import org.opensearch.plugins.Plugin;
 import org.opensearch.repositories.RepositoriesService;
 import org.opensearch.script.ScriptService;
 import org.opensearch.script.ScriptType;
-import org.opensearch.serverless.shell.RefusingIndexNameExpressionResolver;
+import org.opensearch.serverless.action.RefusingIndexNameExpressionResolver;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.threadpool.ThreadPool;

@@ -8,6 +8,7 @@
 package org.opensearch.serverless.reconcile;
 
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.serverless.node.ReconcileSignals;
 
 import java.util.Set;
 

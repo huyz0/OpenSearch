@@ -320,7 +320,7 @@ public class ServerlessGetTests extends OpenSearchTestCase {
     private static String idRoutingTo(IndexDescriptor descriptor, int shard) {
         for (int i = 0;; i++) {
             final String candidate = "aimed-" + i;
-            if (org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor, candidate) == shard) {
+            if (org.opensearch.serverless.ops.DocumentRouting.shardFor(descriptor, candidate) == shard) {
                 return candidate;
             }
         }

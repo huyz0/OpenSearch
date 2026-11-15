@@ -15,9 +15,9 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.SearchDrain;
-import org.opensearch.serverless.shell.SearchReadiness;
+import org.opensearch.serverless.node.SearchReadiness;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.warm.SearchDrain;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.Set;
@@ -43,7 +43,7 @@ public class SearchDrainTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", roles)
             .put("serverless.block_cache.block_size", 4096)
-            .put(org.opensearch.serverless.shell.SearchSettings.DRAIN_SETTLE.getKey(), "0ms")
+            .put(org.opensearch.serverless.node.SearchSettings.DRAIN_SETTLE.getKey(), "0ms")
             .build();
     }
 

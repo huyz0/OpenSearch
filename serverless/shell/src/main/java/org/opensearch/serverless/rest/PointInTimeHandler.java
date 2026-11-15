@@ -17,7 +17,7 @@ import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.PointInTime;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
@@ -73,7 +73,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
             + "; a view pins a commit's files for as long as it lives";
     }
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
     /**
@@ -82,7 +82,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
      * @param node supplies the node
      * @param plane supplies the metadata plane
      */
-    public PointInTimeHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public PointInTimeHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -115,7 +115,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final MetadataPlane metadata = plane.get();
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
@@ -215,15 +215,15 @@ public final class PointInTimeHandler extends BaseRestHandler {
 
     private void dispatch(
         org.opensearch.rest.RestChannel channel,
-        ServerlessNode serving,
+        NodeContext serving,
         String action,
         org.opensearch.action.ActionRequest request,
         org.opensearch.common.CheckedBiConsumer<org.opensearch.action.ActionRequest, org.opensearch.rest.RestChannel, Exception> work
     ) {
         serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                final var opaque = org.opensearch.serverless.shell.ActionGate.<org.opensearch.rest.RestResponse>opaque();
-                final var view = new org.opensearch.serverless.shell.ActionGate.ResponseView<org.opensearch.rest.RestResponse>() {
+                final var opaque = org.opensearch.serverless.action.ActionGate.<org.opensearch.rest.RestResponse>opaque();
+                final var view = new org.opensearch.serverless.action.ActionGate.ResponseView<org.opensearch.rest.RestResponse>() {
                     @Override
                     public org.opensearch.core.action.ActionResponse show(org.opensearch.rest.RestResponse result) {
                         return opaque.show(result);
@@ -234,7 +234,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
                         org.opensearch.core.action.ActionResponse response,
                         org.opensearch.rest.RestResponse original
                     ) {
-                        if (original == null || response instanceof org.opensearch.serverless.shell.ActionGate.Admitted == false) {
+                        if (original == null || response instanceof org.opensearch.serverless.action.ActionGate.Admitted == false) {
                             throw unsupported("cached or rewritten native PIT responses are not supported by this endpoint");
                         }
                         return original;
@@ -362,7 +362,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
      *
      * @param ids the views to release, or null for every live one
      */
-    private void release(org.opensearch.rest.RestChannel channel, ServerlessNode serving, MetadataPlane metadata, List<String> ids)
+    private void release(org.opensearch.rest.RestChannel channel, NodeContext serving, MetadataPlane metadata, List<String> ids)
         throws IOException {
         final List<String> named = ids;
         final List<String> targets;

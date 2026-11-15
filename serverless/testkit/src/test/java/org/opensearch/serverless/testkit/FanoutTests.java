@@ -8,7 +8,7 @@
 
 package org.opensearch.serverless.testkit;
 
-import org.opensearch.serverless.rest.Fanout;
+import org.opensearch.serverless.ops.Fanout;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;

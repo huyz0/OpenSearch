@@ -15,9 +15,8 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.NodePackCollector;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
-import org.opensearch.serverless.reconcile.GarbageCollector;
-import org.opensearch.serverless.reconcile.NodePackCollector;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.NodePackLedger;
@@ -306,7 +305,7 @@ public class NodeLogSoakMeterTests extends OpenSearchTestCase {
                         new NodePackLedger(plane.blobStore(), plane.basePath(), firstId),
                         plane,
                         clock::get,
-                        GarbageCollector.DEFAULT_MINIMUM_UNREFERENCED_MILLIS
+                        org.opensearch.serverless.node.NodePackCollector.DEFAULT_MINIMUM_UNREFERENCED_MILLIS
                     );
                     for (int pass = 0; pass < 4; pass++) {
                         collector.run();

@@ -17,6 +17,10 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.ops.DocumentRouting;
+import org.opensearch.serverless.ops.ResponseMemory;
+import org.opensearch.serverless.ops.SearchFanout;
+import org.opensearch.serverless.ops.SearchRendering;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.ByteArrayInputStream;
@@ -47,7 +51,7 @@ import java.util.function.Supplier;
 public final class MultiSearchHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    private final Supplier<org.opensearch.serverless.node.NodeContext> node;
 
     /**
      * Creates the handler.
@@ -55,7 +59,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the serving node
      */
-    public MultiSearchHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public MultiSearchHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -261,7 +265,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
     void answer(
         org.opensearch.rest.RestChannel channel,
         MetadataPlane metadata,
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         List<Sub> batch,
         org.opensearch.core.xcontent.ToXContent.Params params
     ) throws IOException {
@@ -278,7 +282,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
                     // The same resolution a lone _search does, refusals included. This used to look each name
                     // up and silently drop the ones it could not find, so a line naming a misspelt index
                     // answered from the others and looked complete.
-                    final SearchHandler.Resolution resolved = SearchHandler.resolveIndices(
+                    final org.opensearch.serverless.rest.IndexResolution resolved = SearchHandler.resolveIndices(
                         metadata,
                         serving,
                         sub.index(),

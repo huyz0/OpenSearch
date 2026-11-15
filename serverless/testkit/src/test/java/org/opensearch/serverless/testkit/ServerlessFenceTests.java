@@ -22,7 +22,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.RegisterMap;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.shell.WriteOutcome;
+import org.opensearch.serverless.write.WriteOutcome;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;

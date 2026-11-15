@@ -25,10 +25,11 @@ import org.opensearch.action.index.IndexResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.serverless.action.ActionGate;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.ops.ShardOperations;
 import org.opensearch.serverless.shard.NoSuchIndexException;
 import org.opensearch.serverless.shard.NotHereException;
-import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.support.AbstractClient;
 
@@ -316,7 +317,7 @@ public final class ServerlessClient extends AbstractClient {
             throw new UnsupportedOperationException(unsupported);
         }
         String names = request.indices().length == 0 ? "*" : String.join(",", request.indices());
-        org.opensearch.serverless.rest.SearchHandler.Resolution resolved = org.opensearch.serverless.rest.SearchHandler.resolveIndices(
+        org.opensearch.serverless.rest.IndexResolution resolved = org.opensearch.serverless.rest.SearchHandler.resolveIndices(
             metadata,
             serving,
             names,
@@ -356,7 +357,7 @@ public final class ServerlessClient extends AbstractClient {
                 false
             );
         }
-        final org.opensearch.serverless.rest.SearchHandler.Resolution found = resolved;
+        final org.opensearch.serverless.rest.IndexResolution found = resolved;
         if (found.refused()) {
             if (found.status() == org.opensearch.core.rest.RestStatus.NOT_FOUND) {
                 throw new org.opensearch.index.IndexNotFoundException(names);
@@ -369,13 +370,13 @@ public final class ServerlessClient extends AbstractClient {
             request,
             found.indices().keySet(),
             source,
-            (admitted, admittedRequest) -> org.opensearch.serverless.rest.SearchFanout.run(
+            (admitted, admittedRequest) -> org.opensearch.serverless.ops.SearchFanout.run(
                 serving,
                 metadata,
                 found.indices(),
                 admitted,
-                org.opensearch.serverless.rest.SearchFanout.Options.DEFAULT.withRouting(
-                    org.opensearch.serverless.rest.DocumentRouting.searchRoutings(request.routing())
+                org.opensearch.serverless.ops.SearchFanout.Options.DEFAULT.withRouting(
+                    org.opensearch.serverless.ops.DocumentRouting.searchRoutings(request.routing())
                 ).withOnlyShards(selectedShards(admittedRequest.preference()))
             )
         );
@@ -407,7 +408,7 @@ public final class ServerlessClient extends AbstractClient {
     }
 
     /** The pattern a resolution found no index for, or null when it was refused for another reason. */
-    private static String unmatchedPattern(org.opensearch.serverless.rest.SearchHandler.Resolution resolved) {
+    private static String unmatchedPattern(org.opensearch.serverless.rest.IndexResolution resolved) {
         final String prefix = "no index matches [";
         if (resolved.status() != org.opensearch.core.rest.RestStatus.NOT_FOUND
             || resolved.reason() == null

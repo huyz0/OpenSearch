@@ -1,0 +1,435 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+package org.opensearch.serverless.node;
+
+import org.opensearch.cluster.ClusterState;
+import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.cluster.ShardAssignment;
+import org.opensearch.serverless.write.ShardBehindLogException;
+import org.opensearch.serverless.write.StaleIncarnationException;
+
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Serves shards as readers for {@link NodeContext}: opens or shares a reader, checks it is still current, and
+ * forgets it.
+ */
+public final class ReaderServing {
+
+    /**
+     * What a reader open refused at this node's shard cap says, so a coordinator can tell a full node, which another
+     * node may stand in for, from a shard nobody can open.
+     */
+    public static final String AT_THE_CAP = " shards, the cap; ";
+
+    private final NodeContext node;
+
+    final Map<String, IndexDescriptor> served = new java.util.concurrent.ConcurrentHashMap<>();
+    final Set<Map.Entry<String, Integer>> readerShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /**
+     * Reader opens in flight, by index and number, so concurrent callers for one shard share one open.
+     *
+     * <p>Every item of a multi-get over a shard nobody owns needs the same reader, and they arrive together.
+     * Each used to open it for itself: one won the shard lock and the rest failed "failed to obtain in-memory
+     * shard lock", which a client reads as documents missing. The fleet run found it as acknowledged writes
+     * that were absent on first read-back and present on the second.
+     */
+    final Map<String, java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId>> readerOpens =
+        new java.util.concurrent.ConcurrentHashMap<>();
+    final java.util.Map<String, Long> readerTerms = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Shards being opened right now, by index and number: no concurrent view may drop their bookkeeping. */
+    final java.util.Set<String> openingShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    ReaderServing(NodeContext node) {
+        this.node = node;
+    }
+
+    /**
+     * Serves a shard as a reader: opens the published commit without owning the shard.
+     *
+     * <p>Reader activation is the cheap half of the design. There is no compare-and-swap and no entry in
+     * the shard-head, because a reader cannot conflict with anything — it does not write, and the node's
+     * engine is read-only when it does not accept writer activation. Any number of search nodes may
+     * serve the same shard at once.
+     *
+     * <p>Accumulating rather than replacing: a search node typically serves many shards, and each call
+     * re-projects the full set so the view keeps describing everything this node holds.
+     *
+     * @param plane the metadata plane to read from
+     * @param indexName the index to serve
+     * @param shardNumber the shard to serve
+     * @return the shard id now open as a reader
+     * @throws Exception if the index does not exist, nothing has been published, or opening fails
+     */
+    public org.opensearch.core.index.shard.ShardId serveAsReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber
+    ) throws Exception {
+        return serveAsReader(plane, indexName, shardNumber, null);
+    }
+
+    /**
+     * Opens a reader only for the incarnation this request resolved.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index name
+     * @param shardNumber the shard number
+     * @param expectedUuid the resolved incarnation, or null for an unbound control-plane caller
+     * @return the shard to serve
+     * @throws Exception if opening fails or the name now resolves to another incarnation
+     */
+    public org.opensearch.core.index.shard.ShardId serveAsReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String expectedUuid
+    ) throws Exception {
+        return serveAsReader(plane, indexName, shardNumber, expectedUuid, null);
+    }
+
+    /**
+     * Reopens a reader on a commit its writer pushed, reusing the descriptor this node served it with when the writer
+     * said its mapping and settings are no newer than that copy's; otherwise as {@link #serveAsReader(
+     * org.opensearch.serverless.metadata.MetadataPlane, String, int, String)}.
+     *
+     * <p>What the descriptor read bought on such a reopen was the mapping and settings the new segment was written
+     * under, and the writer's versions say whether this node already has them. The read was not what confirms the index
+     * still exists for a search: every search checks that itself, by the incarnation fence. So a reuse confirms nothing.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index
+     * @param shardNumber the shard
+     * @param expectedUuid the incarnation the push was for
+     * @param had the descriptor this node served the shard with before letting the old reader go, or null
+     * @param mappingVersion the mapping version the writer holds, or -1 if it did not say
+     * @param settingsVersion the settings version the writer holds, or -1 if it did not say
+     * @return the shard now open as a reader
+     * @throws Exception if opening fails
+     */
+    public org.opensearch.core.index.shard.ShardId serveAsReaderOnPush(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String expectedUuid,
+        IndexDescriptor had,
+        long mappingVersion,
+        long settingsVersion
+    ) throws Exception {
+        final IndexDescriptor known = mappingVersion >= 0
+            && settingsVersion >= 0
+            && had != null
+            && had.uuid().equals(expectedUuid)
+            && had.mappingVersion() >= mappingVersion
+            && had.settingsVersion() >= settingsVersion ? had : null;
+        if (known != null) {
+            descriptorReadsSkipped.incrementAndGet();
+        }
+        return serveAsReader(plane, indexName, shardNumber, expectedUuid, known);
+    }
+
+    /**
+     * The descriptor this node serves an index's readers with, or null.
+     *
+     * @param indexName the index
+     * @return the descriptor, or null
+     */
+    public IndexDescriptor servedDescriptor(String indexName) {
+        return served.get(indexName);
+    }
+
+    private final java.util.concurrent.atomic.AtomicLong descriptorReadsSkipped = new java.util.concurrent.atomic.AtomicLong();
+
+    /** @return how many pushed reopens reused the descriptor this node held rather than reading it */
+    public long descriptorReadsSkipped() {
+        return descriptorReadsSkipped.get();
+    }
+
+    private org.opensearch.core.index.shard.ShardId serveAsReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String expectedUuid,
+        IndexDescriptor known
+    ) throws Exception {
+        node.ensureStarted();
+        node.adopt(plane);
+        node.reconciler.setSegmentPublishers(NodePackWiring.publishers(node, plane));
+        node.reconciler.setBeforePublish(widensRollupsOf(plane));
+        node.reconciler.replayLogs();
+        node.reconciler.setOwnershipCheck((id, term) -> node.leases.ownsAtTerm(plane, id, term));
+        final String openingKey = indexName + "#" + shardNumber;
+        final org.opensearch.core.index.shard.ShardId served = openOrShareReader(plane, indexName, shardNumber, openingKey, known);
+        requireReaderIncarnation(served, expectedUuid);
+        try {
+            validateReader(plane, indexName, shardNumber, served);
+        } catch (ShardBehindLogException e) {
+            if (e.superseded() == false || node.reconciler.isReader(served)) {
+                throw e;
+            }
+            // The copy was on a replaced commit and has been let go: one open now is onto the current one.
+            final org.opensearch.core.index.shard.ShardId reopened = openOrShareReader(plane, indexName, shardNumber, openingKey);
+            requireReaderIncarnation(reopened, expectedUuid);
+            validateReader(plane, indexName, shardNumber, reopened);
+            return reopened;
+        }
+        return served;
+    }
+
+    static void requireReaderIncarnation(org.opensearch.core.index.shard.ShardId actual, String expectedUuid)
+        throws StaleIncarnationException {
+        if (expectedUuid != null && expectedUuid.equals(actual.getIndex().getUUID()) == false) {
+            throw new StaleIncarnationException(
+                new org.opensearch.core.index.shard.ShardId(actual.getIndexName(), expectedUuid, actual.id())
+            );
+        }
+    }
+
+    /** Refuses to let a reader serve a commit behind an acknowledged write; see {@link ReaderValidation#validateReader}. */
+    void validateReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        org.opensearch.core.index.shard.ShardId shardId
+    ) throws java.io.IOException {
+        node.readerValidation.validateReader(plane, indexName, shardNumber, shardId);
+        ensureFresh(indexName, shardNumber, shardId);
+    }
+
+    /**
+     * Refuses a reader that cannot be sure it holds every write its live writer has answered as refreshed, in
+     * {@code everywhere} mode; see {@code TailOverlays#ensureFresh}. A shard nobody
+     * writes needs nothing more than the log check: its commit is current or refused already.
+     */
+    private void ensureFresh(String indexName, int shardNumber, org.opensearch.core.index.shard.ShardId shardId)
+        throws ShardBehindLogException {
+        if (node.push() == null || node.push().grantsFreshness() == false) {
+            return;
+        }
+        final String owner = node.readerValidation.checkedOwner(indexName, shardNumber);
+        if (owner == null || owner.equals(node.localNode().getId())) {
+            return;
+        }
+        final var shard = node.reconciler.shard(shardId);
+        if (shard == null || node.reconciler.readerCommit(shardId).isEmpty()) {
+            return;
+        }
+        final boolean fresh = node.push().ensureFresh(shardId, owner, shard.seqNoStats().getLocalCheckpoint(), () -> {
+            // Acquiring a searcher has the engine take what is held for it.
+            try (var searcher = shard.acquireSearcher("refresh_visibility")) {
+                assert searcher != null;
+            } catch (RuntimeException e) {
+                // The search that follows fails the same way, and asks another copy.
+            }
+        });
+        if (fresh == false) {
+            throw ShardBehindLogException.notCaughtUp(indexName, shardNumber);
+        }
+    }
+
+    /**
+     * Checks a shard open here before it answers, if it is open as a reader; see {@link #validateReader}.
+     *
+     * <p>For the paths that find a reader already open and query it directly, without going through
+     * {@link #serveAsReader}: they would otherwise answer from a commit behind the log the moment its writer died.
+     *
+     * @param plane the metadata plane
+     * @param indexName the index
+     * @param shardNumber the shard
+     * @param shardId the shard open here
+     * @throws java.io.IOException {@link ShardBehindLogException} if it may not answer, or if the check could not run
+     */
+    public void ensureReaderCurrent(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        org.opensearch.core.index.shard.ShardId shardId
+    ) throws java.io.IOException {
+        validateReader(plane, indexName, shardNumber, shardId);
+    }
+
+    org.opensearch.core.index.shard.ShardId openOrShareReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String openingKey
+    ) throws Exception {
+        return openOrShareReader(plane, indexName, shardNumber, openingKey, null);
+    }
+
+    org.opensearch.core.index.shard.ShardId openOrShareReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String openingKey,
+        IndexDescriptor known
+    ) throws Exception {
+        final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> mine =
+            new java.util.concurrent.CompletableFuture<>();
+        final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> running = readerOpens.putIfAbsent(
+            openingKey,
+            mine
+        );
+        if (running != null) {
+            // Someone is opening it already: their answer is this one's, success or failure.
+            try {
+                return running.get();
+            } catch (java.util.concurrent.ExecutionException e) {
+                throw e.getCause() instanceof Exception cause ? cause : e;
+            }
+        }
+        final long describedAt = System.nanoTime();
+        openingShards.add(openingKey);
+        try {
+            final IndexDescriptor descriptor = known != null
+                ? known
+                : plane.describe(indexName).orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
+            final org.opensearch.core.index.shard.ShardId opened = openReader(plane, indexName, shardNumber, descriptor, openingKey);
+            if (known == null) {
+                // The read above confirmed the incarnation, so the query this open serves need not read it again.
+                node.fences().confirmIncarnation(descriptor.uuid(), describedAt);
+            }
+            mine.complete(opened);
+            return opened;
+        } catch (Exception e) {
+            mine.completeExceptionally(e);
+            throw e;
+        } finally {
+            openingShards.remove(openingKey);
+            readerOpens.remove(openingKey, mine);
+        }
+    }
+
+    org.opensearch.core.index.shard.ShardId openReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        IndexDescriptor descriptor,
+        String openingKey
+    ) throws Exception {
+        // Readers this node has since let go of are dropped from the record before this one is added,
+        // or a search node that cycles through many distinct readers carries every one it ever opened
+        // into every reader open for the rest of its life: the N-th open cost O(N) and descriptors of
+        // deleted indices stayed projected forever.
+        pruneReaderBookkeeping();
+        served.put(indexName, descriptor);
+        readerShards.add(new java.util.AbstractMap.SimpleEntry<>(indexName, shardNumber));
+
+        if (node.shards().localShardOf(indexName, shardNumber) == null
+            && node.reconciler.heldShards().size() >= node.nodeCapacity().admission.maxShardsHeld()
+            && node.nodeCapacity().admission.makeRoom() == false) {
+            // Readers used to be uncapped: a wide search burst could open thousands of shards on one
+            // node. The same ceiling demand-driven writers have applies -- the configured one, counting
+            // views -- and the same eviction makes room before this refuses.
+            node.nodeCapacity().readerOpensRefusedAtCap.incrementAndGet();
+            node.nodeCapacity().noteRefusedRecently(indexName, shardNumber);
+            throw new IllegalStateException(
+                "this node holds "
+                    + node.reconciler.openShards().size()
+                    + ReaderServing.AT_THE_CAP
+                    + indexName
+                    + "["
+                    + shardNumber
+                    + "] was not opened"
+            );
+        }
+        // One manifest read: the shard being opened. Every other reader's term is what was read when it
+        // was opened. This used to re-read every held reader's manifest on every open -- the 500th reader
+        // cost 500 reads before its own.
+        //
+        // Read once, and handed on: the reconciler and the directory factory each used to read the same
+        // register again, so one reader open was three to four reads of one manifest. By the uuid already in
+        // hand: the two-argument form resolves it with another descriptor read.
+        // The register, or the newer commit its writer staged after it, asked of the writer rather than the store.
+        // A commit the writer pushed a moment ago is the one to open, and it costs no read at all.
+        final java.util.Optional<org.opensearch.serverless.store.CommitManifest> pushed = node.push() == null
+            ? java.util.Optional.empty()
+            : node.push().takePushed(indexName, descriptor.uuid(), shardNumber);
+        final java.util.Optional<org.opensearch.serverless.store.CommitManifest> manifest;
+        if (pushed.isPresent()) {
+            manifest = pushed;
+        } else {
+            final java.util.Optional<org.opensearch.serverless.store.CommitManifest> register = plane.segmentPublisher(
+                indexName,
+                descriptor.uuid(),
+                shardNumber
+            ).readManifest();
+            manifest = node.push() == null ? register : node.push().newerThan(register, indexName, descriptor.uuid(), shardNumber);
+        }
+        readerTerms.put(openingKey, manifest.map(org.opensearch.serverless.store.CommitManifest::term).orElse(1L));
+        // The union of what this node serves and what it hosts, plus the reader being opened: a view
+        // that described only the readers used to drop every writer index from the applied state on a
+        // dual-role node.
+        final ShardAssignment opening = new ShardAssignment(indexName, shardNumber, readerTerms.getOrDefault(openingKey, 1L));
+        final boolean alreadyOpen = node.reconciler.servingShard(
+            new org.opensearch.core.index.shard.ShardId(indexName, descriptor.uuid(), shardNumber)
+        ) != null;
+        final ClusterState view = node.projectAndApply(java.util.List.of(descriptor), java.util.List.of(opening));
+        final org.opensearch.core.index.shard.ShardId opened = node.reconciler.openReader(
+            view,
+            indexName,
+            shardNumber,
+            manifest.orElse(null)
+        );
+        if (node.push() != null && manifest.isPresent() && alreadyOpen == false) {
+            // What the writer acknowledged past this commit, and its next writes, for the reader's tail overlay. Once per
+            // open: a reader already open is subscribed already.
+            final var shard = node.reconciler.shard(opened);
+            if (shard != null) {
+                node.push().opened(opened, manifest.get().writer(), shard.seqNoStats().getLocalCheckpoint());
+            }
+        }
+        return opened;
+    }
+
+    /**
+     * Forgets that this node served a shard as a reader, once it no longer does.
+     *
+     * @param shardId the reader shard that was closed
+     */
+    public void forgetReader(org.opensearch.core.index.shard.ShardId shardId) {
+        readerShards.remove(new java.util.AbstractMap.SimpleEntry<>(shardId.getIndexName(), shardId.id()));
+        readerTerms.remove(NodeContext.shardKey(shardId.getIndexName(), shardId.id()));
+        pruneServedIndices();
+    }
+
+    /** Drops reader records for shards no longer open here as readers, and the descriptors nothing refers to. */
+    void pruneReaderBookkeeping() {
+        final java.util.Set<org.opensearch.core.index.shard.ShardId> readers = node.reconciler.readerShards();
+        final java.util.Set<String> openReaderKeys = new java.util.HashSet<>();
+        for (org.opensearch.core.index.shard.ShardId reader : readers) {
+            openReaderKeys.add(NodeContext.shardKey(reader.getIndexName(), reader.id()));
+        }
+        for (Map.Entry<String, Integer> entry : new java.util.ArrayList<>(readerShards)) {
+            final String key = NodeContext.shardKey(entry.getKey(), entry.getValue());
+            if (openReaderKeys.contains(key) == false && openingShards.contains(key) == false) {
+                readerShards.remove(entry);
+                readerTerms.remove(key);
+            }
+        }
+        pruneServedIndices();
+    }
+
+    void pruneServedIndices() {
+        final java.util.Set<String> referenced = new java.util.HashSet<>();
+        for (Map.Entry<String, Integer> entry : readerShards) {
+            referenced.add(entry.getKey());
+        }
+        served.keySet().removeIf(index -> referenced.contains(index) == false);
+    }
+
+    /**
+     * What a publish does to the plane's digest rollups before its manifest is written: widen the shard's entry, unless
+     * the publishing writer's own mark already keeps the shard from being ruled out.
+     */
+    static org.opensearch.serverless.shard.BeforePublish widensRollupsOf(org.opensearch.serverless.metadata.MetadataPlane plane) {
+        return (id, shards, term, digest) -> plane.rollups()
+            .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest);
+    }
+}

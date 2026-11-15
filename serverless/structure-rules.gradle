@@ -35,12 +35,16 @@ def structureLayers = [
   ingest: 2, membership: 2,
   cluster: 3,
   metadata: 4,
-  engine: 5, script: 5,
+  engine: 5, script: 5, write: 5, action: 5,
   shard: 6,
-  reconcile: 7, split: 7, bucket: 7,
-  transport: 8,
-  rest: 9,
-  shell: 10
+  bucket: 7, plugins: 7,
+  node: 8,
+  split: 9,
+  transport: 10,
+  reconcile: 11,
+  ops: 12, warm: 12,
+  rest: 13,
+  shell: 14
 ]
 def maxClassLines = 1000
 def maxPackageFiles = 40

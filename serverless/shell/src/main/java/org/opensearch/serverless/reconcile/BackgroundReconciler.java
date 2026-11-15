@@ -10,8 +10,9 @@ package org.opensearch.serverless.reconcile;
 
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.shell.ShardAdmission;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.node.ReconcileSignals;
+import org.opensearch.serverless.node.ShardAdmission;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -52,26 +53,6 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class BackgroundReconciler implements Closeable {
 
     /**
-     * How many shards a node takes on demand before refusing.
-     *
-     * <p>Measured, now, and memory is not what bounds it: a held shard costs 110-190 KB of heap, writer or reader, so a
-     * thousand is under 200 MB. A fleet of 3 GB nodes ran at 1,200 shards each with heap under 1.7 GB and steady writes at
-     * 3-8% errors, and refused no search for want of room -- once publishing ran a pass at a time on a pool of its own.
-     * Before that, the cost that grew with shards held was publishing: passes piled up on GENERIC and starved the writes.
-     * What a higher cap still costs is background store requests, about 240-330 per held shard-hour, and a longer
-     * takeover when a node holding that many dies.
-     */
-    public static final int DEFAULT_MAX_SHARDS_HELD = 1000;
-
-    /**
-     * How long a shard must have gone unused before a node at its cap will evict it for a new one.
-     *
-     * <p>A minute: long enough that a busy shard is never taken from under a caller, short enough that a
-     * full node reshapes its working set within a request or two rather than waiting on the idle sweep.
-     */
-    public static final long DEFAULT_EVICT_AFTER_MILLIS = 60_000L;
-
-    /**
      * How far below the cap eviction clears room to, as a fraction of {@link #maxShardsHeld}.
      *
      * <p><b>What hysteresis buys here, precisely.</b> It does not reduce how many shards get evicted under
@@ -82,7 +63,7 @@ public final class BackgroundReconciler implements Closeable {
      * it and nothing more. With headroom, one full pass clears room for the whole burst, up to this
      * fraction of the cap, so the next several arrivals find room already there.
      *
-     * <p>Five percent, floored at one shard: a fifth of the {@link #DEFAULT_EVICT_AFTER_MILLIS} of grace
+     * <p>Five percent, floored at one shard: a fifth of the {@link org.opensearch.serverless.node.ActivationSettings#DEFAULT_EVICT_AFTER_MILLIS} of grace
      * a shard already gets before it is eligible at all, chosen the same way that constant was — an order
      * of magnitude inside what would visibly cost something (evicting a shard nobody asked to be evicted,
      * unused as it is, costs nothing but the object-store round trip to publish and release it) rather
@@ -92,7 +73,7 @@ public final class BackgroundReconciler implements Closeable {
 
     static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(BackgroundReconciler.class);
 
-    final ServerlessNode node;
+    final NodeContext node;
     final MetadataPlane plane;
     final RoutingHints hints = new RoutingHints();
     final Set<Map.Entry<String, Integer>> wanted = ConcurrentHashMap.newKeySet();
@@ -123,7 +104,7 @@ public final class BackgroundReconciler implements Closeable {
      */
     final Map<Map.Entry<String, Integer>, java.util.concurrent.CompletableFuture<Optional<ShardId>>> activating = new ConcurrentHashMap<>();
     /** Activations run at most this many at a time, on the generic pool; the rest queue. */
-    volatile int activationConcurrency = DEFAULT_ACTIVATION_CONCURRENCY;
+    volatile int activationConcurrency = org.opensearch.serverless.node.ActivationSettings.DEFAULT_ACTIVATION_CONCURRENCY;
     /**
      * Activations waiting for a slot: those this node is the preferred taker of first, see {@link #takeoverRank}.
      *
@@ -156,20 +137,9 @@ public final class BackgroundReconciler implements Closeable {
     /** Guards the shard cap across concurrent on-demand activations, with the slots they have reserved. */
     final Object capLock = new Object();
     int capReserved;
-    volatile int maxShardsHeld = DEFAULT_MAX_SHARDS_HELD;
-    volatile long evictAfterMillis = DEFAULT_EVICT_AFTER_MILLIS;
+    volatile int maxShardsHeld = org.opensearch.serverless.node.ActivationSettings.DEFAULT_MAX_SHARDS_HELD;
+    volatile long evictAfterMillis = org.opensearch.serverless.node.ActivationSettings.DEFAULT_EVICT_AFTER_MILLIS;
     volatile double evictHeadroomFraction = DEFAULT_EVICT_HEADROOM_FRACTION;
-
-    /**
-     * How long a shard may go unused before a node lets go of it, when idle release is enabled.
-     *
-     * <p>Five minutes. Derived rather than picked: re-opening costs about 41 object-store requests and
-     * holding costs a few reads per tick, so the break-even is on the order of a minute at the default
-     * backstop interval. Five sits an order of magnitude above the noise in that estimate, because the
-     * asymmetry is not symmetric — holding a shard too long wastes a little money, and releasing one that
-     * was about to be used again costs a cold open and the latency a user sees.
-     */
-    public static final long DEFAULT_IDLE_AFTER_MILLIS = 300_000L;
 
     /** Zero disables it, which is the library default; {@code ServerlessBootstrap} turns it on. */
     volatile long idleAfterMillis = 0L;
@@ -186,7 +156,7 @@ public final class BackgroundReconciler implements Closeable {
      * @param node the node whose shards this manages
      * @param plane the metadata plane
      */
-    public BackgroundReconciler(ServerlessNode node, MetadataPlane plane) {
+    public BackgroundReconciler(NodeContext node, MetadataPlane plane) {
         this.node = node;
         this.plane = plane;
         this.collector = new GarbageCollector(plane.blobStore(), plane.basePath());
@@ -316,7 +286,7 @@ public final class BackgroundReconciler implements Closeable {
      * Sets how long a blob must have been unreferenced, by the plane's clock, before a graced sweep may
      * delete it -- on top of the pass count.
      *
-     * <p>Zero in the library and {@link GarbageCollector#DEFAULT_MINIMUM_UNREFERENCED_MILLIS} in the
+     * <p>Zero in the library and {@link org.opensearch.serverless.node.NodePackCollector#DEFAULT_MINIMUM_UNREFERENCED_MILLIS} in the
      * daemon, the same split idle release and demand-driven activation use, and for the same reason: a
      * test that drives passes by hand at one clock value is asserting the pass count, and a node running
      * unattended is the one whose passes can come round a second apart under a burst of publishes --
@@ -653,10 +623,8 @@ public final class BackgroundReconciler implements Closeable {
      * shard nobody owns is read from that commit. So it is opened, over the cap if it must be; the next eviction
      * brings the node back under it the proper way, publishing before it lets go.
      */
-    /** How far past its cap a node may take a dead member's shards, as a fraction of the cap. */
-    public static final double DEFAULT_TAKEOVER_OVERCOMMIT = 0.2;
 
-    volatile double takeoverOvercommit = DEFAULT_TAKEOVER_OVERCOMMIT;
+    volatile double takeoverOvercommit = org.opensearch.serverless.node.ActivationSettings.DEFAULT_TAKEOVER_OVERCOMMIT;
 
     /**
      * Sets how far past its cap a node may take a dead member's shards; 0 turns overcommitting off. Bounded in memory:
@@ -752,18 +720,12 @@ public final class BackgroundReconciler implements Closeable {
         leases.refreshMembership(maxAgeMillis);
     }
 
-    /** How many shards a node activates at once by default, or the most when the limit adapts. */
-    public static final int DEFAULT_ACTIVATION_CONCURRENCY = 8;
-
     /** Where the adaptive activation limit starts, and the fewest it falls to. */
     static final int ACTIVATION_LIMIT_START = 8;
     static final int ACTIVATION_LIMIT_FLOOR = 4;
 
-    /** How long an activation that opened a shard should take, by default; longer means the store is the limit. */
-    public static final long DEFAULT_ACTIVATION_TARGET_MILLIS = 2_000L;
-
     volatile boolean adaptiveActivation;
-    volatile long activationTargetMillis = DEFAULT_ACTIVATION_TARGET_MILLIS;
+    volatile long activationTargetMillis = org.opensearch.serverless.node.ActivationSettings.DEFAULT_ACTIVATION_TARGET_MILLIS;
 
     /**
      * Lets the number of shards activated at once follow the store, up to the activation concurrency; off, it is that number.

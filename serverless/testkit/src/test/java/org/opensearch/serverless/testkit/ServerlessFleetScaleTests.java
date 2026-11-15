@@ -17,7 +17,6 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.net.URI;
@@ -133,7 +132,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         final int population = intProp("population", 2_000);
         final int activePerNode = intProp("active", 50);
         final int seconds = intProp("scenario_seconds", 60);
-        ttlMillis = Long.parseLong(prop("ttl_millis", Long.toString(ServerlessBootstrap.DEFAULT_LEASE_TTL_MILLIS)));
+        ttlMillis = Long.parseLong(prop("ttl_millis", Long.toString(org.opensearch.serverless.node.NodeSettings.DEFAULT_LEASE_TTL_MILLIS)));
         final List<String> scenarios = List.of(prop("scenarios", "steady,kill,pause,partition,slowdown,restart,storm").split(","));
         final String runId = "run" + System.currentTimeMillis();
         final String bucket = prop("bucket", "fleet-" + randomAlphaOfLength(8).toLowerCase(Locale.ROOT));
@@ -164,8 +163,8 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         nodeSettings.put(org.opensearch.serverless.store.ObjectStoreSettings.PATH_STYLE_ACCESS.getKey(), prop("path_style", "true"));
         nodeSettings.put(org.opensearch.serverless.store.ObjectStoreSettings.REGION.getKey(), prop("region", "us-east-1"));
         nodeSettings.put(org.opensearch.serverless.store.ObjectStoreSettings.PROVIDER_ACK.getKey(), "true");
-        nodeSettings.put(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), Long.toString(ttlMillis));
-        nodeSettings.put(org.opensearch.serverless.shell.ActivationSettings.MAX_SHARDS.getKey(), prop("max_shards", "100"));
+        nodeSettings.put(org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(), Long.toString(ttlMillis));
+        nodeSettings.put(org.opensearch.serverless.node.ActivationSettings.MAX_SHARDS.getKey(), prop("max_shards", "100"));
         nodeSettings.put("serverless.roles", "ingest,search");
         // Any node setting, as tests.fleet.setting.<name>: what an A/B run changes without a code change.
         nodeSettings.putAll(settingOverrides());
@@ -1534,9 +1533,9 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 "logger.serverless.level = " + prop("log_level", "info"),
                 // A stack trace for every shard a search could not reach, every two seconds, for every node down:
                 // tens of thousands of lines a minute in a failure scenario, burying what the log is kept for.
-                "logger.fanout.name = org.opensearch.serverless.rest.Fanout",
+                "logger.fanout.name = org.opensearch.serverless.ops.Fanout",
                 "logger.fanout.level = error",
-                "logger.searchfanout.name = org.opensearch.serverless.rest.SearchFanout",
+                "logger.searchfanout.name = org.opensearch.serverless.ops.SearchFanout",
                 "logger.searchfanout.level = error",
                 debugLoggers(),
                 ""

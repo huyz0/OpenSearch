@@ -13,7 +13,7 @@ import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.RegisterMap;
-import org.opensearch.serverless.reconcile.NodePackCollector;
+import org.opensearch.serverless.node.NodePackCollector;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.FileLocation;
 import org.opensearch.serverless.store.NodePackLedger;

@@ -13,7 +13,7 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
-import org.opensearch.serverless.shell.SearchDrain;
+import org.opensearch.serverless.warm.SearchDrain;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;

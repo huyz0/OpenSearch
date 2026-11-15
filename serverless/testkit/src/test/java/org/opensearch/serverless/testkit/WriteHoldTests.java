@@ -14,13 +14,13 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
-import org.opensearch.serverless.rest.DocumentRouting;
-import org.opensearch.serverless.shell.BulkOperation;
-import org.opensearch.serverless.shell.BulkOutcome;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.shell.WriteHold;
-import org.opensearch.serverless.shell.WriteOutcome;
+import org.opensearch.serverless.write.BulkOperation;
+import org.opensearch.serverless.write.BulkOutcome;
+import org.opensearch.serverless.write.WriteHold;
+import org.opensearch.serverless.write.WriteOutcome;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;

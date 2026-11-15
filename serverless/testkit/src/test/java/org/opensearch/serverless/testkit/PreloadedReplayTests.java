@@ -16,10 +16,10 @@ import org.opensearch.index.seqno.SeqNoStats;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
-import org.opensearch.serverless.shell.Document;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.shell.WriteOutcome;
 import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.write.Document;
+import org.opensearch.serverless.write.WriteOutcome;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;

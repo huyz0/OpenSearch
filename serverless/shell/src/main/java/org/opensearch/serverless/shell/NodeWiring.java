@@ -10,8 +10,12 @@ package org.opensearch.serverless.shell;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.rest.RestController;
+import org.opensearch.serverless.node.SearchReadiness;
+import org.opensearch.serverless.plugins.PluginActions;
+import org.opensearch.serverless.plugins.PluginInjector;
 import org.opensearch.serverless.rest.ServerlessHealthHandler;
 import org.opensearch.serverless.rest.ServerlessRootHandler;
+import org.opensearch.serverless.warm.SearchDrain;
 import org.opensearch.usage.UsageService;
 
 import java.util.Set;
@@ -38,8 +42,8 @@ final class NodeWiring {
             // The seam a plugin authenticates on: it sees every request before the handler does, can
             // refuse it, and can leave an identity in the ThreadContext. Passed here because the
             // controller takes it at construction, which is why plugins are held before this runs.
-            node.plugins.restHandlerWrapper(node.threadPool.getThreadContext(), Set.of()),
-            node.nodeClient,
+            node.plugins().restHandlerWrapper(node.threadPool().getThreadContext(), Set.of()),
+            node.nodeClient(),
             node.services().circuitBreakerService(),
             new UsageService()
         );
@@ -50,114 +54,135 @@ final class NodeWiring {
         controller.registerHandler(
             guarded.apply(
                 new ServerlessRootHandler(
-                    node.nodeName,
-                    ClusterName.CLUSTER_NAME_SETTING.get(node.settings).value(),
-                    node.nodeEnvironment::nodeId
+                    node.nodeName(),
+                    ClusterName.CLUSTER_NAME_SETTING.get(node.settings()).value(),
+                    node.nodeEnvironment()::nodeId
                 )
             )
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.IndexAdminHandler(() -> node.metadataPlane, () -> node))
+            guarded.apply(new org.opensearch.serverless.rest.IndexAdminHandler(() -> node.metadataPlane(), () -> node))
         );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.DocumentHandler(() -> node, () -> node.metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.BulkHandler(() -> node, () -> node.metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.GetHandler(() -> node, () -> node.metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.MultiGetHandler(() -> node, () -> node.metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.UpdateHandler(() -> node, () -> node.metadataPlane)));
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.DocumentHandler(() -> node, () -> node.metadataPlane()))
+        );
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.BulkHandler(() -> node, () -> node.metadataPlane())));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.GetHandler(() -> node, () -> node.metadataPlane())));
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.MultiGetHandler(() -> node, () -> node.metadataPlane()))
+        );
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.UpdateHandler(() -> node, () -> node.metadataPlane())));
         // Plugin routes last, so a plugin cannot take over an endpoint the shell has already claimed:
         // RestController refuses a duplicate path rather than replacing it, and refusing loudly at boot
         // is the right answer -- a plugin that silently replaced the write path would be a system whose
         // behaviour depends on registration order.
-        for (org.opensearch.rest.RestHandler handler : node.plugins.restHandlers(
-            node.settings,
-            controller,
-            clusterSettings,
-            node.services.indexScopedSettings(),
-            node.services.indexNameExpressionResolver(),
-            () -> node.clusterService().state().nodes()
-        )) {
+        for (org.opensearch.rest.RestHandler handler : node.plugins()
+            .restHandlers(
+                node.settings(),
+                controller,
+                clusterSettings,
+                node.services().indexScopedSettings(),
+                node.services().indexNameExpressionResolver(),
+                () -> node.clusterService().state().nodes()
+            )) {
             controller.registerHandler(handler);
         }
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SearchHandler(() -> node, () -> node.metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.CatalogHandler(() -> node.metadataPlane, () -> node)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StatsHandler(() -> node, () -> node.metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AliasHandler(() -> node.metadataPlane, () -> node)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SearchHandler(() -> node, () -> node.metadataPlane())));
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.PointInTimeHandler(() -> node, () -> node.metadataPlane))
+            guarded.apply(new org.opensearch.serverless.rest.CatalogHandler(() -> node.metadataPlane(), () -> node))
+        );
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StatsHandler(() -> node, () -> node.metadataPlane())));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AliasHandler(() -> node.metadataPlane(), () -> node)));
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.PointInTimeHandler(() -> node, () -> node.metadataPlane()))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.DeleteByQueryHandler(() -> node, () -> node.metadataPlane))
+            guarded.apply(new org.opensearch.serverless.rest.DeleteByQueryHandler(() -> node, () -> node.metadataPlane()))
         );
         // Snapshot/restore, backed by this deployment's own object store rather than a distinct
         // repository backend.
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.RepositoryHandler(() -> node.metadataPlane, () -> node))
+            guarded.apply(new org.opensearch.serverless.rest.RepositoryHandler(() -> node.metadataPlane(), () -> node))
         );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.SnapshotHandler(() -> node.metadataPlane, () -> node)));
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.SnapshotHandler(() -> node.metadataPlane(), () -> node))
+        );
         // The one piece of /_cluster/* not refused below: cluster/config is one register, exactly
         // like an index descriptor, and this node can answer for it the same honest way it answers for an
         // index -- unlike health, state or stats, which are genuinely cluster-wide and would mislead
         // coming from one node.
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.ClusterSettingsHandler(() -> node.metadataPlane, () -> node))
+            guarded.apply(new org.opensearch.serverless.rest.ClusterSettingsHandler(() -> node.metadataPlane(), () -> node))
         );
         // Cluster-shaped endpoints this deployment can answer honestly. See ClusterHealthHandler for what
         // green is redefined to mean and why, and NodesHandler for why "no node can answer this" stopped
         // being true the moment leases became an address book.
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.ClusterHealthHandler(() -> node.metadataPlane, () -> node))
+            guarded.apply(new org.opensearch.serverless.rest.ClusterHealthHandler(() -> node.metadataPlane(), () -> node))
         );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.NodesHandler(() -> node.metadataPlane, () -> node)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.NodesHandler(() -> node.metadataPlane(), () -> node)));
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.MappingUpdateHandler(() -> node.metadataPlane, () -> node))
-        );
-        controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.FieldCapabilitiesHandler(() -> node.metadataPlane, () -> node))
+            guarded.apply(new org.opensearch.serverless.rest.MappingUpdateHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.ListIndicesHandler(() -> node.metadataPlane, () -> node))
+            guarded.apply(new org.opensearch.serverless.rest.FieldCapabilitiesHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.SettingsUpdateHandler(() -> node.metadataPlane, () -> node))
-        );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AnalyzeHandler(() -> node.metadataPlane, () -> node)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.TemplateHandler(() -> node.metadataPlane, () -> node)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.PipelineHandler(() -> node.metadataPlane, () -> node)));
-        controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.StoredScriptHandler(() -> node.metadataPlane, () -> node))
+            guarded.apply(new org.opensearch.serverless.rest.ListIndicesHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.SearchPipelineHandler(() -> node.metadataPlane, () -> node))
+            guarded.apply(new org.opensearch.serverless.rest.SettingsUpdateHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.SearchTemplateHandler(() -> node, () -> node.metadataPlane))
-        );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.RankEvalHandler(() -> node, () -> node.metadataPlane)));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.RolloverHandler(() -> node, () -> node.metadataPlane)));
-        controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.DataStreamHandler(() -> node, () -> node.metadataPlane))
+            guarded.apply(new org.opensearch.serverless.rest.AnalyzeHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.ValidateAndResolveHandler(() -> node.metadataPlane, () -> node))
+            guarded.apply(new org.opensearch.serverless.rest.TemplateHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.MultiSearchHandler(() -> node.metadataPlane, () -> node))
+            guarded.apply(new org.opensearch.serverless.rest.PipelineHandler(() -> node.metadataPlane(), () -> node))
         );
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.ExplainHandler(() -> node.metadataPlane, () -> node)));
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.StoredScriptHandler(() -> node.metadataPlane(), () -> node))
+        );
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.SearchPipelineHandler(() -> node.metadataPlane(), () -> node))
+        );
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.SearchTemplateHandler(() -> node, () -> node.metadataPlane()))
+        );
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.RankEvalHandler(() -> node, () -> node.metadataPlane()))
+        );
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.RolloverHandler(() -> node, () -> node.metadataPlane()))
+        );
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.DataStreamHandler(() -> node, () -> node.metadataPlane()))
+        );
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.ValidateAndResolveHandler(() -> node.metadataPlane(), () -> node))
+        );
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.MultiSearchHandler(() -> node.metadataPlane(), () -> node))
+        );
+        controller.registerHandler(
+            guarded.apply(new org.opensearch.serverless.rest.ExplainHandler(() -> node.metadataPlane(), () -> node))
+        );
         controller.registerHandler(
             new ServerlessHealthHandler(
-                () -> node.started,
-                () -> node.membershipSource == null ? 1 : node.membershipSource.current().size(),
-                node.nodeEnvironment::nodeId
+                () -> node.isStarted(),
+                () -> node.membershipSource() == null ? 1 : node.membershipSource().current().size(),
+                node.nodeEnvironment()::nodeId
             )
         );
 
         controller.registerHandler(
-            new org.opensearch.serverless.rest.ServerlessReadyHandler(() -> node.started, () -> SearchReadiness.of(node))
+            new org.opensearch.serverless.rest.ServerlessReadyHandler(() -> node.isStarted(), () -> SearchReadiness.of(node))
         );
         controller.registerHandler(
             new org.opensearch.serverless.rest.ServerlessDrainHandler(
-                () -> SearchDrain.drain(node, node.metadataPlane),
+                () -> SearchDrain.drain(node, node.metadataPlane()),
                 runnable -> node.threadPool().generic().execute(runnable)
             )
         );
@@ -183,7 +208,7 @@ final class NodeWiring {
      */
     org.opensearch.transport.TransportInterceptor authenticatedPluginHops(org.opensearch.transport.TransportInterceptor fromPlugins) {
         final org.opensearch.transport.TransportInterceptor shell = new org.opensearch.serverless.transport.PluginHopAuthentication(
-            () -> node.router,
+            () -> node.router(),
             name -> node.pluginActionNames.contains(name)
         );
         return new org.opensearch.transport.TransportInterceptor() {
@@ -227,7 +252,7 @@ final class NodeWiring {
      */
     Set<String> declaredPluginActionNames() {
         final Set<String> names = new java.util.HashSet<>();
-        for (org.opensearch.plugins.ActionPlugin plugin : node.plugins.filter(org.opensearch.plugins.ActionPlugin.class)) {
+        for (org.opensearch.plugins.ActionPlugin plugin : node.plugins().filter(org.opensearch.plugins.ActionPlugin.class)) {
             for (org.opensearch.plugins.ActionPlugin.ActionHandler<?, ?> handler : plugin.getActions()) {
                 names.add(handler.getAction().name());
             }
@@ -236,45 +261,47 @@ final class NodeWiring {
     }
 
     PluginActions buildPluginActions() {
-        final java.util.List<org.opensearch.plugins.ActionPlugin> actionPlugins = node.plugins.filter(
-            org.opensearch.plugins.ActionPlugin.class
-        );
-        final boolean inject = node.plugins.plugins().isEmpty() == false;
+        final java.util.List<org.opensearch.plugins.ActionPlugin> actionPlugins = node.plugins()
+            .filter(org.opensearch.plugins.ActionPlugin.class);
+        final boolean inject = node.plugins().plugins().isEmpty() == false;
         if (actionPlugins.isEmpty() && inject == false) {
             return PluginActions.none();
         }
         final java.util.List<Object> services = java.util.List.of(
             // First, so a plugin asking core's injector for a Client gets the NodeClient, as on a classic node.
-            node.nodeClient,
-            new org.opensearch.action.support.ActionFilters(new java.util.HashSet<>(node.plugins.actionFilters())),
+            node.nodeClient(),
+            new org.opensearch.action.support.ActionFilters(new java.util.HashSet<>(node.plugins().actionFilters())),
             node.transportService,
             node.transportService.getTaskManager(),
-            node.threadPool,
+            node.threadPool(),
             node.services().client(),
-            node.clusterService,
-            node.settings,
+            node.clusterService(),
+            node.settings(),
             node.services().namedWriteableRegistry(),
             node.services().indexNameExpressionResolver(),
             node.services().circuitBreakerService(),
-            node.indicesService,
+            node.indicesService(),
             // What a classic node's injector also hands a transport action and plugins ask for by type: index
             // management takes the NodeClient, query insights and others the services below.
-            node.nodeClient,
-            node.searchService,
+            node.nodeClient(),
+            node.searchService(),
             node.services().scriptService(),
             node.services().searchXContentRegistry(),
             node.services().resourceWatcherService(),
             node.services().bigArrays(),
             node.services().identityService(),
-            node.clusterService.getClusterSettings(),
-            node.services.indexScopedSettings(),
-            node.nodeEnvironment,
+            node.clusterService().getClusterSettings(),
+            node.services().indexScopedSettings(),
+            node.nodeEnvironment(),
             node.pluginsService,
-            node.indicesService.getAnalysis(),
+            node.indicesService().getAnalysis(),
             // Index management validates replica counts against zone awareness with it; core builds it from
             // the same two arguments in ClusterModule.
-            new org.opensearch.cluster.routing.allocation.AwarenessReplicaBalance(node.settings, node.clusterService.getClusterSettings()),
-            new org.opensearch.env.Environment(node.settings, null),
+            new org.opensearch.cluster.routing.allocation.AwarenessReplicaBalance(
+                node.settings(),
+                node.clusterService().getClusterSettings()
+            ),
+            new org.opensearch.env.Environment(node.settings(), null),
             // An action asks for these where a classic node's injector binds them; the shell traces and meters
             // its own work, so a plugin's spans and metrics go nowhere rather than failing its start.
             org.opensearch.telemetry.tracing.noop.NoopTracer.INSTANCE,
@@ -284,18 +311,18 @@ final class NodeWiring {
             // snapshot restore against (the shell's snapshots go to its own store, so none are registered),
             // the point-in-time service, and the extensions manager (the shell hosts no extensions).
             new org.opensearch.repositories.RepositoriesService(
-                node.settings,
-                node.clusterService,
+                node.settings(),
+                node.clusterService(),
                 node.transportService,
                 java.util.Map.of(),
                 java.util.Map.of(),
-                node.threadPool
+                node.threadPool()
             ),
             new org.opensearch.action.search.SearchTransportService(node.transportService, NodeWiring.unwrapped()),
             noExtensions()
         );
         if (inject) {
-            node.pluginInjector = PluginInjector.build(node.plugins.plugins(), services, node.plugins.components());
+            node.pluginInjector = PluginInjector.build(node.plugins().plugins(), services, node.plugins().components());
         }
         // Each action's constructor is resolved against the node's services and the components *its own*
         // plugin built -- never another plugin's. The aggregate list used to be offered to every action,
@@ -303,7 +330,7 @@ final class NodeWiring {
         // satisfied, and get that plugin's private object handed to it by reflection.
         return PluginActions.build(actionPlugins, plugin -> {
             final java.util.List<Object> available = new java.util.ArrayList<>(
-                node.plugins.componentsOf((org.opensearch.plugins.Plugin) plugin)
+                node.plugins().componentsOf((org.opensearch.plugins.Plugin) plugin)
             );
             available.addAll(services);
             return available;

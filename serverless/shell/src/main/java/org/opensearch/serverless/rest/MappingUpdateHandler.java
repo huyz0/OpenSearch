@@ -20,9 +20,9 @@ import org.opensearch.index.mapper.MapperService;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.serverless.action.ActionGate;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ActionGate;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -63,7 +63,7 @@ public final class MappingUpdateHandler extends BaseRestHandler {
     private static final int ATTEMPTS = 4;
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    private final Supplier<org.opensearch.serverless.node.NodeContext> node;
 
     /**
      * Creates the handler.
@@ -71,7 +71,7 @@ public final class MappingUpdateHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the serving node
      */
-    public MappingUpdateHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public MappingUpdateHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -184,7 +184,7 @@ public final class MappingUpdateHandler extends BaseRestHandler {
 
     private MappingResult apply(
         MetadataPlane metadata,
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         String index,
         Index concrete,
         String body
@@ -229,7 +229,7 @@ public final class MappingUpdateHandler extends BaseRestHandler {
      * @return the merged mapping source
      * @throws IOException if the mapper service cannot be built
      */
-    private static String mergedMapping(org.opensearch.serverless.shell.ServerlessNode serving, IndexDescriptor descriptor, String body)
+    private static String mergedMapping(org.opensearch.serverless.node.NodeContext serving, IndexDescriptor descriptor, String body)
         throws IOException {
         final IndexMetadata metadata = descriptor.toIndexMetadata(Map.of());
         final MapperService mapperService = serving.indicesService().createIndexMapperService(metadata);

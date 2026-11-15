@@ -22,11 +22,26 @@ public final class NotHereException extends IOException {
     private final boolean retryable;
     private final boolean behindLog;
 
-    NotHereException(String message, String owner, boolean retryable) {
+    /**
+     * Creates the exception.
+     *
+     * @param message what happened
+     * @param owner the node that owns the shard, if known
+     * @param retryable whether asking again may succeed
+     */
+    public NotHereException(String message, String owner, boolean retryable) {
         this(message, owner, retryable, null);
     }
 
-    NotHereException(String message, String owner, boolean retryable, Throwable cause) {
+    /**
+     * Creates the exception with its cause.
+     *
+     * @param message what happened
+     * @param owner the node that owns the shard, if known
+     * @param retryable whether asking again may succeed
+     * @param cause the cause
+     */
+    public NotHereException(String message, String owner, boolean retryable, Throwable cause) {
         this(message, owner, retryable, cause, false);
     }
 
@@ -41,7 +56,7 @@ public final class NotHereException extends IOException {
      * A shard nobody is writing whose published commit is behind acknowledged writes, which nobody took over
      * in time to answer from. Retryable: the refusal asked for the takeover that makes it current.
      */
-    static NotHereException behindLog(org.opensearch.serverless.shell.ShardBehindLogException cause) {
+    public static NotHereException behindLog(org.opensearch.serverless.write.ShardBehindLogException cause) {
         return new NotHereException(cause.getMessage(), null, true, cause, true);
     }
 

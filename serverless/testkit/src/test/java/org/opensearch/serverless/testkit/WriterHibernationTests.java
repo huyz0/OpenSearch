@@ -16,9 +16,9 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.ShardHead;
+import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.ReconcileScheduler;
-import org.opensearch.serverless.rest.DocumentRouting;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 

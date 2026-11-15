@@ -14,7 +14,7 @@ import org.opensearch.action.support.ActionFilterChain;
 import org.opensearch.action.support.ActionRequestMetadata;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.action.ActionResponse;
-import org.opensearch.serverless.shell.ActionGate;
+import org.opensearch.serverless.action.ActionGate;
 import org.opensearch.tasks.Task;
 import org.opensearch.test.OpenSearchTestCase;
 

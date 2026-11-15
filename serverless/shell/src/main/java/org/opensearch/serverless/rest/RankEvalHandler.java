@@ -27,7 +27,8 @@ import org.opensearch.script.TemplateScript;
 import org.opensearch.search.SearchHit;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.SearchFanout;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -47,7 +48,7 @@ import java.util.function.Supplier;
  */
 public final class RankEvalHandler extends BaseRestHandler {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
     /**
@@ -56,7 +57,7 @@ public final class RankEvalHandler extends BaseRestHandler {
      * @param node supplies the node
      * @param plane supplies the metadata plane
      */
-    public RankEvalHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public RankEvalHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -95,7 +96,7 @@ public final class RankEvalHandler extends BaseRestHandler {
             );
         }
         final MetadataPlane metadata = plane.get();
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
@@ -130,7 +131,12 @@ public final class RankEvalHandler extends BaseRestHandler {
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 // Resolved here rather than on the HTTP thread: it reads registers.
-                final SearchHandler.Resolution resolved = SearchHandler.resolveIndices(metadata, serving, index, false);
+                final org.opensearch.serverless.rest.IndexResolution resolved = SearchHandler.resolveIndices(
+                    metadata,
+                    serving,
+                    index,
+                    false
+                );
                 if (resolved.refused()) {
                     channel.sendResponse(IndexAdminHandler.error(channel, resolved.status(), resolved.type(), resolved.reason()));
                     return;
@@ -148,7 +154,7 @@ public final class RankEvalHandler extends BaseRestHandler {
 
     private void evaluate(
         org.opensearch.rest.RestChannel channel,
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         Map<String, org.opensearch.serverless.cluster.IndexDescriptor> indices,
         RankEvalSpec spec,

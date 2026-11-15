@@ -1,0 +1,161 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+package org.opensearch.serverless.node;
+
+import org.opensearch.serverless.cluster.IndexDescriptor;
+
+import java.util.Map;
+
+/**
+ * Keeps {@link NodeContext}'s copies of index descriptors current: refreshes the open indices' descriptors and
+ * applies a newer one to the shards here.
+ */
+public final class DescriptorRefresh {
+
+    private final NodeContext node;
+
+    /** The descriptors of the indices this node holds writer shards of, as last read; the reader half is {@link ReaderServing#served}. */
+    final Map<String, IndexDescriptor> hosted = new java.util.concurrent.ConcurrentHashMap<>();
+    final java.util.Map<String, long[]> appliedDescriptorVersions = new java.util.concurrent.ConcurrentHashMap<>();
+    /** When each open index's descriptor was last read, by the refresh or by the fence, in {@link System#nanoTime} terms. */
+    final java.util.Map<String, Long> descriptorReadAtNanos = new java.util.concurrent.ConcurrentHashMap<>();
+    volatile long descriptorRefreshIntervalMillis = 0L;
+    /** The cluster's segment placement as last read from its register, or null; see {@link SegmentPlacement}. */
+    volatile String clusterSegmentPlacement;
+    /** The cluster's bucket policy as last read with the segment placement, or null when unset. */
+    volatile String clusterBucketPolicy;
+    volatile long clusterSegmentPlacementReadAtNanos;
+    volatile boolean clusterSegmentPlacementRead;
+
+    DescriptorRefresh(NodeContext node) {
+        this.node = node;
+    }
+
+    /**
+     * Applies mapping and settings changes made elsewhere to the shards this node holds open.
+     *
+     * <p>A mapping or settings update reached only the node that served it; every other node's open
+     * shard kept the old one until it was reopened. One descriptor read per open index per heartbeat --
+     * the heartbeat already reads a head per shard -- and a refresh only when a version moved.
+     */
+    java.util.Map<String, java.util.Optional<IndexDescriptor>> refreshDescriptorsOfOpenIndices(
+        org.opensearch.serverless.metadata.MetadataPlane plane
+    ) {
+        final java.util.Set<String> indices = new java.util.LinkedHashSet<>();
+        for (org.opensearch.core.index.shard.ShardId shardId : node.reconciler.openShards()) {
+            indices.add(shardId.getIndexName());
+        }
+        if (indices.isEmpty() == false) {
+            refreshClusterPlacement(plane, false);
+        }
+        // What was read, for the caller: present, or definitely absent. An index whose read failed is
+        // left out, so a transient error is never mistaken for a deletion.
+        final java.util.Map<String, java.util.Optional<IndexDescriptor>> read = new java.util.LinkedHashMap<>();
+        final long intervalNanos = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(descriptorRefreshIntervalMillis);
+        final long nowNanos = System.nanoTime();
+        for (String indexName : indices) {
+            final Long lastRead = descriptorReadAtNanos.get(indexName);
+            if (intervalNanos > 0L && lastRead != null && nowNanos - lastRead < intervalNanos) {
+                // Read within the interval -- by an earlier pass, or by the incarnation fence answering a
+                // request -- and applied then. Left out of the result, which the caller reads as "not
+                // known" rather than "deleted": a deletion is refused at the fence meanwhile.
+                continue;
+            }
+            try {
+                final long startedAt = System.nanoTime();
+                final var descriptor = plane.describe(indexName);
+                read.put(indexName, descriptor);
+                descriptorReadAtNanos.put(indexName, startedAt);
+                if (descriptor.isEmpty()) {
+                    continue;
+                }
+                applyDescriptor(indexName, descriptor.get());
+            } catch (Exception e) {
+                NodeContext.logger.warn("could not refresh the descriptor of " + indexName + " on this node's open shards", e);
+            }
+        }
+        descriptorReadAtNanos.keySet().retainAll(indices);
+        return read;
+    }
+
+    /**
+     * Reads the cluster's segment placement from its register, at most every few minutes unless forced: one read for
+     * every shard this node publishes, since a publish reads the copy kept here.
+     *
+     * @param plane the metadata plane
+     * @param force true to read now
+     */
+    void refreshClusterPlacement(org.opensearch.serverless.metadata.MetadataPlane plane, boolean force) {
+        final long now = System.nanoTime();
+        if (force == false
+            && clusterSegmentPlacementRead
+            && now - clusterSegmentPlacementReadAtNanos < SegmentPlacement.CLUSTER_REFRESH_NANOS) {
+            return;
+        }
+        try {
+            final org.opensearch.common.settings.Settings cluster = plane.clusterConfig().read().settings();
+            clusterSegmentPlacement = cluster.get(NodeSettings.SEGMENT_PLACEMENT_CLUSTER.getKey());
+            clusterBucketPolicy = cluster.get(org.opensearch.serverless.bucket.BucketSettings.CLUSTER_POLICY.getKey());
+            // The checkpoint age for log commits rides on the same read.
+            LogCommitCheckpoint.applyCluster(node, cluster);
+            // And whether writes are searched before they are published.
+            if (node.push() != null) {
+                node.push().applyCluster(cluster);
+            }
+            clusterSegmentPlacementReadAtNanos = now;
+            clusterSegmentPlacementRead = true;
+        } catch (Exception e) {
+            NodeContext.logger.warn("could not read the cluster's segment placement; keeping [" + clusterSegmentPlacement + "]", e);
+        }
+    }
+
+    /**
+     * Brings this node's open shards of an index up to a descriptor just read.
+     *
+     * <p>From the per-pass refresh and from the incarnation fence, which reads the same register for an
+     * index being used and so keeps its mapping and settings current at no further cost.
+     */
+    void applyDescriptor(String indexName, IndexDescriptor descriptor) throws java.io.IOException {
+        // The copies the next projection is built from follow what was read, or a reader opened after a
+        // mapping update would be projected with the mapping from before it.
+        hosted.computeIfPresent(indexName, (k, v) -> descriptor);
+        node.readerServing.served.computeIfPresent(indexName, (k, v) -> descriptor);
+        final long[] applied = appliedDescriptorVersions.computeIfAbsent(indexName, k -> new long[] { -1L, -1L });
+        synchronized (applied) {
+            if (applied[0] != descriptor.mappingVersion()) {
+                node.reconciler.refresh().refreshMapping(indexName, descriptor);
+                applied[0] = descriptor.mappingVersion();
+            }
+            if (applied[1] != descriptor.settingsVersion()) {
+                node.reconciler.refresh().refreshSettings(indexName, descriptor);
+                applied[1] = descriptor.settingsVersion();
+            }
+        }
+    }
+
+    /**
+     * Applies a descriptor some other read found -- one routing a request, say -- if it is newer than what this node's
+     * shards carry. Newer, not merely different: such a read can be older than the one the fence last applied.
+     */
+    void applyIfNewer(String indexName, IndexDescriptor descriptor, long readStartedNanos) {
+        final long[] applied = appliedDescriptorVersions.get(indexName);
+        if (applied != null) {
+            synchronized (applied) {
+                if (descriptor.mappingVersion() <= applied[0] && descriptor.settingsVersion() <= applied[1]) {
+                    return;
+                }
+            }
+        }
+        try {
+            applyDescriptor(indexName, descriptor);
+            descriptorReadAtNanos.merge(indexName, readStartedNanos, Math::max);
+        } catch (Exception e) {
+            NodeContext.logger.warn("could not apply the descriptor of " + indexName + " read while routing", e);
+        }
+    }
+}

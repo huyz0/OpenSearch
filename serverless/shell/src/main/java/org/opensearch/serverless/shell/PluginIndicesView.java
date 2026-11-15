@@ -34,6 +34,7 @@ import org.opensearch.serverless.cluster.Rendezvous;
 import org.opensearch.serverless.metadata.AliasAtGeneration;
 import org.opensearch.serverless.metadata.ChangeStripes;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.plugins.PluginSettings;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
 
@@ -117,7 +118,7 @@ final class PluginIndicesView {
         } catch (Exception e) {
             logger.warn("could not load the plugins' indices into the local view; plugins will not find them there", e);
         }
-        final TimeValue every = PluginSettings.INDICES_VIEW_REFRESH_INTERVAL.get(node.settings);
+        final TimeValue every = PluginSettings.INDICES_VIEW_REFRESH_INTERVAL.get(node.settings());
         if (every.millis() > 0) {
             try {
                 refresher = node.threadPool().scheduleWithFixedDelay(() -> refresh(plane, every), every, ThreadPool.Names.GENERIC);
@@ -239,7 +240,7 @@ final class PluginIndicesView {
     /** Whether the members differ from the ones the applied owners were chosen among: the view's nodes come from the same leases. */
     private boolean membersChanged(MetadataPlane plane) {
         final Set<String> members = new TreeSet<>();
-        members.add(node.localNode.getId());
+        members.add(node.localNode().getId());
         for (org.opensearch.serverless.membership.NodeLease lease : plane.membership().current()) {
             members.add(lease.nodeId());
         }
@@ -253,7 +254,7 @@ final class PluginIndicesView {
      * @param names the indices changed
      */
     void changed(Collection<String> names) {
-        final MetadataPlane plane = node.metadataPlane;
+        final MetadataPlane plane = node.metadataPlane();
         if (loaded == false || plane == null || names.isEmpty()) {
             return;
         }
@@ -370,7 +371,7 @@ final class PluginIndicesView {
     }
 
     private void apply() throws Exception {
-        if (node.projector != null) {
+        if (node.projector() != null) {
             node.projectAndApply(List.of(), List.of());
         }
     }

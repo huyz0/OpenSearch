@@ -26,7 +26,7 @@ import java.util.concurrent.atomic.AtomicLong;
 /**
  * {@code POST /{index}/_delete_by_query} — every document a query matches, removed.
  *
- * <p>See {@link org.opensearch.serverless.shard.ShardOperations#deleteByQuery} for how it matches what a search sees
+ * <p>See {@link org.opensearch.serverless.ops.ShardOperations#deleteByQuery} for how it matches what a search sees
  * when it starts, one shard at a time in sequence-number order.
  *
  * <p>Runs against {@code FsBlobContainer} only.

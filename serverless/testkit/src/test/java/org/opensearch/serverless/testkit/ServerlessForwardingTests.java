@@ -122,8 +122,8 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
                 )
             );
             assertEquals(
-                org.opensearch.serverless.transport.ForwardFailure.NOT_OWNER,
-                org.opensearch.serverless.transport.ForwardFailure.classify(getFailure)
+                org.opensearch.serverless.write.ForwardFailure.NOT_OWNER,
+                org.opensearch.serverless.write.ForwardFailure.classify(getFailure)
             );
             final var query = org.opensearch.index.query.QueryBuilders.matchAllQuery();
             final var explainFailure = expectThrows(
@@ -134,8 +134,8 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
                 )
             );
             assertEquals(
-                org.opensearch.serverless.transport.ForwardFailure.NOT_OWNER,
-                org.opensearch.serverless.transport.ForwardFailure.classify(explainFailure)
+                org.opensearch.serverless.write.ForwardFailure.NOT_OWNER,
+                org.opensearch.serverless.write.ForwardFailure.classify(explainFailure)
             );
             assertFalse(
                 router.forwardGet(peer, new org.opensearch.serverless.transport.ForwardedGetRequest("alpha", uuid, 1, "doc"))
@@ -483,7 +483,7 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
     private static String idRoutingTo(IndexDescriptor descriptor, int shard) {
         for (int i = 0;; i++) {
             final String candidate = "aimed-" + i;
-            if (org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor, candidate) == shard) {
+            if (org.opensearch.serverless.ops.DocumentRouting.shardFor(descriptor, candidate) == shard) {
                 return candidate;
             }
         }
