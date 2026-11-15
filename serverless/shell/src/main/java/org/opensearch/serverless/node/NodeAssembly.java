@@ -85,6 +85,9 @@ final class NodeAssembly {
             settings,
             org.opensearch.serverless.bucket.BucketSettings.GROUP::get,
             () -> usageOf(node.metadataPlane),
+            () -> node.threadPool == null
+                ? Integer.MAX_VALUE
+                : node.threadPool.info(org.opensearch.threadpool.ThreadPool.Names.SEARCH).getMax(),
             System::currentTimeMillis
         );
         node.attach(org.opensearch.serverless.usage.Guardrails.class, guardrails);

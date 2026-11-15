@@ -850,3 +850,13 @@ What a level does, when enforced, to that tenant's indices only:
   acknowledged, which costs no store request, so searches see them as soon as before; only the commits are fewer. On a
   test node publishing every second, a tenant at level 1 paid half the PUTs of its neighbour written at the same rate
   (`PublishStretchNodeTests`; the rest is both indices' equal share of the node log).
+- **Level 2 and above**: its searches wait while half the node's search slots are taken, up to
+  `serverless.cost.max_wait_millis` (1 s), then run.
+
+**Search fair share**, whatever the mode: while a node runs as many searches as it has slots
+(`serverless.cost.search.slots`, default the search pool's size), a tenant already holding a quarter of them
+(`serverless.cost.search.tenant_share`, 0.25; 0 turns it off) waits for one of its own to end, up to the same longest
+wait, and other tenants go ahead. Below that nothing waits. On one 4-core test node with a tenant keeping 32 searches
+running, a quiet tenant's p50 went from 74-81 ms with the share off to 24-25 ms with it on (alone: 8-9 ms), p99 from
+109-117 ms to 49-57 ms, while the noisy tenant still ran 385 searches a second against 404 (`SearchFairShareMeterTests`,
+`-Dtests.meter.search_share=true`, three runs).
