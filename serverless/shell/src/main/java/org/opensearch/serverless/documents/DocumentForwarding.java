@@ -5,16 +5,16 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.documents;
 
+import org.opensearch.serverless.documents.DocumentWriteOutcomes.ForwardFailed;
 import org.opensearch.serverless.node.NodeContext;
-import org.opensearch.serverless.rest.DocumentWriteOutcomes.ForwardFailed;
 
 import java.util.Optional;
 
 /**
  * Sends a single-document write to the node the shard-head names, as a forwarded index request. Split out of
- * {@link DocumentHandler}.
+ * the REST document handler.
  */
 final class DocumentForwarding {
 

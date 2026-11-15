@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.documents;
 
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
@@ -27,15 +27,15 @@ import java.util.Optional;
 import java.util.function.Supplier;
 
 /**
- * Routes a parsed bulk request for {@link BulkHandler}: runs each item's pipeline, groups the items by shard, applies
+ * Routes a parsed bulk request for the REST bulk handler: runs each item's pipeline, groups the items by shard, applies
  * the groups this node owns and forwards the rest, and records every item's outcome.
  */
-final class BulkDispatch {
+public final class BulkDispatch {
 
     private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
-    BulkDispatch(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
+    public BulkDispatch(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -43,10 +43,10 @@ final class BulkDispatch {
     /**
      * Decides, per item, which shard it belongs to and who owns it — or records why it cannot be placed.
      */
-    void route(NodeContext serving, MetadataPlane metadata, List<BulkHandler.Item> items) throws IOException {
+    public void route(NodeContext serving, MetadataPlane metadata, List<BulkItem> items) throws IOException {
         final Map<String, Optional<WriteTarget>> targets = new HashMap<>();
         final java.util.Set<String> failures = new java.util.HashSet<>();
-        for (BulkHandler.Item item : items) {
+        for (BulkItem item : items) {
             if (item.failed()) {
                 continue;
             }
@@ -129,9 +129,9 @@ final class BulkDispatch {
      * pipeline does not run over a document nobody will store. Compiled once per distinct pipeline per
      * batch, which now matters more: a default pipeline is by definition the same one for every item.
      */
-    void shape(NodeContext serving, MetadataPlane metadata, List<BulkHandler.Item> items) {
+    public void shape(NodeContext serving, MetadataPlane metadata, List<BulkItem> items) {
         final Map<String, org.opensearch.ingest.Pipeline> compiled = new HashMap<>();
-        for (BulkHandler.Item item : items) {
+        for (BulkItem item : items) {
             if (item.failed() || item.pipelines.isEmpty() || item.operation.isDeletion()) {
                 continue;
             }
@@ -176,18 +176,18 @@ final class BulkDispatch {
      * @return true if a refresh was asked for and every group that applied is visible as far as it promises
      */
     /** The error type of a group refused for back-pressure before anything was applied, so safe to send again. */
-    static final String THROTTLED = "throttled";
+    public static final String THROTTLED = "throttled";
 
-    boolean dispatch(NodeContext serving, List<BulkHandler.Item> items, boolean refresh) throws IOException {
-        final Map<String, List<BulkHandler.Item>> groups = new LinkedHashMap<>();
-        for (BulkHandler.Item item : items) {
+    public boolean dispatch(NodeContext serving, List<BulkItem> items, boolean refresh) throws IOException {
+        final Map<String, List<BulkItem>> groups = new LinkedHashMap<>();
+        for (BulkItem item : items) {
             if (item.failed() == false && item.status == null) {
                 groups.computeIfAbsent(item.writtenIndex + "[" + item.shard + "]", key -> new ArrayList<>()).add(item);
             }
         }
         final List<java.util.concurrent.Callable<Void>> tasks = new ArrayList<>(groups.size());
         final java.util.concurrent.atomic.AtomicBoolean refreshed = new java.util.concurrent.atomic.AtomicBoolean(refresh);
-        for (List<BulkHandler.Item> group : groups.values()) {
+        for (List<BulkItem> group : groups.values()) {
             tasks.add(() -> {
                 if (applyGroup(serving, group, refresh) == false) {
                     refreshed.set(false);
@@ -203,7 +203,7 @@ final class BulkDispatch {
         }
         // A group whose task died before recording anything would leave its items with no outcome at all,
         // which would serialize as a success with no result. Say so instead.
-        for (BulkHandler.Item item : items) {
+        for (BulkItem item : items) {
             if (item.failed() == false && item.status == null) {
                 item.fail(RestStatus.INTERNAL_SERVER_ERROR, "no_outcome", "the writer returned no outcome for this operation");
             }
@@ -233,12 +233,12 @@ final class BulkDispatch {
      * @return false if a refresh was asked for and what the group applied is not visible as far as it promises; true
      *     otherwise, a failed group included, since it applied nothing to make visible
      */
-    boolean applyGroup(NodeContext serving, List<BulkHandler.Item> group, boolean refresh) throws IOException {
+    boolean applyGroup(NodeContext serving, List<BulkItem> group, boolean refresh) throws IOException {
         final String index = group.get(0).writtenIndex;
         final String uuid = group.get(0).writtenUuid;
         final int shard = group.get(0).shard;
         final List<BulkOperation> operations = new ArrayList<>(group.size());
-        for (BulkHandler.Item item : group) {
+        for (BulkItem item : group) {
             operations.add(new BulkOperation(item.operation, item.ifSeqNo, item.ifPrimaryTerm, item.requireAbsent));
         }
 
@@ -354,13 +354,13 @@ final class BulkDispatch {
     }
 
     /** Whether a group's writes are pushed to its shard's search nodes: every item of a request says the same. */
-    private static boolean tailPush(List<BulkHandler.Item> group) {
+    private static boolean tailPush(List<BulkItem> group) {
         return group.get(0).tailPush;
     }
 
     private static org.opensearch.serverless.transport.ForwardedBulkRequest forwarded(
         org.opensearch.serverless.transport.ForwardedBulkRequest request,
-        List<BulkHandler.Item> group
+        List<BulkItem> group
     ) {
         return tailPush(group) ? request : request.withoutTailPush();
     }
@@ -372,7 +372,7 @@ final class BulkDispatch {
      */
     boolean steerGroup(
         NodeContext serving,
-        List<BulkHandler.Item> group,
+        List<BulkItem> group,
         String index,
         String uuid,
         int shard,
@@ -438,7 +438,7 @@ final class BulkDispatch {
      * indexing-pressure limit told a local batch 429 and a forwarded one 503; a deadline was worded as
      * "stale routing, retry", which for a batch of auto-id documents is an invitation to write them twice.
      */
-    void failForwarded(NodeContext serving, List<BulkHandler.Item> group, String index, int shard, String owner, Exception e) {
+    void failForwarded(NodeContext serving, List<BulkItem> group, String index, int shard, String owner, Exception e) {
         final org.opensearch.serverless.write.ForwardFailure kind = org.opensearch.serverless.write.ForwardFailure.classify(e);
         if (kind.castsDoubtOnOwnership()) {
             serving.signals().ownershipDoubted(index, shard);
@@ -494,7 +494,7 @@ final class BulkDispatch {
         }
     }
 
-    void record(List<BulkHandler.Item> group, List<BulkOutcome> outcomes, String nodeId) {
+    void record(List<BulkItem> group, List<BulkOutcome> outcomes, String nodeId) {
         if (outcomes.size() != group.size()) {
             // Cannot happen through either path, and if it ever does, silently pairing the wrong outcome
             // with the wrong document is far worse than saying so.
@@ -511,8 +511,8 @@ final class BulkDispatch {
         }
     }
 
-    void failGroup(List<BulkHandler.Item> group, RestStatus status, String type, String reason) {
-        for (BulkHandler.Item item : group) {
+    void failGroup(List<BulkItem> group, RestStatus status, String type, String reason) {
+        for (BulkItem item : group) {
             item.fail(status, type, reason);
         }
     }
