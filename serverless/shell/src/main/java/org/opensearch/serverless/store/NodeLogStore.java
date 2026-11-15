@@ -214,10 +214,15 @@ public final class NodeLogStore {
         java.util.concurrent.Executor executor
     ) {
         final java.util.concurrent.CompletableFuture<Void> out = new java.util.concurrent.CompletableFuture<>();
+        // The PUT runs on another thread: carry who it is charged to along with it.
+        final StoreUsage.Scope scope = StoreUsage.currentScope();
         try {
             executor.execute(() -> {
                 try {
-                    append(epoch, ordinal, blob);
+                    StoreUsage.within(scope, () -> {
+                        append(epoch, ordinal, blob);
+                        return null;
+                    });
                     out.complete(null);
                 } catch (Throwable t) {
                     out.completeExceptionally(t);

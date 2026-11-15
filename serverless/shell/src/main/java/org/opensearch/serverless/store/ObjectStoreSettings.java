@@ -53,11 +53,25 @@ public final class ObjectStoreSettings implements SettingsProvider {
      */
     public static final Setting<Boolean> PROVIDER_ACK = Setting.boolSetting("serverless.store.provider_ack", false, Property.NodeScope);
 
+    /**
+     * Whether the store charges every request to the index it was made for, on top of the node totals. The counters
+     * are a few hundred bytes for each index the node has touched, and nothing is uploaded.
+     */
+    public static final Setting<Boolean> METERING = Setting.boolSetting("serverless.cost.metering", true, Property.NodeScope);
+
+    /** How many indices metering tracks one by one before counting the rest on one line. */
+    public static final Setting<Integer> METERING_MAX_INDICES = Setting.intSetting(
+        "serverless.cost.metering.max_indices",
+        StoreUsage.DEFAULT_MAX_INDICES,
+        0,
+        Property.NodeScope
+    );
+
     /** Used by {@link java.util.ServiceLoader}. */
     public ObjectStoreSettings() {}
 
     @Override
     public List<Setting<?>> settings() {
-        return List.of(TYPE, BUCKET, ENDPOINT, REGION, PATH_STYLE_ACCESS, PATH, PROVIDER_ACK);
+        return List.of(TYPE, BUCKET, ENDPOINT, REGION, PATH_STYLE_ACCESS, PATH, PROVIDER_ACK, METERING, METERING_MAX_INDICES);
     }
 }

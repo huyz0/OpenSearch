@@ -905,7 +905,7 @@ public final class SegmentPublisher {
         if (location == null) {
             throw new java.io.FileNotFoundException(fileName + " is not in the commit");
         }
-        final BlobContainer container = blobStore.blobContainer(location.containerPath(shardBase));
+        final BlobContainer container = MeteredBlobStore.chargedTo(blobStore.blobContainer(location.containerPath(shardBase)), shardBase);
         return location.isPacked()
             ? container.readBlob(location.blob(), location.offset(), location.length())
             : container.readBlob(location.blob());

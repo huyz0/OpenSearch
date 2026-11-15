@@ -51,7 +51,7 @@ import java.util.concurrent.atomic.AtomicLong;
  * of the shards the writes go to (all), {@code -Dtests.tput.clients} the most
  * requests in flight (4096), {@code -Dtests.tput.cadence} {@code node} (default: publishes and renewals driven by the node's own
  * scheduler with its defaults, as a running node) or {@code meter} (every shard with anything new published once a second, as
- * the soak does), {@code -Dtests.tput.takeover} true to time a takeover at the end, {@code -Dtests.tput.activation} how many shards the take opens at once (8; pair it with {@code serverless.activation.concurrency} in the settings so the pool is sized to match), and {@code -Dtests.tput.settings}
+ * the soak does), {@code -Dtests.tput.takeover} true to time a takeover at the end, {@code -Dtests.tput.metering} {@code totals} or {@code on} to put the production store meter under the node, without or with per-index usage, {@code -Dtests.tput.activation} how many shards the take opens at once (8; pair it with {@code serverless.activation.concurrency} in the settings so the pool is sized to match), and {@code -Dtests.tput.settings}
  * extra node settings as {@code key=value,key=value}. {@link MeterStores} picks the store and the latency.
  */
 @com.carrotsearch.randomizedtesting.annotations.TimeoutSuite(millis = 7_200_000)
@@ -567,7 +567,19 @@ public class WriteThroughputMeterTests extends OpenSearchTestCase {
         final org.opensearch.common.blobstore.BlobStore inner = MeterStores.create(createTempDir(), createTempDir());
         final LatencyInjectingBlobStore slow = new LatencyInjectingBlobStore(inner, 0);
         final List<String> report = new ArrayList<>();
-        try (CountingBlobStore store = new CountingBlobStore(slow)) {
+        // -Dtests.tput.metering: absent runs without the production store meter, as before; "totals" wraps the store in it
+        // with node totals only; "on" adds per-index usage, so the two can be compared for what metering costs.
+        final String metering = System.getProperty("tests.tput.metering", "");
+        final org.opensearch.common.blobstore.BlobStore underMeter = metering.isEmpty()
+            ? slow
+            : new org.opensearch.serverless.store.MeteredBlobStore(
+                slow,
+                "on".equals(metering)
+                    ? new org.opensearch.serverless.store.StoreUsage(org.opensearch.serverless.store.StoreUsage.DEFAULT_MAX_INDICES)
+                    : null
+            );
+        logger.info("TPUT|metering={}", metering.isEmpty() ? "absent" : metering);
+        try (CountingBlobStore store = new CountingBlobStore(underMeter)) {
             final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock, TTL);
             final long createStarted = System.nanoTime();
             for (int i = 0; i < shards; i++) {

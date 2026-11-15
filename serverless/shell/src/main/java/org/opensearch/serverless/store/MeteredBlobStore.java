@@ -30,6 +30,7 @@ public final class MeteredBlobStore implements BlobStore {
     private final java.util.concurrent.atomic.AtomicLong bytesRead = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong bytesWritten = new java.util.concurrent.atomic.AtomicLong();
     private final java.util.concurrent.atomic.AtomicLong errors = new java.util.concurrent.atomic.AtomicLong();
+    private final StoreUsage usage;
 
     /**
      * Wraps a store.
@@ -37,7 +38,44 @@ public final class MeteredBlobStore implements BlobStore {
      * @param delegate the real store
      */
     public MeteredBlobStore(BlobStore delegate) {
+        this(delegate, new StoreUsage(StoreUsage.DEFAULT_MAX_INDICES));
+    }
+
+    /**
+     * Wraps a store, keeping per-index usage in the given counters.
+     *
+     * @param delegate the real store
+     * @param usage where each request is charged to the index it was made for; null counts only node totals
+     */
+    public MeteredBlobStore(BlobStore delegate, StoreUsage usage) {
         this.delegate = delegate;
+        this.usage = usage;
+    }
+
+    /**
+     * Returns what each index's requests cost, if per-index metering is on.
+     *
+     * @return the usage, or null when metering is off
+     */
+    public StoreUsage usage() {
+        return usage;
+    }
+
+    /**
+     * Returns a container whose requests are charged to the shard a path names, whatever the container's own path
+     * says: for a shard reading a file that lives in a node pack, outside its own path. A container from any other
+     * store is returned as it is.
+     *
+     * @param container a container from a metered store
+     * @param shardBase the shard's base path, {@code <base>/segments/<shard>}
+     * @return the charged container
+     */
+    public static BlobContainer chargedTo(BlobContainer container, BlobPath shardBase) {
+        final String index = StoreUsage.indexOfContainer(shardBase);
+        if (container instanceof Counting counting && index != null && index.equals(counting.owner) == false) {
+            return counting.store().new Counting(counting.inner, index);
+        }
+        return container;
     }
 
     /**
@@ -158,16 +196,52 @@ public final class MeteredBlobStore implements BlobStore {
     private final class Counting implements ConditionalBlobContainer {
 
         private final BlobContainer inner;
+        // The index the whole container belongs to, if any; else the naming that tells a blob's index from its name.
+        private final String owner;
+        private final StoreUsage.BlobNaming naming;
 
         Counting(BlobContainer inner) {
             this.inner = inner;
+            this.owner = usage == null ? null : StoreUsage.indexOfContainer(inner.path());
+            this.naming = usage == null || owner != null ? StoreUsage.BlobNaming.NONE : StoreUsage.BlobNaming.of(inner.path());
+        }
+
+        Counting(BlobContainer inner, String owner) {
+            this.inner = inner;
+            this.owner = owner;
+            this.naming = StoreUsage.BlobNaming.NONE;
+        }
+
+        MeteredBlobStore store() {
+            return MeteredBlobStore.this;
+        }
+
+        private String ownerOf(String blobName) {
+            return owner != null ? owner : StoreUsage.indexOfBlob(naming, blobName);
+        }
+
+        private void written(String blobName, long blobSize) {
+            final long size = Math.max(0L, blobSize);
+            bytesWritten.addAndGet(size);
+            if (usage != null) {
+                usage.charge(ownerOf(blobName), IndexUsage.Kind.BYTES_WRITTEN, size);
+            }
+        }
+
+        private CountedStream counted(String blobName, java.io.InputStream in) {
+            return new CountedStream(in, usage == null ? null : usage.payer(ownerOf(blobName)));
         }
 
         private <T> T count(
             java.util.concurrent.atomic.AtomicLong counter,
+            IndexUsage.Kind kind,
+            String blobName,
             org.opensearch.common.CheckedSupplier<T, java.io.IOException> call
         ) throws java.io.IOException {
             counter.incrementAndGet();
+            if (usage != null) {
+                usage.charge(ownerOf(blobName), kind, IndexUsage.ONE_REQUEST);
+            }
             final java.util.concurrent.atomic.AtomicLong attributed = ObjectStores.ATTRIBUTION.get();
             if (attributed != null) {
                 attributed.incrementAndGet();
@@ -187,24 +261,27 @@ public final class MeteredBlobStore implements BlobStore {
 
         @Override
         public boolean blobExists(String blobName) throws java.io.IOException {
-            return count(blobReads, () -> inner.blobExists(blobName));
+            return count(blobReads, IndexUsage.Kind.BLOB_READ, blobName, () -> inner.blobExists(blobName));
         }
 
         @Override
         public java.io.InputStream readBlob(String blobName) throws java.io.IOException {
-            return new CountedStream(count(blobReads, () -> inner.readBlob(blobName)));
+            return counted(blobName, count(blobReads, IndexUsage.Kind.BLOB_READ, blobName, () -> inner.readBlob(blobName)));
         }
 
         @Override
         public java.io.InputStream readBlob(String blobName, long position, long length) throws java.io.IOException {
-            return new CountedStream(count(blobReads, () -> inner.readBlob(blobName, position, length)));
+            return counted(
+                blobName,
+                count(blobReads, IndexUsage.Kind.BLOB_READ, blobName, () -> inner.readBlob(blobName, position, length))
+            );
         }
 
         @Override
         public void writeBlob(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
             throws java.io.IOException {
-            bytesWritten.addAndGet(Math.max(0L, blobSize));
-            count(blobWrites, () -> {
+            written(blobName, blobSize);
+            count(blobWrites, IndexUsage.Kind.BLOB_WRITE, blobName, () -> {
                 inner.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
                 return null;
             });
@@ -213,8 +290,8 @@ public final class MeteredBlobStore implements BlobStore {
         @Override
         public void writeBlobAtomic(String blobName, java.io.InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
             throws java.io.IOException {
-            bytesWritten.addAndGet(Math.max(0L, blobSize));
-            count(blobWrites, () -> {
+            written(blobName, blobSize);
+            count(blobWrites, IndexUsage.Kind.BLOB_WRITE, blobName, () -> {
                 inner.writeBlobAtomic(blobName, inputStream, blobSize, failIfAlreadyExists);
                 return null;
             });
@@ -222,12 +299,12 @@ public final class MeteredBlobStore implements BlobStore {
 
         @Override
         public DeleteResult delete() throws java.io.IOException {
-            return count(deletes, inner::delete);
+            return count(deletes, IndexUsage.Kind.DELETE, null, inner::delete);
         }
 
         @Override
         public void deleteBlobsIgnoringIfNotExists(java.util.List<String> blobNames) throws java.io.IOException {
-            count(deletes, () -> {
+            count(deletes, IndexUsage.Kind.DELETE, blobNames.size() == 1 ? blobNames.get(0) : null, () -> {
                 inner.deleteBlobsIgnoringIfNotExists(blobNames);
                 return null;
             });
@@ -235,13 +312,13 @@ public final class MeteredBlobStore implements BlobStore {
 
         @Override
         public java.util.Map<String, BlobMetadata> listBlobs() throws java.io.IOException {
-            return count(listings, inner::listBlobs);
+            return count(listings, IndexUsage.Kind.LISTING, null, inner::listBlobs);
         }
 
         @Override
         public java.util.Map<String, BlobContainer> children() throws java.io.IOException {
             // A listing with a delimiter on every provider worth naming, and priced as one.
-            final java.util.Map<String, BlobContainer> children = count(listings, inner::children);
+            final java.util.Map<String, BlobContainer> children = count(listings, IndexUsage.Kind.LISTING, null, inner::children);
             final java.util.Map<String, BlobContainer> counted = new java.util.LinkedHashMap<>();
             for (java.util.Map.Entry<String, BlobContainer> child : children.entrySet()) {
                 counted.put(child.getKey(), new Counting(child.getValue()));
@@ -251,7 +328,7 @@ public final class MeteredBlobStore implements BlobStore {
 
         @Override
         public java.util.Map<String, BlobMetadata> listBlobsByPrefix(String blobNamePrefix) throws java.io.IOException {
-            return count(listings, () -> inner.listBlobsByPrefix(blobNamePrefix));
+            return count(listings, IndexUsage.Kind.LISTING, null, () -> inner.listBlobsByPrefix(blobNamePrefix));
         }
 
         // Everything below is delegated rather than left to the interface default: a default here would
@@ -263,18 +340,28 @@ public final class MeteredBlobStore implements BlobStore {
             int limit,
             BlobNameSortOrder blobNameSortOrder
         ) throws java.io.IOException {
-            return count(listings, () -> inner.listBlobsByPrefixInSortedOrder(blobNamePrefix, limit, blobNameSortOrder));
+            return count(
+                listings,
+                IndexUsage.Kind.LISTING,
+                null,
+                () -> inner.listBlobsByPrefixInSortedOrder(blobNamePrefix, limit, blobNameSortOrder)
+            );
         }
 
         @Override
         public java.util.List<BlobMetadata> listBlobsByPrefix(String blobNamePrefix, String startAfter, int limit)
             throws java.io.IOException {
-            return count(listings, () -> inner.listBlobsByPrefix(blobNamePrefix, startAfter, limit));
+            return count(listings, IndexUsage.Kind.LISTING, null, () -> inner.listBlobsByPrefix(blobNamePrefix, startAfter, limit));
         }
 
         @Override
         public java.util.Map<String, BlobContainer> children(String startAfter, int limit) throws java.io.IOException {
-            final java.util.Map<String, BlobContainer> children = count(listings, () -> inner.children(startAfter, limit));
+            final java.util.Map<String, BlobContainer> children = count(
+                listings,
+                IndexUsage.Kind.LISTING,
+                null,
+                () -> inner.children(startAfter, limit)
+            );
             final java.util.Map<String, BlobContainer> counted = new java.util.LinkedHashMap<>();
             for (java.util.Map.Entry<String, BlobContainer> child : children.entrySet()) {
                 counted.put(child.getKey(), new Counting(child.getValue()));
@@ -289,14 +376,19 @@ public final class MeteredBlobStore implements BlobStore {
 
         @Override
         public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws java.io.IOException {
-            return count(deletes, () -> ConditionalBlobContainer.of(inner).deleteRegisterIfUnchanged(blobName, expectedGeneration));
+            return count(
+                deletes,
+                IndexUsage.Kind.DELETE,
+                blobName,
+                () -> ConditionalBlobContainer.of(inner).deleteRegisterIfUnchanged(blobName, expectedGeneration)
+            );
         }
 
         @Override
         public org.opensearch.common.blobstore.InputStreamWithMetadata readBlobWithMetadata(String blobName) throws java.io.IOException {
-            final var result = count(blobReads, () -> inner.readBlobWithMetadata(blobName));
+            final var result = count(blobReads, IndexUsage.Kind.BLOB_READ, blobName, () -> inner.readBlobWithMetadata(blobName));
             return new org.opensearch.common.blobstore.InputStreamWithMetadata(
-                result.getInputStream() == null ? null : new CountedStream(result.getInputStream()),
+                result.getInputStream() == null ? null : counted(blobName, result.getInputStream()),
                 result.getMetadata()
             );
         }
@@ -309,8 +401,8 @@ public final class MeteredBlobStore implements BlobStore {
             boolean failIfAlreadyExists,
             java.util.Map<String, String> metadata
         ) throws java.io.IOException {
-            bytesWritten.addAndGet(Math.max(0L, blobSize));
-            count(blobWrites, () -> {
+            written(blobName, blobSize);
+            count(blobWrites, IndexUsage.Kind.BLOB_WRITE, blobName, () -> {
                 inner.writeBlobWithMetadata(blobName, inputStream, blobSize, failIfAlreadyExists, metadata);
                 return null;
             });
@@ -325,8 +417,8 @@ public final class MeteredBlobStore implements BlobStore {
             java.util.Map<String, String> metadata,
             org.opensearch.cluster.metadata.CryptoMetadata cryptoMetadata
         ) throws java.io.IOException {
-            bytesWritten.addAndGet(Math.max(0L, blobSize));
-            count(blobWrites, () -> {
+            written(blobName, blobSize);
+            count(blobWrites, IndexUsage.Kind.BLOB_WRITE, blobName, () -> {
                 inner.writeBlobWithMetadata(blobName, inputStream, blobSize, failIfAlreadyExists, metadata, cryptoMetadata);
                 return null;
             });
@@ -340,8 +432,8 @@ public final class MeteredBlobStore implements BlobStore {
             long blobSize,
             boolean failIfAlreadyExists
         ) throws java.io.IOException {
-            bytesWritten.addAndGet(Math.max(0L, blobSize));
-            count(blobWrites, () -> {
+            written(blobName, blobSize);
+            count(blobWrites, IndexUsage.Kind.BLOB_WRITE, blobName, () -> {
                 inner.writeBlobAtomicWithMetadata(blobName, inputStream, metadata, blobSize, failIfAlreadyExists);
                 return null;
             });
@@ -354,16 +446,24 @@ public final class MeteredBlobStore implements BlobStore {
 
         @Override
         public org.opensearch.common.blobstore.VersionedBlob readBlobWithVersion(String blobName) throws java.io.IOException {
-            final var result = count(blobReads, () -> inner.readBlobWithVersion(blobName));
+            final var result = count(blobReads, IndexUsage.Kind.BLOB_READ, blobName, () -> inner.readBlobWithVersion(blobName));
             bytesRead.addAndGet(result.content().length);
+            if (usage != null) {
+                usage.charge(ownerOf(blobName), IndexUsage.Kind.BYTES_READ, result.content().length);
+            }
             return result;
         }
 
         @Override
         public String writeBlobConditionally(String blobName, java.io.InputStream inputStream, long blobSize, String expectedVersionToken)
             throws java.io.IOException {
-            bytesWritten.addAndGet(Math.max(0L, blobSize));
-            return count(blobWrites, () -> inner.writeBlobConditionally(blobName, inputStream, blobSize, expectedVersionToken));
+            written(blobName, blobSize);
+            return count(
+                blobWrites,
+                IndexUsage.Kind.BLOB_WRITE,
+                blobName,
+                () -> inner.writeBlobConditionally(blobName, inputStream, blobSize, expectedVersionToken)
+            );
         }
 
         @Override
@@ -374,6 +474,9 @@ public final class MeteredBlobStore implements BlobStore {
             org.opensearch.core.action.ActionListener<java.util.List<BlobMetadata>> listener
         ) {
             listings.incrementAndGet();
+            if (usage != null) {
+                usage.charge(owner, IndexUsage.Kind.LISTING, IndexUsage.ONE_REQUEST);
+            }
             final java.util.concurrent.atomic.AtomicLong attributed = ObjectStores.ATTRIBUTION.get();
             if (attributed != null) {
                 attributed.incrementAndGet();
@@ -407,7 +510,12 @@ public final class MeteredBlobStore implements BlobStore {
 
         @Override
         public java.util.Optional<BlobRegister> readRegister(String blobName) throws java.io.IOException {
-            return count(registerReads, () -> ConditionalBlobContainer.of(inner).readRegister(blobName));
+            return count(
+                registerReads,
+                IndexUsage.Kind.REGISTER_READ,
+                blobName,
+                () -> ConditionalBlobContainer.of(inner).readRegister(blobName)
+            );
         }
 
         @Override
@@ -415,21 +523,39 @@ public final class MeteredBlobStore implements BlobStore {
             throws java.io.IOException {
             return count(
                 registerWrites,
+                IndexUsage.Kind.REGISTER_WRITE,
+                blobName,
                 () -> ConditionalBlobContainer.of(inner).compareAndSwapRegister(blobName, expectedGeneration, newValue)
             );
         }
 
         @Override
         public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws java.io.IOException {
-            return count(registerWrites, () -> ConditionalBlobContainer.of(inner).createRegisterIfAbsent(blobName, value));
+            return count(
+                registerWrites,
+                IndexUsage.Kind.REGISTER_WRITE,
+                blobName,
+                () -> ConditionalBlobContainer.of(inner).createRegisterIfAbsent(blobName, value)
+            );
         }
     }
 
     /** Counts the bytes a caller actually pulls through a read, which for a ranged read is the range. */
     private final class CountedStream extends java.io.FilterInputStream {
 
-        CountedStream(java.io.InputStream in) {
+        // Fixed when the stream opened: bytes are pulled later, maybe on another thread or outside the caller's scope.
+        private final StoreUsage.Scope payer;
+
+        CountedStream(java.io.InputStream in, StoreUsage.Scope payer) {
             super(in);
+            this.payer = payer;
+        }
+
+        private void pulled(long n) {
+            bytesRead.addAndGet(n);
+            if (payer != null) {
+                payer.charge(usage, IndexUsage.Kind.BYTES_READ, n);
+            }
         }
 
         @Override
@@ -437,7 +563,7 @@ public final class MeteredBlobStore implements BlobStore {
             try {
                 final int b = super.read();
                 if (b >= 0) {
-                    bytesRead.incrementAndGet();
+                    pulled(1L);
                 }
                 return b;
             } catch (java.io.IOException | RuntimeException failure) {
@@ -451,7 +577,7 @@ public final class MeteredBlobStore implements BlobStore {
             try {
                 final int n = super.read(buffer, offset, length);
                 if (n > 0) {
-                    bytesRead.addAndGet(n);
+                    pulled(n);
                 }
                 return n;
             } catch (java.io.IOException | RuntimeException failure) {
@@ -465,7 +591,7 @@ public final class MeteredBlobStore implements BlobStore {
             try {
                 final long skipped = super.skip(n);
                 if (skipped > 0) {
-                    bytesRead.addAndGet(skipped);
+                    pulled(skipped);
                 }
                 return skipped;
             } catch (java.io.IOException | RuntimeException failure) {

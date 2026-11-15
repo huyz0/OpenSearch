@@ -180,8 +180,16 @@ public final class NodePackStore {
             sources.add(part.source());
             lengths.add(part.length());
         }
+        final java.util.Map<String, Long> bytesByIndex = new java.util.HashMap<>();
+        for (Part part : parts) {
+            bytesByIndex.merge(part.indexName(), part.length(), Long::sum);
+        }
         try (NodePackInputStream stream = new NodePackInputStream(encoded.bytes(), sources, lengths)) {
-            container(epoch).writeBlob(name(ordinal), stream, stream.length(), true);
+            // One PUT for every shard in the pack: each index pays its share of the bytes.
+            StoreUsage.split(bytesByIndex, () -> {
+                container(epoch).writeBlob(name(ordinal), stream, stream.length(), true);
+                return null;
+            });
         }
         return encoded.header();
     }

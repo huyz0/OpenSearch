@@ -805,3 +805,19 @@ adds requests; so hibernation stays off by default. Setting `hibernate_after_mil
 `idle_after_millis` to, say, 30 minutes trades about 4 requests and 20-80 ms saved on each 5-30 minute gap for about 4
 requests more on each longer one, at released heap and descriptors. The cache warm before closing fills only free
 cache room, so it never evicts a block in use and never adds heap.
+
+## Per-index store usage
+
+Every object-store request is charged to the index it was made for (`serverless.cost.metering`, on by default), on top
+of the node totals the stats already report. Most requests name their index in their key: a shard's data path, a head,
+a descriptor, an assignment. A shard reading a file that lives in a node pack is charged to that shard. Uploads that
+carry many indices at once are shared between them: a node-log PUT by each index's bytes in the blob, a node-pack PUT
+by bytes, and a bucket manifest swap equally between the members it advances. Leases, membership and other node work
+go on a `_node` line. Requests are kept in thousandths so small shares add up, and every request the store counted
+lands on exactly one line (`StoreUsageNodeTests`). Past `serverless.cost.metering.max_indices` (100,000) indices, the
+rest share an `_other` line, so a janitor pass over a large cluster cannot grow the counters without limit.
+
+Nothing is uploaded: the counters live in the heap, about 200 bytes an index. Charging a request costs about 65 ns on
+the test JVM, against 0.04 store requests per document at 1,000-2,000 docs/s, so about 3 ns per document. On the write
+meter (1,000 shards, 20 ms store latency, two runs each way), p99, CPU per document, live heap and store requests
+moved within run-to-run noise.
