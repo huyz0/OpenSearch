@@ -210,7 +210,7 @@ public class GuardrailsTests extends OpenSearchTestCase {
         expectThrows(IllegalArgumentException.class, () -> UsageSettings.INDEX_TIER.get(tier("huge")));
         assertEquals(UsageSettings.Mode.ENFORCE, UsageSettings.Mode.parse(" Enforce "));
         assertEquals("", UsageSettings.INDEX_MODE.get(Settings.EMPTY));
-        assertEquals(12, new UsageSettings().settings().size());
+        assertEquals(13, new UsageSettings().settings().size());
     }
 
     public void testLevelsSetFromOutsideParseAndTheHigherHolds() throws IOException {
@@ -263,5 +263,81 @@ public class GuardrailsTests extends OpenSearchTestCase {
         assertEquals(500L, guardrails.publishAge("a", 500L));
         tenSeconds(guardrails, "a", 10);
         assertEquals(2_000L, guardrails.publishAge("a", 500L));
+    }
+
+    /** Ten seconds on, the index writing {@code puts} PUTs and {@code docs} documents in them, then a tick. */
+    private void tenSeconds(Guardrails guardrails, String index, int count, int docs) throws IOException {
+        guardrails.wrote(index, docs);
+        tenSeconds(guardrails, index, count);
+    }
+
+    public void testAtLevelThreeWritesArePacedToTheBudgetAndRefusedPastTheLongestWait() throws IOException {
+        final Guardrails guardrails = guardrails(
+            Settings.builder().put(UsageSettings.MODE.getKey(), "enforce").put(UsageSettings.MAX_WAIT_MILLIS.getKey(), 500L).build()
+        );
+        guardrails.note("a", tier("small"));
+        baseline(guardrails, "a");
+        // 60 cost units and 360 documents a minute: three times the budget, so 2 documents a second fit it.
+        for (int i = 0; i < 31; i++) {
+            tenSeconds(guardrails, "a", 10, 60);
+        }
+        assertEquals(3, guardrails.level("a"));
+        // A burst of four seconds' worth fits at once.
+        guardrails.paceWrite("a", 7);
+        guardrails.paceWrite("b", 1_000);
+        final long started = System.nanoTime();
+        guardrails.paceWrite("a", 2);
+        final long heldMillis = (System.nanoTime() - started) / 1_000_000L;
+        assertTrue("held about half a second, was " + heldMillis, heldMillis >= 400L && heldMillis < 5_000L);
+        expectThrows(org.opensearch.core.concurrency.OpenSearchRejectedExecutionException.class, () -> guardrails.paceWrite("a", 5));
+        assertEquals("a refusal shows as level four", 4, guardrails.level("a"));
+        assertEquals(1L, guardrails.tenants().get("a").get("refused"));
+        assertEquals(1L, guardrails.tenants().get("a").get("paced"));
+        now.addAndGet(4_000L);
+        guardrails.paceWrite("a", 5);
+        now.addAndGet(61_000L);
+        assertEquals("a minute after", 3, guardrails.level("a"));
+    }
+
+    public void testPacingOnlyWhenEnforcedAndOverBudgetHere() throws IOException {
+        final Guardrails observing = guardrails(Settings.builder().put(UsageSettings.MAX_WAIT_MILLIS.getKey(), 0L).build());
+        observing.note("a", tier("small"));
+        baseline(observing, "a");
+        for (int i = 0; i < 31; i++) {
+            tenSeconds(observing, "a", 10, 60);
+        }
+        assertEquals(3, observing.level("a"));
+        observing.paceWrite("a", 1_000_000);
+
+        final Guardrails enforcing = guardrails(
+            Settings.builder().put(UsageSettings.MODE.getKey(), "enforce").put(UsageSettings.MAX_WAIT_MILLIS.getKey(), 0L).build()
+        );
+        enforcing.note("a", tier("large"));
+        enforcing.applyCluster(Settings.builder().put(UsageSettings.TENANT_LEVELS.getKey(), "a=3").build());
+        baseline(enforcing, "a");
+        tenSeconds(enforcing, "a", 10, 60);
+        assertEquals(3, enforcing.level("a"));
+        enforcing.paceWrite("a", 1_000_000);
+    }
+
+    public void testAtLevelThreeASearchStillWaitingAtTheDeadlineIsRefused() throws IOException {
+        final Guardrails guardrails = guardrails(
+            Settings.builder()
+                .put(UsageSettings.MODE.getKey(), "enforce")
+                .put(UsageSettings.SEARCH_SLOTS.getKey(), 2)
+                .put(UsageSettings.MAX_WAIT_MILLIS.getKey(), 100L)
+                .build()
+        );
+        guardrails.applyCluster(Settings.builder().put(UsageSettings.TENANT_LEVELS.getKey(), "over=3,two=2").build());
+        try (Releasable other = guardrails.admitSearch(List.of("other"))) {
+            expectThrows(
+                org.opensearch.core.concurrency.OpenSearchRejectedExecutionException.class,
+                () -> guardrails.admitSearch(List.of("over"))
+            );
+            guardrails.admitSearch(List.of("two")).close();
+        }
+        assertEquals(0, guardrails.searchesInFlight());
+        guardrails.admitSearch(List.of("over")).close();
+        assertEquals(1L, guardrails.tenants().get("over").get("refused"));
     }
 }

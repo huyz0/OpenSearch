@@ -64,4 +64,80 @@ public class WritePoolsTests extends OpenSearchTestCase {
         fourth.join();
         assertEquals(3, pools.freePermits());
     }
+
+    /** An apply on another thread, entered or still waiting. */
+    private static final class Apply {
+        final CountDownLatch entered = new CountDownLatch(1);
+        final CountDownLatch end = new CountDownLatch(1);
+        final Thread thread;
+
+        Apply(WritePools pools, String index) {
+            thread = new Thread(() -> {
+                try (Releasable ignored = pools.enterApply(index)) {
+                    entered.countDown();
+                    end.await();
+                } catch (Exception e) {
+                    throw new AssertionError(e);
+                }
+            });
+            thread.start();
+        }
+
+        boolean enteredWithin(long millis) throws InterruptedException {
+            return entered.await(millis, TimeUnit.MILLISECONDS);
+        }
+
+        void finish() throws InterruptedException {
+            end.countDown();
+            thread.join(10_000L);
+        }
+    }
+
+    public void testAnIndexOverItsShareOfAFullGateLetsAnotherGoFirst() throws Exception {
+        // Four permits, an index's share two.
+        final WritePools pools = WritePools.of(Settings.builder().put(cores(3)).put("serverless.cost.max_wait_millis", 10_000L).build());
+        final List<Releasable> hot = new ArrayList<>();
+        for (int i = 0; i < 4; i++) {
+            hot.add(pools.enterApply("hot"));
+        }
+        assertEquals("alone, an index takes every permit", 0, pools.freePermits());
+        final Apply hotAgain = new Apply(pools, "hot");
+        assertFalse(hotAgain.enteredWithin(100L));
+        final Apply cold = new Apply(pools, "cold");
+        assertFalse(cold.enteredWithin(100L));
+        hot.remove(0).close();
+        assertTrue("the permit given back is the other index's", cold.enteredWithin(2_000L));
+        assertFalse("still over its share of a full gate", hotAgain.enteredWithin(200L));
+        hot.remove(0).close();
+        assertTrue(hotAgain.enteredWithin(2_000L));
+        cold.finish();
+        hotAgain.finish();
+        hot.forEach(Releasable::close);
+        assertEquals(4, pools.freePermits());
+    }
+
+    public void testOverItsShareAnIndexWaitsForAnApplyQueuedBehindIt() throws Exception {
+        final WritePools pools = WritePools.of(Settings.builder().put(cores(1)).put("serverless.cost.max_wait_millis", 200L).build());
+        final Releasable a = pools.enterApply("hot");
+        final Releasable b = pools.enterApply("hot");
+        final Apply cold = new Apply(pools, "cold");
+        assertFalse(cold.enteredWithin(100L));
+        // The hot index is over its share of one permit, with another index queued: it waits, then goes to the gate.
+        final Apply hotAgain = new Apply(pools, "hot");
+        a.close();
+        assertTrue(cold.enteredWithin(2_000L));
+        b.close();
+        assertTrue(hotAgain.enteredWithin(2_000L));
+        cold.finish();
+        hotAgain.finish();
+    }
+
+    public void testShareZeroLeavesTheGateAsItWas() throws Exception {
+        final WritePools pools = WritePools.of(Settings.builder().put(cores(1)).put("serverless.cost.write.index_share", 0.0).build());
+        final Releasable a = pools.enterApply("hot");
+        final Releasable b = pools.enterApply("hot");
+        assertEquals(0, pools.freePermits());
+        a.close();
+        b.close();
+    }
 }

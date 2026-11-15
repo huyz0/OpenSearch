@@ -268,6 +268,15 @@ public final class BulkDispatch {
                     failGroup(group, RestStatus.TOO_MANY_REQUESTS, THROTTLED, throttled.getMessage());
                     return true;
                 }
+                final Throwable rejected = org.opensearch.ExceptionsHelper.unwrap(
+                    e,
+                    org.opensearch.core.concurrency.OpenSearchRejectedExecutionException.class
+                );
+                if (rejected != null) {
+                    // Refused before anything was applied, its tenant over its cost budget: a 429 to retry.
+                    failGroup(group, RestStatus.TOO_MANY_REQUESTS, "rejected_execution_exception", rejected.getMessage());
+                    return true;
+                }
                 // A batch that could not be applied here -- the log append failed and the shard was
                 // released, the shard turned out to be a reader, this node's own lease had lapsed -- used
                 // to escape into the fan-out, which swallowed it, and every item answered 500 "the writer

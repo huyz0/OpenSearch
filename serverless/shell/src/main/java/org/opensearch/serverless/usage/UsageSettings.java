@@ -134,6 +134,18 @@ public final class UsageSettings implements SettingsProvider {
     /** How many searches a node runs at once before the fair share applies; zero takes the search pool's size. */
     public static final Setting<Integer> SEARCH_SLOTS = Setting.intSetting("serverless.cost.search.slots", 0, 0, Property.NodeScope);
 
+    /**
+     * The most of a node's write permits one index holds while they are all taken; zero turns it off. Half by default, so
+     * a bulk-heavy member of a bucket cannot starve its neighbours on their shared owner.
+     */
+    public static final Setting<Double> WRITE_INDEX_SHARE = Setting.doubleSetting(
+        "serverless.cost.write.index_share",
+        0.5,
+        0.0,
+        1.0,
+        Property.NodeScope
+    );
+
     /** The longest a search or write is held back; past it, it goes ahead, or is refused where a level says so. */
     public static final Setting<Long> MAX_WAIT_MILLIS = Setting.longSetting(
         "serverless.cost.max_wait_millis",
@@ -159,7 +171,8 @@ public final class UsageSettings implements SettingsProvider {
             TENANT_LEVELS,
             SEARCH_TENANT_SHARE,
             SEARCH_SLOTS,
-            MAX_WAIT_MILLIS
+            MAX_WAIT_MILLIS,
+            WRITE_INDEX_SHARE
         );
     }
 }
