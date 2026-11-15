@@ -8,13 +8,18 @@
 
 package org.opensearch.serverless.store;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.store.BufferedIndexInput;
 import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.blobstore.BlobContainer;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.util.concurrent.Executor;
+import java.util.concurrent.RejectedExecutionException;
 
 /**
  * Reads one segment file out of the object store, a block at a time.
@@ -22,6 +27,10 @@ import java.nio.ByteBuffer;
  * <p>Extends {@link BufferedIndexInput} so Lucene's own buffering and slicing come for free and only
  * the fetch is ours. A read that crosses a block boundary fetches each block it touches and no more —
  * the point being that a query reading a few kilobytes of postings does not pay for the whole segment.
+ *
+ * <p>A slice is a view of the same file, not a copy: its blocks are the file's blocks, keyed on the file's own
+ * grid, so a compound file's sub-file read through a slice and read through the whole file share one cached copy,
+ * and a hint given to a slice reaches the store rather than being dropped by a generic wrapper.
  */
 final class ObjectStoreIndexInput extends BufferedIndexInput {
 
@@ -36,9 +45,22 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
      */
     private static final int MAX_READAHEAD_BLOCKS = 128;
 
+    /**
+     * The most blocks one hint fetches. Lucene announces a term block, a postings start or a stored-fields chunk, each
+     * a few kilobytes, so a hint is one block in practice; the bound keeps a mistaken long one from evicting the cache.
+     */
+    static final int MAX_HINT_BLOCKS = 16;
+
+    private static final Logger logger = LogManager.getLogger(ObjectStoreIndexInput.class);
+
     private final String blobName;
     private final String cacheKeyPrefix;
+    /** The length of this view: the whole file's, or a slice's. */
     private final long length;
+    /** Where this view starts in the file: zero unless it is a slice. */
+    private final long sliceOffset;
+    /** The whole file's length, which bounds a fetch whatever view made it. */
+    private final long fileLength;
     /** Where the file starts in its blob: zero for a file of its own, its offset in a pack. */
     private final long blobOffset;
     private long position;
@@ -70,7 +92,72 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
         this.blobName = blobName;
         this.cacheKeyPrefix = cacheKeyPrefix;
         this.length = length;
+        this.sliceOffset = 0;
+        this.fileLength = length;
         this.blobOffset = blobOffset;
+    }
+
+    private ObjectStoreIndexInput(String resourceDescription, ObjectStoreIndexInput file, long sliceOffset, long length) {
+        super(resourceDescription, file.getBufferSize());
+        this.container = file.container;
+        this.cache = file.cache;
+        this.blobName = file.blobName;
+        this.cacheKeyPrefix = file.cacheKeyPrefix;
+        this.length = length;
+        this.sliceOffset = sliceOffset;
+        this.fileLength = file.fileLength;
+        this.blobOffset = file.blobOffset;
+    }
+
+    @Override
+    public IndexInput slice(String sliceDescription, long offset, long length) {
+        if (offset < 0 || length < 0 || offset + length > this.length) {
+            throw new IllegalArgumentException("slice() " + sliceDescription + " out of bounds: " + this);
+        }
+        return new ObjectStoreIndexInput(getFullSliceDescription(sliceDescription), this, sliceOffset + offset, length);
+    }
+
+    /**
+     * Fetches the announced range ahead, on the cache's prefetch executor, so the read that follows finds it held or
+     * in flight. Does nothing when hints are off, for blocks already held, and for a range past the end: a hint never
+     * fails and never blocks the reader that gave it.
+     */
+    @Override
+    public void prefetch(long offset, long length) {
+        final Executor executor = cache.readPrefetchExecutor();
+        if (executor == null || length <= 0 || offset < 0 || offset >= this.length) {
+            return;
+        }
+        final int blockSize = cache.blockSize();
+        long first = (sliceOffset + offset) / blockSize;
+        long last = Math.min((sliceOffset + Math.min(this.length, offset + length) - 1) / blockSize, first + MAX_HINT_BLOCKS - 1);
+        while (first <= last && cache.holds(key(first))) {
+            first++;
+        }
+        while (last > first && cache.holds(key(last))) {
+            last--;
+        }
+        if (first > last) {
+            return;
+        }
+        final long from = first;
+        final int blocks = (int) (last - first + 1);
+        try {
+            executor.execute(() -> {
+                try {
+                    cache.fetchAhead(key(from), () -> fetchSpan(from, (long) blocks * blockSize));
+                } catch (IOException | RuntimeException e) {
+                    // The read the hint was for fetches for itself, and reports the failure if it is real.
+                    logger.debug("fetch ahead of " + blobName + " block " + from + " failed", e);
+                }
+            });
+        } catch (RejectedExecutionException e) {
+            // A busy pool drops the hint; the read pays its own round trip, as it did before hints.
+        }
+    }
+
+    private String key(long blockIndex) {
+        return cacheKeyPrefix + "#" + blockIndex;
     }
 
     @Override
@@ -79,7 +166,7 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
         if (position + wanted > length) {
             throw new IOException("read past end of " + blobName + ": " + (position + wanted) + " > " + length);
         }
-        long remainingOffset = position;
+        long remainingOffset = sliceOffset + position;
         int remaining = wanted;
         while (remaining > 0) {
             final int blockSize = cache.blockSize();
@@ -96,7 +183,7 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
     }
 
     private byte[] blockAt(long blockIndex) throws IOException {
-        final String key = cacheKeyPrefix + "#" + blockIndex;
+        final String key = key(blockIndex);
         final byte[] resident = cache.get(key);
         if (resident != null) {
             // A hit says nothing about the access pattern -- under read-ahead most of a sequential scan is
@@ -106,44 +193,55 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
         // Single-flighted: a cold block every concurrent query of this segment needs at once is fetched
         // by the first of them and handed to the rest, rather than fetched once per query.
         return cache.fetch(key, () -> {
-            final int blockSize = cache.blockSize();
             // Sequential if this miss is for the block right after the last fetch ended. A scan therefore
             // ramps -- 1 block, 2, 4, 8 -- and a seek drops straight back to one, so random access costs
             // exactly what it did before read-ahead existed.
             readahead = blockIndex == fetchedThrough + 1 ? Math.min(readahead * 2, MAX_READAHEAD_BLOCKS) : 1;
-            final long start = blockIndex * blockSize;
-            final int size = (int) Math.min((long) readahead * blockSize, length - start);
-            final byte[] span = new byte[size];
-            // The one range request, and the whole point of the ramp: a cold scan of a large segment used
-            // to pay one of these per 64 KB, which on an object store is one billed round trip per 64 KB.
-            try (InputStream in = container.readBlob(blobName, blobOffset + start, size)) {
-                int read = 0;
-                while (read < size) {
-                    final int n = in.read(span, read, size - read);
-                    if (n < 0) {
-                        throw new IOException("short read of " + blobName + " at " + start + ": wanted " + size + ", got " + read);
-                    }
-                    read += n;
-                }
-            }
-            fetchedThrough = blockIndex + (size + blockSize - 1) / blockSize - 1;
-            if (size <= blockSize) {
-                // One block: the span is the block, and there is nothing to split or to put.
-                return span;
-            }
-            // Everything the span carried beyond the block that was asked for goes into the cache, so the
-            // reads that follow are hits rather than requests. Put, not fetch: these are not being waited
-            // on, and a concurrent writer of the same key is storing identical bytes.
-            for (int offset = blockSize; offset < size; offset += blockSize) {
-                final int blockLength = Math.min(blockSize, size - offset);
-                final byte[] ahead = new byte[blockLength];
-                System.arraycopy(span, offset, ahead, 0, blockLength);
-                cache.put(cacheKeyPrefix + "#" + (blockIndex + offset / blockSize), ahead);
-            }
-            final byte[] first = new byte[blockSize];
-            System.arraycopy(span, 0, first, 0, blockSize);
-            return first;
+            final int blockSize = cache.blockSize();
+            final long wanted = Math.min((long) readahead * blockSize, fileLength - blockIndex * blockSize);
+            final byte[] block = fetchSpan(blockIndex, wanted);
+            fetchedThrough = blockIndex + (wanted + blockSize - 1) / blockSize - 1;
+            return block;
         });
+    }
+
+    /**
+     * Fetches up to {@code wanted} bytes of the file from the start of a block in one range request, puts every block
+     * after the first into the cache, and returns the first.
+     */
+    private byte[] fetchSpan(long blockIndex, long wanted) throws IOException {
+        final int blockSize = cache.blockSize();
+        final long start = blockIndex * blockSize;
+        final int size = (int) Math.min(wanted, fileLength - start);
+        final byte[] span = new byte[size];
+        // The one range request, and the whole point of the ramp: a cold scan of a large segment used
+        // to pay one of these per 64 KB, which on an object store is one billed round trip per 64 KB.
+        try (InputStream in = container.readBlob(blobName, blobOffset + start, size)) {
+            int read = 0;
+            while (read < size) {
+                final int n = in.read(span, read, size - read);
+                if (n < 0) {
+                    throw new IOException("short read of " + blobName + " at " + start + ": wanted " + size + ", got " + read);
+                }
+                read += n;
+            }
+        }
+        if (size <= blockSize) {
+            // One block: the span is the block, and there is nothing to split or to put.
+            return span;
+        }
+        // Everything the span carried beyond the block that was asked for goes into the cache, so the
+        // reads that follow are hits rather than requests. Put, not fetch: these are not being waited
+        // on, and a concurrent writer of the same key is storing identical bytes.
+        for (int offset = blockSize; offset < size; offset += blockSize) {
+            final int blockLength = Math.min(blockSize, size - offset);
+            final byte[] ahead = new byte[blockLength];
+            System.arraycopy(span, offset, ahead, 0, blockLength);
+            cache.put(key(blockIndex + offset / blockSize), ahead);
+        }
+        final byte[] first = new byte[blockSize];
+        System.arraycopy(span, 0, first, 0, blockSize);
+        return first;
     }
 
     @Override

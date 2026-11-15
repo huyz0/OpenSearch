@@ -92,6 +92,7 @@ public final class BlockCache {
     private final AtomicLong bytesResident = new AtomicLong();
     private final AtomicLong bytesCopied = new AtomicLong();
     private volatile java.util.concurrent.Executor prefetchExecutor;
+    private volatile boolean prefetchReads;
     private volatile java.util.function.LongSupplier clock = System::currentTimeMillis;
 
     /**
@@ -146,6 +147,67 @@ public final class BlockCache {
     /** Where opens fetch ahead, or null when they do not. */
     java.util.concurrent.Executor prefetchExecutor() {
         return prefetchExecutor;
+    }
+
+    /**
+     * Lets an input read over this cache act on Lucene's {@code IndexInput#prefetch} hints: the announced blocks are
+     * fetched on the prefetch executor while the reader goes on to announce the next segment's, so a query over many
+     * segments waits for their round trips together rather than one after another. Has no effect without an executor.
+     *
+     * @param enabled whether hints fetch ahead
+     * @return this, for chaining
+     */
+    public BlockCache prefetchingReads(boolean enabled) {
+        this.prefetchReads = enabled;
+        return this;
+    }
+
+    /** Where a read hint fetches ahead, or null when hints fetch nothing. */
+    java.util.concurrent.Executor readPrefetchExecutor() {
+        return prefetchReads ? prefetchExecutor : null;
+    }
+
+    /**
+     * Fetches a block nobody is waiting on yet, unless it is held or already being fetched.
+     *
+     * <p>Claims the key like {@link #fetch}, so a reader that misses while this runs waits for it rather than
+     * fetching the block again. Counts no hit or miss: a hint is not a read. If it fails, the readers that waited are
+     * told to fetch for themselves rather than handed a failure of a request they never made.
+     *
+     * @param key the block's identity
+     * @param fetcher how to fetch it
+     * @throws IOException if the fetch failed
+     */
+    void fetchAhead(String key, Fetcher fetcher) throws IOException {
+        if (peek(key) != null) {
+            return;
+        }
+        final CompletableFuture<byte[]> mine = new CompletableFuture<>();
+        if (inFlight.putIfAbsent(key, mine) != null) {
+            return;
+        }
+        try {
+            final byte[] landed = peek(key);
+            if (landed != null) {
+                mine.complete(landed);
+                return;
+            }
+            final byte[] block = fetcher.fetch();
+            put(key, block);
+            mine.complete(block);
+        } catch (IOException | RuntimeException | Error e) {
+            mine.completeExceptionally(new AheadFetchFailed(e));
+            throw e;
+        } finally {
+            inFlight.remove(key, mine);
+        }
+    }
+
+    /** A fetch ahead failed: whoever waited on it did not ask for that request and fetches for itself. */
+    private static final class AheadFetchFailed extends RuntimeException {
+        AheadFetchFailed(Throwable cause) {
+            super(cause);
+        }
     }
 
     /** Looks up a block without counting a hit or a miss: a prefetch asking what it can skip is not a reader. */
@@ -341,6 +403,10 @@ public final class BlockCache {
                 Thread.currentThread().interrupt();
                 throw new IOException("interrupted while waiting for another reader's fetch of " + key, e);
             } catch (ExecutionException e) {
+                if (e.getCause() instanceof AheadFetchFailed) {
+                    // A hint's fetch, not a reader's: its failure is not this reader's, which tries for itself.
+                    return fetch(key, fetcher);
+                }
                 if (e.getCause() instanceof IOException io) {
                     throw new IOException("the fetch of " + key + " this reader waited on failed", io);
                 }
