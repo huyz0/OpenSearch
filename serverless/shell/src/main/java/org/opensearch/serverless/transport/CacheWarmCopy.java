@@ -13,8 +13,7 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.CacheHotSet;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.store.BlockCache;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportChannel;
@@ -35,7 +34,7 @@ import java.util.function.LongSupplier;
  * <p>A search node that joins cold serves its first searches from S3: every block a query touches is a GET, and the
  * shards it is handed were warm on another node a moment before. Those blocks are worth the same on any node, since a
  * cache key names a shard's storage and a file, not the node. So a joiner asks each search peer which of the peer's
- * readers it will serve once ready ({@link CacheHotSet}), then pulls those blocks, hottest first, over the transport.
+ * readers it will serve once ready ({@code CacheHotSet}), then pulls those blocks, hottest first, over the transport.
  *
  * <p>Bounded on both sides. The joiner paces itself to {@code serverless.search.warm_copy.max_bytes_per_second} and asks for
  * {@code serverless.search.warm_copy.batch_blocks} blocks at a time, so a peer serving searches gives up a little bandwidth and no more; the peer
@@ -133,8 +132,8 @@ public final class CacheWarmCopy {
      * @param node the node
      * @return a copier
      */
-    public static CacheWarmCopy of(ServerlessNode node) {
-        return new CacheWarmCopy(node.router());
+    public static CacheWarmCopy of(NodeContext node) {
+        return new CacheWarmCopy(org.opensearch.serverless.transport.ShardRouter.of(node));
     }
 
     /**
@@ -172,6 +171,29 @@ public final class CacheWarmCopy {
         );
     }
 
+    /** What this node answers a draining peer and a joiner with, defined above the transport and attached to the node. */
+    public interface Answers {
+        /**
+         * Takes over a draining peer's share of the readers: copies their warm blocks, opens the shards.
+         *
+         * @param plane this node's metadata plane
+         * @param drainingId the draining peer
+         * @return how many shards were opened and blocks copied
+         */
+        HandOffResponse takeOverFrom(MetadataPlane plane, String drainingId);
+
+        /**
+         * The shards held here as readers that a joiner will serve, with their hot blocks.
+         *
+         * @param members the live leases
+         * @param joinerId the joining node
+         * @param readSinceMillis the oldest last read that still counts as hot, by this node's clock
+         * @param maxBytes the most bytes of blocks to name
+         * @return the joiner's share, each shard's keys hottest first
+         */
+        List<HotSetResponse.HotShard> hotSet(java.util.Collection<NodeLease> members, String joinerId, long readSinceMillis, long maxBytes);
+    }
+
     void handleHandOff(HandOffRequest request, TransportChannel channel, org.opensearch.tasks.Task task) throws Exception {
         router.requireMac(HandOffRequest.ACTION, request);
         final MetadataPlane plane = router.plane.get();
@@ -179,12 +201,7 @@ public final class CacheWarmCopy {
             channel.sendResponse(new HandOffResponse(0, 0));
             return;
         }
-        final org.opensearch.serverless.shell.SearchWarmup.Outcome outcome = org.opensearch.serverless.shell.SearchWarmup.takeOverFrom(
-            router.node,
-            plane,
-            request.drainingId()
-        );
-        channel.sendResponse(new HandOffResponse(outcome.opened(), outcome.copy().blocksCopied()));
+        channel.sendResponse(router.node.part(Answers.class).takeOverFrom(plane, request.drainingId()));
     }
 
     /**
@@ -222,18 +239,11 @@ public final class CacheWarmCopy {
             // The joiner renewed a moment ago and this node's snapshot has not caught up: it asked because it is a member.
             members = plane.membership().refresh();
         }
-        final ServerlessNode node = router.node;
+        final long readSince = request.recentMillis() == Long.MAX_VALUE
+            ? Long.MIN_VALUE
+            : router.node.blockCache().nowMillis() - request.recentMillis();
         channel.sendResponse(
-            new HotSetResponse(
-                CacheHotSet.forJoiner(
-                    node,
-                    members,
-                    request.joinerId(),
-                    org.opensearch.serverless.cluster.HotShardSpread.of(node, node.settings()),
-                    request.recentMillis() == Long.MAX_VALUE ? Long.MIN_VALUE : node.blockCache().nowMillis() - request.recentMillis(),
-                    request.maxBytes()
-                )
-            )
+            new HotSetResponse(router.node.part(Answers.class).hotSet(members, request.joinerId(), readSince, request.maxBytes()))
         );
     }
 
@@ -275,7 +285,7 @@ public final class CacheWarmCopy {
         final long now = plane.clock().getAsLong();
         for (NodeLease lease : plane.membership().refresh()) {
             if (lease.nodeId().equals(self) == false
-                && lease.roles().contains(ServerlessNode.ROLE_SEARCH)
+                && lease.roles().contains(NodeContext.ROLE_SEARCH)
                 && lease.isExpiredAt(now) == false) {
                 peers.add(lease.nodeId());
             }
@@ -365,7 +375,7 @@ public final class CacheWarmCopy {
                     continue;
                 }
                 final List<List<String>> perShard = new ArrayList<>();
-                for (CacheHotSet.HotShard hot : got.get().getValue().shards()) {
+                for (HotSetResponse.HotShard hot : got.get().getValue().shards()) {
                     final Shard shard = new Shard(hot.indexName(), hot.indexUuid(), hot.shard());
                     shards.computeIfAbsent(shard, k -> new java.util.LinkedHashSet<>());
                     for (String key : hot.keys()) {

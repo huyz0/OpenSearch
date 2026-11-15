@@ -82,7 +82,7 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
     /** Settings that send a forked node's data to a bucket instead of a directory. */
     private Map<String, String> bucketSettings(String bucket) {
         return Map.of(
-            org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(),
+            org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(),
             TTL,
             org.opensearch.serverless.store.ObjectStoreSettings.TYPE.getKey(),
             "s3",
@@ -235,7 +235,7 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
                     )
                 );
                 final Map<String, String> settings = new java.util.LinkedHashMap<>(bucketSettings(bucket));
-                settings.put(org.opensearch.serverless.shell.ActivationSettings.MAX_SHARDS.getKey(), "2");
+                settings.put(org.opensearch.serverless.node.ActivationSettings.MAX_SHARDS.getKey(), "2");
                 fleet.add(NodeProcess.start(name, null, home, settings));
             }
 

@@ -14,9 +14,9 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.WriteFences;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.shell.WriteFences;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.concurrent.atomic.AtomicLong;
@@ -143,7 +143,7 @@ public class ServerlessRoutingFreshnessTests extends OpenSearchTestCase {
 
             // But the shard it would route to no longer answers for that name, so the write is refused.
             // place() matches an open shard on uuid, and the recreated index's shard is a different one.
-            final var operations = new org.opensearch.serverless.shard.ShardOperations(node, mine);
+            final var operations = new org.opensearch.serverless.ops.ShardOperations(node, mine);
             final var refused = expectThrows(
                 Exception.class,
                 "a write routed by a stale resolution must not be acknowledged into the previous incarnation",

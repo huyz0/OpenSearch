@@ -71,7 +71,7 @@ public class ServerlessOnObjectStoreTests extends OpenSearchTestCase {
             // resolves -- which surfaces as a timeout rather than as a configuration error.
             .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH_STYLE_ACCESS.getKey(), true)
             .put(org.opensearch.serverless.store.ObjectStoreSettings.REGION.getKey(), "us-east-1")
-            .put(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), 3_000L)
+            .put(org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(), 3_000L)
             .setSecureSettings(secure)
             .build();
     }

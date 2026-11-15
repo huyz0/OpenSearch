@@ -9,7 +9,7 @@
 package org.opensearch.serverless.shard;
 
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.serverless.shell.Document;
+import org.opensearch.serverless.write.Document;
 
 /** A document, and which copy answered for it. */
 public final class Read {
@@ -19,7 +19,7 @@ public final class Read {
     private final boolean realtime;
     private final ShardId shardId;
 
-    Read(Document document, String servedBy, boolean realtime, ShardId shardId) {
+    public Read(Document document, String servedBy, boolean realtime, ShardId shardId) {
         this.document = document;
         this.servedBy = servedBy;
         this.realtime = realtime;

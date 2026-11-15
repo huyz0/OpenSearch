@@ -8,6 +8,7 @@
 package org.opensearch.serverless.transport;
 
 import org.opensearch.node.NodeClosedException;
+import org.opensearch.serverless.write.ForwardFailure;
 import org.opensearch.test.OpenSearchTestCase;
 import org.opensearch.transport.ConnectTransportException;
 import org.opensearch.transport.SendRequestTransportException;

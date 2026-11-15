@@ -59,7 +59,7 @@ import java.util.function.Supplier;
 public final class FieldCapabilitiesHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    private final Supplier<org.opensearch.serverless.node.NodeContext> node;
 
     /**
      * Creates the handler.
@@ -67,7 +67,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the serving node
      */
-    public FieldCapabilitiesHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public FieldCapabilitiesHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -190,7 +190,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                             throw unsupported("field capabilities require index names or a bounded prefix pattern");
                         }
                         return answer(metadata, serving, String.join(",", selected.indices()), selected.fields());
-                    }, new org.opensearch.serverless.shell.ActionGate.ResponseView<CapabilitiesResult>() {
+                    }, new org.opensearch.serverless.action.ActionGate.ResponseView<CapabilitiesResult>() {
                         @Override
                         public org.opensearch.core.action.ActionResponse show(CapabilitiesResult value) {
                             return value.response();
@@ -224,7 +224,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
 
     private CapabilitiesResult answer(
         MetadataPlane metadata,
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         String index,
         String[] wanted
     ) throws Exception {

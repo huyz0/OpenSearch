@@ -70,10 +70,10 @@ final class PluginNodeAnswers {
         final FsService fs;
 
         Monitors(ServerlessNode node) throws IOException {
-            this.os = new OsService(node.settings);
-            this.process = new ProcessService(node.settings);
-            this.jvm = new JvmService(node.settings);
-            this.fs = new FsService(node.settings, node.nodeEnvironment(), null);
+            this.os = new OsService(node.settings());
+            this.process = new ProcessService(node.settings());
+            this.jvm = new JvmService(node.settings());
+            this.fs = new FsService(node.settings(), node.nodeEnvironment(), null);
         }
     }
 
@@ -89,7 +89,7 @@ final class PluginNodeAnswers {
                     Version.CURRENT,
                     Build.CURRENT,
                     local,
-                    metrics.contains(NodesInfoRequest.Metric.SETTINGS.metricName()) ? node.settings : null,
+                    metrics.contains(NodesInfoRequest.Metric.SETTINGS.metricName()) ? node.settings() : null,
                     metrics.contains(NodesInfoRequest.Metric.OS.metricName()) ? monitors.os.info() : null,
                     metrics.contains(NodesInfoRequest.Metric.PROCESS.metricName()) ? monitors.process.info() : null,
                     metrics.contains(NodesInfoRequest.Metric.JVM.metricName()) ? monitors.jvm.info() : null,
@@ -216,12 +216,12 @@ final class PluginNodeAnswers {
             || patterns.length == 0
             || (patterns.length == 1 && ("_all".equals(patterns[0]) || "*".equals(patterns[0])));
         final List<IndexShard> shards = new ArrayList<>();
-        if (node.reconciler == null) {
+        if (node.reconciler() == null) {
             return shards;
         }
-        for (ShardId shardId : node.reconciler.openShards()) {
+        for (ShardId shardId : node.reconciler().openShards()) {
             if (all || Regex.simpleMatch(patterns, shardId.getIndexName())) {
-                final IndexShard shard = node.reconciler.shard(shardId);
+                final IndexShard shard = node.reconciler().shard(shardId);
                 if (shard != null) {
                     shards.add(shard);
                 }

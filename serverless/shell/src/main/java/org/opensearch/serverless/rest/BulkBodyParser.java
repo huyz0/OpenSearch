@@ -13,6 +13,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.store.WalRecord;
 
 import java.io.ByteArrayInputStream;

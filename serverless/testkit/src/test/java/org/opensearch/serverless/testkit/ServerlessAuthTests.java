@@ -908,7 +908,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = Settings.builder()
             .put(nodeSettings("auth-daemon"))
             .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), store.toString())
-            .put(org.opensearch.serverless.shell.NodeSettings.PLUGINS.getKey(), ServerlessAuthPlugin.class.getName())
+            .put(org.opensearch.serverless.node.NodeSettings.PLUGINS.getKey(), ServerlessAuthPlugin.class.getName())
             .build();
 
         try (var boot = org.opensearch.serverless.shell.ServerlessBootstrap.start(settings)) {
@@ -930,7 +930,7 @@ public class ServerlessAuthTests extends OpenSearchTestCase {
         final Settings settings = Settings.builder()
             .put(nodeSettings("auth-daemon-missing"))
             .put(org.opensearch.serverless.store.ObjectStoreSettings.PATH.getKey(), createTempDir().toString())
-            .put(org.opensearch.serverless.shell.NodeSettings.PLUGINS.getKey(), "com.example.NotAPluginThatExists")
+            .put(org.opensearch.serverless.node.NodeSettings.PLUGINS.getKey(), "com.example.NotAPluginThatExists")
             .build();
         final var failure = expectThrows(
             IllegalArgumentException.class,

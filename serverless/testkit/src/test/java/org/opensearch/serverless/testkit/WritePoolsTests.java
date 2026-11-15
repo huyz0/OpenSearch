@@ -10,7 +10,7 @@ package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
-import org.opensearch.serverless.shell.WritePools;
+import org.opensearch.serverless.node.WritePools;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;

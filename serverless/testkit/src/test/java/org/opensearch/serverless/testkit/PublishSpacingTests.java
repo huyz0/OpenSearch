@@ -132,12 +132,17 @@ public class PublishSpacingTests extends OpenSearchTestCase {
         final int shards = 4;
         final int seconds = 20;
         final Cost everyPass = writeOncePerSecond("every-pass", shards, seconds, 0L);
-        final Cost spaced = writeOncePerSecond("spaced", shards, seconds, ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL.millis());
+        final Cost spaced = writeOncePerSecond(
+            "spaced",
+            shards,
+            seconds,
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MIN_INTERVAL.millis()
+        );
         logger.info(
             "publish spacing: {} PUTs per write publishing every pass, {} with a {} minimum interval",
             String.format(Locale.ROOT, "%.2f", everyPass.putsPerWrite()),
             String.format(Locale.ROOT, "%.2f", spaced.putsPerWrite()),
-            ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MIN_INTERVAL
         );
         // Every write still pays its own log append, so neither run can go below one PUT per write.
         assertTrue("a write costs at least its log append: " + spaced.putsPerWrite(), spaced.putsPerWrite() >= 1.0);

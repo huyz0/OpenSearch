@@ -39,7 +39,7 @@ import java.util.function.Supplier;
 public final class IndexAdminHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    private final Supplier<org.opensearch.serverless.node.NodeContext> node;
 
     /**
      * Creates the handler.
@@ -56,7 +56,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the node, whose action gate the plugins' filters live behind
      */
-    public IndexAdminHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public IndexAdminHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -458,7 +458,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * @throws Exception if validation or metadata persistence fails
      */
     public static IndexDescriptor createIndex(
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         MetadataPlane metadata,
         org.opensearch.action.admin.indices.create.CreateIndexRequest request
     ) throws Exception {
@@ -470,7 +470,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
     }
 
     static IndexDescriptor createIndex(
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         MetadataPlane metadata,
         String index,
         IndexCreateRequest create
@@ -479,7 +479,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
     }
 
     static IndexDescriptor createIndex(
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         MetadataPlane metadata,
         String index,
         IndexCreateRequest create,
@@ -512,7 +512,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
         IndexCreation.validateIndexSettings(settings, atCreation);
     }
 
-    static void validateIndexSettings(Settings settings, boolean atCreation, org.opensearch.serverless.shell.ServerlessNode serving)
+    static void validateIndexSettings(Settings settings, boolean atCreation, org.opensearch.serverless.node.NodeContext serving)
         throws RefusedException {
         IndexCreation.validateIndexSettings(settings, atCreation, IndexCreation.scopedFor(serving));
     }
@@ -576,7 +576,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * @throws Exception if a filter refused, or the work itself failed
      */
     public static <T> T gate(
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         String action,
         org.opensearch.action.ActionRequest request,
         org.opensearch.common.CheckedSupplier<T, Exception> work
@@ -609,7 +609,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
      * @param answer what to send once the window has passed
      */
     static void afterDeleteSettles(
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         org.opensearch.common.CheckedRunnable<IOException> answer
     ) throws IOException {
         if (serving == null) {
@@ -624,7 +624,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
                     .warn("could not answer a delete after it settled", e);
             }
         },
-            org.opensearch.common.unit.TimeValue.timeValueMillis(org.opensearch.serverless.shell.WriteFences.DELETE_SETTLE_MILLIS),
+            org.opensearch.common.unit.TimeValue.timeValueMillis(org.opensearch.serverless.node.WriteFences.DELETE_SETTLE_MILLIS),
             org.opensearch.threadpool.ThreadPool.Names.GENERIC
         );
     }
@@ -640,7 +640,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
                 response.addHeader("Retry-After", Integer.toString(throttled.retryAfterSeconds()));
                 return response;
             }
-            if (cause instanceof org.opensearch.serverless.shell.StaleIncarnationException) {
+            if (cause instanceof org.opensearch.serverless.write.StaleIncarnationException) {
                 // Routed by a resolution that has since gone stale; resolving again is the whole remedy.
                 return error(channel, RestStatus.SERVICE_UNAVAILABLE, "index_recreated", cause.getMessage());
             }

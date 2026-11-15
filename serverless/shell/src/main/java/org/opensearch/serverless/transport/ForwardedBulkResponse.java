@@ -11,7 +11,7 @@ package org.opensearch.serverless.transport;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.transport.TransportResponse;
-import org.opensearch.serverless.shell.BulkOutcome;
+import org.opensearch.serverless.write.BulkOutcome;
 
 import java.io.IOException;
 import java.util.ArrayList;

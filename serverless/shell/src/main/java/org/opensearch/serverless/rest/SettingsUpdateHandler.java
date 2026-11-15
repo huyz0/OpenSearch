@@ -57,7 +57,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
     private static final int ATTEMPTS = 4;
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    private final Supplier<org.opensearch.serverless.node.NodeContext> node;
 
     /**
      * Creates the handler.
@@ -65,7 +65,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the serving node
      */
-    public SettingsUpdateHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public SettingsUpdateHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -207,10 +207,10 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
                 }
                 continue;
             }
-            if (org.opensearch.serverless.shell.NodeSettings.SEGMENT_PLACEMENT_INDEX.getKey().equals(key)) {
+            if (org.opensearch.serverless.node.NodeSettings.SEGMENT_PLACEMENT_INDEX.getKey().equals(key)) {
                 // Ours, and dynamic: it applies to each shard's next publish.
                 try {
-                    org.opensearch.serverless.shell.SegmentPlacement.check(requested.get(key));
+                    org.opensearch.serverless.node.SegmentPlacement.check(requested.get(key));
                 } catch (IllegalArgumentException e) {
                     return e.getMessage();
                 }
@@ -288,7 +288,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
     private void apply(
         org.opensearch.rest.RestChannel channel,
         MetadataPlane metadata,
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         String index,
         Settings requested,
         boolean preserveExisting

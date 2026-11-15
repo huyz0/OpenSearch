@@ -15,13 +15,14 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.DocumentRouting;
+import org.opensearch.serverless.ops.ShardOperations;
+import org.opensearch.serverless.ops.UpdateOutcome;
 import org.opensearch.serverless.shard.DocumentMissingException;
 import org.opensearch.serverless.shard.NoSuchIndexException;
 import org.opensearch.serverless.shard.NotHereException;
-import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.serverless.shard.SystemIndexException;
-import org.opensearch.serverless.shard.UpdateOutcome;
-import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -35,7 +36,7 @@ import java.util.function.Supplier;
  */
 public final class UpdateHandler extends BaseRestHandler {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
     /**
@@ -44,7 +45,7 @@ public final class UpdateHandler extends BaseRestHandler {
      * @param node supplies the node serving the request
      * @param plane supplies the metadata plane
      */
-    public UpdateHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public UpdateHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -176,8 +177,8 @@ public final class UpdateHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_write", "_source on an update is not supported")
             );
         }
-        final ServerlessNode serving = node.get();
-        return channel -> serving.threadPool().executor(org.opensearch.serverless.shell.WritePools.POOL).execute(() -> {
+        final NodeContext serving = node.get();
+        return channel -> serving.threadPool().executor(org.opensearch.serverless.node.WritePools.POOL).execute(() -> {
             final var operations = new ShardOperations(serving, metadata, true);
             try {
                 respond(channel, operations.update(parsed));

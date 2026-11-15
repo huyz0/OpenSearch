@@ -131,7 +131,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
                 node.shards().publishShard(writer, plane.heads().read("recreated", 0).orElseThrow().term());
                 final var failure = expectThrows(
                     IOException.class,
-                    () -> org.opensearch.serverless.rest.SearchFanout.run(
+                    () -> org.opensearch.serverless.ops.SearchFanout.run(
                         node,
                         plane,
                         original,
@@ -140,7 +140,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
                 );
                 assertNotNull(
                     "the old plan must fail instead of returning replacement documents",
-                    org.opensearch.ExceptionsHelper.unwrap(failure, org.opensearch.serverless.shell.StaleIncarnationException.class)
+                    org.opensearch.ExceptionsHelper.unwrap(failure, org.opensearch.serverless.write.StaleIncarnationException.class)
                 );
             }
         }
@@ -172,7 +172,7 @@ public class ServerlessReaderCorrectnessTests extends OpenSearchTestCase {
                 node.shards().publishShard(writer, term);
                 assertTrue(plane.heads().release("recreated", 0, node.localNode().getId(), term));
                 node.shards().releaseShard(writer, "the replacement is served only from its published commit");
-                final var operations = new org.opensearch.serverless.shard.ShardOperations(node, plane);
+                final var operations = new org.opensearch.serverless.ops.ShardOperations(node, plane);
                 operations.assumeDescribed(original);
                 if (explain) {
                     assertFalse(

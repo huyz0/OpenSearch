@@ -11,13 +11,23 @@ package org.opensearch.serverless.transport;
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.transport.TransportResponse;
-import org.opensearch.serverless.shell.CacheHotSet.HotShard;
 
 import java.io.IOException;
 import java.util.List;
 
 /** A peer's answer to a {@link HotSetRequest}: the joiner's share of its readers, with their warm block keys. */
 public final class HotSetResponse extends TransportResponse {
+
+    /**
+     * One shard the joiner will serve, and the blocks to copy for it.
+     *
+     * @param indexName the index
+     * @param indexUuid the index's uuid
+     * @param shard the shard number
+     * @param keys block cache keys, hottest first
+     */
+    public record HotShard(String indexName, String indexUuid, int shard, List<String> keys) {
+    }
 
     private final List<HotShard> shards;
 

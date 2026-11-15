@@ -22,9 +22,9 @@ import org.opensearch.action.support.WriteRequest;
 import org.opensearch.action.update.UpdateRequest;
 import org.opensearch.action.update.UpdateResponse;
 import org.opensearch.core.action.ActionResponse;
+import org.opensearch.serverless.ops.ShardOperations;
 import org.opensearch.serverless.shard.NoSuchIndexException;
 import org.opensearch.serverless.shard.NotHereException;
-import org.opensearch.serverless.shard.ShardOperations;
 
 /**
  * Multi-get, bulk and update for plugins, built from the single-document operations the client already runs.

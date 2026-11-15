@@ -85,7 +85,7 @@ public class WarmCopyFromManyPeersTests extends OpenSearchTestCase {
                         "many-joiner",
                         "search",
                         Settings.builder()
-                            .put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), true)
+                            .put(org.opensearch.serverless.node.SearchSettings.WARM_ON_JOIN.getKey(), true)
                             .put(org.opensearch.serverless.transport.WarmCopySettings.BATCH_BLOCKS.getKey(), 1)
                             .build()
                     )

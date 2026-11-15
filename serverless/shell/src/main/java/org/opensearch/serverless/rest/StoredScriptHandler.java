@@ -18,8 +18,8 @@ import org.opensearch.script.ScriptModule;
 import org.opensearch.script.StoredScriptSource;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.StoredScriptStore;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.script.StoredScripts;
-import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -37,7 +37,7 @@ import java.util.function.Supplier;
 public final class StoredScriptHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
 
     /**
      * Creates the handler.
@@ -45,7 +45,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the node
      */
-    public StoredScriptHandler(Supplier<MetadataPlane> plane, Supplier<ServerlessNode> node) {
+    public StoredScriptHandler(Supplier<MetadataPlane> plane, Supplier<NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -76,7 +76,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
         request.param("master_timeout");
         request.param("timeout");
         final MetadataPlane metadata = plane.get();
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
@@ -112,7 +112,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
                             validate(selected, selected.id());
                             return put(serving, store, selected.id(), selected.context(), selected.source());
                         },
-                            org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.serverless.action.ActionGate.identity(
                                 org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
                             )
                         );
@@ -134,7 +134,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
                                 validate(selected, selected.id());
                                 return delete(serving, store, selected.id());
                             },
-                            org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.serverless.action.ActionGate.identity(
                                 org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
                             )
                         );
@@ -156,7 +156,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
                                 validate(selected, selected.id());
                                 return get(store, selected.id());
                             },
-                            org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.serverless.action.ActionGate.identity(
                                 org.opensearch.action.admin.cluster.storedscripts.GetStoredScriptResponse.class
                             )
                         );
@@ -180,7 +180,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
     }
 
     private org.opensearch.action.support.clustermanager.AcknowledgedResponse put(
-        ServerlessNode serving,
+        NodeContext serving,
         StoredScriptStore store,
         String id,
         String context,
@@ -219,7 +219,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
     }
 
     @SuppressWarnings({ "rawtypes", "unchecked" })
-    private static void compile(ServerlessNode serving, StoredScriptSource source, ScriptContext context) {
+    private static void compile(NodeContext serving, StoredScriptSource source, ScriptContext context) {
         serving.services()
             .scriptService()
             .compile(
@@ -259,7 +259,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
     }
 
     private static org.opensearch.action.support.clustermanager.AcknowledgedResponse delete(
-        ServerlessNode serving,
+        NodeContext serving,
         StoredScriptStore store,
         String id
     ) throws IOException {

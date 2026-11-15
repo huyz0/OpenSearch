@@ -17,7 +17,6 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.ReconcileScheduler;
 import org.opensearch.serverless.shard.ShardReconciler;
-import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.transport.RefreshVisibility;
 import org.opensearch.test.OpenSearchTestCase;
@@ -45,7 +44,7 @@ import java.util.concurrent.atomic.AtomicInteger;
     S3ClientThreads.class })
 public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
 
-    private static final long TTL = ServerlessBootstrap.DEFAULT_LEASE_TTL_MILLIS;
+    private static final long TTL = org.opensearch.serverless.node.NodeSettings.DEFAULT_LEASE_TTL_MILLIS;
     private static final long WINDOW = 250;
     private static final long REQUEST_MILLIS = 20;
     private static final int TAIL_EVERY = 50;
@@ -73,8 +72,8 @@ public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
 
     private static ReconcileScheduler scheduled(ServerlessNode node, MetadataPlane plane, BackgroundReconciler loop) {
         loop.setLazyPublish(
-            ServerlessBootstrap.DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS,
-            ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS,
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS,
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS,
             WINDOW
         );
         final ReconcileScheduler scheduler = new ReconcileScheduler(
@@ -86,8 +85,8 @@ public class RefreshVisibilityMeterTests extends OpenSearchTestCase {
             ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
         );
         scheduler.setPublishSpacing(
-            ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL,
-            ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MIN_INTERVAL,
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS
         );
         node.setSignals(scheduler);
         return scheduler.start();

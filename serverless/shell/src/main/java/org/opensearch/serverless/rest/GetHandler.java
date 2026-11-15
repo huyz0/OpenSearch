@@ -16,8 +16,10 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.Document;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.DocumentRouting;
+import org.opensearch.serverless.ops.SourceFiltering;
+import org.opensearch.serverless.write.Document;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.ByteArrayInputStream;
@@ -53,7 +55,7 @@ import java.util.function.Supplier;
  */
 public final class GetHandler extends BaseRestHandler {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
     /**
@@ -62,7 +64,7 @@ public final class GetHandler extends BaseRestHandler {
      * @param node supplies the node serving the request
      * @param plane supplies the metadata plane
      */
-    public GetHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public GetHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -147,7 +149,7 @@ public final class GetHandler extends BaseRestHandler {
                 )
             );
         }
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_not_ready", "no node is serving requests yet")
@@ -177,7 +179,7 @@ public final class GetHandler extends BaseRestHandler {
 
     private void answer(
         org.opensearch.rest.RestChannel channel,
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         IndexDescriptor descriptor,
         String id,
@@ -188,7 +190,7 @@ public final class GetHandler extends BaseRestHandler {
         boolean sourceOnly
     ) throws Exception {
         final String index = descriptor.name();
-        final var operations = new org.opensearch.serverless.shard.ShardOperations(serving, metadata, true);
+        final var operations = new org.opensearch.serverless.ops.ShardOperations(serving, metadata, true);
         // Read once, above, for the shard number; not again for the placement.
         operations.assumeDescribed(descriptor);
         try {

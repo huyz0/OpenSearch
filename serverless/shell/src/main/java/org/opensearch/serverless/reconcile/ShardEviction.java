@@ -157,7 +157,7 @@ final class ShardEviction {
                 && reconciler.node.nodeCapacity().memberBelowMean(reconciler.plane).isPresent()) {
                 final int floor = (int) Math.ceil(
                     reconciler.node.nodeCapacity().fleetMeanHeld(reconciler.plane)
-                        * org.opensearch.serverless.shell.NodeCapacity.HAND_OFF_DOWN_TO_MEAN
+                        * org.opensearch.serverless.node.NodeCapacity.HAND_OFF_DOWN_TO_MEAN
                 );
                 return evictDownTo(floor, Math.max(1, reconciler.maxShardsHeld / 10), true);
             }

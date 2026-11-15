@@ -53,10 +53,10 @@ public class BucketCheckpointTests extends OpenSearchTestCase {
             .put("serverless.roles", roles)
             .put("serverless.segments.node_pack.enabled", true)
             .put("serverless.buckets.enabled", true)
-            .put(org.opensearch.serverless.shell.WriteSettings.NODE_LOG_PUBLISH_MAX_AGE_MILLIS.getKey(), 0L)
-            .put(org.opensearch.serverless.shell.WriteSettings.PUBLISH_MIN_INTERVAL_MILLIS.getKey(), 0L)
+            .put(org.opensearch.serverless.node.WriteSettings.NODE_LOG_PUBLISH_MAX_AGE_MILLIS.getKey(), 0L)
+            .put(org.opensearch.serverless.node.WriteSettings.PUBLISH_MIN_INTERVAL_MILLIS.getKey(), 0L)
             .put(
-                org.opensearch.serverless.shell.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey(),
+                org.opensearch.serverless.node.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey(),
                 org.opensearch.serverless.store.CommitStaging.MIN_STAGED_MILLIS
             )
             .build();

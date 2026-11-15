@@ -60,7 +60,7 @@ final class LeaseUpkeep {
      * <p>Separated from {@link #verifyHeads()} so the lease can be renewed on its own clock, ahead of and
      * independent from the pass that reads one head per held shard. If the lease had already lapsed by
      * this node's own clock, every writer shard is released <em>before</em> the renewal -- see
-     * {@link org.opensearch.serverless.shell.NodeLeases#renewLease}.
+     * {@link org.opensearch.serverless.node.NodeLeases#renewLease}.
      *
      * @return the shards released because the lease had lapsed
      * @throws Exception if the metadata plane cannot be reached

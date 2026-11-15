@@ -21,12 +21,13 @@ import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.DocumentRouting;
+import org.opensearch.serverless.ops.ShardOperations;
 import org.opensearch.serverless.shard.Explained;
 import org.opensearch.serverless.shard.NoSuchIndexException;
 import org.opensearch.serverless.shard.NotHereException;
-import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.serverless.shard.SystemIndexException;
-import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -53,7 +54,7 @@ import java.util.function.Supplier;
 public final class ExplainHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
 
     /**
      * Creates the handler.
@@ -61,7 +62,7 @@ public final class ExplainHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the serving node
      */
-    public ExplainHandler(Supplier<MetadataPlane> plane, Supplier<ServerlessNode> node) {
+    public ExplainHandler(Supplier<MetadataPlane> plane, Supplier<NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -108,7 +109,7 @@ public final class ExplainHandler extends BaseRestHandler {
         }
 
         final MetadataPlane metadata = plane.get();
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")

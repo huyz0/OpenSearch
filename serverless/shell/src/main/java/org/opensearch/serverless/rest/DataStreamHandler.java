@@ -20,7 +20,7 @@ import org.opensearch.serverless.metadata.AliasAtGeneration;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.TemplateResolver;
 import org.opensearch.serverless.metadata.TooManyMatchesException;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -43,7 +43,7 @@ import java.util.function.Supplier;
  */
 public final class DataStreamHandler extends BaseRestHandler {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
     /**
@@ -52,7 +52,7 @@ public final class DataStreamHandler extends BaseRestHandler {
      * @param node supplies the node
      * @param plane supplies the metadata plane
      */
-    public DataStreamHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public DataStreamHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -121,7 +121,7 @@ public final class DataStreamHandler extends BaseRestHandler {
             request.param(hint);
         }
         final MetadataPlane metadata = plane.get();
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
@@ -154,7 +154,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                             }
                             listener.onResponse(create(serving, metadata, selected.indices()[0]));
                         },
-                        org.opensearch.serverless.shell.ActionGate.identity(
+                        org.opensearch.serverless.action.ActionGate.identity(
                             org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
                         ),
                         answer(channel)
@@ -175,7 +175,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                             }
                             listener.onResponse(describe(serving, metadata, selected.indices()));
                         },
-                        org.opensearch.serverless.shell.ActionGate.identity(
+                        org.opensearch.serverless.action.ActionGate.identity(
                             org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Response.class
                         ),
                         answer(channel)
@@ -212,7 +212,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                                 () -> listener.onResponse(new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true))
                             );
                         },
-                        org.opensearch.serverless.shell.ActionGate.identity(
+                        org.opensearch.serverless.action.ActionGate.identity(
                             org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
                         ),
                         answer(channel)
@@ -267,7 +267,7 @@ public final class DataStreamHandler extends BaseRestHandler {
     }
 
     private org.opensearch.action.support.clustermanager.AcknowledgedResponse create(
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         String name
     ) throws Exception {
@@ -350,7 +350,7 @@ public final class DataStreamHandler extends BaseRestHandler {
     }
 
     private org.opensearch.action.admin.indices.datastream.GetDataStreamAction.Response describe(
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         String[] names
     ) throws Exception {

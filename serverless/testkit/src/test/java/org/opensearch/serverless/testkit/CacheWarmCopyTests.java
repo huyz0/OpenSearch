@@ -77,7 +77,7 @@ public class CacheWarmCopyTests extends OpenSearchTestCase {
                 nodeSettings(
                     "copy-joiner",
                     "search",
-                    Settings.builder().put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), true).build()
+                    Settings.builder().put(org.opensearch.serverless.node.SearchSettings.WARM_ON_JOIN.getKey(), true).build()
                 )
             );
             ServerlessNode slow = new ServerlessNode(
@@ -85,7 +85,7 @@ public class CacheWarmCopyTests extends OpenSearchTestCase {
                     "copy-slow",
                     "search",
                     Settings.builder()
-                        .put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), true)
+                        .put(org.opensearch.serverless.node.SearchSettings.WARM_ON_JOIN.getKey(), true)
                         .put(org.opensearch.serverless.transport.WarmCopySettings.MAX_BYTES_PER_SECOND.getKey(), 64 * 1024)
                         .build()
                 )

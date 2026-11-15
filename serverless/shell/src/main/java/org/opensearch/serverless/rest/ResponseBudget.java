@@ -9,7 +9,8 @@ package org.opensearch.serverless.rest;
 
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.io.stream.Writeable;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.ResponseMemory;
 
 /** One batch's retained responses, including work completing after its caller gives up. */
 final class ResponseBudget implements AutoCloseable {
@@ -17,7 +18,7 @@ final class ResponseBudget implements AutoCloseable {
     private long reserved;
     private volatile boolean closed;
 
-    ResponseBudget(ServerlessNode serving) {
+    ResponseBudget(NodeContext serving) {
         breaker = serving.services().circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
     }
 

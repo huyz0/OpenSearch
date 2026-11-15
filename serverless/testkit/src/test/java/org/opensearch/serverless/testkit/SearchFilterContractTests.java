@@ -12,9 +12,9 @@ import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.serverless.ops.ShardOperations;
 import org.opensearch.serverless.rest.SearchHandler;
 import org.opensearch.serverless.shard.SearchOutcome;
-import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 

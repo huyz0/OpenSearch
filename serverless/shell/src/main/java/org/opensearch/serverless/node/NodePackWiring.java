@@ -1,0 +1,159 @@
+/*
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * The OpenSearch Contributors require contributions made to
+ * this file be licensed under the Apache-2.0 license or a
+ * compatible open source license.
+ */
+
+package org.opensearch.serverless.node;
+
+import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.store.CommitStaging;
+import org.opensearch.serverless.store.NodePackLedger;
+import org.opensearch.serverless.store.NodePackStore;
+import org.opensearch.serverless.store.NodePackWriter;
+import org.opensearch.serverless.store.SegmentPublisher;
+import org.opensearch.threadpool.ThreadPool;
+
+import java.util.IdentityHashMap;
+import java.util.Map;
+import java.util.WeakHashMap;
+import java.util.function.Function;
+
+/**
+ * Builds the segment publishers a node's shards use, with node packs when the node has them on.
+ *
+ * <p>Node packs are on by default and switched by {@code serverless.segments.node_pack.enabled}: with them off every
+ * shard keeps one blob per segment under its own prefix. With them on, a publish's segment blobs of up to
+ * {@code serverless.segments.node_pack.max_blob_bytes} go into the node's next pack, shared with whatever other shards
+ * of any index publish within {@code serverless.segments.node_pack.linger_millis}; larger blobs keep their own PUT.
+ *
+ * <p>One writer serves every shard of a node for one plane, so concurrent publishes share packs. Its epoch is the
+ * wall-clock millisecond it was made at, which a restarted node has always moved past, and is recorded in the node's
+ * {@link NodePackLedger} just before its first pack is written. A {@link NodePackCollector} beside it deletes the node's
+ * packs, of this epoch and every earlier one, once nothing names them, every
+ * {@code serverless.segments.node_pack.collect_interval_millis}.
+ */
+public final class NodePackWiring {
+
+    /** On: a 1K-shard soak measured a third of the PUTs, a faster first search and a takeover within a tenth. */
+    static final boolean ENABLED_DEFAULT = true;
+    static final long DEFAULT_COLLECT_INTERVAL_MILLIS = 60_000L;
+    static final long DEFAULT_MAX_BLOB_BYTES = 8L * 1024 * 1024;
+    static final long DEFAULT_LINGER_MILLIS = 50L;
+    /** A pack this full is written without waiting out the linger. */
+    static final long MAX_PACK_BYTES = 64L * 1024 * 1024;
+
+    private static final Map<NodeContext, Map<MetadataPlane, NodePackWriter>> WRITERS = new WeakHashMap<>();
+    private static long lastEpoch = -1L;
+
+    private NodePackWiring() {}
+
+    /**
+     * Returns how a node opens each shard's publisher on a plane.
+     *
+     * @param node the node
+     * @param plane the plane its shards publish to
+     * @return the publisher for a shard
+     */
+    static Function<ShardId, SegmentPublisher> publishers(NodeContext node, MetadataPlane plane) {
+        final boolean enabled = WriteSettings.NODE_PACK_ENABLED.get(node.settings);
+        if (enabled == false) {
+            collectEarlierPacks(node, plane);
+        }
+        final long maxBlobBytes = maxBlobBytes(node.settings);
+        // Every publisher can use node packs: whether a publish does is decided per publish (see SegmentPlacement), and
+        // the node's writer, with its collector, is made the first time one does.
+        return id -> {
+            final SegmentPublisher publisher = plane.segmentPublisher(id.getIndexName(), id.getIndex().getUUID(), id.id())
+                .packing(true)
+                .nodePackSource(() -> writer(node, plane), id.getIndexName(), id.getIndex().getUUID(), id.id(), maxBlobBytes);
+            publisher.useNodePacks(enabled);
+            // Commits are recorded with the node log, so a shard stages them whenever its node writes one.
+            return publisher.staging(new CommitStaging(() -> node.logCommitCheckpointMillis));
+        };
+    }
+
+    /**
+     * Starts collecting the packs this node wrote before, if its ledger names any, even though its packs are off now.
+     * Without it, a node restarted with packs off, or whose indices all moved to segment blobs, kept every pack it had
+     * written forever. One ledger read per plane.
+     */
+    private static void collectEarlierPacks(NodeContext node, MetadataPlane plane) {
+        synchronized (WRITERS) {
+            if (node.packLedgersChecked.add(plane) == false) {
+                return;
+            }
+            final Map<MetadataPlane, NodePackWriter> byPlane = WRITERS.get(node);
+            if (byPlane != null && byPlane.containsKey(plane)) {
+                return;
+            }
+        }
+        try {
+            final NodePackLedger ledger = new NodePackLedger(plane.blobStore(), plane.basePath(), node.localNode().getId());
+            if (ledger.read().epochs().isEmpty() == false) {
+                writer(node, plane);
+            }
+        } catch (Exception e) {
+            NodeContext.logger.warn("could not read this node's pack ledger; its earlier packs are collected once it writes one", e);
+        }
+    }
+
+    static long maxBlobBytes(Settings settings) {
+        return WriteSettings.NODE_PACK_MAX_BLOB_BYTES.get(settings).getBytes();
+    }
+
+    private static NodePackWriter writer(NodeContext node, MetadataPlane plane) {
+        synchronized (WRITERS) {
+            final Map<MetadataPlane, NodePackWriter> byPlane = WRITERS.computeIfAbsent(node, n -> new IdentityHashMap<>());
+            final NodePackWriter existing = byPlane.get(plane);
+            if (existing != null) {
+                return existing;
+            }
+            final String nodeId = node.localNode().getId();
+            final NodePackStore store = new NodePackStore(plane.blobStore(), plane.basePath(), nodeId);
+            final NodePackLedger ledger = new NodePackLedger(plane.blobStore(), plane.basePath(), nodeId);
+            final long epoch = nextEpoch();
+            final long linger = WriteSettings.NODE_PACK_LINGER_MILLIS.get(node.settings);
+            final NodePackWriter writer = new NodePackWriter(store, epoch, linger, MAX_PACK_BYTES);
+            writer.recordIn(ledger);
+            final NodePackCollector collector = new NodePackCollector(
+                store,
+                ledger,
+                plane,
+                plane.clock(),
+                NodePackCollector.DEFAULT_MINIMUM_UNREFERENCED_MILLIS
+            );
+            collector.follow(writer);
+            final long interval = WriteSettings.NODE_PACK_COLLECT_INTERVAL_MILLIS.get(node.settings);
+            if (interval > 0L) {
+                node.threadPool()
+                    .scheduleWithFixedDelay(collector::runQuietly, TimeValue.timeValueMillis(interval), ThreadPool.Names.GENERIC);
+            }
+            byPlane.put(plane, writer);
+            return writer;
+        }
+    }
+
+    /**
+     * Lets go of a node's writers once it is closed. The map is weak in the node, but a writer's plane can reach the node
+     * through what it notifies, so without this every node a process made stayed reachable, with all it held.
+     *
+     * @param node the node
+     */
+    public static void forget(NodeContext node) {
+        synchronized (WRITERS) {
+            WRITERS.remove(node);
+        }
+    }
+
+    // Two writers made in one process within the same millisecond, as tests do, still get distinct epochs.
+    private static long nextEpoch() {
+        lastEpoch = Math.max(lastEpoch + 1L, System.currentTimeMillis());
+        return lastEpoch;
+    }
+}

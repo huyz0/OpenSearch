@@ -10,7 +10,7 @@ package org.opensearch.serverless.shard;
 
 /** A known capability refusal: retains the native exception contract and receives HTTP 501. */
 public final class UnsupportedRequestOptionException extends UnsupportedOperationException {
-    UnsupportedRequestOptionException(String message) {
+    public UnsupportedRequestOptionException(String message) {
         super(message);
     }
 }

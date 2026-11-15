@@ -16,7 +16,7 @@ import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.TemplateStore;
 import org.opensearch.serverless.metadata.TooManyTemplatesException;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -40,7 +40,7 @@ import java.util.function.Supplier;
 public final class PipelineHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    private final Supplier<org.opensearch.serverless.node.NodeContext> node;
 
     /**
      * Creates the handler.
@@ -48,7 +48,7 @@ public final class PipelineHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the serving node
      */
-    public PipelineHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public PipelineHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -135,7 +135,7 @@ public final class PipelineHandler extends BaseRestHandler {
                         concreteId(selected.getId());
                         return put(serving, store, selected.getId(), jsonSource(selected.getSource(), selected.getMediaType()));
                     },
-                        org.opensearch.serverless.shell.ActionGate.identity(
+                        org.opensearch.serverless.action.ActionGate.identity(
                             org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
                         )
                     );
@@ -149,7 +149,7 @@ public final class PipelineHandler extends BaseRestHandler {
                         concreteId(selected.getId());
                         return delete(store, selected.getId());
                     },
-                        org.opensearch.serverless.shell.ActionGate.identity(
+                        org.opensearch.serverless.action.ActionGate.identity(
                             org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
                         )
                     );
@@ -186,7 +186,7 @@ public final class PipelineHandler extends BaseRestHandler {
     }
 
     private org.opensearch.action.support.clustermanager.AcknowledgedResponse put(
-        ServerlessNode serving,
+        NodeContext serving,
         TemplateStore store,
         String id,
         String body
@@ -215,7 +215,7 @@ public final class PipelineHandler extends BaseRestHandler {
      */
     private void simulate(
         org.opensearch.rest.RestChannel channel,
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         TemplateStore store,
         String id,
         String body
@@ -400,13 +400,13 @@ public final class PipelineHandler extends BaseRestHandler {
 
     private static void buffered(
         org.opensearch.rest.RestChannel channel,
-        ServerlessNode serving,
+        NodeContext serving,
         String action,
         org.opensearch.action.ActionRequest request,
         org.opensearch.common.CheckedBiConsumer<org.opensearch.action.ActionRequest, org.opensearch.rest.RestChannel, Exception> work
     ) throws Exception {
-        final var opaque = org.opensearch.serverless.shell.ActionGate.<org.opensearch.rest.RestResponse>opaque();
-        final var view = new org.opensearch.serverless.shell.ActionGate.ResponseView<org.opensearch.rest.RestResponse>() {
+        final var opaque = org.opensearch.serverless.action.ActionGate.<org.opensearch.rest.RestResponse>opaque();
+        final var view = new org.opensearch.serverless.action.ActionGate.ResponseView<org.opensearch.rest.RestResponse>() {
             @Override
             public org.opensearch.core.action.ActionResponse show(org.opensearch.rest.RestResponse result) {
                 return opaque.show(result);
@@ -417,7 +417,7 @@ public final class PipelineHandler extends BaseRestHandler {
                 org.opensearch.core.action.ActionResponse response,
                 org.opensearch.rest.RestResponse original
             ) {
-                if (original == null || response instanceof org.opensearch.serverless.shell.ActionGate.Admitted == false) {
+                if (original == null || response instanceof org.opensearch.serverless.action.ActionGate.Admitted == false) {
                     throw unsupported("cached or rewritten native pipeline read/simulate responses are not supported");
                 }
                 return original;

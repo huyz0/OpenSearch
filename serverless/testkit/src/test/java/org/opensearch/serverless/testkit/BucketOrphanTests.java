@@ -18,9 +18,8 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.bucket.BucketManifest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.NodePackCollector;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
-import org.opensearch.serverless.reconcile.GarbageCollector;
-import org.opensearch.serverless.reconcile.NodePackCollector;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.NodePackLedger;
 import org.opensearch.serverless.store.NodePackStore;
@@ -120,7 +119,7 @@ public class BucketOrphanTests extends OpenSearchTestCase {
                     new NodePackLedger(plane.blobStore(), plane.basePath(), nodeId),
                     plane,
                     clock::get,
-                    GarbageCollector.DEFAULT_MINIMUM_UNREFERENCED_MILLIS
+                    org.opensearch.serverless.node.NodePackCollector.DEFAULT_MINIMUM_UNREFERENCED_MILLIS
                 );
                 final long written = packBytes(plane, nodeId);
                 assertTrue(written > 0);

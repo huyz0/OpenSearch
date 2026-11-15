@@ -340,7 +340,7 @@ final class ShardActivations {
             }
             try {
                 // Never GENERIC: what waits for an activation waits there. See NodeThreadPools#ACTIVATION_POOL.
-                reconciler.node.threadPool().executor(org.opensearch.serverless.shell.NodeThreadPools.ACTIVATION_POOL).execute(() -> {
+                reconciler.node.threadPool().executor(org.opensearch.serverless.node.NodeThreadPools.ACTIVATION_POOL).execute(() -> {
                     try {
                         task.run();
                     } finally {
@@ -420,7 +420,7 @@ final class ShardActivations {
         // Paced by the write path's limiter: a takeover storm saturated the store, and the live writes paid -- a fleet run
         // shed 77% of them while survivors opened a dead node's shards. While the limiter has cut how many writes may wait,
         // activations are cut in the same proportion; never below one, so takeovers still move.
-        return Math.max(1, (int) Math.floor(limit * reconciler.node.writeHeadroom()));
+        return Math.max(1, (int) Math.floor(limit * reconciler.node.writes().headroom()));
     }
 
     /**

@@ -19,15 +19,40 @@ public final class DeleteByQueryOutcome {
     private final org.opensearch.index.reindex.BulkByScrollResponse response;
     private final org.opensearch.index.engine.VersionConflictEngineException conflict;
 
-    DeleteByQueryOutcome(long matched, long deleted) {
+    /**
+     * An outcome with no conflicts.
+     *
+     * @param matched documents matched
+     * @param deleted documents deleted
+     */
+    public DeleteByQueryOutcome(long matched, long deleted) {
         this(matched, deleted, 0L, null);
     }
 
-    DeleteByQueryOutcome(long matched, long deleted, long versionConflicts, String abortedOn) {
+    /**
+     * An outcome, possibly aborted.
+     *
+     * @param matched documents matched
+     * @param deleted documents deleted
+     * @param versionConflicts conflicts met
+     * @param abortedOn why it stopped early, or null
+     */
+    public DeleteByQueryOutcome(long matched, long deleted, long versionConflicts, String abortedOn) {
         this(matched, deleted, versionConflicts, abortedOn, null, null, matched == 0 ? 0 : 1);
     }
 
-    DeleteByQueryOutcome(
+    /**
+     * A full outcome.
+     *
+     * @param matched documents matched
+     * @param deleted documents deleted
+     * @param versionConflicts conflicts met
+     * @param abortedOn why it stopped early, or null
+     * @param response core's own response, if one was built
+     * @param conflict the first conflict, if one stopped it
+     * @param batches how many batches ran
+     */
+    public DeleteByQueryOutcome(
         long matched,
         long deleted,
         long versionConflicts,
@@ -52,7 +77,7 @@ public final class DeleteByQueryOutcome {
         return response;
     }
 
-    DeleteByQueryOutcome withResponse(String index, long nanos) {
+    public DeleteByQueryOutcome withResponse(String index, long nanos) {
         final var status = new org.opensearch.index.reindex.BulkByScrollTask.Status(
             null,
             matched,

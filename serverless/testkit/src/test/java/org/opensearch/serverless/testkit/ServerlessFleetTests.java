@@ -58,15 +58,15 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
     /** Capped at two shards each, so four shards cannot fit on one node. */
     private Map<String, String> cappedSettings() {
         return Map.of(
-            org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(),
+            org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(),
             TTL,
-            org.opensearch.serverless.shell.ActivationSettings.MAX_SHARDS.getKey(),
+            org.opensearch.serverless.node.ActivationSettings.MAX_SHARDS.getKey(),
             "2"
         );
     }
 
     private Map<String, String> settings() {
-        return Map.of(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), TTL);
+        return Map.of(org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(), TTL);
     }
 
     /**
@@ -247,11 +247,11 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
     public void testASearchMissingAShardSaysSoInsteadOfUnderReportingSilently() throws Exception {
         final var store = createTempDir();
         final Map<String, String> neverPublish = Map.of(
-            org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(),
+            org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(),
             TTL,
-            org.opensearch.serverless.shell.ActivationSettings.MAX_SHARDS.getKey(),
+            org.opensearch.serverless.node.ActivationSettings.MAX_SHARDS.getKey(),
             "2",
-            org.opensearch.serverless.shell.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(),
+            org.opensearch.serverless.node.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(),
             "600000"
         );
         try (

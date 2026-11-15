@@ -14,7 +14,7 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.DescriptorPage;
 import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.rest.Fanout;
+import org.opensearch.serverless.ops.Fanout;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;

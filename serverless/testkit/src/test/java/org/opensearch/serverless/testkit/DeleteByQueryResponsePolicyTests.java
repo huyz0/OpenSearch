@@ -16,7 +16,7 @@ import org.opensearch.index.reindex.BulkByScrollTask;
 import org.opensearch.index.reindex.DeleteByQueryAction;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shard.ShardOperations;
+import org.opensearch.serverless.ops.ShardOperations;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 

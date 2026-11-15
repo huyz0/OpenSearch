@@ -11,7 +11,9 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.Fanout;
+import org.opensearch.serverless.ops.SearchFanout;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -54,12 +56,8 @@ final class SearchIndexResolver {
      * @return the indices and their shard counts, or the refusal
      * @throws IOException if a register cannot be read
      */
-    public static SearchHandler.Resolution resolveIndices(
-        MetadataPlane metadata,
-        ServerlessNode serving,
-        String index,
-        boolean ignoreUnavailable
-    ) throws IOException {
+    public static IndexResolution resolveIndices(MetadataPlane metadata, NodeContext serving, String index, boolean ignoreUnavailable)
+        throws IOException {
         return resolveIndices(metadata, serving, index, ignoreUnavailable, true);
     }
 
@@ -78,9 +76,9 @@ final class SearchIndexResolver {
      * @return the indices and their shard counts, or the refusal
      * @throws IOException if a register cannot be read
      */
-    public static SearchHandler.Resolution resolveIndices(
+    public static IndexResolution resolveIndices(
         MetadataPlane metadata,
-        ServerlessNode serving,
+        NodeContext serving,
         String index,
         boolean ignoreUnavailable,
         boolean throughRequestPath
@@ -108,9 +106,9 @@ final class SearchIndexResolver {
      * @return the indices and their shard counts, or the refusal
      * @throws IOException if a register cannot be read
      */
-    public static SearchHandler.Resolution resolveIndices(
+    public static IndexResolution resolveIndices(
         MetadataPlane metadata,
-        ServerlessNode serving,
+        NodeContext serving,
         String index,
         boolean ignoreUnavailable,
         boolean throughRequestPath,
@@ -120,10 +118,10 @@ final class SearchIndexResolver {
         final java.util.List<String> requested = java.util.List.of(index.split(",", -1));
         for (String name : requested) {
             if (name.isEmpty()) {
-                return SearchHandler.Resolution.refuse(RestStatus.BAD_REQUEST, "unsupported_search", "an empty index name was given");
+                return IndexResolution.refuse(RestStatus.BAD_REQUEST, "unsupported_search", "an empty index name was given");
             }
             if (name.indexOf('?') >= 0 || isPrefixPattern(name) == false && name.indexOf('*') >= 0) {
-                return SearchHandler.Resolution.refuse(
+                return IndexResolution.refuse(
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_search",
                     "only a trailing-wildcard pattern is supported, and ["
@@ -160,7 +158,7 @@ final class SearchIndexResolver {
                     groupEntries = readRollups(metadata, serving, prefix);
                 } catch (Exception e) {
                     // Not answered from a partial list: a name missing from it would be a wrong answer.
-                    return SearchHandler.Resolution.refuse(
+                    return IndexResolution.refuse(
                         RestStatus.SERVICE_UNAVAILABLE,
                         "rollups_unavailable",
                         "could not read the index names of [" + prefix + "*]: " + e.getMessage()
@@ -178,7 +176,7 @@ final class SearchIndexResolver {
                 try {
                     matched = metadata.namesWithPrefix(prefix, serving.searchSettings().patternCap());
                 } catch (org.opensearch.serverless.metadata.TooManyMatchesException e) {
-                    return SearchHandler.Resolution.refuse(RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
+                    return IndexResolution.refuse(RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
                 }
             }
             final java.util.Set<String> ruledOut = ruledOutByRollups(
@@ -195,7 +193,7 @@ final class SearchIndexResolver {
             if (groupEntries != null && matched.size() - ruledOut.size() > serving.searchSettings().patternCap()) {
                 // The cap bounds the work a search fans out to, so it counts what is left to search, not names a
                 // digest has already ruled out.
-                return SearchHandler.Resolution.refuse(
+                return IndexResolution.refuse(
                     RestStatus.BAD_REQUEST,
                     "too_many_indices",
                     "more than "
@@ -238,7 +236,7 @@ final class SearchIndexResolver {
                 // hits and a complete flag is the confident empty answer this surface exists to avoid. A
                 // caller who means "whatever is there, possibly nothing" says so with ignore_unavailable,
                 // the same way they do for a named index that may not exist yet.
-                return SearchHandler.Resolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no index matches [" + name + "]");
+                return IndexResolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no index matches [" + name + "]");
             }
         }
         // Every name's resolution at once, through the fan-out, before the loop below reads them in order: one
@@ -276,7 +274,7 @@ final class SearchIndexResolver {
                     skipped.add(name);
                     continue;
                 }
-                return SearchHandler.Resolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name);
+                return IndexResolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name);
             }
             if (resolved.index() != null) {
                 if (throughRequestPath && serving.isSystemIndex(name)) {
@@ -291,7 +289,7 @@ final class SearchIndexResolver {
                     // Checked here, on the resolved name, and not only on the path parameter: a comma list
                     // or a body index used to walk straight past the guard. A name the caller typed is
                     // refused as before; the name was theirs to begin with.
-                    return SearchHandler.Resolution.refuse(
+                    return IndexResolution.refuse(
                         RestStatus.FORBIDDEN,
                         "system_index",
                         "[" + name + "] belongs to a plugin and is not reachable through the request path"
@@ -312,14 +310,14 @@ final class SearchIndexResolver {
                         skipped.add(target);
                         continue;
                     }
-                    return SearchHandler.Resolution.refuse(
+                    return IndexResolution.refuse(
                         RestStatus.NOT_FOUND,
                         "index_not_found",
                         "alias [" + name + "] names [" + target + "], which does not exist"
                     );
                 }
                 if (throughRequestPath && serving.isSystemIndex(target)) {
-                    return SearchHandler.Resolution.refuse(
+                    return IndexResolution.refuse(
                         RestStatus.FORBIDDEN,
                         "system_index",
                         "[" + target + "] belongs to a plugin and is not reachable through the request path"
@@ -335,19 +333,19 @@ final class SearchIndexResolver {
                 // Everything the patterns matched was a plugin's. To this caller that is a pattern that
                 // matched nothing, and it is answered as one -- without the names, which are not theirs
                 // to learn from an error message.
-                return SearchHandler.Resolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no index matches [" + index + "]");
+                return IndexResolution.refuse(RestStatus.NOT_FOUND, "index_not_found", "no index matches [" + index + "]");
             }
             // Every name was absent. Answering 200 with no hits here would be the very thing the flag is
             // not for: the caller allowed for *some* of their indices to be missing, not all of them, and
             // an empty answer over nothing at all is indistinguishable from an empty answer over
             // everything.
-            return SearchHandler.Resolution.refuse(
+            return IndexResolution.refuse(
                 RestStatus.NOT_FOUND,
                 "index_not_found",
                 "none of the indices named exist: " + String.join(", ", visible)
             );
         }
-        return new SearchHandler.Resolution(indices, skipped, null, null, null, prunedShards, judged);
+        return new IndexResolution(indices, skipped, null, null, null, prunedShards, judged);
     }
 
     /**
@@ -371,7 +369,7 @@ final class SearchIndexResolver {
      */
     static java.util.Set<String> ruledOutByRollups(
         MetadataPlane metadata,
-        ServerlessNode serving,
+        NodeContext serving,
         String prefix,
         java.util.List<String> matched,
         SearchSourceBuilder source,
@@ -425,7 +423,7 @@ final class SearchIndexResolver {
     /** Reads a prefix's rollup group on GENERIC, reusing this node's copy within the routing cache's window. */
     static java.util.Map<String, org.opensearch.serverless.metadata.RollupEntry> readRollups(
         MetadataPlane metadata,
-        ServerlessNode serving,
+        NodeContext serving,
         String prefix
     ) throws java.io.IOException {
         final java.util.concurrent.Executor pool = serving.threadPool().executor(ThreadPool.Names.GENERIC);
@@ -445,7 +443,7 @@ final class SearchIndexResolver {
 
     /** Resolves many names concurrently; a name whose read failed is left for the caller to read and fail on. */
     static java.util.Map<String, org.opensearch.serverless.metadata.DescriptorResolution> prefetch(
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         java.util.Collection<String> names
     ) {
