@@ -56,7 +56,7 @@ public class IdleIndexRequestTests extends OpenSearchTestCase {
         return String.format(Locale.ROOT, "idle-%04d", i);
     }
 
-    /** Requests one simulated hour of periodic work makes once {@code indices} written indices have gone idle. */
+    /** S3 requests one simulated hour of periodic work makes once {@code indices} written indices have gone idle. */
     private long idleHour(int indices, int orphanSliceBudget, StringBuilder report) throws Exception {
         final AtomicLong clock = new AtomicLong(1_000_000L);
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
@@ -112,12 +112,12 @@ public class IdleIndexRequestTests extends OpenSearchTestCase {
                         Locale.ROOT,
                         "%n%d idle indices: %d requests (%s)%n%s",
                         indices,
-                        store.total(),
+                        store.impliedS3Requests(),
                         store.breakdown(),
                         store.byCaller()
                     )
                 );
-                return store.total();
+                return store.impliedS3Requests();
             }
         }
     }
@@ -146,6 +146,8 @@ public class IdleIndexRequestTests extends OpenSearchTestCase {
         final long many = idleHour(40, 0, report);
         logger.info("IDLE|{}", report);
         assertEquals("an idle index must cost no periodic store requests; per-hour totals differ:" + report, few, many);
+        // And what that hour costs the node is pinned, so a new periodic request every node pays shows up too.
+        RequestBudgets.check("idle_released.node_requests_per_hour", few, report.toString());
     }
 
     /** The orphan backstop's hour costs its budget, not the number of indices: past the budget, more indices add nothing. */

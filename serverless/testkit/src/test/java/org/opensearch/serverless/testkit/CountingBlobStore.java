@@ -17,6 +17,7 @@ import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.serverless.store.MeteredBlobStore;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -109,6 +110,8 @@ public final class CountingBlobStore implements BlobStore {
         if (traceCallers) {
             final String callers = java.util.Arrays.stream(Thread.currentThread().getStackTrace())
                 .filter(f -> f.getClassName().startsWith("org.opensearch.serverless.") && f.getClassName().contains(".testkit.") == false)
+                // The metering wrapper's own frames say nothing about who asked.
+                .filter(f -> f.getClassName().startsWith(MeteredBlobStore.class.getName()) == false)
                 .limit(callerDepth)
                 .map(
                     f -> f.getClassName().substring(f.getClassName().lastIndexOf('.') + 1)
@@ -184,7 +187,7 @@ public final class CountingBlobStore implements BlobStore {
     }
 
     /**
-     * Returns ordinary blob reads, ranged or whole.
+     * Returns ordinary blob reads, ranged or whole, and existence checks, which S3 bills as reads.
      *
      * @return the count
      */
@@ -313,7 +316,10 @@ public final class CountingBlobStore implements BlobStore {
 
         @Override
         public boolean blobExists(String blobName) throws IOException {
+            // A HEAD, billed as a GET.
             reads.incrementAndGet();
+            blobReads.incrementAndGet();
+            note("HEAD", inner.path(), blobName);
             return inner.blobExists(blobName);
         }
 
