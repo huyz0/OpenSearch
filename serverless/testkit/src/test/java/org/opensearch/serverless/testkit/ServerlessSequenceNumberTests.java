@@ -387,8 +387,8 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
             clock,
             TTL,
             java.util.List.of(
-                new org.opensearch.serverless.store.WalRecord("a", "{\"msg\":\"first\",\"n\":1}", 0L, 1L, 1L),
-                new org.opensearch.serverless.store.WalRecord("c", "{\"msg\":\"third\",\"n\":3}", 2L, 1L, 1L)
+                new org.opensearch.serverless.nodelog.WalRecord("a", "{\"msg\":\"first\",\"n\":1}", 0L, 1L, 1L),
+                new org.opensearch.serverless.nodelog.WalRecord("c", "{\"msg\":\"third\",\"n\":3}", 2L, 1L, 1L)
             )
         );
         assertEquals(1L, term);

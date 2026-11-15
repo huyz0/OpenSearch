@@ -7,7 +7,7 @@
  */
 package org.opensearch.serverless.engine;
 
-import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;

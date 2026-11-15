@@ -12,16 +12,17 @@ import org.opensearch.common.CheckedConsumer;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.nodelog.NodeLogBlob.Range;
+import org.opensearch.serverless.nodelog.NodeLogBlob.ShardKey;
+import org.opensearch.serverless.nodelog.NodeLogCommitter;
+import org.opensearch.serverless.nodelog.NodeLogEpoch;
+import org.opensearch.serverless.nodelog.NodeLogPin;
+import org.opensearch.serverless.nodelog.NodeLogStore;
+import org.opensearch.serverless.nodelog.NodeLogTakeover;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.serverless.shard.LoggedCommitHooks.Logged;
 import org.opensearch.serverless.shard.LoggedCommits;
 import org.opensearch.serverless.shard.ShardReconciler;
-import org.opensearch.serverless.store.NodeLogBlob.Range;
-import org.opensearch.serverless.store.NodeLogBlob.ShardKey;
-import org.opensearch.serverless.store.NodeLogCommitter;
-import org.opensearch.serverless.store.NodeLogEpoch;
-import org.opensearch.serverless.store.NodeLogStore;
-import org.opensearch.serverless.store.NodeLogTakeover;
-import org.opensearch.serverless.store.WalRecord;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -532,7 +533,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
      * @return the pin, which the caller closes
      * @throws IllegalStateException if the shard is already pinned
      */
-    public NodeLogCommitter.Pin retain(ShardId shardId, long maxMillis) {
+    public NodeLogPin retain(ShardId shardId, long maxMillis) {
         return committer.pin(keyOf(shardId), maxMillis);
     }
 

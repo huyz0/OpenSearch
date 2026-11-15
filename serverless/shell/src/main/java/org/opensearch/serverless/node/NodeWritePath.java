@@ -298,7 +298,7 @@ public final class NodeWritePath {
             shardId,
             shard,
             java.util.List.of(
-                new org.opensearch.serverless.store.WalRecord(id, source, result.getSeqNo(), result.getTerm(), result.getVersion())
+                new org.opensearch.serverless.nodelog.WalRecord(id, source, result.getSeqNo(), result.getTerm(), result.getVersion())
                     .withRouting(routing)
             )
         );
@@ -366,7 +366,7 @@ public final class NodeWritePath {
     void appendOrRelease(
         org.opensearch.core.index.shard.ShardId shardId,
         org.opensearch.index.shard.IndexShard shard,
-        java.util.List<org.opensearch.serverless.store.WalRecord> records
+        java.util.List<org.opensearch.serverless.nodelog.WalRecord> records
     ) throws java.io.IOException {
         appendOrRelease(shardId, shard, records, true);
     }
@@ -378,7 +378,7 @@ public final class NodeWritePath {
     void appendOrRelease(
         org.opensearch.core.index.shard.ShardId shardId,
         org.opensearch.index.shard.IndexShard shard,
-        java.util.List<org.opensearch.serverless.store.WalRecord> records,
+        java.util.List<org.opensearch.serverless.nodelog.WalRecord> records,
         boolean tailPush
     ) throws java.io.IOException {
         final var writerTerm = node.reconciler.writerTerm(shardId);
@@ -566,7 +566,7 @@ public final class NodeWritePath {
             shardId,
             shard,
             java.util.List.of(
-                org.opensearch.serverless.store.WalRecord.deletion(id, result.getSeqNo(), result.getTerm(), result.getVersion())
+                org.opensearch.serverless.nodelog.WalRecord.deletion(id, result.getSeqNo(), result.getTerm(), result.getVersion())
                     .withRouting(routing)
             )
         );
@@ -591,7 +591,7 @@ public final class NodeWritePath {
      * <p><b>Ordering within the batch is preserved</b>, and it has to be. A batch that writes a document
      * and then deletes it must leave it gone, and one that deletes and then rewrites must leave it
      * present. Since a record's kind travels with it, replay reproduces the same sequence — see
-     * {@link org.opensearch.serverless.store.NodeLogBlob}.
+     * {@link org.opensearch.serverless.nodelog.NodeLogBlob}.
      *
      * <p><b>A failed operation does not roll back the ones before it</b>, exactly as in classic
      * OpenSearch: a bulk is a batch, not a transaction. The failure is reported for its own item and the
@@ -604,10 +604,10 @@ public final class NodeWritePath {
      */
     public java.util.List<BulkOutcome> bulk(
         org.opensearch.core.index.shard.ShardId shardId,
-        java.util.List<org.opensearch.serverless.store.WalRecord> operations
+        java.util.List<org.opensearch.serverless.nodelog.WalRecord> operations
     ) throws java.io.IOException {
         final java.util.List<BulkOperation> plain = new java.util.ArrayList<>(operations.size());
-        for (org.opensearch.serverless.store.WalRecord record : operations) {
+        for (org.opensearch.serverless.nodelog.WalRecord record : operations) {
             plain.add(BulkOperation.of(record));
         }
         return bulkOperations(shardId, plain);
@@ -792,7 +792,7 @@ public final class NodeWritePath {
         // such item rather than skipping it is what keeps the batch's order: an item deferred past a
         // later delete of the same id would resurrect the document the request said to remove.
         final BulkOutcome[] outcomes = new BulkOutcome[batch.size()];
-        final java.util.List<org.opensearch.serverless.store.WalRecord> applied = new java.util.ArrayList<>(batch.size());
+        final java.util.List<org.opensearch.serverless.nodelog.WalRecord> applied = new java.util.ArrayList<>(batch.size());
         final boolean[] grewFor = new boolean[batch.size()];
         int from = 0;
         while (from < batch.size()) {
@@ -803,7 +803,7 @@ public final class NodeWritePath {
             try (org.opensearch.common.lease.Releasable gate = writePools.enterApply(shard, 0)) {
                 for (int i = from; i < batch.size(); i++) {
                     final BulkOperation item = batch.get(i);
-                    final org.opensearch.serverless.store.WalRecord operation = item.record();
+                    final org.opensearch.serverless.nodelog.WalRecord operation = item.record();
                     try {
                         if (operation.isDeletion()) {
                             final org.opensearch.index.engine.Engine.DeleteResult result;
@@ -825,7 +825,7 @@ public final class NodeWritePath {
                                 continue;
                             }
                             applied.add(
-                                org.opensearch.serverless.store.WalRecord.deletion(
+                                org.opensearch.serverless.nodelog.WalRecord.deletion(
                                     operation.id(),
                                     result.getSeqNo(),
                                     result.getTerm(),
@@ -883,7 +883,7 @@ public final class NodeWritePath {
                                 continue;
                             }
                             applied.add(
-                                new org.opensearch.serverless.store.WalRecord(
+                                new org.opensearch.serverless.nodelog.WalRecord(
                                     operation.id(),
                                     operation.source(),
                                     result.getSeqNo(),

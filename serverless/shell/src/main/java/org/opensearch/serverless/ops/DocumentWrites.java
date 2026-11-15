@@ -61,7 +61,7 @@ final class DocumentWrites {
         try (
             var ignored = node.services()
                 .indexingPressure()
-                .markCoordinatingOperationStarted(org.opensearch.serverless.store.WalRecord.contentBytes(id, source), false)
+                .markCoordinatingOperationStarted(org.opensearch.serverless.nodelog.WalRecord.contentBytes(id, source), false)
         ) {
             final Written written = written(
                 accepted.index(),

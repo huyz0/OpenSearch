@@ -16,9 +16,9 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.ActivationSettings;
 import org.opensearch.serverless.node.NodeSettings;
 import org.opensearch.serverless.node.WriteSettings;
+import org.opensearch.serverless.nodelog.NodeLogCommitter;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.ReconcileScheduler;
-import org.opensearch.serverless.store.NodeLogCommitter;
 import org.opensearch.serverless.warm.SearchDrain;
 import org.opensearch.serverless.warm.SearchWarmup;
 
@@ -227,11 +227,11 @@ public final class ServerlessBootstrap implements Closeable {
 
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             openedLoop = loop;
-            final long window = org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.get(complete);
+            final long window = org.opensearch.serverless.nodelog.NodeLogSettings.WINDOW_MILLIS.get(complete);
             if (NodeLogCommitter.ALLOWED_WINDOW_MILLIS.contains(window) == false) {
                 throw new IllegalArgumentException(
                     "["
-                        + org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.getKey()
+                        + org.opensearch.serverless.nodelog.NodeLogSettings.WINDOW_MILLIS.getKey()
                         + "] must be one of "
                         + new java.util.TreeSet<>(NodeLogCommitter.ALLOWED_WINDOW_MILLIS)
                         + ", got "

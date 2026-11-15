@@ -15,7 +15,7 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
-import org.opensearch.serverless.store.NodeLogEpoch;
+import org.opensearch.serverless.nodelog.NodeLogEpoch;
 
 import java.io.IOException;
 import java.io.InputStream;

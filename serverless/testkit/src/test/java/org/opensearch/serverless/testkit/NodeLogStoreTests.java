@@ -10,12 +10,12 @@ package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
-import org.opensearch.serverless.store.NodeLogBlob;
-import org.opensearch.serverless.store.NodeLogBlob.Range;
-import org.opensearch.serverless.store.NodeLogBlob.ShardBatch;
-import org.opensearch.serverless.store.NodeLogBlob.ShardKey;
-import org.opensearch.serverless.store.NodeLogStore;
-import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.nodelog.NodeLogBlob;
+import org.opensearch.serverless.nodelog.NodeLogBlob.Range;
+import org.opensearch.serverless.nodelog.NodeLogBlob.ShardBatch;
+import org.opensearch.serverless.nodelog.NodeLogBlob.ShardKey;
+import org.opensearch.serverless.nodelog.NodeLogStore;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.nio.file.FileAlreadyExistsException;

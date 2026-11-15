@@ -17,7 +17,7 @@ import org.apache.lucene.util.OfflineSorter;
 import org.opensearch.common.CheckedConsumer;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.translog.Translog;
-import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.nodelog.WalRecord;
 
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;

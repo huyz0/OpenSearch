@@ -41,7 +41,7 @@ final class ShardPublishing {
     }
 
     /** What a staged commit leaves to its checkpoint: trimming the logs it covers. */
-    private record StagedTrim(long term, org.opensearch.serverless.store.NodeLogCommitter.Position nodeLogAt) {
+    private record StagedTrim(long term, org.opensearch.serverless.nodelog.NodeLogCommitter.Position nodeLogAt) {
     }
 
     private final java.util.Map<ShardId, StagedTrim> stagedTrims = new java.util.concurrent.ConcurrentHashMap<>();
@@ -80,7 +80,7 @@ final class ShardPublishing {
         // Commits are staged only beside the node's own write log, never a shard's: the node log is what a successor
         // replays past the register, and what keeps every staged commit's records until a checkpoint covers them.
         final boolean stages = mayStage && nodeLogHooks != null;
-        final org.opensearch.serverless.store.NodeLogCommitter.Position nodeLogAt;
+        final org.opensearch.serverless.nodelog.NodeLogCommitter.Position nodeLogAt;
         exclusive.lock();
         try {
             // Where no write is between its apply and its append, as for the ordinal below.
@@ -282,7 +282,8 @@ final class ShardPublishing {
         stagedTrims.remove(shardId);
     }
 
-    private void trim(ShardId shardId, long term, org.opensearch.serverless.store.NodeLogCommitter.Position nodeLogAt) throws IOException {
+    private void trim(ShardId shardId, long term, org.opensearch.serverless.nodelog.NodeLogCommitter.Position nodeLogAt)
+        throws IOException {
         final ShardReconciler.NodeLogHooks nodeLogHooks = reconciler.nodeLog;
         if (nodeLogHooks != null) {
             nodeLogHooks.published(shardId, nodeLogAt);
