@@ -116,6 +116,8 @@ final class NodeAssembly {
         // An open fetches the blocks it will read concurrently rather than one round trip at a time, on GENERIC as
         // the log replay's reads do; the opening thread reads too, so a busy pool costs width only.
         node.blockCache.prefetchingWith(node.threadPool.generic());
+        // A read's prefetch hints fetch ahead on the same pool, so a query's segments wait for their round trips together.
+        node.blockCache.prefetchingReads(org.opensearch.serverless.store.CacheSettings.READ_PREFETCH.get(settings));
         boolean success = false;
         try {
             node.nodeEnvironment = new NodeEnvironment(settings, node.environment);
