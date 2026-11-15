@@ -42,6 +42,8 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
     private static final long TTL = 30_000L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"keyword\"},\"n\":{\"type\":\"long\"}}}";
     private static final String INDEX = "fresh";
+    /** How long the writer's pushes linger: far longer than a search takes to follow a write. */
+    private static final long LINGER_MILLIS = 1_000L;
 
     /** Whether the nodes take batches as streams, as they do by default, or whole. */
     private boolean streaming = true;
@@ -57,7 +59,7 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", roles)
             .put(org.opensearch.serverless.transport.ReaderPushSettings.COMMIT_PUSH_ENABLED.getKey(), true)
-            .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_PUSH_LINGER_MILLIS.getKey(), 1_000L);
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_PUSH_LINGER_MILLIS.getKey(), LINGER_MILLIS);
         if (mode != null) {
             builder.put(org.opensearch.serverless.transport.ReaderPushSettings.REFRESH_VISIBILITY.getKey(), mode);
         }
@@ -102,6 +104,10 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
                     plane.heads().read(INDEX, 0).orElseThrow().term()
                 );
             assertBusy(() -> assertEquals(1L, hits(reader, "seed")));
+            // The seed write's push lingers a second after it was acknowledged. Left pending, it carries out a write the
+            // scenario makes in the meantime early, or fails into a fault the scenario then injects and drops the reader
+            // before the write the scenario is about: either way the scenario no longer tests what it says.
+            Thread.sleep(LINGER_MILLIS + 500);
             scenario.run(plane, writer, reader, name -> {
                 final ServerlessNode node = joined(new ServerlessNode(nodeSettings(name, "search", mode)), plane);
                 joined.add(node);
@@ -200,8 +206,6 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
             streaming = streamed;
             withNodes(null, Settings.EMPTY, (plane, writer, reader, join) -> {
                 final var push = writer.router().tailPush();
-                // The seed write may still be lingering on its way to the search node.
-                Thread.sleep(1_500);
                 final long pushedBefore = push.counts()[0];
                 final List<String> ids = new ArrayList<>();
                 for (ServerlessNode via : new ServerlessNode[] { writer, reader }) {
