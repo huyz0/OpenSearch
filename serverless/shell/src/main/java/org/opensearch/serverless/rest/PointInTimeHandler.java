@@ -18,6 +18,8 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.PointInTime;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.restcore.PendingRestChannel;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
@@ -118,7 +120,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
         final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         if (request.method() == RestRequest.Method.GET) {
@@ -202,7 +204,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
                 throw unsupported("PIT preferences are not supported: capture covers every shard of one concrete index");
             }
             if (selected.getKeepAlive().millis() > MAX_KEEP_ALIVE_MILLIS) {
-                output.sendResponse(IndexAdminHandler.error(output, RestStatus.BAD_REQUEST, "keep_alive_too_long", keepAliveTooLong()));
+                output.sendResponse(RestReplies.error(output, RestStatus.BAD_REQUEST, "keep_alive_too_long", keepAliveTooLong()));
                 return;
             }
             freeze(output, metadata, selected.getIndices()[0], selected.getKeepAlive().millis(), request);
@@ -265,7 +267,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
             // record that names an index per shard entry, which this one does not. Said as what it is,
             // rather than as "no such index" for a name that was never meant to be one.
             channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_point_in_time",
@@ -276,14 +278,14 @@ public final class PointInTimeHandler extends BaseRestHandler {
         }
         final var resolved = metadata.resolve(index);
         if (resolved.absent()) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
             return;
         }
         if (resolved.index() == null) {
             // An alias. Core freezes every index behind it; this record holds one index, so the honest
             // answer names the indices the caller can freeze rather than claiming the alias does not exist.
             channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_point_in_time",
@@ -315,7 +317,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
                 // for the whole keep-alive the caller asked for, on a request that froze nothing.
                 metadata.releasePointInTime(pitId);
                 channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.CONFLICT,
                         "nothing_published",
@@ -393,12 +395,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
         }
         if (named != null && released.values().stream().noneMatch(Boolean::booleanValue)) {
             channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_FOUND,
-                    "pit_not_found",
-                    "no such point in time: " + String.join(", ", named)
-                )
+                RestReplies.error(channel, RestStatus.NOT_FOUND, "pit_not_found", "no such point in time: " + String.join(", ", named))
             );
             return;
         }
@@ -447,7 +444,7 @@ public final class PointInTimeHandler extends BaseRestHandler {
 
     private void report(org.opensearch.rest.RestChannel channel, Exception e) {
         try {
-            channel.sendResponse(IndexAdminHandler.failure(channel, e));
+            channel.sendResponse(RestReplies.failure(channel, e));
         } catch (IOException nested) {
             logger.error("failed to report a point-in-time failure", nested);
         }

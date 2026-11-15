@@ -34,7 +34,7 @@ import java.util.Objects;
  * in it — the same store, the same durability, the same conformance question. {@code type} is accepted
  * and stored for a client that sends it, but only the value meaning "this deployment's own store" is
  * functional; a genuinely distinct backend is refused at the REST layer rather than silently ignored (see
- * {@link org.opensearch.serverless.rest.RepositoryHandler}). A caller asking for real cross-store
+ * {@code RepositoryHandler}). A caller asking for real cross-store
  * durability wants object-store replication, not a second repository type here.
  *
  * <p><b>{@code settings.remote_store_index_shallow_copy}</b> is the one setting that does something: it

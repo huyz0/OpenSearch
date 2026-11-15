@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.snapshot;
 
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -16,6 +16,7 @@ import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.RepositoryDescriptor;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -91,7 +92,7 @@ public final class SnapshotHandler extends BaseRestHandler {
         final String snapshotParam = request.param("snapshot");
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         final boolean waitForCompletion = request.paramAsBoolean("wait_for_completion", false);
@@ -115,7 +116,7 @@ public final class SnapshotHandler extends BaseRestHandler {
         if (badName != null || badSnapshot != null) {
             final String reason = badName != null ? badName : badSnapshot;
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "invalid_snapshot_name_exception", reason)
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "invalid_snapshot_name_exception", reason)
             );
         }
         if (request.path().endsWith("/_restore")) {
@@ -123,7 +124,7 @@ public final class SnapshotHandler extends BaseRestHandler {
             for (Map.Entry<String, String> refused : SnapshotRequestBodies.RESTORE_REFUSED_KEYS.entrySet()) {
                 if (body.containsKey(refused.getKey())) {
                     return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.NOT_IMPLEMENTED,
                             "unsupported_restore",
@@ -135,7 +136,7 @@ public final class SnapshotHandler extends BaseRestHandler {
             final String unknown = SnapshotRequestBodies.firstUnknownKey(body, SnapshotRequestBodies.RESTORE_KNOWN_KEYS);
             if (unknown != null) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "unknown_parameter", "Unknown parameter " + unknown)
+                    RestReplies.error(channel, RestStatus.BAD_REQUEST, "unknown_parameter", "Unknown parameter " + unknown)
                 );
             }
             return channel -> dispatch(
@@ -155,7 +156,7 @@ public final class SnapshotHandler extends BaseRestHandler {
                     // Refused rather than admitted and dropped: the record has no field for it, and a
                     // caller who sent it and then read the snapshot back found nothing, with no reason why.
                     return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.NOT_IMPLEMENTED,
                             "unsupported_snapshot_option",
@@ -169,18 +170,13 @@ public final class SnapshotHandler extends BaseRestHandler {
                     // The same check the restore path has always made, which the create path did not: an
                     // unknown key was accepted and dropped.
                     return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.BAD_REQUEST,
-                            "unknown_parameter",
-                            "Unknown parameter " + unknownCreateKey
-                        )
+                        RestReplies.error(channel, RestStatus.BAD_REQUEST, "unknown_parameter", "Unknown parameter " + unknownCreateKey)
                     );
                 }
                 final List<String> indices = SnapshotRequestBodies.readIndices(body.get("indices"));
                 if (indices.isEmpty()) {
                     return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.BAD_REQUEST,
                             "missing_indices",
@@ -224,7 +220,7 @@ public final class SnapshotHandler extends BaseRestHandler {
             }
             default:
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.METHOD_NOT_ALLOWED,
                         "method_not_allowed",
@@ -330,7 +326,7 @@ public final class SnapshotHandler extends BaseRestHandler {
             work.run();
         } catch (Exception e) {
             try {
-                channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                channel.sendResponse(RestReplies.failure(channel, e));
             } catch (IOException nested) {
                 logger.error("failed to report a snapshot operation failure", nested);
             }

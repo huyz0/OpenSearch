@@ -29,6 +29,7 @@ import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.SearchFanout;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -83,11 +84,11 @@ public final class RankEvalHandler extends BaseRestHandler {
         try {
             searchType = org.opensearch.action.search.SearchType.fromString(request.param("search_type"));
         } catch (IllegalArgumentException e) {
-            return channel -> channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_request", e.getMessage()));
+            return channel -> channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_request", e.getMessage()));
         }
         if (searchType != org.opensearch.action.search.SearchType.QUERY_THEN_FETCH) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_search",
@@ -99,7 +100,7 @@ public final class RankEvalHandler extends BaseRestHandler {
         final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         final RankEvalSpec spec;
@@ -114,13 +115,13 @@ public final class RankEvalHandler extends BaseRestHandler {
             spec = RankEvalSpec.parse(parser);
         } catch (Exception e) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_request", "could not parse the evaluation: " + e.getMessage())
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_request", "could not parse the evaluation: " + e.getMessage())
             );
         }
         if (spec.getRatedRequests().size() > MultiSearchHandler.MAX_SEARCHES) {
             // Each rated request is a full search; the same bound a batch has.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "bad_request",
@@ -138,13 +139,13 @@ public final class RankEvalHandler extends BaseRestHandler {
                     false
                 );
                 if (resolved.refused()) {
-                    channel.sendResponse(IndexAdminHandler.error(channel, resolved.status(), resolved.type(), resolved.reason()));
+                    channel.sendResponse(RestReplies.error(channel, resolved.status(), resolved.type(), resolved.reason()));
                     return;
                 }
                 evaluate(channel, serving, metadata, resolved.indices(), spec, request);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a rank-eval failure", nested);
                 }

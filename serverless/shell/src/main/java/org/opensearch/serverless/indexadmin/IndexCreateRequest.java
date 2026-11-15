@@ -6,14 +6,16 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.indexadmin;
 
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.serverless.alias.AliasHandler;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.restcore.RestReplies;
 
 import java.io.IOException;
 import java.util.Map;
@@ -145,7 +147,7 @@ final class IndexCreateRequest {
         return new IndexCreateRequest(shards, updatedMapping, settings, explicitShards);
     }
 
-    static IndexCreateRequest parse(RestRequest request) throws IndexAdminHandler.RefusedException {
+    static IndexCreateRequest parse(RestRequest request) throws RestReplies.RefusedException {
         final int fromQuery = request.paramAsInt("shards", 1);
         if (request.hasContent() == false) {
             return new IndexCreateRequest(fromQuery, null, null, fromQuery != 1);
@@ -159,7 +161,7 @@ final class IndexCreateRequest {
                 org.opensearch.common.xcontent.XContentType.JSON
             ).v2();
         } catch (Exception e) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "the body is not a JSON object");
+            throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "the body is not a JSON object");
         }
         return parse(parsed, body, fromQuery);
     }
@@ -172,15 +174,15 @@ final class IndexCreateRequest {
      * @param body the body's text, for the bare-mapping form
      * @param fromQuery the shard count the query gave, 1 when it gave none
      * @return the request
-     * @throws IndexAdminHandler.RefusedException if the body asks for something refused
+     * @throws RestReplies.RefusedException if the body asks for something refused
      */
-    static IndexCreateRequest parse(Map<String, Object> parsed, String body, int fromQuery) throws IndexAdminHandler.RefusedException {
+    static IndexCreateRequest parse(Map<String, Object> parsed, String body, int fromQuery) throws RestReplies.RefusedException {
         try {
             if (parsed == null) {
                 throw new IllegalArgumentException("no body");
             }
         } catch (Exception e) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "malformed_body",
                 "could not parse the request body: " + e.getMessage()
@@ -206,12 +208,12 @@ final class IndexCreateRequest {
                 }
                 final String refused = AliasHandler.unsupportedAliasOption(options);
                 if (refused != null) {
-                    throw new IndexAdminHandler.RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_alias_option", refused);
+                    throw new RestReplies.RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_alias_option", refused);
                 }
                 aliases.put(String.valueOf(entry.getKey()), options);
             }
         } else if (parsed.containsKey("aliases")) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "'aliases' must be an object");
+            throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "'aliases' must be an object");
         }
 
         String mapping = null;
@@ -222,14 +224,14 @@ final class IndexCreateRequest {
                 builder.map(mappings);
                 mapping = builder.toString();
             } catch (IOException e) {
-                throw new IndexAdminHandler.RefusedException(
+                throw new RestReplies.RefusedException(
                     RestStatus.BAD_REQUEST,
                     "malformed_body",
                     "could not read 'mappings': " + e.getMessage()
                 );
             }
         } else if (parsed.containsKey("mappings")) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "'mappings' must be an object");
+            throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "'mappings' must be an object");
         }
 
         Settings settings = Settings.EMPTY;
@@ -240,7 +242,7 @@ final class IndexCreateRequest {
             // core names it by, and it is core's own normalisation rather than a guess at one.
             settings = Settings.builder().loadFromMap(raw).normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX).build();
         } else if (parsed.containsKey("settings")) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "'settings' must be an object");
+            throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "'settings' must be an object");
         }
 
         final IndexCreateRequest request = fromSettings(settings, mapping, fromQuery);
@@ -248,12 +250,12 @@ final class IndexCreateRequest {
         return request;
     }
 
-    static IndexCreateRequest fromSettings(Settings settings, String mapping, int fromQuery) throws IndexAdminHandler.RefusedException {
+    static IndexCreateRequest fromSettings(Settings settings, String mapping, int fromQuery) throws RestReplies.RefusedException {
         final String replicas = settings.get(IndexMetadata.SETTING_NUMBER_OF_REPLICAS);
         if (replicas != null && "0".equals(replicas) == false) {
             // Refused, and with the real reason. Accepting it would mean recording a replica count that
             // nothing acts on, and reporting a redundancy this deployment does not provide that way.
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.NOT_IMPLEMENTED,
                 "unsupported_setting",
                 "number_of_replicas is not supported: a shard has one writer and its durability comes from "
@@ -270,11 +272,11 @@ final class IndexCreateRequest {
             try {
                 shards = Integer.parseInt(requested);
             } catch (NumberFormatException e) {
-                throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "number_of_shards must be a number");
+                throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "number_of_shards must be a number");
             }
         }
         if (shards < 1 || shards > IndexDescriptor.MAX_SHARDS) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "invalid_shard_count",
                 "number_of_shards must be between 1 and " + IndexDescriptor.MAX_SHARDS + ", got " + shards

@@ -15,6 +15,8 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.restcore.CatTable;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -91,7 +93,7 @@ public final class NodesHandler extends BaseRestHandler {
             // never a name.
             final String asked = metric != null ? metric : wanted;
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "not_implemented",
@@ -110,14 +112,14 @@ public final class NodesHandler extends BaseRestHandler {
 
         if (unsupported != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_cat_parameter", unsupported)
+                RestReplies.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_cat_parameter", unsupported)
             );
         }
 
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
@@ -174,7 +176,7 @@ public final class NodesHandler extends BaseRestHandler {
             }
             if (wanted != null && selected.isEmpty()) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "node_not_found", "no live node matches [" + wanted + "]")
+                    RestReplies.error(channel, RestStatus.NOT_FOUND, "node_not_found", "no live node matches [" + wanted + "]")
                 );
                 return;
             }
@@ -263,7 +265,7 @@ public final class NodesHandler extends BaseRestHandler {
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
         try {
-            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+            channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
             logger.error("failed to report a nodes refusal", e);
         }
@@ -293,7 +295,7 @@ public final class NodesHandler extends BaseRestHandler {
 
     private void run(org.opensearch.rest.RestChannel channel, org.opensearch.common.CheckedRunnable<Exception> work) {
         try {
-            IndexAdminHandler.gate(
+            RestReplies.gate(
                 node.get(),
                 org.opensearch.action.admin.cluster.node.info.NodesInfoAction.NAME,
                 new org.opensearch.action.admin.cluster.node.info.NodesInfoRequest(),
@@ -304,7 +306,7 @@ public final class NodesHandler extends BaseRestHandler {
             );
         } catch (Exception e) {
             try {
-                channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                channel.sendResponse(RestReplies.failure(channel, e));
             } catch (IOException nested) {
                 logger.error("failed to report a nodes failure", nested);
             }

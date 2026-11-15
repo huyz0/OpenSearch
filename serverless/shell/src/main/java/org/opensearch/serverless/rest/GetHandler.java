@@ -19,6 +19,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.ops.SourceFiltering;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.write.Document;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -114,12 +115,12 @@ public final class GetHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         if (storedFields != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_read",
@@ -129,7 +130,7 @@ public final class GetHandler extends BaseRestHandler {
         }
         if (version != null || versionType != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_read",
@@ -141,7 +142,7 @@ public final class GetHandler extends BaseRestHandler {
         if (sourceOnly && fetchSource != null && fetchSource.fetchSource() == false) {
             // Core's own refusal, with its own words: the endpoint exists to return the source.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "action_request_validation_exception",
@@ -152,7 +153,7 @@ public final class GetHandler extends BaseRestHandler {
         final NodeContext serving = node.get();
         if (serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_not_ready", "no node is serving requests yet")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_not_ready", "no node is serving requests yet")
             );
         }
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GET).execute(() -> {
@@ -160,16 +161,14 @@ public final class GetHandler extends BaseRestHandler {
                 // Routing-cache misses read the object store, so resolution belongs off the HTTP thread too.
                 final Optional<IndexDescriptor> descriptor = metadata.describeForRouting(index);
                 if (descriptor.isEmpty()) {
-                    channel.sendResponse(
-                        IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index)
-                    );
+                    channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
                     return;
                 }
                 final int shard = DocumentRouting.shardFor(descriptor.get(), id, routing);
                 answer(channel, serving, metadata, descriptor.get(), id, routing, shard, bodyless, fetchSource, sourceOnly);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a read failure", nested);
                 }
@@ -207,13 +206,13 @@ public final class GetHandler extends BaseRestHandler {
                 sourceOnly
             );
         } catch (org.opensearch.serverless.shard.SystemIndexException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
         } catch (org.opensearch.serverless.shard.NotHereException e) {
             // A "not here" is never answered from a published commit that a live writer is already ahead
             // of, which would be a stale document -- or a 404 for a document that exists -- reported as
             // success. The status and type are the exception's own, so this endpoint says the same thing
             // about the same state as every other.
-            channel.sendResponse(IndexAdminHandler.error(channel, e.restStatus(), e.restType(serving.localNode().getId()), e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, e.restStatus(), e.restType(serving.localNode().getId()), e.getMessage()));
         }
     }
 
@@ -240,7 +239,7 @@ public final class GetHandler extends BaseRestHandler {
             // structurally could not read at all.
             if (document.found() == false) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.NOT_FOUND,
                         "resource_not_found_exception",

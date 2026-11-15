@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.restcore;
 
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -31,16 +31,16 @@ import java.util.List;
  * caller a table that is not the one they asked for, which on this surface is the failure that matters more
  * than the missing feature. So they are refused, by name, and the default column set is what there is.
  */
-final class CatTable {
+public final class CatTable {
 
     private final List<String> headers;
     private final List<List<String>> rows = new ArrayList<>();
 
-    CatTable(String... headers) {
+    public CatTable(String... headers) {
         this.headers = List.of(headers);
     }
 
-    void row(Object... cells) {
+    public void row(Object... cells) {
         final List<String> row = new ArrayList<>(cells.length);
         for (Object cell : cells) {
             row.add(cell == null ? "null" : String.valueOf(cell));
@@ -54,7 +54,7 @@ final class CatTable {
      * @param request the request
      * @return the refusal reason, or null when the request is answerable
      */
-    static String unsupported(RestRequest request) {
+    public static String unsupported(RestRequest request) {
         // Consumed, not merely inspected. BaseRestHandler rejects a request whose parameters were not all
         // read, and it does so after this handler has already decided to refuse -- so a refusal that only
         // looked at the parameter came back as "unrecognized parameter: [h]" instead of as itself.
@@ -78,7 +78,7 @@ final class CatTable {
      * @param request the request, read for {@code format} and {@code v}
      * @throws IOException if writing fails
      */
-    void send(RestChannel channel, RestRequest request) throws IOException {
+    public void send(RestChannel channel, RestRequest request) throws IOException {
         send(channel, request, null, false);
     }
 
@@ -92,7 +92,7 @@ final class CatTable {
      * @param nextToken where the next page starts, or null on the last page
      * @throws IOException if writing fails
      */
-    void sendPage(RestChannel channel, RestRequest request, String entity, String nextToken) throws IOException {
+    public void sendPage(RestChannel channel, RestRequest request, String entity, String nextToken) throws IOException {
         this.entity = entity;
         send(channel, request, nextToken, true);
     }

@@ -24,6 +24,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.ops.ShardOperations;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.shard.Explained;
 import org.opensearch.serverless.shard.NoSuchIndexException;
 import org.opensearch.serverless.shard.NotHereException;
@@ -98,7 +99,7 @@ public final class ExplainHandler extends BaseRestHandler {
             // Refused rather than silently omitted: core answers these with a "get" block carrying the
             // document, and this explains a score without fetching the document back.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_explain",
@@ -112,7 +113,7 @@ public final class ExplainHandler extends BaseRestHandler {
         final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
@@ -130,22 +131,12 @@ public final class ExplainHandler extends BaseRestHandler {
                 source = SearchSourceBuilder.fromXContent(parser, true);
             } catch (Exception e) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "bad_query",
-                        "could not parse the explain body: " + e.getMessage()
-                    )
+                    RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_query", "could not parse the explain body: " + e.getMessage())
                 );
             }
             if (source.query() == null) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "bad_query",
-                        "the body must contain a query to explain against"
-                    )
+                    RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_query", "the body must contain a query to explain against")
                 );
             }
             query = source.query();
@@ -159,7 +150,7 @@ public final class ExplainHandler extends BaseRestHandler {
             // this document against nothing in particular" is not one, and answering it with match_all
             // would hand back a constant score that looks like a real result.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_query", "send a query body, or a q= query string")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_query", "send a query body, or a q= query string")
             );
         }
 
@@ -176,7 +167,7 @@ public final class ExplainHandler extends BaseRestHandler {
                 sendQuietly(channel, e.restStatus(), e.restType(serving.localNode().getId()), e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report an explain failure", nested);
                 }
@@ -225,7 +216,7 @@ public final class ExplainHandler extends BaseRestHandler {
 
     private void sendQuietly(RestChannel channel, RestStatus status, String type, String reason) {
         try {
-            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+            channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
             logger.error("failed to report an explain refusal", e);
         }

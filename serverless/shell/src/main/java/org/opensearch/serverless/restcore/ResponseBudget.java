@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.restcore;
 
 import org.opensearch.core.common.breaker.CircuitBreaker;
 import org.opensearch.core.common.io.stream.Writeable;
@@ -13,23 +13,23 @@ import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.ResponseMemory;
 
 /** One batch's retained responses, including work completing after its caller gives up. */
-final class ResponseBudget implements AutoCloseable {
+public final class ResponseBudget implements AutoCloseable {
     private final CircuitBreaker breaker;
     private long reserved;
     private volatile boolean closed;
 
-    ResponseBudget(NodeContext serving) {
+    public ResponseBudget(NodeContext serving) {
         breaker = serving.services().circuitBreakerService().getBreaker(CircuitBreaker.REQUEST);
     }
 
-    void keep(Writeable value, Runnable retain) {
+    public void keep(Writeable value, Runnable retain) {
         if (closed) {
             throw new IllegalStateException("the batch no longer accepts responses");
         }
         keep(ResponseMemory.of(value), retain);
     }
 
-    synchronized void keep(long bytes, Runnable retain) {
+    public synchronized void keep(long bytes, Runnable retain) {
         if (closed) {
             throw new IllegalStateException("the batch no longer accepts responses");
         }
@@ -44,13 +44,13 @@ final class ResponseBudget implements AutoCloseable {
         }
     }
 
-    synchronized void ensureAtLeast(long bytes) {
+    public synchronized void ensureAtLeast(long bytes) {
         if (bytes > reserved) {
             keep(bytes - reserved, () -> {});
         }
     }
 
-    synchronized void abandon(Runnable discard) {
+    public synchronized void abandon(Runnable discard) {
         try {
             discard.run();
         } finally {

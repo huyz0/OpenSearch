@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.indexadmin;
 
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.rest.RestStatus;
@@ -21,6 +21,8 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.TemplateResolver;
 import org.opensearch.serverless.metadata.TooManyMatchesException;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.restcore.IndexPatterns;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -124,12 +126,12 @@ public final class DataStreamHandler extends BaseRestHandler {
         final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         if (name.startsWith("_") || name.startsWith(".")) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     name.startsWith("_") ? RestStatus.NOT_IMPLEMENTED : RestStatus.BAD_REQUEST,
                     name.startsWith("_") ? "not_implemented" : "illegal_argument_exception",
@@ -199,7 +201,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                                 || selected.indices()[0].contains(",")
                                 || selected.indices()[0].contains("*")
                                 || selected.indices()[0].contains("?")) {
-                                throw new IndexAdminHandler.RefusedException(
+                                throw new RestReplies.RefusedException(
                                     RestStatus.NOT_IMPLEMENTED,
                                     "unsupported_data_stream_delete",
                                     "deleting multiple data streams or patterns is not supported; name one concrete data stream"
@@ -233,12 +235,12 @@ public final class DataStreamHandler extends BaseRestHandler {
             }
         }, failure -> {
             try {
-                if (failure instanceof IndexAdminHandler.RefusedException refused) {
+                if (failure instanceof RestReplies.RefusedException refused) {
                     sendQuietly(channel, refused.status, refused.type, refused.getMessage());
                 } else if (failure instanceof TooManyMatchesException matches) {
                     sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", matches.getMessage());
                 } else {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, failure));
+                    channel.sendResponse(RestReplies.failure(channel, failure));
                 }
             } catch (IOException nested) {
                 logger.error("failed to report a data-stream failure", nested);
@@ -246,12 +248,12 @@ public final class DataStreamHandler extends BaseRestHandler {
         });
     }
 
-    private static void validateName(String name) throws IndexAdminHandler.RefusedException {
+    private static void validateName(String name) throws RestReplies.RefusedException {
         if (name == null || name.isBlank()) {
             throw new IllegalArgumentException("a data stream name is required");
         }
         if (name.startsWith("_") || name.startsWith(".")) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 name.startsWith("_") ? RestStatus.NOT_IMPLEMENTED : RestStatus.BAD_REQUEST,
                 name.startsWith("_") ? "not_implemented" : "illegal_argument_exception",
                 "'" + name + "' is not a data stream name"
@@ -278,7 +280,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                 // A name a plugin declared as its own is reserved on every path that creates a name, not
                 // only on PUT /{index}: a stream created under it would resolve the plugin's own writes to a
                 // backing index nothing guards.
-                throw new IndexAdminHandler.RefusedException(
+                throw new RestReplies.RefusedException(
                     RestStatus.FORBIDDEN,
                     "system_index",
                     "[" + minted + "] belongs to a plugin and cannot be created here"
@@ -286,7 +288,7 @@ public final class DataStreamHandler extends BaseRestHandler {
             }
         }
         if (metadata.resolve(name).absent() == false) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "resource_already_exists_exception",
                 "[" + name + "] already exists"
@@ -299,7 +301,7 @@ public final class DataStreamHandler extends BaseRestHandler {
         );
         if (inherited.isDataStream() == false) {
             // Core's own requirement, in core's words.
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "illegal_argument_exception",
                 "no matching index template found for data stream [" + name + "]"
@@ -322,13 +324,13 @@ public final class DataStreamHandler extends BaseRestHandler {
                 inherited
             );
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "resource_already_exists_exception",
                 "index [" + backing + "] already exists"
             );
-        } catch (IndexAdminHandler.RefusedException e) {
-            throw new IndexAdminHandler.RefusedException(e.status, e.type, e.getMessage());
+        } catch (RestReplies.RefusedException e) {
+            throw new RestReplies.RefusedException(e.status, e.type, e.getMessage());
         }
         try {
             metadata.createAlias(new AliasRecord(name, List.of(backing), true, 1L, inherited.timestampField()));
@@ -340,7 +342,7 @@ public final class DataStreamHandler extends BaseRestHandler {
             } catch (Exception cleanup) {
                 logger.warn("could not remove the backing index [" + backing + "] of a data stream that was not created", cleanup);
             }
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "resource_already_exists_exception",
                 "[" + name + "] already exists"
@@ -375,7 +377,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                     if (resolved.alias() != null && resolved.alias().dataStream()) {
                         streams.putIfAbsent(each, resolved.alias());
                     } else if (pattern == false) {
-                        throw new IndexAdminHandler.RefusedException(
+                        throw new RestReplies.RefusedException(
                             RestStatus.NOT_FOUND,
                             "resource_not_found_exception",
                             "data stream [" + each + "] does not exist"
@@ -424,7 +426,7 @@ public final class DataStreamHandler extends BaseRestHandler {
         validateName(name);
         final Optional<AliasAtGeneration> found = metadata.aliasWithGeneration(name);
         if (found.isEmpty() || found.get().alias().dataStream() == false) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.NOT_FOUND,
                 "resource_not_found_exception",
                 "data stream [" + name + "] does not exist"
@@ -440,7 +442,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                 .ifPresent(descriptor -> backings.add(new org.opensearch.core.index.Index(backing, descriptor.uuid())));
         }
         if (metadata.deleteAlias(record, found.get().generation()) == false) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.CONFLICT,
                 "version_conflict_engine_exception",
                 "data stream [" + name + "] was changed concurrently; nothing was deleted, retry"
@@ -455,7 +457,7 @@ public final class DataStreamHandler extends BaseRestHandler {
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
         try {
-            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+            channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
             logger.error("failed to report a data-stream refusal", e);
         }

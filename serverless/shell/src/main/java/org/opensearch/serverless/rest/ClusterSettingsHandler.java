@@ -19,6 +19,7 @@ import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.ClusterConfig;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -78,7 +79,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
         request.paramAsBoolean("flat_settings", false);
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
@@ -86,7 +87,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
             final NodeContext reader = node.get();
             if (reader == null) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable")
+                    RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable")
                 );
             }
             final var nativeRequest = new org.opensearch.action.admin.cluster.state.ClusterStateRequest().clear().metadata(true);
@@ -141,7 +142,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                     }
                 } catch (Exception e) {
                     try {
-                        channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                        channel.sendResponse(RestReplies.failure(channel, e));
                     } catch (IOException nested) {
                         logger.error("failed to report a cluster settings read failure", nested);
                     }
@@ -154,7 +155,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
         final NodeContext serving = node.get();
         if (serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable")
             );
         }
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.WRITE).execute(() -> {
@@ -269,7 +270,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                 }
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a cluster settings write failure", nested);
                 }

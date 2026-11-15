@@ -61,7 +61,7 @@ final class NodeWiring {
             )
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.IndexAdminHandler(() -> node.metadataPlane(), () -> node))
+            guarded.apply(new org.opensearch.serverless.indexadmin.IndexAdminHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
             guarded.apply(new org.opensearch.serverless.rest.DocumentHandler(() -> node, () -> node.metadataPlane()))
@@ -92,7 +92,7 @@ final class NodeWiring {
             guarded.apply(new org.opensearch.serverless.rest.CatalogHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.StatsHandler(() -> node, () -> node.metadataPlane())));
-        controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.AliasHandler(() -> node.metadataPlane(), () -> node)));
+        controller.registerHandler(guarded.apply(new org.opensearch.serverless.alias.AliasHandler(() -> node.metadataPlane(), () -> node)));
         controller.registerHandler(
             guarded.apply(new org.opensearch.serverless.rest.PointInTimeHandler(() -> node, () -> node.metadataPlane()))
         );
@@ -102,10 +102,10 @@ final class NodeWiring {
         // Snapshot/restore, backed by this deployment's own object store rather than a distinct
         // repository backend.
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.RepositoryHandler(() -> node.metadataPlane(), () -> node))
+            guarded.apply(new org.opensearch.serverless.snapshot.RepositoryHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.SnapshotHandler(() -> node.metadataPlane(), () -> node))
+            guarded.apply(new org.opensearch.serverless.snapshot.SnapshotHandler(() -> node.metadataPlane(), () -> node))
         );
         // The one piece of /_cluster/* not refused below: cluster/config is one register, exactly
         // like an index descriptor, and this node can answer for it the same honest way it answers for an
@@ -122,7 +122,7 @@ final class NodeWiring {
         );
         controller.registerHandler(guarded.apply(new org.opensearch.serverless.rest.NodesHandler(() -> node.metadataPlane(), () -> node)));
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.MappingUpdateHandler(() -> node.metadataPlane(), () -> node))
+            guarded.apply(new org.opensearch.serverless.indexadmin.MappingUpdateHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
             guarded.apply(new org.opensearch.serverless.rest.FieldCapabilitiesHandler(() -> node.metadataPlane(), () -> node))
@@ -131,7 +131,7 @@ final class NodeWiring {
             guarded.apply(new org.opensearch.serverless.rest.ListIndicesHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.SettingsUpdateHandler(() -> node.metadataPlane(), () -> node))
+            guarded.apply(new org.opensearch.serverless.indexadmin.SettingsUpdateHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
             guarded.apply(new org.opensearch.serverless.rest.AnalyzeHandler(() -> node.metadataPlane(), () -> node))
@@ -155,10 +155,10 @@ final class NodeWiring {
             guarded.apply(new org.opensearch.serverless.rest.RankEvalHandler(() -> node, () -> node.metadataPlane()))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.RolloverHandler(() -> node, () -> node.metadataPlane()))
+            guarded.apply(new org.opensearch.serverless.indexadmin.RolloverHandler(() -> node, () -> node.metadataPlane()))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.rest.DataStreamHandler(() -> node, () -> node.metadataPlane()))
+            guarded.apply(new org.opensearch.serverless.indexadmin.DataStreamHandler(() -> node, () -> node.metadataPlane()))
         );
         controller.registerHandler(
             guarded.apply(new org.opensearch.serverless.rest.ValidateAndResolveHandler(() -> node.metadataPlane(), () -> node))

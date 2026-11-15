@@ -28,6 +28,7 @@ import org.opensearch.script.mustache.SearchTemplateRequest;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -109,9 +110,9 @@ public final class SearchTemplateHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
-            IndexAdminHandler.consumeAllParams(request);
+            RestReplies.consumeAllParams(request);
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         final String path = request.path();
@@ -154,7 +155,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
 
     private void report(org.opensearch.rest.RestChannel channel, Exception e, String what) {
         try {
-            channel.sendResponse(IndexAdminHandler.failure(channel, e));
+            channel.sendResponse(RestReplies.failure(channel, e));
         } catch (IOException nested) {
             logger.error("failed to report a search template " + what + " failure", nested);
         }
@@ -172,14 +173,9 @@ public final class SearchTemplateHandler extends BaseRestHandler {
                 template = SearchTemplateRequest.fromXContent(parser);
             }
         } catch (Exception e) {
-            IndexAdminHandler.consumeAllParams(request);
+            RestReplies.consumeAllParams(request);
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "bad_query",
-                    "could not parse the search template: " + e.getMessage()
-                )
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_query", "could not parse the search template: " + e.getMessage())
             );
         }
         // Everything after parsing runs off the HTTP thread, as SearchHandler.prepareRequest and multi()
@@ -216,14 +212,12 @@ public final class SearchTemplateHandler extends BaseRestHandler {
         try {
             batch = RestMultiSearchTemplateAction.parseRequest(request, true);
         } catch (Exception e) {
-            IndexAdminHandler.consumeAllParams(request);
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "malformed_request", e.getMessage())
-            );
+            RestReplies.consumeAllParams(request);
+            return channel -> channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "malformed_request", e.getMessage()));
         }
         if (batch.requests().size() > MultiSearchHandler.MAX_SEARCHES) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "malformed_request",
@@ -276,7 +270,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
                 multiSearch.answer(channel, metadata, serving, subs, request);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a multi-search-template failure", nested);
                 }

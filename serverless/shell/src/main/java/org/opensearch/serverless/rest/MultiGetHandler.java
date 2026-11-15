@@ -27,6 +27,8 @@ import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.ops.Fanout;
 import org.opensearch.serverless.ops.ResponseMemory;
 import org.opensearch.serverless.ops.ShardOperations;
+import org.opensearch.serverless.restcore.ResponseBudget;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.shard.NoSuchIndexException;
 import org.opensearch.serverless.shard.NotHereException;
 import org.opensearch.serverless.shard.SystemIndexException;
@@ -80,7 +82,7 @@ public final class MultiGetHandler extends BaseRestHandler {
         final boolean refresh = request.paramAsBoolean("refresh", false);
         if (storedFields != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_read",
@@ -90,7 +92,7 @@ public final class MultiGetHandler extends BaseRestHandler {
         }
         if (request.hasContentOrSourceParam() == false) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a multi-get needs a body naming the documents")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a multi-get needs a body naming the documents")
             );
         }
         final MultiGetRequest ask = new MultiGetRequest().preference(preference).realtime(realtime).refresh(refresh);
@@ -108,14 +110,14 @@ public final class MultiGetHandler extends BaseRestHandler {
             }
         } catch (Exception e) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_request", "the body could not be read: " + e.getMessage())
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_request", "the body could not be read: " + e.getMessage())
             );
         }
         final MetadataPlane metadata = plane.get();
         final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         return channel -> serving.threadPool().executor(ThreadPool.Names.GENERIC).execute(() -> {
@@ -138,7 +140,7 @@ public final class MultiGetHandler extends BaseRestHandler {
                 }
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a multi-get failure", nested);
                 }

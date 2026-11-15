@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.restcore;
 
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.rest.BaseRestHandler;
@@ -78,7 +78,7 @@ public final class NotImplementedHandler extends BaseRestHandler {
         // The path is carried in the reason rather than as a field of its own, because the error object's
         // shape is core's and is not this handler's to extend.
         return channel -> channel.sendResponse(
-            IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "not_implemented", path + " is not available here: " + reason)
+            RestReplies.error(channel, RestStatus.NOT_IMPLEMENTED, "not_implemented", path + " is not available here: " + reason)
         );
     }
 }

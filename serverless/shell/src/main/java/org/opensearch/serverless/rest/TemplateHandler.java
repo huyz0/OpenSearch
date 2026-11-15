@@ -13,9 +13,11 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.serverless.indexadmin.IndexAdminHandler;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.TemplateStore;
 import org.opensearch.serverless.metadata.TooManyTemplatesException;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -101,7 +103,7 @@ public final class TemplateHandler extends BaseRestHandler {
             // implement. Without this, POST /_index_template/_simulate -- core's own simulate endpoint --
             // matched the {name} placeholder and stored a live template called "_simulate" with a 200.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "not_implemented",
@@ -117,13 +119,13 @@ public final class TemplateHandler extends BaseRestHandler {
         final var serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
         if ((method == RestRequest.Method.PUT || method == RestRequest.Method.POST) && content.length() == 0) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a template body is required")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a template body is required")
             );
         }
 
@@ -257,7 +259,7 @@ public final class TemplateHandler extends BaseRestHandler {
                         render(channel, response, request);
                     }
                 }
-            } catch (IndexAdminHandler.RefusedException e) {
+            } catch (RestReplies.RefusedException e) {
                 sendQuietly(channel, e.status, e.type, e.getMessage());
             } catch (TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_templates", e.getMessage());
@@ -265,7 +267,7 @@ public final class TemplateHandler extends BaseRestHandler {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a template failure", nested);
                 }
@@ -279,7 +281,7 @@ public final class TemplateHandler extends BaseRestHandler {
         String name,
         String body,
         boolean create
-    ) throws IOException, IndexAdminHandler.RefusedException {
+    ) throws IOException, RestReplies.RefusedException {
         final Map<String, Object> parsed;
         try {
             parsed = org.opensearch.common.xcontent.XContentHelper.convertToMap(
@@ -288,7 +290,7 @@ public final class TemplateHandler extends BaseRestHandler {
                 org.opensearch.common.xcontent.XContentType.JSON
             ).v2();
         } catch (Exception e) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "malformed_body",
                 "could not parse the template: " + e.getMessage()
@@ -311,7 +313,7 @@ public final class TemplateHandler extends BaseRestHandler {
         if (parsed.get("template") instanceof Map<?, ?> template
             && template.get("aliases") instanceof Map<?, ?> aliases
             && aliases.isEmpty() == false) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.NOT_IMPLEMENTED,
                 "unsupported_template",
                 "template.aliases is not supported: aliases are not created with an index here. Create the index, "
@@ -319,11 +321,7 @@ public final class TemplateHandler extends BaseRestHandler {
             );
         }
         if (parsed.get("data_stream") != null && (parsed.get("data_stream") instanceof Map<?, ?>) == false) {
-            throw new IndexAdminHandler.RefusedException(
-                RestStatus.BAD_REQUEST,
-                "illegal_argument_exception",
-                "data_stream must be an object"
-            );
+            throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", "data_stream must be an object");
         }
         if (parsed.get("template") instanceof Map<?, ?> template && template.get("settings") != null) {
             // The settings a template contributes are validated the way a create request's are, in every
@@ -331,11 +329,7 @@ public final class TemplateHandler extends BaseRestHandler {
             // failing the first index that inherits it. Replicas above zero and the pipeline settings are
             // refused for the reasons a create refuses them.
             if ((template.get("settings") instanceof Map<?, ?>) == false) {
-                throw new IndexAdminHandler.RefusedException(
-                    RestStatus.BAD_REQUEST,
-                    "malformed_body",
-                    "template.settings must be an object"
-                );
+                throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "malformed_body", "template.settings must be an object");
             }
             final org.opensearch.common.settings.Settings settings;
             try {
@@ -346,7 +340,7 @@ public final class TemplateHandler extends BaseRestHandler {
                     .normalizePrefix(org.opensearch.cluster.metadata.IndexMetadata.INDEX_SETTING_PREFIX)
                     .build();
             } catch (Exception e) {
-                throw new IndexAdminHandler.RefusedException(
+                throw new RestReplies.RefusedException(
                     RestStatus.BAD_REQUEST,
                     "malformed_body",
                     "could not read template.settings: " + e.getMessage()
@@ -354,7 +348,7 @@ public final class TemplateHandler extends BaseRestHandler {
             }
             final String replicas = settings.get(org.opensearch.cluster.metadata.IndexMetadata.SETTING_NUMBER_OF_REPLICAS);
             if (replicas != null && "0".equals(replicas) == false) {
-                throw new IndexAdminHandler.RefusedException(
+                throw new RestReplies.RefusedException(
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_setting",
                     "number_of_replicas is not supported: a shard has one writer and its durability comes from the "
@@ -363,17 +357,17 @@ public final class TemplateHandler extends BaseRestHandler {
             }
             try {
                 IndexAdminHandler.validateIndexSettings(settings, false, node.get());
-            } catch (IndexAdminHandler.RefusedException e) {
-                throw new IndexAdminHandler.RefusedException(e.status, e.type, e.getMessage());
+            } catch (RestReplies.RefusedException e) {
+                throw new RestReplies.RefusedException(e.status, e.type, e.getMessage());
             }
         }
         store.put(name, body, create);
         return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
 
-    private static Map<String, String> get(TemplateStore store, String name) throws IOException, IndexAdminHandler.RefusedException {
+    private static Map<String, String> get(TemplateStore store, String name) throws IOException, RestReplies.RefusedException {
         if (name != null && name.startsWith("_")) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.NOT_IMPLEMENTED, "not_implemented", "reserved template API: " + name);
+            throw new RestReplies.RefusedException(RestStatus.NOT_IMPLEMENTED, "not_implemented", "reserved template API: " + name);
         }
         if (name == null) {
             return store.all();
@@ -383,7 +377,7 @@ public final class TemplateHandler extends BaseRestHandler {
         }
         final var one = store.get(name);
         if (one.isEmpty()) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.NOT_FOUND, "template_missing", "no such template: " + name);
+            throw new RestReplies.RefusedException(RestStatus.NOT_FOUND, "template_missing", "no such template: " + name);
         }
         return Map.of(name, one.get());
     }
@@ -393,9 +387,9 @@ public final class TemplateHandler extends BaseRestHandler {
     }
 
     private static org.opensearch.action.support.clustermanager.AcknowledgedResponse delete(TemplateStore store, String name)
-        throws IOException, IndexAdminHandler.RefusedException {
+        throws IOException, RestReplies.RefusedException {
         if (store.delete(name) == false) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.NOT_FOUND, "template_missing", "no such template: " + name);
+            throw new RestReplies.RefusedException(RestStatus.NOT_FOUND, "template_missing", "no such template: " + name);
         }
         return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
@@ -471,7 +465,7 @@ public final class TemplateHandler extends BaseRestHandler {
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
         try {
-            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+            channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
             logger.error("failed to report a template refusal", e);
         }
