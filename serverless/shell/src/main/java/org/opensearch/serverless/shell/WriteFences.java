@@ -418,9 +418,9 @@ public final class WriteFences {
      *
      * <p><b>It bounds; it does not fence.</b> The check and the append are not atomic, so a pause between
      * them long enough to outlive the deadline still lands the append. That is the classic lease race and
-     * it cannot be closed from the writer's side. It is closed on the reader's side instead, by the replay
-     * cutoff in {@link org.opensearch.serverless.store.WalStore#position()}: a successor does not read what
-     * was appended after it took over, whether the appender believed itself entitled or not.
+     * it cannot be closed from the writer's side. It is closed on the reader's side instead, by the fence a
+     * successor places in this node's log before it replays it: what lands after the fence is never read, whether the
+     * appender believed itself entitled or not.
      *
      * <p>The shard is released rather than merely refused, because a node past its own deadline has lost
      * every shard it held, not just this one's write — and a released shard is one a successor can take

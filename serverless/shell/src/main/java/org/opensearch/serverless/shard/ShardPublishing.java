@@ -73,8 +73,9 @@ final class ShardPublishing {
         // in the translog, which this does not upload. Under the write guard, so the commit cannot split
         // an apply from its append -- see writeGuard for the lie that would tell.
         final ReentrantReadWriteLock.WriteLock exclusive = reconciler.guardFor(shardId).writeLock();
-        final var log = reconciler.wal(shardId);
-        final long walOrdinal;
+        // No write goes to the shard's own log, so a commit reaches all of it: zero, where a commit published before
+        // commits recorded their reach says -1.
+        final long walOrdinal = reconciler.replaysLogs ? 0L : -1L;
         final ShardReconciler.NodeLogHooks nodeLogHooks = reconciler.nodeLog;
         // Commits are staged only beside the node's own write log, never a shard's: the node log is what a successor
         // replays past the register, and what keeps every staged commit's records until a checkpoint covers them.
@@ -84,11 +85,6 @@ final class ShardPublishing {
         try {
             // Where no write is between its apply and its append, as for the ordinal below.
             nodeLogAt = nodeLogHooks == null ? null : nodeLogHooks.position(shardId);
-            // How far into the log this commit reaches, read where no write is between its apply and its append:
-            // every record at or below it holds operations the flush below commits. A reader of a shard nobody is
-            // writing compares it with what has landed, so a commit behind an acknowledged write is never served
-            // as though it were current.
-            walOrdinal = log == null ? -1L : log.appendedThrough(term);
             advanceGlobalCheckpoint(shard);
             shard.flush(new org.opensearch.action.admin.indices.flush.FlushRequest().force(true).waitIfOngoing(true));
         } finally {
@@ -287,24 +283,9 @@ final class ShardPublishing {
     }
 
     private void trim(ShardId shardId, long term, org.opensearch.serverless.store.NodeLogCommitter.Position nodeLogAt) throws IOException {
-        final var log = reconciler.wal(shardId);
         final ShardReconciler.NodeLogHooks nodeLogHooks = reconciler.nodeLog;
-        if (log != null) {
-            // Only after the commit is durable in the object store. Truncation drops what the previous
-            // publish saw, never what this one did -- see WalStore for why that gap is load-bearing.
-            log.onPublished(term);
-        }
         if (nodeLogHooks != null) {
             nodeLogHooks.published(shardId, nodeLogAt);
-            // What the open replayed from the shard's own log is in this commit: the head can say that log is quiet.
-            if (reconciler.shardLogQuietOnPublish.remove(shardId, term)) {
-                try {
-                    nodeLogHooks.shardLogQuiet(shardId, term);
-                } catch (IOException | RuntimeException e) {
-                    // The next owner closes the shard's log again, which costs listings, never records.
-                    ShardReconciler.logger.debug("could not record that " + shardId + "'s own log is quiet", e);
-                }
-            }
         }
     }
 

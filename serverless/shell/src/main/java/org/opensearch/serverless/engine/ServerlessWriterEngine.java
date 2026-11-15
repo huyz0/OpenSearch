@@ -14,7 +14,6 @@ import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.translog.Translog;
 import org.opensearch.serverless.store.WalRecord;
-import org.opensearch.serverless.store.WalStore;
 
 import java.io.IOException;
 import java.util.List;
@@ -40,11 +39,9 @@ import java.util.List;
  * <p><b>The fencing obligation, stated because core's javadoc requires it to be.</b> That javadoc warns
  * that replayed operations must be fenced against a competing writer which has taken the shard over since
  * they were written, or "a naive implementation reintroduces a lost-write bug". Here, that fencing is the
- * replay cutoff. A snapshot of how far the log had been written is taken when the replay is armed, and
- * nothing appended after it is read — so a writer which has lost its head but has not yet noticed, and
- * which goes on appending correctly-tagged records under its own still-valid-looking term, cannot have
- * that history replayed as though it had been acknowledged. See {@link WalStore#position()} for why a
- * snapshot is sufficient, and {@code rfc-fencing-closure.md} for the window it does not close.
+ * node log's: a successor fences each predecessor's log before it reads it, so a writer which has lost its
+ * head but has not yet noticed, and goes on appending under its own still-valid-looking term, lands its
+ * records behind the fence, where no replay reads them. See {@code NodeLogTakeover}.
  */
 public final class ServerlessWriterEngine extends InternalEngine {
 

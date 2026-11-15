@@ -39,11 +39,11 @@ import java.util.Objects;
  * <p><b>Replay stays idempotent, and is now idempotent for a better reason.</b> Before, replaying a
  * record twice was safe because the same id and source applied twice leaves the same state — but it
  * consumed two sequence numbers. Now a replayed operation carries the sequence number it already had, so
- * the engine recognises an already-processed operation and skips it outright. The conservative
- * truncation rule in {@link WalStore} therefore costs even less than it did.
+ * the engine recognises an already-processed operation and skips it outright, so a log that keeps a few
+ * records past a commit costs nothing to replay.
  *
  * <p><b>A record with no sequence number is still readable</b>, and is replayed the old way — as a fresh
- * primary operation. That is what a log written before this change contains, and treating it as a parse
+ * primary operation. That is what a log written before records carried one contains, and treating it as a parse
  * failure would turn a recoverable shard into an unrecoverable one over a field that has a sound
  * fallback.
  */

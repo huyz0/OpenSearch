@@ -65,63 +65,8 @@ final class ShardActivation {
      * @throws IOException if the register cannot be read or created
      */
     public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid) throws IOException {
-        return activate(indexName, shardId, nodeId, ephemeralId, indexUuid, false);
-    }
-
-    /**
-     * Attempts to take ownership of a shard of one incarnation of an index, saying which write log the taker writes.
-     *
-     * @param indexName the index
-     * @param shardId the shard number
-     * @param nodeId the acquiring node
-     * @param ephemeralId the acquiring node's ephemeral id
-     * @param indexUuid the uuid of the index being activated
-     * @param writesNodeLog whether the acquiring node writes its node's log rather than the shard's own; see
-     *     {@link ShardHead#withShardLogQuietSince}
-     * @return the outcome, carrying the winner's head either way
-     * @throws IOException if the register cannot be read or created
-     */
-    public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid, boolean writesNodeLog)
-        throws IOException {
-        final Acquisition acquisition = heads.acquire(indexName, shardId, nodeId, ephemeralId, indexUuid, writesNodeLog);
+        final Acquisition acquisition = heads.acquire(indexName, shardId, nodeId, ephemeralId, indexUuid);
         if (acquisition.acquired()) {
-            // Seal the log here, at the swap, rather than leaving it to whoever opens the shard.
-            //
-            // The seal is what stops a predecessor that has not yet noticed it lost this shard from
-            // having its later appends replayed as acknowledged history. It used to be taken when the
-            // shard was opened, which is several object-store round trips and a whole shard creation
-            // after the moment ownership actually moved -- and every one of the predecessor's appends
-            // inside that window fell in front of the cutoff and replayed. Taking it here narrows the
-            // window to the one blob write below: from the swap that transferred ownership to the seal
-            // that records where the predecessor's history ended.
-            //
-            // The open path still seals, and must: a shard released locally and reopened at the same
-            // term never passes through here. That second seal cannot loosen this one, because seals
-            // merge by taking the lowest recorded position per term -- see WalStore#sealAt -- so the
-            // tighter bound taken here is the one every later recovery inherits. The cost is one extra
-            // seal per acquisition, on a path that runs at failover rather than per write.
-            //
-            // Only when the uuid is known, because that is what locates the shard's bytes. A caller
-            // that acquires without one -- the overload that skips the incarnation check -- gets the
-            // old behaviour, with the open path's seal as the bound.
-            // Not for a head whose shard log is quiet: every term of it is closed already, and fencing them again is a
-            // listing per term to find so.
-            if (acquisition.head().indexUuid() != null && acquisition.head().shardLogQuiet() == false) {
-                try {
-                    plane.walStore(indexName, acquisition.head().indexUuid(), shardId).fenceOlderTerms(acquisition.head().term());
-                } catch (IOException e) {
-                    // A head won and a log unsealed is worse than no head at all: this node would go on
-                    // to open the shard and seal late, which is the window this exists to close. Give
-                    // the head back at the term just won and let the caller see the failure, exactly as
-                    // the unwritten claim below does.
-                    try {
-                        heads.release(indexName, shardId, nodeId, acquisition.head().term());
-                    } catch (IOException release) {
-                        e.addSuppressed(release);
-                    }
-                    throw e;
-                }
-            }
             // Record the claim so this node can find it again without reading the world. Written after
             // the compare-and-swap, never before: if the process dies in between, the node simply does
             // not see the shard on its next read and re-acquires, which self-heals. Writing it first

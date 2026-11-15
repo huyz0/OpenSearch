@@ -377,24 +377,21 @@ public class ServerlessSequenceNumberTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final Path objectStore = createTempDir();
         final MetadataPlane plane = freshIndex(clock, objectStore);
-        final String uuid = plane.describe("alpha").orElseThrow().uuid();
 
-        // Held first by a writer of the shard's own log, so the head does not say that log is quiet and the next open
-        // reads it.
-        final var earlier = plane.activate("alpha", 0, "shard-log-writer", "shard-log-writer-eph", uuid, false);
-        assertTrue(earlier.acquired());
-        assertEquals(1L, earlier.head().term());
-        clock.addAndGet(2 * TTL);
-
-        // Sequence numbers 0 and 2, with nothing at 1: the shape a burned-but-unlogged number leaves.
-        final var wal = plane.walStore("alpha", uuid, 0);
-        wal.append(
-            1L,
+        // Sequence numbers 0 and 2, with nothing at 1: the shape a burned-but-unlogged number leaves, in the log of a
+        // writer that held the shard at term 1 and died.
+        final long term = PlantedNodeLog.plant(
+            plane,
+            plane.describe("alpha").orElseThrow(),
+            0,
+            clock,
+            TTL,
             java.util.List.of(
                 new org.opensearch.serverless.store.WalRecord("a", "{\"msg\":\"first\",\"n\":1}", 0L, 1L, 1L),
                 new org.opensearch.serverless.store.WalRecord("c", "{\"msg\":\"third\",\"n\":3}", 2L, 1L, 1L)
             )
         );
+        assertEquals(1L, term);
 
         try (ServerlessNode writer = new ServerlessNode(nodeSettings("gap-writer"))) {
             writer.startup().start();

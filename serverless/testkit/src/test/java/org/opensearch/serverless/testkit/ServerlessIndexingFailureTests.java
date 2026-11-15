@@ -22,7 +22,7 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 
 public class ServerlessIndexingFailureTests extends OpenSearchTestCase {
-    public void testRejectedFieldKeepsItsNativeParsingErrorAndDoesNotEnterTheWal() throws Exception {
+    public void testRejectedFieldKeepsItsNativeParsingErrorAndDoesNotEnterTheLog() throws Exception {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
             final var metadata = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, 30_000L);
             final var descriptor = new IndexDescriptor("typed", "uuid-typed", 1, "{\"properties\":{\"n\":{\"type\":\"long\"}}}", null);
@@ -52,7 +52,12 @@ public class ServerlessIndexingFailureTests extends OpenSearchTestCase {
                     assertEquals(response.body(), 400, response.statusCode());
                     assertTrue(response.body(), response.body().contains("mapper_parsing_exception"));
                     assertFalse(node.reads().get(shard, "bad").found());
-                    assertTrue(metadata.walStore(descriptor.name(), descriptor.uuid(), 0).replayable().isEmpty());
+                    final long term = metadata.heads().read(descriptor.name(), 0).orElseThrow().term();
+                    assertEquals(
+                        "a refused write logs nothing",
+                        0L,
+                        node.nodeLogWriter().forEachRecordSince(shard, term, -1L, record -> fail("logged " + record.id()))
+                    );
                 }
             }
         }

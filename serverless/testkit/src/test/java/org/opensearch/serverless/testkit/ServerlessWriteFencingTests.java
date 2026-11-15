@@ -18,32 +18,22 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.store.WalRecord;
-import org.opensearch.serverless.store.WalStore;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Path;
-import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Fencing a writer that has lost its shard but has not yet noticed.
  *
- * <p><b>The hole this closes.</b> Precisely: a writer at term T appends to
- * {@code wal/t=T}, and a successor replays every term it finds, so records the old writer appends
- * <em>after</em> ownership moved are replayed as though they had been acknowledged before it. The
- * term-scoped key path separates the two writers' blobs; it never stopped anyone from reading the older
- * term, which is exactly what recovery does. The reference implementation in
- * {@code plugins/serverless-storage} documents the identical hole in its own log.
- *
- * <p><b>Two defences, doing different jobs.</b> A node that checks its own lease before appending stops
- * writing no later than the deadline it last published, which turns an unbounded zombie into one bounded
- * by the TTL. That is a bound, not a fence: the check and the append are not atomic. The fence is on the
- * other side — a successor seals the log at takeover and nothing appended after the seal is ever replayed,
- * by it or by any node after it. The first test here covers the bound, the second the fence.
+ * <p>A node that checks its own lease before appending stops writing no later than the deadline it last
+ * published, which turns an unbounded zombie into one bounded by the TTL. That is a bound, not a fence: the
+ * check and the append are not atomic. The fence is the successor's: it fences each predecessor's node log
+ * before reading it, so nothing appended after the takeover is replayed. That half is held by
+ * {@code NodeLogNodeFaultTestCase}; the tests here cover the bound, and a write that landed before the takeover.
  *
  * <p>Runs against {@code FsBlobContainer} only.
  */
@@ -106,241 +96,6 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
                 refused.getMessage().contains("lease has expired")
             );
             assertNull("a node that may no longer write must not go on holding the shard", node.reconciler().shard(shardId));
-        }
-    }
-
-    /**
-     * A record appended after a successor took over is never replayed — not by that successor, and not by
-     * the one after it.
-     *
-     * <p><b>Why three generations and not two.</b> A cutoff held in memory by the node taking over would
-     * pass a two-generation test and still be worthless, because the case that matters is the successor
-     * dying before it publishes: the zombie's records then sit in the log looking like ordinary history,
-     * and the <em>next</em> node to take over replays them. So B takes over and seals, the zombie appends
-     * afterwards, B dies without ever publishing, and C is the one that must not be fooled. Only a durable
-     * seal passes this.
-     *
-     * <p>The zombie is B's predecessor's own log object, deliberately: a fresh {@code WalStore} restarts
-     * its ordinal at 1 and would overwrite the existing record rather than append after it. Continuing the
-     * ordinal is what a node that has not noticed anything is wrong would actually do.
-     */
-    public void testARecordAppendedAfterTakeoverIsNeverReplayed() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final Path objectStore = createTempDir();
-        final MetadataPlane plane = freshIndex(clock, objectStore);
-
-        final WalStore zombieLog;
-        final long zombieTerm;
-
-        final ServerlessNode a = new ServerlessNode(nodeSettings("fence-a"));
-        a.startup().start();
-        final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
-        loopA.want("alpha", 0);
-        loopA.tick(clock.get());
-        final ShardId onA = a.reconciler().openShards().iterator().next();
-
-        // Written and acknowledged before anything went wrong: this one is legitimate history and must
-        // survive everything below.
-        a.writes().index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
-        zombieTerm = a.reads().get(onA, "legitimate").primaryTerm();
-        zombieLog = a.reconciler().wal(onA);
-        assertNotNull("the test needs the predecessor's own log object to be a faithful zombie", zombieLog);
-
-        a.close();
-        clock.set(clock.get() + TTL + 1);
-
-        // B takes the shard over, which seals the log at the point legitimate history ended.
-        final ServerlessNode b = new ServerlessNode(nodeSettings("fence-b"));
-        b.startup().start();
-        final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
-        loopB.want("alpha", 0);
-        loopB.tick(clock.get());
-        final ShardId onB = b.reconciler().openShards().iterator().next();
-        assertTrue("the legitimate write must have replayed onto the successor", b.reads().get(onB, "legitimate").found());
-
-        // Now the zombie wakes up and appends under its old term, exactly as a node that has not yet
-        // noticed it lost the shard would. Nothing rejects this: it is a well-formed write to a path the
-        // zombie still believes is its own.
-        // Refused by the store: the takeover fenced this term, and the fence holds the slot it writes next.
-        expectThrows(
-            IOException.class,
-            () -> zombieLog.append(
-                zombieTerm,
-                List.of(new WalRecord("zombie", "{\"msg\":\"appended after the takeover\"}", 99L, zombieTerm, 1L))
-            )
-        );
-
-        // B dies without ever publishing, so the log is still the only account of this shard's history.
-        b.close();
-        clock.set(clock.get() + TTL + 1);
-
-        try (ServerlessNode c = new ServerlessNode(nodeSettings("fence-c"))) {
-            c.startup().start();
-            final BackgroundReconciler loopC = new BackgroundReconciler(c, plane);
-            loopC.want("alpha", 0);
-            loopC.tick(clock.get());
-            final ShardId onC = c.reconciler().openShards().iterator().next();
-
-            assertTrue("history written before the takeover must still survive", c.reads().get(onC, "legitimate").found());
-            assertFalse(
-                "a record appended after the shard changed hands must not be replayed as acknowledged history",
-                c.reads().get(onC, "zombie").found()
-            );
-        }
-    }
-
-    /**
-     * The same fence, in the state this system is normally in: an empty log.
-     *
-     * <p><b>Why this is the case that matters, not a variation on the last one.</b> A publish truncates the
-     * log, so a shard that has been publishing normally has an empty or nearly-empty log at any given
-     * moment — which means the seal a successor writes is usually empty too. An empty seal has to be read
-     * as "there was nothing here", because the alternative, treating a term a seal does not mention as
-     * unbounded, hands a zombie's later appends straight back to the next successor. That is the steady
-     * state of the system, so getting it wrong would leave the fence working only for shards that had
-     * never published.
-     */
-    public void testAZombieIsFencedEvenWhenTheLogWasEmptyAtTakeover() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final Path objectStore = createTempDir();
-        final MetadataPlane plane = freshIndex(clock, objectStore);
-
-        final WalStore zombieLog;
-        final long zombieTerm;
-
-        final ServerlessNode a = new ServerlessNode(nodeSettings("empty-a"));
-        a.startup().start();
-        final BackgroundReconciler loopA = new BackgroundReconciler(a, plane);
-        loopA.want("alpha", 0);
-        loopA.tick(clock.get());
-        final ShardId onA = a.reconciler().openShards().iterator().next();
-
-        a.writes().index(onA, "legitimate", "{\"msg\":\"written and published\"}");
-        zombieTerm = a.reads().get(onA, "legitimate").primaryTerm();
-        zombieLog = a.reconciler().wal(onA);
-
-        // Publish, which is what empties the log: the document now lives in a commit and its record is
-        // truncated away. This is the ordinary state of a healthy shard.
-        loopA.tick(clock.get() + 1_000);
-        loopA.tick(clock.get() + 2_000);
-
-        a.close();
-        clock.set(clock.get() + TTL + 1);
-
-        final ServerlessNode b = new ServerlessNode(nodeSettings("empty-b"));
-        b.startup().start();
-        final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
-        loopB.want("alpha", 0);
-        loopB.tick(clock.get());
-        final ShardId onB = b.reconciler().openShards().iterator().next();
-        assertTrue("the published document must have arrived in the commit", b.reads().get(onB, "legitimate").found());
-
-        // The zombie appends under its old term, into a log that was empty when B sealed it.
-        // Refused by the store: the takeover fenced this term, and the fence holds the slot it writes next.
-        expectThrows(
-            IOException.class,
-            () -> zombieLog.append(
-                zombieTerm,
-                List.of(new WalRecord("zombie", "{\"msg\":\"appended after the takeover\"}", 99L, zombieTerm, 1L))
-            )
-        );
-
-        b.close();
-        clock.set(clock.get() + TTL + 1);
-
-        try (ServerlessNode c = new ServerlessNode(nodeSettings("empty-c"))) {
-            c.startup().start();
-            final BackgroundReconciler loopC = new BackgroundReconciler(c, plane);
-            loopC.want("alpha", 0);
-            loopC.tick(clock.get());
-            final ShardId onC = c.reconciler().openShards().iterator().next();
-
-            assertTrue("published history must still be there", c.reads().get(onC, "legitimate").found());
-            assertFalse(
-                "an empty seal must be read as 'there was nothing here', not as 'nothing is known'",
-                c.reads().get(onC, "zombie").found()
-            );
-        }
-    }
-
-    /**
-     * The window between the swap that moves ownership and the seal that records where history ended.
-     *
-     * <p><b>What this is about.</b> The seal used to be taken when the successor opened the shard, which is
-     * a shard creation, a local-file drop and a translog bootstrap after the compare-and-swap that actually
-     * transferred ownership. Every append a predecessor made inside that stretch was in front of the cutoff
-     * and replayed as acknowledged history — a wrong answer, not a missing feature. The seal is now taken at
-     * the swap, so the stretch is one blob write instead.
-     *
-     * <p><b>Where the append is injected, and why there.</b> {@code MetadataPlane#activate} writes the
-     * acquiring node's assignment claim immediately after it seals, so a hook on that write fires strictly
-     * after the seal under the current code and strictly before it under the old code, while sitting inside
-     * the window either way. That is the whole discrimination: nothing else about the test changes.
-     *
-     * <p><b>And now the store refuses it.</b> The seal is a fence -- the predecessor's next slot, occupied -- so an
-     * append after it is not merely left out of replay but refused. An append between the swap and the fence is
-     * the other half, acknowledged and replayed, held for the node log by
-     * {@code NodeLogNodeFaultTestCase#testALapsedWriterRacingItsSuccessorLosesNoAcknowledgedWrite}.
-     *
-     * <p>Runs against {@code FsBlobContainer} only.
-     */
-    public void testAZombieAppendingBetweenTheSwapAndTheOpenIsFenced() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final Path objectStore = createTempDir();
-        final MetadataPlane setup = freshIndex(clock, objectStore);
-
-        final WalStore zombieLog;
-        final long zombieTerm;
-
-        final ServerlessNode a = new ServerlessNode(nodeSettings("window-a"));
-        a.startup().start();
-        final BackgroundReconciler loopA = new BackgroundReconciler(a, setup);
-        loopA.want("alpha", 0);
-        loopA.tick(clock.get());
-        final ShardId onA = a.reconciler().openShards().iterator().next();
-
-        // Legitimate history, never published, so the log is the only account of it and the cutoff is what
-        // decides whether it survives.
-        a.writes().index(onA, "legitimate", "{\"msg\":\"written before the takeover\"}");
-        zombieTerm = a.reads().get(onA, "legitimate").primaryTerm();
-        zombieLog = a.reconciler().wal(onA);
-
-        a.close();
-        clock.set(clock.get() + TTL + 1);
-
-        // The successor's plane, with one hook: the moment it records its claim on the shard it has just
-        // won, the predecessor appends. That is inside the window by construction.
-        final AtomicBoolean appended = new AtomicBoolean();
-        final AtomicBoolean refused = new AtomicBoolean();
-        final BlobStore hooked = new ClaimHookingBlobStore(new FsBlobStore(1024, objectStore, false), () -> {
-            if (appended.compareAndSet(false, true)) {
-                try {
-                    zombieLog.append(
-                        zombieTerm,
-                        List.of(new WalRecord("zombie", "{\"msg\":\"appended inside the window\"}", 99L, zombieTerm, 1L))
-                    );
-                } catch (IOException e) {
-                    // The takeover fenced the zombie's term before this claim, so the store refuses it.
-                    refused.set(true);
-                }
-            }
-        });
-        final MetadataPlane plane = new MetadataPlane(hooked, BlobPath.cleanPath(), clock::get, TTL);
-
-        try (ServerlessNode b = new ServerlessNode(nodeSettings("window-b"))) {
-            b.startup().start();
-            final BackgroundReconciler loopB = new BackgroundReconciler(b, plane);
-            loopB.want("alpha", 0);
-            loopB.tick(clock.get());
-            assertTrue("the hook must have fired, or this test proves nothing", appended.get());
-            assertTrue("an append after the fence must be refused by the store, not merely left out of replay", refused.get());
-
-            final ShardId onB = b.reconciler().openShards().iterator().next();
-            assertTrue("history written before the takeover must still survive", b.reads().get(onB, "legitimate").found());
-            assertFalse(
-                "a record appended between the swap and the open must not be replayed as acknowledged history",
-                b.reads().get(onB, "zombie").found()
-            );
         }
     }
 
@@ -450,44 +205,6 @@ public class ServerlessWriteFencingTests extends OpenSearchTestCase {
                             Thread.currentThread().interrupt();
                         }
                     }
-                }
-            };
-        }
-
-        @Override
-        public void close() throws IOException {
-            delegate.close();
-        }
-    }
-
-    /** Fires a hook when a node records its claim on a shard it has just acquired. */
-    private static final class ClaimHookingBlobStore implements BlobStore {
-
-        private final BlobStore delegate;
-        private final Runnable onClaim;
-
-        ClaimHookingBlobStore(BlobStore delegate, Runnable onClaim) {
-            this.delegate = delegate;
-            this.onClaim = onClaim;
-        }
-
-        @Override
-        public void validateKey(BlobPath path, String blobName) {
-            delegate.validateKey(path, blobName);
-        }
-
-        @Override
-        public BlobContainer blobContainer(BlobPath path) {
-            final BlobContainer honest = delegate.blobContainer(path);
-            if (path.buildAsString().startsWith("assignments/") == false) {
-                return honest;
-            }
-            return new DelegatingBlobContainer(honest) {
-                @Override
-                public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists)
-                    throws IOException {
-                    onClaim.run();
-                    super.writeBlob(blobName, inputStream, blobSize, failIfAlreadyExists);
                 }
             };
         }
