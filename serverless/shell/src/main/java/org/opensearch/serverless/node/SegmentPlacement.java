@@ -77,6 +77,11 @@ public final class SegmentPlacement {
         node.descriptorRefresh.clusterSegmentPlacement = written.get(NodeSettings.SEGMENT_PLACEMENT_CLUSTER.getKey());
         node.descriptorRefresh.clusterBucketPolicy = written.get(org.opensearch.serverless.bucket.BucketSettings.CLUSTER_POLICY.getKey());
         LogCommitCheckpoint.applyCluster(node, written);
+        final org.opensearch.serverless.usage.Guardrails guardrails = node.part(org.opensearch.serverless.usage.Guardrails.class);
+        if (guardrails != null) {
+            // The tenant levels a collector set, from the same read.
+            guardrails.applyCluster(written);
+        }
         if (node.push() != null) {
             node.push().applyCluster(written);
         }

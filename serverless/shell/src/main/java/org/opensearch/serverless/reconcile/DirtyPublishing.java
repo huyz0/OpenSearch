@@ -203,7 +203,7 @@ final class DirtyPublishing {
         }
         // A write reported while a publish was in flight may have lost its stamp; it is aged from now.
         final long since = reconciler.unpublishedSinceMillis.computeIfAbsent(shardId, ignored -> nowMillis);
-        final long age = publishAgeOf(shard, overlaidAge(shard, maxAge));
+        final long age = stretched(shard, publishAgeOf(shard, overlaidAge(shard, maxAge)));
         if (age >= 0) {
             final long tick = reconciler.lazyPublishTickMillis;
             final long dueAt = since + age;
@@ -226,6 +226,12 @@ final class DirtyPublishing {
             return maxAge;
         }
         return Math.max(maxAge, router.tailOverlays().publishMaxAgeMillis());
+    }
+
+    /** The publish age for a shard whose tenant is over its cost budget: longer, so it publishes less often. */
+    private long stretched(org.opensearch.index.shard.IndexShard shard, long age) {
+        final var guardrails = reconciler.node.part(org.opensearch.serverless.usage.Guardrails.class);
+        return guardrails == null ? age : guardrails.publishAge(shard.shardId().getIndexName(), age);
     }
 
     /** How old a shard's oldest unpublished write may get: its index's refresh interval, or the node's default. */

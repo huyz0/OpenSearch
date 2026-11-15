@@ -103,6 +103,11 @@ public final class DescriptorRefresh {
             clusterBucketPolicy = cluster.get(org.opensearch.serverless.bucket.BucketSettings.CLUSTER_POLICY.getKey());
             // The checkpoint age for log commits rides on the same read.
             LogCommitCheckpoint.applyCluster(node, cluster);
+            final org.opensearch.serverless.usage.Guardrails guardrails = node.part(org.opensearch.serverless.usage.Guardrails.class);
+            if (guardrails != null) {
+                // The tenant levels a collector set, from the same read.
+                guardrails.applyCluster(cluster);
+            }
             // And whether writes are searched before they are published.
             if (node.push() != null) {
                 node.push().applyCluster(cluster);
