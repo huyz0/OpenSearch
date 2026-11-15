@@ -118,7 +118,7 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
                 Exception.class,
                 () -> router.forwardGet(
                     peer,
-                    new org.opensearch.serverless.transport.ForwardedGetRequest("alpha", "uuid-alpha-deleted", 1, "doc")
+                    new org.opensearch.serverless.forwarding.ForwardedGetRequest("alpha", "uuid-alpha-deleted", 1, "doc")
                 )
             );
             assertEquals(
@@ -130,7 +130,7 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
                 Exception.class,
                 () -> router.forwardExplain(
                     peer,
-                    new org.opensearch.serverless.transport.ForwardedExplainRequest("alpha", "uuid-alpha-deleted", 1, "doc", query)
+                    new org.opensearch.serverless.forwarding.ForwardedExplainRequest("alpha", "uuid-alpha-deleted", 1, "doc", query)
                 )
             );
             assertEquals(
@@ -138,13 +138,15 @@ public class ServerlessForwardingTests extends OpenSearchTestCase {
                 org.opensearch.serverless.write.ForwardFailure.classify(explainFailure)
             );
             assertFalse(
-                router.forwardGet(peer, new org.opensearch.serverless.transport.ForwardedGetRequest("alpha", uuid, 1, "doc"))
+                router.forwardGet(peer, new org.opensearch.serverless.forwarding.ForwardedGetRequest("alpha", uuid, 1, "doc"))
                     .document()
                     .found()
             );
             assertFalse(
-                router.forwardExplain(peer, new org.opensearch.serverless.transport.ForwardedExplainRequest("alpha", uuid, 1, "doc", query))
-                    .exists()
+                router.forwardExplain(
+                    peer,
+                    new org.opensearch.serverless.forwarding.ForwardedExplainRequest("alpha", uuid, 1, "doc", query)
+                ).exists()
             );
         }
     }

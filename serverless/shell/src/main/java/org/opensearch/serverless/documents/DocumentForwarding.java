@@ -20,7 +20,7 @@ final class DocumentForwarding {
 
     private DocumentForwarding() {}
 
-    static org.opensearch.serverless.transport.ForwardedIndexResponse forwardTo(
+    static org.opensearch.serverless.forwarding.ForwardedIndexResponse forwardTo(
         NodeContext serving,
         String owner,
         String writtenIndex,
@@ -53,7 +53,7 @@ final class DocumentForwarding {
         );
     }
 
-    static org.opensearch.serverless.transport.ForwardedIndexResponse forwardTo(
+    static org.opensearch.serverless.forwarding.ForwardedIndexResponse forwardTo(
         NodeContext serving,
         String owner,
         String writtenIndex,
@@ -88,7 +88,7 @@ final class DocumentForwarding {
             );
         }
         try {
-            final var request = new org.opensearch.serverless.transport.ForwardedIndexRequest(
+            final var request = new org.opensearch.serverless.forwarding.ForwardedIndexRequest(
                 writtenIndex,
                 indexUuid,
                 shard,

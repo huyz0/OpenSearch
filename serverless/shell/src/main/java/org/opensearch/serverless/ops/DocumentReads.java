@@ -260,7 +260,7 @@ final class DocumentReads {
             final var response = org.opensearch.serverless.transport.ShardRouter.of(node)
                 .forwardGet(
                     peer.get(),
-                    new org.opensearch.serverless.transport.ForwardedGetRequest(index, placement.uuid(), placement.shard(), id)
+                    new org.opensearch.serverless.forwarding.ForwardedGetRequest(index, placement.uuid(), placement.shard(), id)
                 );
             return new Read(
                 response.document(),
@@ -319,7 +319,7 @@ final class DocumentReads {
             final var response = org.opensearch.serverless.transport.ShardRouter.of(node)
                 .forwardExplain(
                     peer.get(),
-                    new org.opensearch.serverless.transport.ForwardedExplainRequest(index, placement.uuid(), placement.shard(), id, query)
+                    new org.opensearch.serverless.forwarding.ForwardedExplainRequest(index, placement.uuid(), placement.shard(), id, query)
                 );
             return new Explained(response.exists(), response.explanation(), response.ownerNodeId(), true);
         } catch (NotHereException e) {
