@@ -106,6 +106,8 @@ final class NodeServiceBuilders {
      * chosen directly, and the rest assumes a cluster with a manager. An operator installs a plugin; nobody
      * installs a module.
      *
+     * <p>It also gives every index the shell's own search listeners: {@link org.opensearch.serverless.shard.StoredFieldsPrefetch}.
+     *
      * @param settings the node settings
      * @param environment the node environment, which knows where {@code plugins/} is
      * @return the loader, holding whatever was installed
@@ -118,7 +120,14 @@ final class NodeServiceBuilders {
             null,                                        // modules: see above
             java.nio.file.Files.isDirectory(pluginsDir) ? pluginsDir : null,
             classpathPlugins(settings)
-        );
+        ) {
+            @Override
+            public void onIndexModule(org.opensearch.index.IndexModule indexModule) {
+                super.onIndexModule(indexModule);
+                // Every shard's fetch announces its hits' stored fields first, so cold blocks are fetched together.
+                indexModule.addSearchOperationListener(org.opensearch.serverless.shard.StoredFieldsPrefetch.INSTANCE);
+            }
+        };
     }
 
     /**
