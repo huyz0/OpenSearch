@@ -107,7 +107,7 @@ final class SnapshotRequestBodies {
         }
         for (String each : list ? name.split(",") : new String[] { name }) {
             try {
-                org.opensearch.serverless.metadata.Names.validateId(each, what);
+                org.opensearch.serverless.cluster.Names.validateId(each, what);
             } catch (IllegalArgumentException e) {
                 return e.getMessage();
             }

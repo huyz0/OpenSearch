@@ -15,6 +15,7 @@ import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.serverless.cluster.Names;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -223,7 +224,7 @@ final class PointInTimeStore {
     List<PointInTime> live(long now) throws IOException {
         final List<PointInTime> live = new ArrayList<>();
         for (String id : inventory.listBlobs().keySet()) {
-            if (PointInTime.looksLikeAnId(id) == false) {
+            if (Names.looksLikeAnId(id) == false) {
                 continue;
             }
             try {
@@ -242,7 +243,7 @@ final class PointInTimeStore {
     int reap(long now) throws IOException {
         int removed = 0;
         for (String id : inventory.listBlobs().keySet()) {
-            if (PointInTime.looksLikeAnId(id) == false) {
+            if (Names.looksLikeAnId(id) == false) {
                 continue;
             }
             try {

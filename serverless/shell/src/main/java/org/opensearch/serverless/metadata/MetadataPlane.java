@@ -13,6 +13,15 @@ import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.membership.BlobLeaseMembership;
 import org.opensearch.serverless.membership.NodeLease;
+import org.opensearch.serverless.repository.RepositoryDescriptor;
+import org.opensearch.serverless.repository.RepositoryInUseException;
+import org.opensearch.serverless.repository.RepositoryStore;
+import org.opensearch.serverless.repository.SnapshotPaths;
+import org.opensearch.serverless.repository.SnapshotRecord;
+import org.opensearch.serverless.repository.SnapshotRecords;
+import org.opensearch.serverless.repository.SnapshotStore;
+import org.opensearch.serverless.template.StoredScriptStore;
+import org.opensearch.serverless.template.TemplateStore;
 
 import java.io.IOException;
 import java.util.List;
@@ -123,7 +132,7 @@ public final class MetadataPlane {
         this.base = base;
         this.leaseTtlMillis = leaseTtlMillis;
         this.clock = clock;
-        this.repositories = new RepositoryStore(blobStore.blobContainer(RegisterMap.repositories(base)), this::listSnapshots);
+        this.repositories = new RepositoryStore(blobStore.blobContainer(SnapshotPaths.repositories(base)), this::listSnapshots, LOGGER);
         this.transportSecretStore = new TransportSecretStore(blobStore.blobContainer(RegisterMap.clusterConfig(base)), clock);
         this.pointInTimeStore = new PointInTimeStore(
             blobStore.blobContainer(RegisterMap.pointsInTime(base)),
@@ -131,8 +140,8 @@ public final class MetadataPlane {
             clock
         );
         this.snapshotStore = new SnapshotStore(
-            blobStore.blobContainer(RegisterMap.snapshots(base)),
-            blobStore.blobContainer(RegisterMap.snapshotStates(base))
+            blobStore.blobContainer(SnapshotPaths.snapshots(base)),
+            blobStore.blobContainer(SnapshotPaths.snapshotStates(base))
         );
         this.settlement = new ShardSettlement(blobStore, base, clock, heads, this);
         this.activation = new ShardActivation(blobStore, base, heads, descriptors, this);
@@ -142,7 +151,7 @@ public final class MetadataPlane {
         this.bucketCommits = new org.opensearch.serverless.bucket.BucketCommits(bucketStore);
         this.paths = new ShardDataPaths(blobStore, base, descriptors, bucketHeads, bucketCommits);
         this.pits = new PointsInTime(pointInTimeStore, descriptors);
-        this.snapshots = new SnapshotRecords(snapshotStore, blobStore, base, this);
+        this.snapshots = new SnapshotRecords(snapshotStore, blobStore, base, repositories, LOGGER);
         this.lifecycle = new IndexLifecycle(blobStore, base, clock, descriptors, heads, reclaimQueue, aliases, this);
     }
 
@@ -186,16 +195,6 @@ public final class MetadataPlane {
     /** Creates an index. */
     public long createIndex(IndexDescriptor descriptor) throws IOException {
         return lifecycle.createIndex(descriptor);
-    }
-
-    /** Reports whether a snapshot record describes a capture that has not finished. */
-    public static boolean capturing(SnapshotRecord.SnapshottedIndex index) {
-        return IndexLifecycle.capturing(index);
-    }
-
-    /** Reports whether a snapshot is still being taken. */
-    public static boolean inProgress(SnapshotRecord snapshot) {
-        return IndexLifecycle.inProgress(snapshot);
     }
 
     /** Deletes an index and every shard-head belonging to it. */

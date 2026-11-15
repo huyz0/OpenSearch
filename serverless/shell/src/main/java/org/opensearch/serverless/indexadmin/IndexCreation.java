@@ -65,7 +65,7 @@ final class IndexCreation {
             return createIndex(serving, metadata, request.index(), fromNative(request));
         } catch (RestReplies.RefusedException e) {
             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), e.status);
-        } catch (org.opensearch.serverless.metadata.TemplateResolver.MissingComponentException e) {
+        } catch (org.opensearch.serverless.template.TemplateResolver.MissingComponentException e) {
             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
         }
     }
@@ -152,7 +152,7 @@ final class IndexCreation {
             metadata,
             index,
             create,
-            org.opensearch.serverless.metadata.TemplateResolver.resolveFromStores(
+            org.opensearch.serverless.template.TemplateResolver.resolveFromStores(
                 metadata.indexTemplates(),
                 metadata::componentTemplates,
                 index
@@ -182,7 +182,7 @@ final class IndexCreation {
         MetadataPlane metadata,
         String index,
         IndexCreateRequest create,
-        org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited
+        org.opensearch.serverless.template.TemplateResolver.Inherited inherited
     ) throws IOException, RestReplies.RefusedException {
         final Settings requested = IndexCreateRequest.settingsWith(create.settings, inherited);
         // The shard mode is the descriptor's own field, not a setting core knows, so it is taken out

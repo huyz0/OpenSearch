@@ -11,7 +11,7 @@ import org.opensearch.cluster.metadata.ComposableIndexTemplate;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
-import org.opensearch.serverless.metadata.TemplateResolver;
+import org.opensearch.serverless.template.TemplateResolver;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.Map;

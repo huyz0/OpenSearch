@@ -14,7 +14,7 @@ import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.script.StoredScriptSource;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.metadata.StoredScriptStore;
+import org.opensearch.serverless.template.StoredScriptStore;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;

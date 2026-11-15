@@ -148,7 +148,7 @@ public final class MappingUpdateHandler extends BaseRestHandler {
                             RestStatus.NOT_IMPLEMENTED
                         );
                     }
-                    org.opensearch.serverless.metadata.Names.validateIndexOrAlias(selectedIndex);
+                    org.opensearch.serverless.cluster.Names.validateIndexOrAlias(selectedIndex);
                     return apply(metadata, serving, selectedIndex, concrete, selected.source());
                 }, responseView());
                 acknowledge(channel, result);

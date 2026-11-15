@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.metadata;
+package org.opensearch.serverless.template;
 
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobRegister;
@@ -20,6 +20,7 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.serverless.cluster.Names;
 
 import java.io.IOException;
 import java.io.InputStream;

@@ -525,7 +525,7 @@ public class ServerlessSnapshotTests extends OpenSearchTestCase {
 
             final var container = plane.blobStore()
                 .blobContainer(
-                    org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(
+                    org.opensearch.serverless.repository.SnapshotPaths.snapshotShardData(
                         plane.basePath(),
                         plane.snapshot("backups", "gone-soon").orElseThrow(),
                         "cleanup",

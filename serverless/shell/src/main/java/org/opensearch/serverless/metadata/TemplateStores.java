@@ -9,6 +9,9 @@ package org.opensearch.serverless.metadata;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.serverless.template.StoredScriptStore;
+import org.opensearch.serverless.template.TemplateCache;
+import org.opensearch.serverless.template.TemplateStore;
 
 /**
  * The template, script and pipeline stores, each sharing one cache per store for the life of the plane. Split out of

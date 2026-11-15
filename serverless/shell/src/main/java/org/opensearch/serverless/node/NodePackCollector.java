@@ -12,7 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.PointInTime;
-import org.opensearch.serverless.metadata.SnapshotRecord;
+import org.opensearch.serverless.repository.SnapshotRecord;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.FileLocation;
 import org.opensearch.serverless.store.NodePackBlob;
@@ -258,7 +258,7 @@ public final class NodePackCollector {
             }
         }
         for (SnapshotRecord snapshot : snapshots) {
-            if (MetadataPlane.inProgress(snapshot)) {
+            if (SnapshotRecord.inProgress(snapshot)) {
                 return new Judgement(0, due.size(), 0, List.of());
             }
         }

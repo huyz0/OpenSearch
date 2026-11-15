@@ -20,11 +20,12 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.IndexAlreadyExistsException;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.RegisterMap;
-import org.opensearch.serverless.metadata.RepositoryDescriptor;
-import org.opensearch.serverless.metadata.RepositoryMissingException;
-import org.opensearch.serverless.metadata.SnapshotAlreadyExistsException;
-import org.opensearch.serverless.metadata.SnapshotRecord;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.repository.RepositoryDescriptor;
+import org.opensearch.serverless.repository.RepositoryMissingException;
+import org.opensearch.serverless.repository.SnapshotAlreadyExistsException;
+import org.opensearch.serverless.repository.SnapshotPaths;
+import org.opensearch.serverless.repository.SnapshotRecord;
 import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.SegmentPublisher;
@@ -219,7 +220,12 @@ final class SnapshotOperations {
                     stored = new LinkedHashMap<>();
                     for (Map.Entry<Integer, CommitManifest> shard : shards.entrySet()) {
                         final BlobPath sourceBase = RegisterMap.shardData(metadata.basePath(), trimmed, descriptor.uuid(), shard.getKey());
-                        final BlobPath destBase = RegisterMap.snapshotShardData(metadata.basePath(), reservation, trimmed, shard.getKey());
+                        final BlobPath destBase = SnapshotPaths.snapshotShardData(
+                            metadata.basePath(),
+                            reservation,
+                            trimmed,
+                            shard.getKey()
+                        );
                         stored.put(shard.getKey(), SnapshotBlobs.copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue()));
                     }
                 }
@@ -250,7 +256,7 @@ final class SnapshotOperations {
             }
             if (shallow == false) {
                 try {
-                    blobStore.blobContainer(RegisterMap.snapshotData(metadata.basePath(), reservation.storageGeneration())).delete();
+                    blobStore.blobContainer(SnapshotPaths.snapshotData(metadata.basePath(), reservation.storageGeneration())).delete();
                 } catch (Exception cleanup) {
                     e.addSuppressed(cleanup);
                 }
@@ -419,7 +425,7 @@ final class SnapshotOperations {
             throw new SnapshotHandler.SnapshotMissingException(repo, snapshot);
         }
         final SnapshotRecord record = found.get();
-        if (MetadataPlane.inProgress(record)) {
+        if (SnapshotRecord.inProgress(record)) {
             throw new SnapshotHandler.SnapshotInProgressException(repo, snapshot);
         }
         final NodeContext serving = handler.node.get();
@@ -491,7 +497,7 @@ final class SnapshotOperations {
                 for (Map.Entry<Integer, CommitManifest> shard : capturedIndex.shards().entrySet()) {
                     final BlobPath sourceBase = record.shallow()
                         ? RegisterMap.shardData(metadata.basePath(), restoring.getKey(), capturedIndex.uuid(), shard.getKey())
-                        : RegisterMap.snapshotShardData(metadata.basePath(), record, restoring.getKey(), shard.getKey());
+                        : SnapshotPaths.snapshotShardData(metadata.basePath(), record, restoring.getKey(), shard.getKey());
                     final BlobPath destBase = RegisterMap.shardData(metadata.basePath(), restoring.getValue(), newUuid, shard.getKey());
                     final CommitManifest restored = SnapshotBlobs.copyShardBlobs(blobStore, sourceBase, destBase, shard.getValue());
                     // Entered before the manifest lands, with a digest that rules nothing out: a restored index holds
@@ -540,8 +546,8 @@ final class SnapshotOperations {
         builder.startArray("data_streams").endArray();
         builder.field("include_global_state", includeGlobalState);
         // A record whose indices have no commits yet is a capture still running -- see
-        // MetadataPlane.capturing -- and says so rather than reporting a success with no shards.
-        builder.field("state", MetadataPlane.inProgress(record) ? "IN_PROGRESS" : "SUCCESS");
+        // SnapshotRecord.capturing -- and says so rather than reporting a success with no shards.
+        builder.field("state", SnapshotRecord.inProgress(record) ? "IN_PROGRESS" : "SUCCESS");
         builder.field("start_time", Instant.ofEpochMilli(record.startTimeMillis()).toString());
         builder.field("start_time_in_millis", record.startTimeMillis());
         builder.field("end_time", Instant.ofEpochMilli(record.endTimeMillis()).toString());

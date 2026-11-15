@@ -10,6 +10,7 @@ package org.opensearch.serverless.metadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.cluster.Names;
 import org.opensearch.serverless.cluster.ShardAssignment;
 
 import java.io.IOException;
@@ -139,13 +140,13 @@ final class ShardActivation {
     public List<Map.Entry<String, Integer>> claimsOf(String nodeId) throws IOException {
         final List<Map.Entry<String, Integer>> claims = new ArrayList<>();
         for (String claim : blobStore.blobContainer(RegisterMap.assignments(base, nodeId)).listBlobs().keySet()) {
-            final int separator = claim.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
+            final int separator = claim.lastIndexOf(Names.KEY_SEPARATOR);
             if (separator < 0) {
                 continue;
             }
             try {
                 final String indexName = claim.substring(0, separator);
-                final int shard = Integer.parseInt(claim.substring(separator + RegisterMap.SHARD_SEPARATOR.length()));
+                final int shard = Integer.parseInt(claim.substring(separator + Names.KEY_SEPARATOR.length()));
                 if (Names.isValidIndexOrAlias(indexName)) {
                     claims.add(Map.entry(indexName, shard));
                 }
@@ -191,14 +192,14 @@ final class ShardActivation {
         // Measured: a sweep cost 2N+1 operations in the population, on the
         // steady-state path, on every node -- the exact O(population) shape this design exists to remove.
         for (String claim : blobStore.blobContainer(RegisterMap.assignments(base, nodeId)).listBlobs().keySet()) {
-            final int separator = claim.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
+            final int separator = claim.lastIndexOf(Names.KEY_SEPARATOR);
             if (separator < 0) {
                 continue;
             }
             final String indexName = claim.substring(0, separator);
             final int shard;
             try {
-                shard = Integer.parseInt(claim.substring(separator + RegisterMap.SHARD_SEPARATOR.length()));
+                shard = Integer.parseInt(claim.substring(separator + Names.KEY_SEPARATOR.length()));
             } catch (NumberFormatException e) {
                 continue;
             }

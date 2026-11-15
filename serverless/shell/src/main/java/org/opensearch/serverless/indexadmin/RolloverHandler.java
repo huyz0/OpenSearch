@@ -340,7 +340,7 @@ public final class RolloverHandler extends BaseRestHandler {
         String createdUuid;
         try {
             if (record.dataStream()) {
-                final var inherited = org.opensearch.serverless.metadata.TemplateResolver.resolveFromStores(
+                final var inherited = org.opensearch.serverless.template.TemplateResolver.resolveFromStores(
                     metadata.indexTemplates(),
                     metadata::componentTemplates,
                     ask.target()

@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.metadata;
+package org.opensearch.serverless.repository;
 
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentType;

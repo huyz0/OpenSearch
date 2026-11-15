@@ -18,11 +18,11 @@ import org.opensearch.serverless.cluster.AliasRecord;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.AliasAtGeneration;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.metadata.TemplateResolver;
 import org.opensearch.serverless.metadata.TooManyMatchesException;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.restcore.IndexPatterns;
 import org.opensearch.serverless.restcore.RestReplies;
+import org.opensearch.serverless.template.TemplateResolver;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
