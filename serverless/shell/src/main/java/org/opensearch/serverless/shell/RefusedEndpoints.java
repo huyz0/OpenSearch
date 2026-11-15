@@ -9,7 +9,7 @@
 package org.opensearch.serverless.shell;
 
 import org.opensearch.rest.RestController;
-import org.opensearch.serverless.rest.NotImplementedHandler;
+import org.opensearch.serverless.restcore.NotImplementedHandler;
 
 /**
  * The endpoints a classic OpenSearch node serves that this shell refuses, each with the reason it is refused for.

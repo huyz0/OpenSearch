@@ -18,6 +18,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.SearchGate;
 import org.opensearch.serverless.ops.SearchRendering;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -111,7 +112,7 @@ public final class SearchHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         final NodeContext serving = node.get();
@@ -173,9 +174,9 @@ public final class SearchHandler extends BaseRestHandler {
         } catch (Exception e) {
             // Everything else is consumed on the way out, or BaseRestHandler reports the parameter it did
             // not get to instead of the parse failure that stopped it getting there.
-            IndexAdminHandler.consumeAllParams(request);
+            RestReplies.consumeAllParams(request);
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_query", "could not parse the search: " + e.getMessage())
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_query", "could not parse the search: " + e.getMessage())
             );
         }
 
@@ -187,7 +188,7 @@ public final class SearchHandler extends BaseRestHandler {
                 plan(request, searchRequest, source, bodyPit, counting).accept(channel);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a search failure", nested);
                 }

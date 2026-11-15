@@ -19,6 +19,7 @@ import org.opensearch.serverless.node.Capacity;
 import org.opensearch.serverless.node.FleetSize;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.Fanout;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.store.MeteredBlobStore;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -138,7 +139,7 @@ public final class StatsHandler extends BaseRestHandler {
                 channel.sendResponse(response);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (Exception ignored) {
                     // The channel is gone; there is nowhere left to report this.
                 }
@@ -171,7 +172,7 @@ public final class StatsHandler extends BaseRestHandler {
         String nodes
     ) throws IOException {
         if (metadata == null) {
-            return IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured");
+            return RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured");
         }
         final java.util.Set<String> wanted = new java.util.LinkedHashSet<>(List.of(nodes.split(",")));
         final boolean all = wanted.contains("_all");
@@ -199,7 +200,7 @@ public final class StatsHandler extends BaseRestHandler {
             }
             final java.util.List<String> unknown = wanted.stream().filter(one -> matched.contains(one) == false).sorted().toList();
             if (unknown.isEmpty() == false) {
-                return IndexAdminHandler.error(
+                return RestReplies.error(
                     channel,
                     RestStatus.NOT_FOUND,
                     "node_not_found",
@@ -222,7 +223,7 @@ public final class StatsHandler extends BaseRestHandler {
             );
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "interrupted", "the fan-out was interrupted");
+            return RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "interrupted", "the fan-out was interrupted");
         }
 
         // Fanout leaves a null where a task threw. Nothing above should throw -- ask() catches -- but a

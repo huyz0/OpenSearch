@@ -2,6 +2,5 @@
 # shorten it after a fix, never lengthen it. See serverless/structure-rules.gradle.
 cluster/IndexDescriptor.java -> bucket
 metadata/MetadataPlane.java -> bucket
-metadata/RepositoryDescriptor.java -> rest
 metadata/ShardDataPaths.java -> bucket
 metadata/ShardHeadStore.java -> bucket

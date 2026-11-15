@@ -20,6 +20,7 @@ import org.opensearch.serverless.documents.DocumentWritePlanner;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.DocumentRouting;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.write.WriteOutcome;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -102,7 +103,7 @@ public final class DocumentHandler extends BaseRestHandler {
         // the id and so it must exist before the request can be placed at all.
         final String id = request.param("id") == null ? org.opensearch.common.UUIDs.base64UUID() : request.param("id");
         final String source = request.hasContent() ? request.content().utf8ToString() : null;
-        final boolean refresh = IndexAdminHandler.refresh(request);
+        final boolean refresh = RestReplies.refresh(request);
         final boolean deletion = request.method() == RestRequest.Method.DELETE;
         // Read, not merely present-checked, so every parameter is consumed regardless of which branch
         // below returns -- the class-level idiom this handler already follows.
@@ -123,22 +124,17 @@ public final class DocumentHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         if (opType != null && "create".equals(opType) == false && "index".equals(opType) == false) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "bad_request",
-                    "op_type must be create or index, not [" + opType + "]"
-                )
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_request", "op_type must be create or index, not [" + opType + "]")
             );
         }
         if (requireAlias) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_write",
@@ -153,7 +149,7 @@ public final class DocumentHandler extends BaseRestHandler {
             // itself assigned, which it now returns. Those are different features, and only the second
             // one is here. Classic OpenSearch steers callers the same way.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_write",
@@ -167,7 +163,7 @@ public final class DocumentHandler extends BaseRestHandler {
             // Core requires both together, and requiring it here too makes the refusal legible: half a
             // condition is a condition that would silently not be one.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "invalid_condition",
@@ -182,24 +178,19 @@ public final class DocumentHandler extends BaseRestHandler {
             ifPrimaryTerm = ifPrimaryTermParam == null ? 0L : Long.parseLong(ifPrimaryTermParam);
         } catch (NumberFormatException e) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "invalid_condition",
-                    "if_seq_no and if_primary_term must be numbers"
-                )
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "invalid_condition", "if_seq_no and if_primary_term must be numbers")
             );
         }
         if (deletion == false && (source == null || source.isBlank())) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a document body is required")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a document body is required")
             );
         }
 
         final NodeContext serving = node.get();
         if (serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_not_ready", "no node is serving requests yet")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_not_ready", "no node is serving requests yet")
             );
         }
         // Resolution, pipeline reads/execution and owner discovery can all block on the store.
@@ -365,8 +356,8 @@ public final class DocumentHandler extends BaseRestHandler {
         try {
             channel.sendResponse(
                 failure instanceof WriteRefusal refusal
-                    ? IndexAdminHandler.error(channel, refusal.status(), refusal.type, refusal.getMessage())
-                    : IndexAdminHandler.failure(channel, failure)
+                    ? RestReplies.error(channel, refusal.status(), refusal.type, refusal.getMessage())
+                    : RestReplies.failure(channel, failure)
             );
         } catch (IOException nested) {
             logger.error("failed to report a write failure", nested);

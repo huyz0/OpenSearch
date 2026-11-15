@@ -17,6 +17,8 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.restcore.IndexPatterns;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -100,7 +102,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                 final Map<String, Object> body = parser.map();
                 if (body.get("index_filter") != null) {
                     return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.NOT_IMPLEMENTED,
                             "unsupported_parameter",
@@ -111,7 +113,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                 }
                 if (body.get("runtime_mappings") != null) {
                     return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.NOT_IMPLEMENTED,
                             "unsupported_parameter",
@@ -129,12 +131,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                 }
             } catch (Exception e) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "malformed_body",
-                        "could not parse the body: " + e.getMessage()
-                    )
+                    RestReplies.error(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not parse the body: " + e.getMessage())
                 );
             }
         }
@@ -146,7 +143,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
 
         if (includeUnmapped != null && Boolean.parseBoolean(includeUnmapped)) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_parameter",
@@ -160,7 +157,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
         final var serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
@@ -208,13 +205,13 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                         }
                     });
                 render(channel, result);
-            } catch (IndexAdminHandler.RefusedException e) {
+            } catch (RestReplies.RefusedException e) {
                 sendQuietly(channel, e.status, e.type, e.getMessage());
             } catch (org.opensearch.serverless.metadata.TooManyMatchesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a field capabilities failure", nested);
                 }
@@ -232,7 +229,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
         // A plugin's index is not described through the request path, whatever spelling reached it.
         names.removeIf(serving::isSystemIndex);
         if (names.isEmpty()) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "no_index", "name an index or a prefix pattern");
+            throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "no_index", "name an index or a prefix pattern");
         }
 
         // field -> type -> the indices mapping it that way. Sorted so the answer is stable across calls,
@@ -253,7 +250,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                     // A pattern is a filter over what exists, not an assertion that anything does.
                     continue;
                 }
-                throw new IndexAdminHandler.RefusedException(RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name);
+                throw new RestReplies.RefusedException(RestStatus.NOT_FOUND, "index_not_found", "no such index: " + name);
             }
             answered.add(name);
             final MapperService mapperService = serving.indicesService()
@@ -417,7 +414,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
         try {
-            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+            channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
             logger.error("failed to report a field capabilities refusal", e);
         }

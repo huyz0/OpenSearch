@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.indexadmin;
 
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.IndexScopedSettings;
@@ -18,6 +18,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -99,7 +100,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
 
         if (body == null || body.isBlank()) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a settings body is required")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a settings body is required")
             );
         }
 
@@ -120,18 +121,13 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
             requested = Settings.builder().loadFromMap(source).normalizePrefix(IndexMetadata.INDEX_SETTING_PREFIX).build();
         } catch (Exception e) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "malformed_body",
-                    "could not parse the settings body: " + e.getMessage()
-                )
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not parse the settings body: " + e.getMessage())
             );
         }
 
         if (requested.isEmpty()) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "no settings were given")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_body", "no settings were given")
             );
         }
 
@@ -140,14 +136,12 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
             // A typo, not a capability this deployment lacks. 400 with core's own vocabulary, because the
             // fix is in the caller's request; the refusals below are 501 because the fix is not.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", unknown)
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", unknown)
             );
         }
         final String refusal = refuse(requested, IndexCreation.scopedFor(node.get()));
         if (refusal != null) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_setting", refusal)
-            );
+            return channel -> channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_setting", refusal));
         }
         try {
             // Every value parsed by core's own setting before anything is written. The first parse used to
@@ -156,21 +150,21 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
             // and failed every node that next opened a shard of the index -- with a 400 to the caller that
             // read as if it had been refused.
             IndexAdminHandler.validateIndexSettings(requested, false, node.get());
-        } catch (IndexAdminHandler.RefusedException e) {
-            return channel -> channel.sendResponse(IndexAdminHandler.error(channel, e.status, e.type, e.getMessage()));
+        } catch (RestReplies.RefusedException e) {
+            return channel -> channel.sendResponse(RestReplies.error(channel, e.status, e.type, e.getMessage()));
         }
 
         final MetadataPlane metadata = plane.get();
         final var serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                IndexAdminHandler.gate(
+                RestReplies.gate(
                     serving,
                     org.opensearch.action.admin.indices.settings.put.UpdateSettingsAction.NAME,
                     new org.opensearch.action.admin.indices.settings.put.UpdateSettingsRequest(requested, index),
@@ -181,7 +175,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
                 );
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a settings update failure", nested);
                 }
@@ -297,7 +291,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
             final long generation = metadata.descriptorGeneration(index);
             final Optional<IndexDescriptor> current = metadata.describe(index);
             if (current.isEmpty()) {
-                channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
+                channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
                 return;
             }
 
@@ -327,7 +321,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
         }
 
         channel.sendResponse(
-            IndexAdminHandler.error(
+            RestReplies.error(
                 channel,
                 RestStatus.CONFLICT,
                 "version_conflict_engine_exception",

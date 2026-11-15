@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.alias;
 
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.serverless.cluster.AliasRecord;
@@ -19,12 +19,12 @@ import java.util.List;
  * Adds or removes indices on an alias by compare-and-swap on its register, refusing what an alias cannot hold.
  * Split out of {@link AliasHandler}.
  */
-final class AliasSwap {
+public final class AliasSwap {
 
     private AliasSwap() {}
 
     /** A refusal, with the status and type the caller should see rather than one status for everything. */
-    record Refusal(RestStatus status, String type, String reason) {
+    public record Refusal(RestStatus status, String type, String reason) {
     }
 
     /** Core's refusal when an alias operation names a data stream. */
@@ -46,7 +46,7 @@ final class AliasSwap {
      * @return a refusal to report, or null on success
      * @throws IOException if the store cannot be read or written
      */
-    static Refusal swap(MetadataPlane metadata, String name, List<String> indices, boolean adding, Boolean isWriteIndex)
+    public static Refusal swap(MetadataPlane metadata, String name, List<String> indices, boolean adding, Boolean isWriteIndex)
         throws IOException {
         if (adding && Boolean.TRUE.equals(isWriteIndex) && indices.size() != 1) {
             return new Refusal(

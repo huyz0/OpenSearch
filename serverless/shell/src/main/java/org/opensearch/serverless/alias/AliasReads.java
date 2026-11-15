@@ -5,13 +5,14 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.alias;
 
 import org.opensearch.cluster.metadata.AliasMetadata;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.restcore.RestReplies;
 
 import java.io.IOException;
 import java.util.List;
@@ -54,7 +55,7 @@ final class AliasReads {
         }
         if (all == false) {
             channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "alias_not_found", "alias [" + name + "] does not cover " + indices)
+                RestReplies.error(channel, RestStatus.NOT_FOUND, "alias_not_found", "alias [" + name + "] does not cover " + indices)
             );
             return;
         }
@@ -79,7 +80,7 @@ final class AliasReads {
             // A data stream is not an alias, and rendering it as one -- backing indices keyed as if a
             // caller had aliased them -- would tell a client it can be managed through this API.
             channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_FOUND,
                     "alias_not_found",
@@ -112,7 +113,7 @@ final class AliasReads {
         throws IOException {
         final var descriptor = metadata.describe(index);
         if (descriptor.isEmpty()) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
             return;
         }
         try (XContentBuilder builder = channel.newBuilder()) {

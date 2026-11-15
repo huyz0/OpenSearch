@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.restcore;
 
 import org.opensearch.common.breaker.ChildMemoryCircuitBreaker;
 import org.opensearch.common.settings.Settings;

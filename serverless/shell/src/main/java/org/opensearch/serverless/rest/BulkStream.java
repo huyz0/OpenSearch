@@ -23,6 +23,7 @@ import org.opensearch.serverless.documents.BulkMemoryBudget;
 import org.opensearch.serverless.documents.BulkNative;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.restcore.RestReplies;
 
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -385,7 +386,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
         }
         try {
             if (all.isEmpty()) {
-                send(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "empty_bulk", "the body contained no operations"));
+                send(RestReplies.error(channel, RestStatus.BAD_REQUEST, "empty_bulk", "the body contained no operations"));
                 return;
             }
             handler.respond(channel, all, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt), allRefreshed);
@@ -412,7 +413,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
         }
         cancel();
         try {
-            send(IndexAdminHandler.error(channel, status, type, reason));
+            send(RestReplies.error(channel, status, type, reason));
         } catch (Exception e) {
             logger.error("failed to report a streamed batch's failure", e);
         }
@@ -427,7 +428,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
         }
         cancel();
         try {
-            send(IndexAdminHandler.failure(channel, failure));
+            send(RestReplies.failure(channel, failure));
         } catch (Exception e) {
             logger.error("failed to report a streamed batch's failure", e);
         }

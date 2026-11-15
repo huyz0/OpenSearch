@@ -19,6 +19,7 @@ import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.ops.ShardOperations;
 import org.opensearch.serverless.ops.UpdateOutcome;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.shard.DocumentMissingException;
 import org.opensearch.serverless.shard.NoSuchIndexException;
 import org.opensearch.serverless.shard.NotHereException;
@@ -85,12 +86,12 @@ public final class UpdateHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         if (requireAlias) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_write",
@@ -103,7 +104,7 @@ public final class UpdateHandler extends BaseRestHandler {
             // carrying the document as written; this path does not carry the written document back from the
             // shard, so accepting the parameter would answer without the one thing it asked for.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_write",
@@ -116,7 +117,7 @@ public final class UpdateHandler extends BaseRestHandler {
             // Same refusal as a plain write, for the same reason: see DocumentHandler. External
             // versioning is a model this system does not keep; optimistic concurrency is one it does.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_write",
@@ -127,7 +128,7 @@ public final class UpdateHandler extends BaseRestHandler {
         }
         if ((ifSeqNoParam == null) != (ifPrimaryTermParam == null)) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "invalid_condition",
@@ -152,7 +153,7 @@ public final class UpdateHandler extends BaseRestHandler {
         }
         if (request.hasContent() == false) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "an update body is required")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_body", "an update body is required")
             );
         }
 
@@ -174,7 +175,7 @@ public final class UpdateHandler extends BaseRestHandler {
         }
         if (parsed.fetchSource() != null && parsed.fetchSource().fetchSource()) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_write", "_source on an update is not supported")
+                RestReplies.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_write", "_source on an update is not supported")
             );
         }
         final NodeContext serving = node.get();
@@ -196,7 +197,7 @@ public final class UpdateHandler extends BaseRestHandler {
                 sendError(channel, e.restStatus(), e.restType(serving.localNode().getId()), e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report an update failure", nested);
                 }
@@ -206,7 +207,7 @@ public final class UpdateHandler extends BaseRestHandler {
 
     private void sendError(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
         try {
-            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+            channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException nested) {
             logger.error("failed to report an update failure", nested);
         }

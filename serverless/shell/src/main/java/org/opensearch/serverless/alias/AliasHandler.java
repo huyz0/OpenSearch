@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.alias;
 
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentParser;
@@ -14,6 +14,7 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.AliasRecord;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -134,7 +135,7 @@ public final class AliasHandler extends BaseRestHandler {
                 channel.sendResponse(response);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report an alias operation failure", nested);
                 }
@@ -215,7 +216,7 @@ public final class AliasHandler extends BaseRestHandler {
             final MetadataPlane reverse = plane.get();
             if (reverse == null) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                    RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
                 );
             }
             return channel -> executeAuthorized(
@@ -243,12 +244,7 @@ public final class AliasHandler extends BaseRestHandler {
         }
         if (name == null && bulk == false) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.BAD_REQUEST,
-                    "missing_alias",
-                    "name the alias, in the path or as 'alias' in the body"
-                )
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_alias", "name the alias, in the path or as 'alias' in the body")
             );
         }
         final String aliasName = name;
@@ -273,7 +269,7 @@ public final class AliasHandler extends BaseRestHandler {
                 final String option = unsupportedAliasOption(body);
                 if (option != null) {
                     return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_alias_option", option)
+                        RestReplies.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_alias_option", option)
                     );
                 }
             }
@@ -282,7 +278,7 @@ public final class AliasHandler extends BaseRestHandler {
         if ((method == RestRequest.Method.PUT || method == RestRequest.Method.POST) && indexParam == null && bulk == false) {
             if (request.hasContentOrSourceParam() == false) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "an alias needs a body naming its indices")
+                    RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_body", "an alias needs a body naming its indices")
                 );
             }
             try (XContentParser parser = request.contentOrSourceParamParser()) {
@@ -295,7 +291,7 @@ public final class AliasHandler extends BaseRestHandler {
             }
             if (indices.isEmpty()) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.BAD_REQUEST,
                         "no_indices",
@@ -308,7 +304,7 @@ public final class AliasHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
@@ -318,7 +314,7 @@ public final class AliasHandler extends BaseRestHandler {
                 body = request.hasContent() ? request.content().utf8ToString() : null;
             } catch (Exception e) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not read the actions")
+                    RestReplies.error(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not read the actions")
                 );
             }
             return channel -> executeAuthorized(
@@ -398,12 +394,12 @@ public final class AliasHandler extends BaseRestHandler {
      * The {@code is_write_index} a body carries: true marks the index as the one writes through the alias go to, false
      * unmarks it, absent leaves the alias as it is.
      */
-    static Boolean writeIndexFlag(java.util.Map<?, ?> body) {
+    public static Boolean writeIndexFlag(java.util.Map<?, ?> body) {
         final Object flag = body.get("is_write_index");
         return flag == null ? null : Boolean.valueOf(String.valueOf(flag));
     }
 
-    static String unsupportedAliasOption(java.util.Map<?, ?> body) {
+    public static String unsupportedAliasOption(java.util.Map<?, ?> body) {
         if (body.get("filter") != null) {
             return "filter is not supported: an alias here names indices and does not narrow them";
         }

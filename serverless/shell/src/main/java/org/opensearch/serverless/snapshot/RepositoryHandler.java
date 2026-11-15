@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.snapshot;
 
 import org.opensearch.action.ActionRequest;
 import org.opensearch.action.admin.cluster.repositories.delete.DeleteRepositoryAction;
@@ -42,6 +42,7 @@ import org.opensearch.serverless.metadata.Names;
 import org.opensearch.serverless.metadata.RepositoryDescriptor;
 import org.opensearch.serverless.metadata.RepositoryInUseException;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -183,7 +184,7 @@ public final class RepositoryHandler extends BaseRestHandler {
                             throw invalid;
                         }
                         if (RepositoryDescriptor.TYPE_NATIVE.equals(selected.type()) == false) {
-                            throw new IndexAdminHandler.RefusedException(
+                            throw new RestReplies.RefusedException(
                                 RestStatus.NOT_IMPLEMENTED,
                                 "unsupported_repository_type",
                                 "type '"
@@ -194,7 +195,7 @@ public final class RepositoryHandler extends BaseRestHandler {
                             );
                         }
                         if (selected.cryptoSettings() != null) {
-                            throw new IndexAdminHandler.RefusedException(
+                            throw new RestReplies.RefusedException(
                                 RestStatus.NOT_IMPLEMENTED,
                                 "unsupported_repository_setting",
                                 "repository crypto_settings are not supported"
@@ -328,12 +329,12 @@ public final class RepositoryHandler extends BaseRestHandler {
             work.run();
         } catch (Exception e) {
             try {
-                if (e instanceof IndexAdminHandler.RefusedException refused) {
+                if (e instanceof RestReplies.RefusedException refused) {
                     channel.sendResponse(error(channel, refused.status, refused.type, refused.getMessage()));
                 } else if (e instanceof RepositoryInUseException) {
                     channel.sendResponse(error(channel, RestStatus.CONFLICT, "repository_in_use", e.getMessage()));
                 } else {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 }
             } catch (IOException nested) {
                 logger.error("failed to report a repository administration failure", nested);
@@ -355,6 +356,6 @@ public final class RepositoryHandler extends BaseRestHandler {
 
     private static BytesRestResponse error(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason)
         throws IOException {
-        return IndexAdminHandler.error(channel, status, type, reason);
+        return RestReplies.error(channel, status, type, reason);
     }
 }

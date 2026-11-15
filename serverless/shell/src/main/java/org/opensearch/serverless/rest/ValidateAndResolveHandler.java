@@ -17,6 +17,8 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.restcore.IndexPatterns;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -94,14 +96,14 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
         final var serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
                 if (resolving) {
-                    IndexAdminHandler.gate(
+                    RestReplies.gate(
                         serving,
                         org.opensearch.action.admin.indices.resolve.ResolveIndexAction.NAME,
                         new org.opensearch.action.admin.indices.resolve.ResolveIndexAction.Request(new String[] { names }),
@@ -111,7 +113,7 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
                         }
                     );
                 } else {
-                    IndexAdminHandler.gate(
+                    RestReplies.gate(
                         serving,
                         org.opensearch.action.admin.indices.validate.query.ValidateQueryAction.NAME,
                         new org.opensearch.action.admin.indices.validate.query.ValidateQueryRequest(index),
@@ -125,7 +127,7 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a validate or resolve failure", nested);
                 }
@@ -269,7 +271,7 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
         try {
-            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+            channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
             logger.error("failed to report a refusal", e);
         }
