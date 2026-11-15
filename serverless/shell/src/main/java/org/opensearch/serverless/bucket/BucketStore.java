@@ -12,6 +12,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.ConditionalBlobContainer;
+import org.opensearch.serverless.cluster.BucketIds;
 
 import java.io.IOException;
 import java.util.Optional;

@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.bucket;
+package org.opensearch.serverless.cluster;
 
 /**
  * What a bucket id may be: a short name safe as one object-store path segment.
