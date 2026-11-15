@@ -794,6 +794,7 @@ public final class NodeWritePath {
         final BulkOutcome[] outcomes = new BulkOutcome[batch.size()];
         final java.util.List<org.opensearch.serverless.nodelog.WalRecord> applied = new java.util.ArrayList<>(batch.size());
         final boolean[] grewFor = new boolean[batch.size()];
+        writePools.pace(shard, batch.size());
         int from = 0;
         while (from < batch.size()) {
             int deferredAt = -1;

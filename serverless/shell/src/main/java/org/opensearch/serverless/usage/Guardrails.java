@@ -10,6 +10,7 @@ package org.opensearch.serverless.usage;
 
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.serverless.store.IndexUsage;
 import org.opensearch.serverless.store.StoreUsage;
 import org.opensearch.serverless.usage.UsageSettings.Mode;
@@ -46,7 +47,9 @@ import java.util.function.Supplier;
  * <p><b>What each level does</b>, only in {@link Mode#ENFORCE} and only to that tenant's indices: at one and above, its
  * shards publish {@link #PUBLISH_STRETCH} times less often. Writes are still pushed to search nodes as they are
  * acknowledged, which costs no store request, so searches see them as soon as before. At two and above, its searches
- * wait while half the node's search slots are taken. In {@link Mode#OBSERVE}, the
+ * wait while half the node's search slots are taken. At three, its writes are paced to what fits its budget, and a
+ * write or search that would wait longer than {@link UsageSettings#MAX_WAIT_MILLIS} is refused with a 429; a refusal
+ * shows as level four for a minute. In {@link Mode#OBSERVE}, the
  * default, levels are only computed and reported. Nothing here sends a request to the store or another node.
  *
  * <p><b>Fair share</b> holds whatever the mode, and only while the node runs as many searches as it has slots: no
@@ -63,6 +66,9 @@ public final class Guardrails {
     private static final long LEVEL_UP_AFTER_MILLIS = 60_000L;
     private static final long NEXT_LEVEL_AFTER_MILLIS = 120_000L;
     private static final long LEVEL_DOWN_AFTER_MILLIS = 300_000L;
+    private static final long REFUSED_SHOWS_MILLIS = 60_000L;
+    // Pacing lets a tenant run ahead of its rate by this many seconds of it.
+    private static final double BURST_SECONDS = 4d;
 
     private final Mode nodeMode;
     private final Tier defaultTier;
@@ -70,6 +76,7 @@ public final class Guardrails {
     private final Function<Settings, String> groupOf;
     private final Supplier<StoreUsage> usage;
     private final LongSupplier clock;
+    private final long maxWaitMillis;
 
     private final ConcurrentHashMap<String, IndexInfo> indices = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Tenant> tenants = new ConcurrentHashMap<>();
@@ -114,6 +121,7 @@ public final class Guardrails {
         this.groupOf = groupOf;
         this.usage = usage;
         this.clock = clock;
+        this.maxWaitMillis = UsageSettings.MAX_WAIT_MILLIS.get(settings);
         final int slots = UsageSettings.SEARCH_SLOTS.get(settings);
         this.searches = new SearchAdmission(
             UsageSettings.SEARCH_TENANT_SHARE.get(settings),
@@ -135,6 +143,13 @@ public final class Guardrails {
         long overSinceMillis = -1L;
         long underSinceMillis = -1L;
         long changedAtMillis = -1L;
+        long refusedAtMillis = -1L;
+        long refused;
+        long paced;
+        // Pacing at level three: documents a second that fit the budget, a bucket of them, and when it was last filled.
+        double allowedDocsPerSecond = Double.MAX_VALUE;
+        double tokens;
+        long tokensAtMillis = -1L;
     }
 
     // ---- what an index is
@@ -186,7 +201,11 @@ public final class Guardrails {
      */
     public int level(String tenant) {
         final Tenant state = tenants.get(tenant);
-        return Math.max(state == null ? 0 : state.level, external.getOrDefault(tenant, 0));
+        int level = state == null ? 0 : state.level;
+        if (state != null && state.refusedAtMillis >= 0 && clock.getAsLong() - state.refusedAtMillis < REFUSED_SHOWS_MILLIS) {
+            level = 4;
+        }
+        return Math.max(level, external.getOrDefault(tenant, 0));
     }
 
     private boolean enforcedAt(IndexInfo info, int minLevel) {
@@ -279,6 +298,11 @@ public final class Guardrails {
                 tenant.costPerMinute = (sum.getValue()[0] - tenant.lastCostMilli) / 1000d * 60_000d / elapsed;
                 tenant.docsPerMinute = (sum.getValue()[1] - tenant.lastDocs) * 60_000d / elapsed;
                 step(tenant, tenant.costPerMinute > budget, now);
+                // What fits the budget at the documents-to-cost ratio it writes at now; never below what it writes while
+                // under it, so a level set from outside paces only where this node sees it over.
+                tenant.allowedDocsPerSecond = tenant.costPerMinute <= budget || tenant.docsPerMinute <= 0
+                    ? Double.MAX_VALUE
+                    : tenant.docsPerMinute / 60d * budget / tenant.costPerMinute;
             }
             tenant.lastCostMilli = sum.getValue()[0];
             tenant.lastDocs = sum.getValue()[1];
@@ -307,6 +331,67 @@ public final class Guardrails {
                 tenant.level--;
                 tenant.changedAtMillis = now;
             }
+        }
+    }
+
+    // ---- level three
+
+    /**
+     * Paces a write at level three and above, when enforced: holds it until it fits the tenant's budget, or refuses it
+     * with a 429 when that would take longer than {@link UsageSettings#MAX_WAIT_MILLIS}. Call before anything is applied.
+     *
+     * @param index the index written to
+     * @param docs how many documents it writes
+     * @throws OpenSearchRejectedExecutionException a 429, when holding it would take too long
+     * @throws IOException if interrupted while held, before anything was applied
+     */
+    public void paceWrite(String index, int docs) throws IOException {
+        final IndexInfo info = info(index);
+        if (docs <= 0 || enforcedAt(info, 3) == false) {
+            return;
+        }
+        final Tenant tenant = tenants.get(info.tenant());
+        if (tenant == null || tenant.allowedDocsPerSecond == Double.MAX_VALUE) {
+            return;
+        }
+        final long waitMillis;
+        synchronized (tenant) {
+            final double rate = Math.max(tenant.allowedDocsPerSecond, 0.01d);
+            final long now = clock.getAsLong();
+            final double capacity = Math.max(docs, rate * BURST_SECONDS);
+            tenant.tokens = tenant.tokensAtMillis < 0
+                ? capacity
+                : Math.min(capacity, tenant.tokens + (now - tenant.tokensAtMillis) / 1000d * rate);
+            tenant.tokensAtMillis = now;
+            tenant.tokens -= docs;
+            waitMillis = tenant.tokens >= 0 ? 0L : (long) Math.ceil(-tenant.tokens / rate * 1000d);
+            if (waitMillis > maxWaitMillis) {
+                tenant.tokens += docs;
+                tenant.refused++;
+                tenant.refusedAtMillis = now;
+                throw new OpenSearchRejectedExecutionException(
+                    "tenant [" + info.tenant() + "] is over its cost budget; retry in " + waitMillis + " ms"
+                );
+            }
+            if (waitMillis > 0) {
+                tenant.paced++;
+            }
+        }
+        if (waitMillis > 0) {
+            try {
+                Thread.sleep(waitMillis);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted while a write was paced; nothing was applied", e);
+            }
+        }
+    }
+
+    private void refused(String tenantName) {
+        final Tenant tenant = tenants.computeIfAbsent(tenantName, k -> new Tenant());
+        synchronized (tenant) {
+            tenant.refused++;
+            tenant.refusedAtMillis = clock.getAsLong();
         }
     }
 
@@ -353,12 +438,22 @@ public final class Guardrails {
         }
         final Set<String> searchTenants = new HashSet<>();
         boolean lowPriority = false;
+        boolean refusable = false;
         for (String index : searched) {
             final IndexInfo info = info(index);
             searchTenants.add(info.tenant());
             lowPriority |= enforcedAt(info, 2);
+            refusable |= enforcedAt(info, 3);
         }
-        final Releasable admitted = searches.admit(searchTenants, lowPriority, false);
+        final Releasable admitted;
+        try {
+            admitted = searches.admit(searchTenants, lowPriority, refusable);
+        } catch (OpenSearchRejectedExecutionException e) {
+            for (String tenant : searchTenants) {
+                refused(tenant);
+            }
+            throw e;
+        }
         final StoreUsage store = usage.get();
         final long started = System.nanoTime();
         return () -> {
@@ -405,6 +500,8 @@ public final class Guardrails {
             line.put("set_level", external.getOrDefault(entry.getKey(), 0));
             line.put("tier", tiers.getOrDefault(entry.getKey(), defaultTier.name().toLowerCase(Locale.ROOT)));
             line.put("budget_per_minute", budgets.getOrDefault(entry.getKey(), tierBudgets[defaultTier.ordinal()]));
+            line.put("paced", tenant.paced);
+            line.put("refused", tenant.refused);
             line.put("cost_per_minute", Math.round(tenant.costPerMinute * 100d) / 100d);
             line.put("docs_per_minute", Math.round(tenant.docsPerMinute * 100d) / 100d);
             out.put(entry.getKey(), line);

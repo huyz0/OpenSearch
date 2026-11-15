@@ -841,7 +841,7 @@ or `index.serverless.cost.budget`. A minute over raises it to level 1, two more 
 under lowers it one. `serverless.cost.guardrails` (node) and `index.serverless.cost.guardrails` (index, wins) are `off`,
 `observe` (the default: levels are computed and reported, nothing is slowed) or `enforce`.
 
-A collector that sees every node can set levels in the cluster settings, `serverless.cost.tenant_levels` as
+A collector that sees every node sets levels in the cluster settings, `serverless.cost.tenant_levels` as
 `tenant=level,...`; a node takes the higher of that and its own, and other nodes read it within five minutes.
 
 What a level does, when enforced, to that tenant's indices only:
@@ -852,6 +852,10 @@ What a level does, when enforced, to that tenant's indices only:
   (`PublishStretchNodeTests`; the rest is both indices' equal share of the node log).
 - **Level 2 and above**: its searches wait while half the node's search slots are taken, up to
   `serverless.cost.max_wait_millis` (1 s), then run.
+- **Level 3**: its writes are paced to what fits its budget, at the documents-to-cost ratio it writes at now, with a
+  burst of four seconds of that rate. A write that would wait longer than the longest wait is refused with a 429 before
+  anything is applied, and so is a search still waiting then; a refusal shows as level 4 for a minute. Pacing only acts
+  where this node sees the tenant over its budget: a tenant over only fleet-wide gets levels 1 and 2 from the collector.
 
 **Search fair share**, whatever the mode: while a node runs as many searches as it has slots
 (`serverless.cost.search.slots`, default the search pool's size), a tenant already holding a quarter of them
@@ -860,3 +864,9 @@ wait, and other tenants go ahead. Below that nothing waits. On one 4-core test n
 running, a quiet tenant's p50 went from 74-81 ms with the share off to 24-25 ms with it on (alone: 8-9 ms), p99 from
 109-117 ms to 49-57 ms, while the noisy tenant still ran 385 searches a second against 404 (`SearchFairShareMeterTests`,
 `-Dtests.meter.search_share=true`, three runs).
+
+**Write share**, whatever the mode: while every engine-apply permit is taken (cores + 1), an index already holding half
+of them (`serverless.cost.write.index_share`, 0.5; 0 turns it off) waits, up to the longest wait, for one of its own to
+be given back, so the next permit goes to another index. A lone index still takes every permit. On the write meter
+(1,000 shards, 1,000 and 2,000 docs/s, two runs each way) p99 and CPU per document moved within run-to-run noise:
+p99 289-363 ms off, 324-361 ms on.
