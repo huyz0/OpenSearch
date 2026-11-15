@@ -59,6 +59,16 @@ public final class CacheSettings implements SettingsProvider {
     );
 
     /** Used by {@link java.util.ServiceLoader}. */
+    /**
+     * Whether a read acts on Lucene's prefetch hints, fetching the announced blocks on the generic pool so a query over
+     * many segments waits for their round trips together rather than one after another.
+     */
+    public static final Setting<Boolean> READ_PREFETCH = Setting.boolSetting(
+        "serverless.block_cache.read_prefetch",
+        true,
+        Property.NodeScope
+    );
+
     public CacheSettings() {}
 
     /** Names the index whose storage a shard should read, when that is not the index it belongs to. */
@@ -103,6 +113,14 @@ public final class CacheSettings implements SettingsProvider {
 
     @Override
     public List<Setting<?>> settings() {
-        return List.of(STORAGE_UUID, BLOCK_SIZE, MAX_BLOCKS, LOCAL_MEMORY_ENABLED, LOCAL_MEMORY_MAX_BYTES, LOCAL_MEMORY_MAX_FILE_BYTES);
+        return List.of(
+            STORAGE_UUID,
+            BLOCK_SIZE,
+            MAX_BLOCKS,
+            LOCAL_MEMORY_ENABLED,
+            LOCAL_MEMORY_MAX_BYTES,
+            LOCAL_MEMORY_MAX_FILE_BYTES,
+            READ_PREFETCH
+        );
     }
 }
