@@ -9,7 +9,7 @@
 package org.opensearch.serverless.documents;
 
 import org.opensearch.core.rest.RestStatus;
-import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.serverless.write.BulkOutcome;
 
 import java.util.List;

@@ -445,8 +445,8 @@ public final class ShardReconciler {
      * @return the records to replay, empty if this shard should not replay any
      * @throws IOException if the log cannot be read
      */
-    public java.util.List<org.opensearch.serverless.store.WalRecord> replayRecordsFor(ShardId shardId) throws IOException {
-        final var records = new java.util.ArrayList<org.opensearch.serverless.store.WalRecord>();
+    public java.util.List<org.opensearch.serverless.nodelog.WalRecord> replayRecordsFor(ShardId shardId) throws IOException {
+        final var records = new java.util.ArrayList<org.opensearch.serverless.nodelog.WalRecord>();
         forEachReplayRecord(shardId, records::add);
         return records;
     }
@@ -454,7 +454,7 @@ public final class ShardReconciler {
     /** Streams a fenced log once; the engine retains only a disposable local spool. */
     public void forEachReplayRecord(
         ShardId shardId,
-        org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> consumer
+        org.opensearch.common.CheckedConsumer<org.opensearch.serverless.nodelog.WalRecord, IOException> consumer
     ) throws IOException {
         ReplayStream.forEach(this, shardId, consumer);
     }
@@ -473,13 +473,13 @@ public final class ShardReconciler {
      * @param records the records, oldest first, each past the local checkpoint of the commit the shard opens from
      * @throws IllegalStateException if records are already waiting for the shard's next open
      */
-    public void preloadReplay(ShardId shardId, java.util.List<org.opensearch.serverless.store.WalRecord> records) {
+    public void preloadReplay(ShardId shardId, java.util.List<org.opensearch.serverless.nodelog.WalRecord> records) {
         if (preloadedReplay.putIfAbsent(shardId, java.util.List.copyOf(records)) != null) {
             throw new IllegalStateException("records are already waiting for the next open of " + shardId);
         }
     }
 
-    final java.util.concurrent.ConcurrentHashMap<ShardId, java.util.List<org.opensearch.serverless.store.WalRecord>> preloadedReplay =
+    final java.util.concurrent.ConcurrentHashMap<ShardId, java.util.List<org.opensearch.serverless.nodelog.WalRecord>> preloadedReplay =
         new java.util.concurrent.ConcurrentHashMap<>();
 
     public boolean retainReplay(ShardId shardId, org.opensearch.serverless.engine.ReplaySpool spool) throws IOException {
@@ -500,7 +500,7 @@ public final class ShardReconciler {
          * @param shardId the shard
          * @return the position, or null if none is unpublished
          */
-        org.opensearch.serverless.store.NodeLogCommitter.Position position(ShardId shardId);
+        org.opensearch.serverless.nodelog.NodeLogCommitter.Position position(ShardId shardId);
 
         /**
          * Records that a publish covering everything up to a position has landed.
@@ -508,7 +508,7 @@ public final class ShardReconciler {
          * @param shardId the shard
          * @param upTo what {@link #position} returned before the publish flushed, or null
          */
-        void published(ShardId shardId, org.opensearch.serverless.store.NodeLogCommitter.Position upTo);
+        void published(ShardId shardId, org.opensearch.serverless.nodelog.NodeLogCommitter.Position upTo);
 
         /**
          * Streams the records a shard being opened must replay from the node logs.
@@ -524,7 +524,7 @@ public final class ShardReconciler {
             ShardId shardId,
             String writer,
             long term,
-            org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> consumer
+            org.opensearch.common.CheckedConsumer<org.opensearch.serverless.nodelog.WalRecord, IOException> consumer
         ) throws IOException;
 
         /**

@@ -71,10 +71,10 @@ public class LocalSegmentMemoryTests extends OpenSearchTestCase {
                 for (ShardId shardId : first.reconciler().openShards()) {
                     // In bulks: one write waits out the log's window, and three hundred of them one at a time take minutes.
                     for (int from = round * docs / 3; from < (round + 1) * docs / 3; from += 20) {
-                        final List<org.opensearch.serverless.store.WalRecord> records = new java.util.ArrayList<>();
+                        final List<org.opensearch.serverless.nodelog.WalRecord> records = new java.util.ArrayList<>();
                         for (int i = from; i < from + 20; i++) {
                             records.add(
-                                new org.opensearch.serverless.store.WalRecord(
+                                new org.opensearch.serverless.nodelog.WalRecord(
                                     "doc-" + i,
                                     "{\"msg\":\"round " + round + " of a document long enough to fill\",\"n\":" + i + "}"
                                 )

@@ -15,9 +15,9 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.node.NodeLogWriter;
+import org.opensearch.serverless.nodelog.NodeLogPin;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.serverless.routing.UnitLayout;
-import org.opensearch.serverless.store.NodeLogCommitter;
-import org.opensearch.serverless.store.WalRecord;
 import org.opensearch.serverless.write.WriteHold;
 
 import java.io.IOException;
@@ -150,7 +150,7 @@ public final class UnitSplitMover {
         final IndexDescriptor reserved = plane.describe(indexName).orElseThrow();
         final UnitLayout after = reserved.layout().apply(split);
 
-        try (NodeLogCommitter.Pin pin = log.retain(parent, pinMillis)) {
+        try (NodeLogPin pin = log.retain(parent, pinMillis)) {
             // Pinned before the build reads the published commit, so every record past that commit's checkpoint stays.
             final UnitSplitBuilder.Built built = UnitSplitBuilder.build(plane, reserved, split, scratch);
             final ShardId left = new ShardId(parent.getIndex(), split.left().id());

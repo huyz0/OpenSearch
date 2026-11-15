@@ -10,7 +10,7 @@ package org.opensearch.serverless.transport;
 
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
-import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.transport.TransportRequest;
 
 import java.io.IOException;

@@ -180,7 +180,7 @@ public final class DocumentWritePlanner {
         }
         final String shapedSource = shaped;
         final int shard = DocumentRouting.shardFor(descriptor.get(), id, routing);
-        final long inFlightBytes = org.opensearch.serverless.store.WalRecord.contentBytes(id, deletion ? null : shapedSource);
+        final long inFlightBytes = org.opensearch.serverless.nodelog.WalRecord.contentBytes(id, deletion ? null : shapedSource);
         final java.util.function.BiConsumer<org.opensearch.core.action.ActionListener<WriteResult>, ShardId> writeHere = (
             listener,
             into) -> {

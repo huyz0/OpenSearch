@@ -6,18 +6,18 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.store;
+package org.opensearch.serverless.nodelog;
 
-import org.opensearch.serverless.store.NodeLogBlob.Range;
-import org.opensearch.serverless.store.NodeLogBlob.ShardBatch;
-import org.opensearch.serverless.store.NodeLogBlob.ShardKey;
+import org.opensearch.serverless.nodelog.NodeLogBlob.Range;
+import org.opensearch.serverless.nodelog.NodeLogBlob.ShardBatch;
+import org.opensearch.serverless.nodelog.NodeLogBlob.ShardKey;
+import org.opensearch.serverless.store.StoreUsage;
 
 import java.io.IOException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -62,10 +62,10 @@ public final class NodeLogCommitter {
      * short enough that a write is acknowledged within a quarter of a second.
      */
     public static final java.util.Set<Long> ALLOWED_WINDOW_MILLIS = java.util.Set.of(100L, 200L, 250L);
-    /** The default {@link org.opensearch.serverless.store.NodeLogSettings#ADMISSION_CONCURRENCY}. */
+    /** The default {@link org.opensearch.serverless.nodelog.NodeLogSettings#ADMISSION_CONCURRENCY}. */
     public static final int DEFAULT_ADMISSION_CONCURRENCY = 32;
 
-    /** The default of {@link org.opensearch.serverless.store.NodeLogSettings#HEDGE_AFTER_MILLIS}. */
+    /** The default of {@link org.opensearch.serverless.nodelog.NodeLogSettings#HEDGE_AFTER_MILLIS}. */
     public static final long DEFAULT_HEDGE_AFTER_MILLIS = 60L;
 
     /** Roughly the most bytes of id and source one window takes before the next arrival opens another. */
@@ -115,15 +115,16 @@ public final class NodeLogCommitter {
 
     private final NodeLogStore store;
     private final EpochLease lease;
-    private final ShardAdmission admission;
+    private final NodeLogAdmissions admissions;
     private final long windowNanos;
     private final long maxBytes;
     private final int maxRecords;
 
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition changed = lock.newCondition();
-    private final Deque<Window> windows = new ArrayDeque<>();
-    private final TreeMap<Long, EpochState> epochs = new TreeMap<>();
+    private final Deque<NodeLogWindow> windows = new ArrayDeque<>();
+    private final TreeMap<Long, NodeLogEpochState> epochs = new TreeMap<>();
+    private final NodeLogPins pins = new NodeLogPins(lock, epochs);
     private boolean flushing;
     /** The epoch being written, or -1 when the next window must open one. */
     private long current = -1L;
@@ -156,7 +157,7 @@ public final class NodeLogCommitter {
     ) {
         this.store = Objects.requireNonNull(store, "store");
         this.lease = Objects.requireNonNull(lease, "lease");
-        this.admission = Objects.requireNonNull(admission, "admission");
+        this.admissions = new NodeLogAdmissions(Objects.requireNonNull(admission, "admission"), timings, this::markAdmitted);
         if (firstEpoch < 0) {
             throw new IllegalArgumentException("firstEpoch must not be negative, got " + firstEpoch);
         }
@@ -189,8 +190,8 @@ public final class NodeLogCommitter {
         lock.lock();
         boolean locked = true;
         try {
-            final List<Window> joinedWindows = joinAll(shard, term, records);
-            final Window mine = joinedWindows.get(joinedWindows.size() - 1);
+            final List<NodeLogWindow> joinedWindows = joinAll(shard, term, records);
+            final NodeLogWindow mine = joinedWindows.get(joinedWindows.size() - 1);
             // Windows are written in order, one at a time, so the last of them landing means the others were written.
             if (mine.driven) {
                 // Another writer already waits on this window and will write it, or the ones before it, when due: this
@@ -208,7 +209,7 @@ public final class NodeLogCommitter {
                 awaitLanded(mine);
             }
             timings.caller(joined, mine);
-            for (Window each : joinedWindows) {
+            for (NodeLogWindow each : joinedWindows) {
                 final IOException failure = each.failures.get(shard);
                 if (failure != null) {
                     throw failure;
@@ -228,7 +229,7 @@ public final class NodeLogCommitter {
      * @return true once it has landed; false if it took so long that this writer should drive it itself, as when its
      *     driver failed with an unexpected error and left it
      */
-    private boolean awaitLandedUnlocked(Window mine) {
+    private boolean awaitLandedUnlocked(NodeLogWindow mine) {
         final long patience = Math.max(4 * windowNanos, TimeUnit.SECONDS.toNanos(1));
         boolean interrupted = false;
         try {
@@ -268,8 +269,8 @@ public final class NodeLogCommitter {
         }
         lock.lock();
         try {
-            final List<Window> joinedWindows = joinAll(shard, term, records);
-            final Window window = joinedWindows.get(joinedWindows.size() - 1);
+            final List<NodeLogWindow> joinedWindows = joinAll(shard, term, records);
+            final NodeLogWindow window = joinedWindows.get(joinedWindows.size() - 1);
             window.onLanded.add(() -> {
                 if (window.landed != null && joinedWindows.stream().noneMatch(each -> each.failures.containsKey(shard))) {
                     onLanded.accept(window.landed);
@@ -287,7 +288,7 @@ public final class NodeLogCommitter {
     public void flushQueued() {
         lock.lock();
         try {
-            final Window last = windows.peekLast();
+            final NodeLogWindow last = windows.peekLast();
             if (last != null && last.onLanded.isEmpty() == false) {
                 awaitLanded(last);
             }
@@ -297,7 +298,7 @@ public final class NodeLogCommitter {
     }
 
     /** Lingers on, or writes, windows until this one is done. Caller holds the lock. */
-    private void awaitLanded(Window mine) {
+    private void awaitLanded(NodeLogWindow mine) {
         while (mine.done == false) {
             if (flushing) {
                 // Uninterruptibly: these records are in a window that will be written whatever this thread does, so
@@ -305,7 +306,7 @@ public final class NodeLogCommitter {
                 changed.awaitUninterruptibly();
                 continue;
             }
-            final Window head = windows.peekFirst();
+            final NodeLogWindow head = windows.peekFirst();
             final long left = head.closesAtNanos - System.nanoTime();
             if (head.full(maxBytes, maxRecords) == false && left > 0) {
                 awaitNanosUninterruptibly(left);
@@ -357,11 +358,11 @@ public final class NodeLogCommitter {
      *
      * @return the windows they joined, oldest first
      */
-    private List<Window> joinAll(ShardKey shard, long term, List<WalRecord> records) {
-        final List<Window> joined = new ArrayList<>(1);
+    private List<NodeLogWindow> joinAll(ShardKey shard, long term, List<WalRecord> records) {
+        final List<NodeLogWindow> joined = new ArrayList<>(1);
         int from = 0;
         while (from < records.size()) {
-            Window last = windows.peekLast();
+            NodeLogWindow last = windows.peekLast();
             final long roomBytes = last == null || last.full(maxBytes, maxRecords) ? maxBytes : maxBytes - last.bytes;
             final int roomRecords = last == null || last.full(maxBytes, maxRecords) ? maxRecords : maxRecords - last.records;
             int to = from;
@@ -384,7 +385,7 @@ public final class NodeLogCommitter {
                 changed.signalAll();
                 continue;
             }
-            final Window window = join(shard, term, from == 0 && to == records.size() ? records : records.subList(from, to));
+            final NodeLogWindow window = join(shard, term, from == 0 && to == records.size() ? records : records.subList(from, to));
             if (to < records.size()) {
                 // More of this shard's records follow in the next window: this one is as full as it will get.
                 window.closeEarly = true;
@@ -399,8 +400,8 @@ public final class NodeLogCommitter {
     }
 
     /** Adds to the youngest window that will take them, or opens one. Caller holds the lock. */
-    private Window join(ShardKey shard, long term, List<WalRecord> records) {
-        Window last = windows.peekLast();
+    private NodeLogWindow join(ShardKey shard, long term, List<WalRecord> records) {
+        NodeLogWindow last = windows.peekLast();
         if (last == null || last.full(maxBytes, maxRecords)) {
             final long now = System.nanoTime();
             long closesAt = now + windowNanos;
@@ -409,7 +410,7 @@ public final class NodeLogCommitter {
                 // record that finds the log quiet for a whole window goes at once instead of waiting one out alone.
                 closesAt = Math.min(closesAt, Math.max(now, lastFlushStartedNanos + windowNanos));
             }
-            last = new Window(closesAt);
+            last = new NodeLogWindow(closesAt);
             windows.addLast(last);
         }
         last.add(shard, term, records);
@@ -421,7 +422,7 @@ public final class NodeLogCommitter {
     }
 
     /** Writes one window. Called with the lock released, by the one flusher. */
-    private void write(Window window) {
+    private void write(NodeLogWindow window) {
         final long epoch;
         final long opening = System.nanoTime();
         try {
@@ -436,27 +437,27 @@ public final class NodeLogCommitter {
 
         // A shard's first records in this epoch wait for a check that this node still owns it.
         final List<ShardBatch> batches = new ArrayList<>();
-        final List<Window.Key> toAdmit = new ArrayList<>();
+        final List<NodeLogWindow.Key> toAdmit = new ArrayList<>();
         // Under one hold of the lock: a window carries thousands of shards on a busy node, and taking it once a shard made
         // the flusher queue behind every writer joining the next window, thousands of times per blob.
         lock.lock();
         try {
             final Map<ShardKey, Long> admittedHere = epochs.get(epoch).admitted;
-            for (Map.Entry<Window.Key, List<WalRecord>> entry : window.batches.entrySet()) {
-                final Window.Key key = entry.getKey();
-                if (window.failures.containsKey(key.shard)) {
+            for (Map.Entry<NodeLogWindow.Key, List<WalRecord>> entry : window.batches.entrySet()) {
+                final NodeLogWindow.Key key = entry.getKey();
+                if (window.failures.containsKey(key.shard())) {
                     continue;
                 }
-                final Long at = admittedHere.get(key.shard);
-                if (at == null || at != key.term) {
+                final Long at = admittedHere.get(key.shard());
+                if (at == null || at != key.term()) {
                     toAdmit.add(key);
                 }
-                batches.add(new ShardBatch(key.shard, key.term, entry.getValue()));
+                batches.add(new ShardBatch(key.shard(), key.term(), entry.getValue()));
             }
         } finally {
             lock.unlock();
         }
-        admitAll(epoch, toAdmit, window);
+        admissions.admitAll(epoch, toAdmit, window);
         batches.removeIf(batch -> window.failures.containsKey(batch.shard()));
         timings.admissionNanos.add(System.nanoTime() - admitting);
         if (batches.isEmpty()) {
@@ -468,7 +469,7 @@ public final class NodeLogCommitter {
         final Map<ShardKey, List<Range>> prior;
         lock.lock();
         try {
-            final EpochState state = epochs.get(epoch);
+            final NodeLogEpochState state = epochs.get(epoch);
             ordinal = state.next;
             trimPoint = state.trimPoint();
             prior = new HashMap<>(state.unpublished);
@@ -508,13 +509,13 @@ public final class NodeLogCommitter {
             timings.putNanos.add(took);
             timings.puts.increment();
             if (failure == null) {
-                notePutTook(took, encoded.bytes().length);
+                hedgeDelay.notePutTook(took, encoded.bytes().length);
             }
         }
 
         lock.lock();
         try {
-            final EpochState state = epochs.get(epoch);
+            final NodeLogEpochState state = epochs.get(epoch);
             // A fence in the slot means the blob did not land. Any other failure may have landed it, so its records count
             // as unpublished until the shards publish past it, and the epoch stays in the lease until then.
             final boolean mayHaveLanded = (failure instanceof java.nio.file.FileAlreadyExistsException) == false;
@@ -579,7 +580,7 @@ public final class NodeLogCommitter {
         try {
             opening = -1L;
             lastEpoch = epoch;
-            epochs.put(epoch, new EpochState());
+            epochs.put(epoch, new NodeLogEpochState());
             current = epoch;
             timings.epochsOpened.increment();
             return epoch;
@@ -589,93 +590,13 @@ public final class NodeLogCommitter {
     }
 
     /**
-     * Checks every shard new to the epoch, a few at a time when an executor is set. One after another, a window carrying
-     * the first records of thousands of shards -- a node's first writes after taking them, or after its epoch changed --
-     * waited one head read per shard before its PUT: at 20 ms a read, a minute for three thousand shards, with every write
-     * on the node waiting behind it and the write limiter refusing them. Each check is independent and all of them still
-     * finish before the PUT, so running them side by side changes only how long the window waits.
-     */
-    private void admitAll(long epoch, List<Window.Key> keys, Window window) {
-        final java.util.concurrent.Executor executor = admissionExecutor;
-        final int parallelism = Math.min(admissionConcurrency, keys.size());
-        if (executor == null || parallelism <= 1) {
-            for (Window.Key key : keys) {
-                admitOne(epoch, key, window);
-            }
-            return;
-        }
-        final java.util.concurrent.ConcurrentLinkedQueue<Window.Key> queue = new java.util.concurrent.ConcurrentLinkedQueue<>(keys);
-        final java.util.concurrent.ConcurrentHashMap<ShardKey, IOException> failed = new java.util.concurrent.ConcurrentHashMap<>();
-        // Counted by checks, not by helpers: a helper the pool runs late finds the queue empty and the flusher has not
-        // waited for it, so a busy pool slows the checks down to the flusher's own pace and never holds the window longer.
-        final java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(keys.size());
-        final Runnable drain = () -> {
-            for (Window.Key key = queue.poll(); key != null; key = queue.poll()) {
-                try {
-                    final IOException failure = check(epoch, key);
-                    if (failure != null) {
-                        failed.put(key.shard, failure);
-                    }
-                } finally {
-                    done.countDown();
-                }
-            }
-        };
-        for (int i = 0; i < parallelism - 1; i++) {
-            try {
-                executor.execute(drain);
-            } catch (RuntimeException rejected) {
-                break;
-            }
-        }
-        // This thread drains too, so the checks finish even when the executor runs none of them.
-        drain.run();
-        boolean interrupted = false;
-        while (true) {
-            try {
-                done.await();
-                break;
-            } catch (InterruptedException e) {
-                interrupted = true;
-            }
-        }
-        if (interrupted) {
-            Thread.currentThread().interrupt();
-        }
-        window.failures.putAll(failed);
-    }
-
-    private void admitOne(long epoch, Window.Key key, Window window) {
-        final IOException failure = check(epoch, key);
-        if (failure != null) {
-            window.failures.put(key.shard, failure);
-        }
-    }
-
-    /** Checks one shard and marks it admitted; returns the refusal, or null. */
-    private IOException check(long epoch, Window.Key key) {
-        try {
-            timings.admissionChecks.increment();
-            admission.admit(key.shard, key.term, epoch);
-            markAdmitted(epoch, key.shard, key.term);
-            return null;
-        } catch (IOException | RuntimeException e) {
-            return new IOException("refused to log to " + key.shard + " at term " + key.term, e);
-        }
-    }
-
-    private volatile java.util.concurrent.Executor admissionExecutor;
-    private volatile int admissionConcurrency = 1;
-
-    /**
      * Checks the shards new to an epoch up to this many at a time, on the given executor and the flusher itself.
      *
      * @param concurrency how many checks may run at once; one or less checks them one after another
      * @param executor where the extra checks run; null checks them one after another
      */
     public void admitConcurrently(int concurrency, java.util.concurrent.Executor executor) {
-        this.admissionExecutor = executor;
-        this.admissionConcurrency = Math.max(1, concurrency);
+        admissions.configure(concurrency, executor);
     }
 
     private void markAdmitted(long epoch, ShardKey shard, long term) {
@@ -699,17 +620,17 @@ public final class NodeLogCommitter {
     public void onPublished(ShardKey shard, Position upTo) {
         lock.lock();
         try {
-            for (Map.Entry<Long, EpochState> entry : epochs.headMap(upTo.epoch(), true).entrySet()) {
-                final EpochState state = entry.getValue();
+            for (Map.Entry<Long, NodeLogEpochState> entry : epochs.headMap(upTo.epoch(), true).entrySet()) {
+                final NodeLogEpochState state = entry.getValue();
                 final List<Range> runs = state.unpublished.get(shard);
                 if (runs == null) {
                     continue;
                 }
                 final List<Range> kept = entry.getKey() < upTo.epoch() ? List.of() : NodeLogBlob.trimBelow(runs, upTo.ordinal() + 1);
-                if (pins.containsKey(shard)) {
+                if (pins.pinnedLocked(shard)) {
                     // Published, but pinned: kept readable, and the trim point stays below it, until the pin goes.
                     final long below = entry.getKey() < upTo.epoch() ? Long.MAX_VALUE : upTo.ordinal() + 1;
-                    final List<Range> dropped = keptBelow(runs, below);
+                    final List<Range> dropped = NodeLogPins.keptBelow(runs, below);
                     if (dropped.isEmpty() == false) {
                         state.retained.computeIfAbsent(shard, k -> new ArrayList<>()).addAll(dropped);
                     }
@@ -739,22 +660,8 @@ public final class NodeLogCommitter {
      * @return the pin
      * @throws IllegalStateException if the shard is already pinned
      */
-    public Pin pin(ShardKey shard, long maxMillis) {
-        if (maxMillis < 1) {
-            throw new IllegalArgumentException("a pin lasts at least 1 ms, not " + maxMillis);
-        }
-        lock.lock();
-        try {
-            final Pin pin = new Pin(shard, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxMillis));
-            if (pins.putIfAbsent(shard, pin) != null) {
-                throw new IllegalStateException(shard + " is already pinned");
-            }
-            // A new pin starts its own reckoning: what an earlier one lapsed over is before it.
-            lapsed.remove(shard);
-            return pin;
-        } finally {
-            lock.unlock();
-        }
+    public NodeLogPin pin(ShardKey shard, long maxMillis) {
+        return pins.pin(shard, maxMillis);
     }
 
     /**
@@ -766,92 +673,12 @@ public final class NodeLogCommitter {
      * @throws IOException if a pin on the shard lapsed, so runs it kept may have been let go of
      */
     public Map<Long, List<Range>> heldRuns(ShardKey shard) throws IOException {
-        lock.lock();
-        try {
-            expirePinsLocked();
-            if (lapsed.contains(shard)) {
-                throw new IOException("the pin on " + shard + "'s node-log records lapsed; records it kept may be gone");
-            }
-            final Map<Long, List<Range>> out = new TreeMap<>();
-            for (Map.Entry<Long, EpochState> entry : epochs.entrySet()) {
-                final List<Range> runs = new ArrayList<>(entry.getValue().retained.getOrDefault(shard, List.of()));
-                runs.addAll(entry.getValue().unpublished.getOrDefault(shard, List.of()));
-                if (runs.isEmpty() == false) {
-                    out.put(entry.getKey(), List.copyOf(runs));
-                }
-            }
-            return out;
-        } finally {
-            lock.unlock();
-        }
+        return pins.heldRuns(shard);
     }
 
     /** Lets go of the pins past their time, so the log can trim what they kept. Called with every lease renewal. */
     public void expirePins() {
-        lock.lock();
-        try {
-            expirePinsLocked();
-        } finally {
-            lock.unlock();
-        }
-    }
-
-    private void expirePinsLocked() {
-        final long now = System.nanoTime();
-        for (Pin pin : List.copyOf(pins.values())) {
-            if (now - pin.deadlineNanos >= 0) {
-                lapsed.add(pin.shard);
-                unpinLocked(pin);
-            }
-        }
-    }
-
-    private void unpinLocked(Pin pin) {
-        if (pins.remove(pin.shard, pin)) {
-            for (EpochState state : epochs.values()) {
-                state.retained.remove(pin.shard);
-            }
-        }
-    }
-
-    /** A shard's records held readable past its publishes; see {@link #pin}. */
-    public final class Pin implements AutoCloseable {
-        private final ShardKey shard;
-        private final long deadlineNanos;
-
-        private Pin(ShardKey shard, long deadlineNanos) {
-            this.shard = shard;
-            this.deadlineNanos = deadlineNanos;
-        }
-
-        /** Lets the log trim what the pin kept; a later {@link #heldRuns} of the shard no longer reports a lapse. */
-        @Override
-        public void close() {
-            lock.lock();
-            try {
-                unpinLocked(this);
-                if (pins.containsKey(shard) == false) {
-                    lapsed.remove(shard);
-                }
-            } finally {
-                lock.unlock();
-            }
-        }
-    }
-
-    private final Map<ShardKey, Pin> pins = new HashMap<>();
-    /** Shards whose pin lapsed and has not been closed since: reading them fails rather than missing records. */
-    private final java.util.Set<ShardKey> lapsed = new java.util.HashSet<>();
-
-    private static List<Range> keptBelow(List<Range> runs, long limit) {
-        final List<Range> out = new ArrayList<>(runs.size());
-        for (Range run : runs) {
-            if (run.from() >= limit) {
-                continue;
-            }
-            out.add(run.to() < limit ? run : new Range(run.from(), limit - 1));
-        }
-        return out;
+        pins.expire();
     }
 
     /**
@@ -863,7 +690,7 @@ public final class NodeLogCommitter {
     public Position lastPosition(ShardKey shard) {
         lock.lock();
         try {
-            for (Map.Entry<Long, EpochState> entry : epochs.descendingMap().entrySet()) {
+            for (Map.Entry<Long, NodeLogEpochState> entry : epochs.descendingMap().entrySet()) {
                 final List<Range> runs = entry.getValue().unpublished.get(shard);
                 if (runs != null && runs.isEmpty() == false) {
                     return new Position(entry.getKey(), runs.get(runs.size() - 1).to());
@@ -886,7 +713,7 @@ public final class NodeLogCommitter {
         lock.lock();
         try {
             final Map<Long, List<Range>> out = new TreeMap<>();
-            for (Map.Entry<Long, EpochState> entry : epochs.entrySet()) {
+            for (Map.Entry<Long, NodeLogEpochState> entry : epochs.entrySet()) {
                 final List<Range> runs = entry.getValue().unpublished.get(shard);
                 if (runs != null && runs.isEmpty() == false) {
                     out.put(entry.getKey(), runs);
@@ -907,7 +734,7 @@ public final class NodeLogCommitter {
     public void forget(ShardKey shard) {
         lock.lock();
         try {
-            for (EpochState state : epochs.values()) {
+            for (NodeLogEpochState state : epochs.values()) {
                 state.admitted.remove(shard);
             }
         } finally {
@@ -932,8 +759,8 @@ public final class NodeLogCommitter {
 
     private List<NodeLogEpoch> positionsLocked() {
         final List<NodeLogEpoch> out = new ArrayList<>();
-        for (Map.Entry<Long, EpochState> entry : epochs.entrySet()) {
-            final EpochState state = entry.getValue();
+        for (Map.Entry<Long, NodeLogEpochState> entry : epochs.entrySet()) {
+            final NodeLogEpochState state = entry.getValue();
             if (state.complete() == false) {
                 out.add(new NodeLogEpoch(entry.getKey(), state.trimPoint(), state.next));
             }
@@ -957,7 +784,7 @@ public final class NodeLogCommitter {
             final List<NodeLogEpoch> out = new ArrayList<>();
             final var it = epochs.entrySet().iterator();
             while (it.hasNext()) {
-                final Map.Entry<Long, EpochState> entry = it.next();
+                final Map.Entry<Long, NodeLogEpochState> entry = it.next();
                 if (entry.getValue().complete()) {
                     out.add(new NodeLogEpoch(entry.getKey(), entry.getValue().next, entry.getValue().next));
                     it.remove();
@@ -1001,7 +828,7 @@ public final class NodeLogCommitter {
         return recordsCommitted.get();
     }
 
-    private final Timings timings = new Timings();
+    private final NodeLogCommitTimings timings = new NodeLogCommitTimings();
 
     private volatile boolean idleFlush;
     /** When the last blob started to be written; guarded by the lock. */
@@ -1024,66 +851,16 @@ public final class NodeLogCommitter {
         this.idleFlush = on;
     }
 
-    private volatile long hedgeAfterNanos;
-
-    /** The most recent PUT durations, for the hedge delay; guarded by itself. */
-    private final long[] recentPutNanos = new long[RECENT_PUTS];
-    /** The sizes of the same PUTs, to scale a larger blob's hedge delay; guarded by {@link #recentPutNanos}. */
-    private final long[] recentPutBytes = new long[RECENT_PUTS];
-    private int recentPuts;
-    private static final int RECENT_PUTS = 128;
-    /** The share of PUTs, at most, that hedging may send twice: the hedge waits at least this quantile of recent ones. */
-    private static final double HEDGE_QUANTILE = 0.95;
-
-    private void notePutTook(long nanos, long bytes) {
-        synchronized (recentPutNanos) {
-            recentPutBytes[recentPuts % RECENT_PUTS] = bytes;
-            recentPutNanos[recentPuts++ % RECENT_PUTS] = nanos;
-        }
-    }
+    private final NodeLogHedgeDelay hedgeDelay = new NodeLogHedgeDelay();
 
     /**
-     * How long this window's PUT waits before it is sent again: the configured delay, or the 95th percentile of the recent
-     * PUTs when that is longer, so that a store slower than the setting expects is hedged on its slowest twentieth at most
-     * rather than on most of its PUTs.
-     */
-    long hedgeDelayNanos() {
-        return hedgeDelayNanos(0L);
-    }
-
-    /**
-     * How long a PUT of this many bytes waits before it is sent again: {@link #hedgeDelayNanos()}, scaled up by how many
-     * times the median of the recent PUTs' sizes it is. A blob ten times the
-     * usual size takes about ten times as long to send; hedged on the usual PUTs' tail, it was nearly always sent twice.
+     * How long a PUT of this many bytes waits before it is sent again; see {@link #hedgeAppends}.
      *
      * @param blobBytes the blob's size; zero or less scales nothing
+     * @return the delay; zero when hedging is off
      */
     public long hedgeDelayNanos(long blobBytes) {
-        final long configured = hedgeAfterNanos;
-        if (configured <= 0) {
-            return 0L;
-        }
-        final long[] sorted;
-        final long[] sizes;
-        synchronized (recentPutNanos) {
-            final int n = Math.min(recentPuts, RECENT_PUTS);
-            sorted = java.util.Arrays.copyOf(recentPutNanos, n);
-            sizes = java.util.Arrays.copyOf(recentPutBytes, n);
-        }
-        if (sorted.length == 0) {
-            return configured;
-        }
-        java.util.Arrays.sort(sorted);
-        final long delay = Math.max(configured, sorted[(int) Math.min(sorted.length - 1, Math.floor(HEDGE_QUANTILE * sorted.length))]);
-        if (blobBytes <= 0) {
-            return delay;
-        }
-        java.util.Arrays.sort(sizes);
-        final long median = Math.max(1L, sizes[sizes.length / 2]);
-        if (blobBytes <= median) {
-            return delay;
-        }
-        return (long) Math.min(Long.MAX_VALUE / 4.0, delay * ((double) blobBytes / median));
+        return hedgeDelay.delayNanos(blobBytes);
     }
 
     private volatile java.util.concurrent.Executor hedgeExecutor;
@@ -1101,7 +878,7 @@ public final class NodeLogCommitter {
      */
     public void hedgeAppends(long afterMillis, java.util.concurrent.Executor executor) {
         this.hedgeExecutor = executor;
-        this.hedgeAfterNanos = afterMillis <= 0 ? 0L : TimeUnit.MILLISECONDS.toNanos(afterMillis);
+        hedgeDelay.configure(afterMillis);
     }
 
     /**
@@ -1109,189 +886,7 @@ public final class NodeLogCommitter {
      *
      * @return the timings
      */
-    public Timings timings() {
+    public NodeLogCommitTimings timings() {
         return timings;
-    }
-
-    /**
-     * Where a {@link #commit} waits: for its window to close, behind the blob before it, and for its own blob's write;
-     * and, per blob, how that write splits between recording an epoch, checking shards new to the epoch, and the PUT.
-     */
-    public static final class Timings {
-        private final java.util.concurrent.atomic.LongAdder callers = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder windowNanos = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder behindNanos = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder writeNanos = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder epochNanos = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder admissionNanos = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder admissionChecks = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder putNanos = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder puts = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder hedges = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder hedgesWon = new java.util.concurrent.atomic.LongAdder();
-        private final java.util.concurrent.atomic.LongAdder epochsOpened = new java.util.concurrent.atomic.LongAdder();
-
-        private void caller(long joinedNanos, Window window) {
-            if (window.flushStartedNanos == 0L) {
-                return;
-            }
-            final long waited = Math.max(0L, window.flushStartedNanos - joinedNanos);
-            final long forWindow = Math.min(waited, Math.max(0L, window.closesAtNanos - joinedNanos));
-            callers.increment();
-            windowNanos.add(forWindow);
-            behindNanos.add(waited - forWindow);
-            writeNanos.add(Math.max(0L, window.doneNanos - window.flushStartedNanos));
-        }
-
-        private static double mean(java.util.concurrent.atomic.LongAdder nanos, java.util.concurrent.atomic.LongAdder count) {
-            final long n = count.sum();
-            return n == 0 ? 0 : nanos.sum() / 1e6 / n;
-        }
-
-        /**
-         * Returns how many PUTs of blobs were tried since the last reset.
-         *
-         * @return the count
-         */
-        public long puts() {
-            return puts.sum();
-        }
-
-        /**
-         * Returns how many blobs were sent a second time since the last reset: the PUTs hedging added.
-         *
-         * @return the count
-         */
-        public long hedges() {
-            return hedges.sum();
-        }
-
-        /**
-         * Returns how many of those hedges landed before the PUT they repeated.
-         *
-         * @return the count
-         */
-        public long hedgesWon() {
-            return hedgesWon.sum();
-        }
-
-        /** Starts the sums over. */
-        public void reset() {
-            for (java.util.concurrent.atomic.LongAdder each : List.of(
-                callers,
-                windowNanos,
-                behindNanos,
-                writeNanos,
-                epochNanos,
-                admissionNanos,
-                admissionChecks,
-                putNanos,
-                puts,
-                hedges,
-                hedgesWon,
-                epochsOpened
-            )) {
-                each.reset();
-            }
-        }
-
-        /**
-         * Describes the means, for a log line: per caller, the wait for its window to close, the wait behind the blob in
-         * flight, and its own blob's write; per blob, recording an epoch, checking new shards, and the PUT.
-         *
-         * @return the means in milliseconds
-         */
-        public String describe() {
-            return String.format(
-                java.util.Locale.ROOT,
-                "callers=%d window=%.1f behind=%.1f write=%.1f | blobs=%d epoch=%.1f admission=%.1f (%d head reads) put=%.1f ms"
-                    + " | hedged=%d won=%d | epochs opened=%d",
-                callers.sum(),
-                mean(windowNanos, callers),
-                mean(behindNanos, callers),
-                mean(writeNanos, callers),
-                puts.sum(),
-                mean(epochNanos, puts),
-                mean(admissionNanos, puts),
-                admissionChecks.sum(),
-                mean(putNanos, puts),
-                hedges.sum(),
-                hedgesWon.sum(),
-                epochsOpened.sum()
-            );
-        }
-    }
-
-    /** What this node knows of one epoch of its log. */
-    private static final class EpochState {
-        /** For each shard, the runs of slots holding its records that it has not published. */
-        private final Map<ShardKey, List<Range>> unpublished = new TreeMap<>();
-        /** For each pinned shard, the runs it published since the pin, kept readable until the pin goes. */
-        private final Map<ShardKey, List<Range>> retained = new HashMap<>();
-        /** The term each shard was confirmed at for this epoch. */
-        private final Map<ShardKey, Long> admitted = new HashMap<>();
-        /** The slot after the last that landed. */
-        private long next;
-        private boolean writing = true;
-
-        private long trimPoint() {
-            long trim = next;
-            for (List<Range> runs : unpublished.values()) {
-                trim = Math.min(trim, runs.get(0).from());
-            }
-            for (List<Range> runs : retained.values()) {
-                trim = Math.min(trim, runs.get(0).from());
-            }
-            return trim;
-        }
-
-        private boolean complete() {
-            return writing == false && unpublished.isEmpty() && retained.isEmpty();
-        }
-    }
-
-    /** One window's records, by shard and term, and how writing them went. */
-    private static final class Window {
-        private record Key(ShardKey shard, long term) {
-        }
-
-        private final long closesAtNanos;
-        private final Map<Key, List<WalRecord>> batches = new LinkedHashMap<>();
-        private final Map<ShardKey, IOException> failures = new HashMap<>();
-        private long bytes;
-        private int records;
-        /** Closed before its bounds because the records after it would not fit: written as soon as it can be. */
-        private boolean closeEarly;
-        private boolean done;
-        /** Counted down once {@link #done}, for writers that wait without the lock. */
-        private final java.util.concurrent.CountDownLatch landedLatch = new java.util.concurrent.CountDownLatch(1);
-        /** Whether a writer already waits on it under the lock, and so will write it when due; guarded by the lock. */
-        private boolean driven;
-        private long flushStartedNanos;
-        private long doneNanos;
-        private Position landed;
-        private final List<Runnable> onLanded = new ArrayList<>();
-
-        private Window(long closesAtNanos) {
-            this.closesAtNanos = closesAtNanos;
-        }
-
-        private void add(ShardKey shard, long term, List<WalRecord> more) {
-            batches.computeIfAbsent(new Key(shard, term), ignored -> new ArrayList<>()).addAll(more);
-            records += more.size();
-            for (WalRecord record : more) {
-                bytes += WalRecord.contentBytes(record.id(), record.source());
-            }
-        }
-
-        private boolean full(long maxBytes, int maxRecords) {
-            return closeEarly || bytes >= maxBytes || records >= maxRecords;
-        }
-
-        private void failAll(IOException failure) {
-            for (Key key : batches.keySet()) {
-                failures.putIfAbsent(key.shard, failure);
-            }
-        }
     }
 }

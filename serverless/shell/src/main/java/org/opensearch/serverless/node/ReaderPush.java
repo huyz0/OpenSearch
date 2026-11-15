@@ -10,8 +10,8 @@ package org.opensearch.serverless.node;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.engine.OverlayReadOnlyEngine;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.serverless.store.CommitManifest;
-import org.opensearch.serverless.store.WalRecord;
 
 import java.util.List;
 import java.util.Optional;

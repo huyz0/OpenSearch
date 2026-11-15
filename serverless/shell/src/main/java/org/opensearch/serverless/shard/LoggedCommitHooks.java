@@ -9,8 +9,8 @@
 package org.opensearch.serverless.shard;
 
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.serverless.nodelog.NodeLogCommitter.Position;
 import org.opensearch.serverless.store.CommitManifest;
-import org.opensearch.serverless.store.NodeLogCommitter.Position;
 
 import java.io.IOException;
 import java.util.List;

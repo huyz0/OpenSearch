@@ -358,7 +358,7 @@ public class LargeDocumentMeterTests extends OpenSearchTestCase {
                                             node.writes().index(shardId, "d" + id, source);
                                             acks.computeIfAbsent(size.name(), k -> new ConcurrentLinkedQueue<>())
                                                 .add(System.nanoTime() - at);
-                                            sourceBytes.add(org.opensearch.serverless.store.WalRecord.contentBytes(null, source));
+                                            sourceBytes.add(org.opensearch.serverless.nodelog.WalRecord.contentBytes(null, source));
                                         } catch (org.opensearch.serverless.store.WriteBackpressure.ThrottledException e) {
                                             refused.computeIfAbsent(size.name(), k -> new LongAdder()).increment();
                                         } catch (Exception e) {

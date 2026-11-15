@@ -6,13 +6,13 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.store;
+package org.opensearch.serverless.nodelog;
 
 import org.opensearch.common.CheckedConsumer;
-import org.opensearch.serverless.store.NodeLogBlob.Header;
-import org.opensearch.serverless.store.NodeLogBlob.Range;
-import org.opensearch.serverless.store.NodeLogBlob.ShardKey;
-import org.opensearch.serverless.store.NodeLogBlob.Slice;
+import org.opensearch.serverless.nodelog.NodeLogBlob.Header;
+import org.opensearch.serverless.nodelog.NodeLogBlob.Range;
+import org.opensearch.serverless.nodelog.NodeLogBlob.ShardKey;
+import org.opensearch.serverless.nodelog.NodeLogBlob.Slice;
 
 import java.io.IOException;
 import java.util.ArrayList;

@@ -69,7 +69,10 @@ final class ForwardedWorkHandlers {
         try (
             org.opensearch.common.lease.Releasable primary = router.node.services()
                 .indexingPressure()
-                .markPrimaryOperationStarted(org.opensearch.serverless.store.WalRecord.contentBytes(request.id(), request.source()), false)
+                .markPrimaryOperationStarted(
+                    org.opensearch.serverless.nodelog.WalRecord.contentBytes(request.id(), request.source()),
+                    false
+                )
         ) {
             handleIndexAccounted(request, channel, shardId);
         }

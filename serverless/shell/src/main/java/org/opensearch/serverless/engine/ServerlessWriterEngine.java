@@ -13,7 +13,7 @@ import org.opensearch.index.engine.EngineConfig;
 import org.opensearch.index.engine.EngineException;
 import org.opensearch.index.engine.InternalEngine;
 import org.opensearch.index.translog.Translog;
-import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.nodelog.WalRecord;
 
 import java.io.IOException;
 import java.util.List;

@@ -19,7 +19,7 @@ import java.util.concurrent.atomic.LongAdder;
  * <p>A write's acknowledgement is the sum of the steps below, run one after another on the caller's thread. Each is
  * summed separately, so a step that waits on the store shows up as itself rather than inside a total. The node log's own
  * split of {@link Step#LOG} (window wait, waiting behind the blob in flight, the PUT) is the committer's to report; see
- * {@link org.opensearch.serverless.store.NodeLogCommitter#timings}.
+ * {@link org.opensearch.serverless.nodelog.NodeLogCommitter#timings}.
  *
  * <p>Every write counts in {@link Step#TOTAL}; the steps before the log are timed for single-document index writes only,
  * so their means are of those. Two clock reads per step, on the write's own thread; nothing here waits or allocates.

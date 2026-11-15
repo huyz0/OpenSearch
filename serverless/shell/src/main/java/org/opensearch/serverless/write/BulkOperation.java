@@ -11,14 +11,14 @@ package org.opensearch.serverless.write;
 /**
  * One operation in a batch, with whatever condition the caller attached to it.
  *
- * <p><b>Why this type exists.</b> The batch path used to take {@link org.opensearch.serverless.store.WalRecord}
+ * <p><b>Why this type exists.</b> The batch path used to take {@link org.opensearch.serverless.nodelog.WalRecord}
  * — the write-ahead <em>log</em> record — as its input type. A log record describes what happened, so
  * there was nowhere in it for a condition, which describes what must be true before anything happens.
  * That is the whole reason {@code _bulk} refused {@code create} and per-item {@code if_seq_no} after
  * the single-document path gained both: not a missing capability, a missing input type.
  */
 public final class BulkOperation {
-    private final org.opensearch.serverless.store.WalRecord record;
+    private final org.opensearch.serverless.nodelog.WalRecord record;
     private final long ifSeqNo;
     private final long ifPrimaryTerm;
     private final boolean requireAbsent;
@@ -31,7 +31,7 @@ public final class BulkOperation {
      * @param ifPrimaryTerm the primary term the document must be at, or 0 when unconditional
      * @param requireAbsent whether the write must fail if the document already exists
      */
-    public BulkOperation(org.opensearch.serverless.store.WalRecord record, long ifSeqNo, long ifPrimaryTerm, boolean requireAbsent) {
+    public BulkOperation(org.opensearch.serverless.nodelog.WalRecord record, long ifSeqNo, long ifPrimaryTerm, boolean requireAbsent) {
         this.record = record;
         this.ifSeqNo = ifSeqNo;
         this.ifPrimaryTerm = ifPrimaryTerm;
@@ -44,7 +44,7 @@ public final class BulkOperation {
      * @param record what to write or delete
      * @return the operation
      */
-    public static BulkOperation of(org.opensearch.serverless.store.WalRecord record) {
+    public static BulkOperation of(org.opensearch.serverless.nodelog.WalRecord record) {
         return new BulkOperation(record, org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO, 0L, false);
     }
 
@@ -53,7 +53,7 @@ public final class BulkOperation {
      *
      * @return the record
      */
-    public org.opensearch.serverless.store.WalRecord record() {
+    public org.opensearch.serverless.nodelog.WalRecord record() {
         return record;
     }
 

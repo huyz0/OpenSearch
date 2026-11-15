@@ -6,11 +6,12 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.store;
+package org.opensearch.serverless.nodelog;
 
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
+import org.opensearch.serverless.store.StoreUsage;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;

@@ -16,12 +16,12 @@ import org.opensearch.index.translog.Translog;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.engine.ReplaySpool;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.ReconcileScheduler;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.split.UnitSplitMover;
-import org.opensearch.serverless.store.WalRecord;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.ByteArrayInputStream;

@@ -14,7 +14,7 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.core.common.bytes.BytesReference;
-import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.ByteArrayInputStream;
