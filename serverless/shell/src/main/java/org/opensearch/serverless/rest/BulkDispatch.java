@@ -251,7 +251,8 @@ final class BulkDispatch {
 
         if (local != null) {
             try {
-                final List<org.opensearch.serverless.write.BulkOutcome> outcomes = serving.writes().bulkOperations(local, operations);
+                final List<org.opensearch.serverless.write.BulkOutcome> outcomes = serving.writes()
+                    .bulkOperations(local, operations, refresh || tailPush(group));
                 record(group, outcomes, serving.localNode().getId());
                 if (refresh) {
                     return serving.writes().refreshWritten(local, outcomes, "serverless-bulk-refresh");
@@ -342,7 +343,7 @@ final class BulkDispatch {
             final var response = org.opensearch.serverless.transport.ShardRouter.of(serving)
                 .forwardBulk(
                     peer.get(),
-                    org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh)
+                    forwarded(org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh), group)
                 );
             record(group, response.outcomes(), response.ownerNodeId());
             return refresh == false || response.refreshed();
@@ -350,6 +351,18 @@ final class BulkDispatch {
             failForwarded(serving, group, index, shard, owner, e);
         }
         return true;
+    }
+
+    /** Whether a group's writes are pushed to its shard's search nodes: every item of a request says the same. */
+    private static boolean tailPush(List<BulkHandler.Item> group) {
+        return group.get(0).tailPush;
+    }
+
+    private static org.opensearch.serverless.transport.ForwardedBulkRequest forwarded(
+        org.opensearch.serverless.transport.ForwardedBulkRequest request,
+        List<BulkHandler.Item> group
+    ) {
+        return tailPush(group) ? request : request.withoutTailPush();
     }
 
     /**
@@ -403,7 +416,10 @@ final class BulkDispatch {
             final var response = org.opensearch.serverless.transport.ShardRouter.of(serving)
                 .forwardBulk(
                     peer.get(),
-                    org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh).steered()
+                    forwarded(
+                        org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh).steered(),
+                        group
+                    )
                 );
             serving.nodeCapacity().noteWriteSteered();
             record(group, response.outcomes(), response.ownerNodeId());

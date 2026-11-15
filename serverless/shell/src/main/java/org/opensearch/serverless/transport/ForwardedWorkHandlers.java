@@ -175,7 +175,7 @@ final class ForwardedWorkHandlers {
             );
         }
         router.requireLiveOwnership(shardId);
-        final var outcomes = router.node.writes().bulkOperations(shardId, request.batch());
+        final var outcomes = router.node.writes().bulkOperations(shardId, request.batch(), request.tailPush());
         final boolean refreshed = request.refresh()
             && router.node.writes().refreshWritten(shardId, outcomes, "serverless-forwarded-refresh");
         channel.sendResponse(new ForwardedBulkResponse(router.node.localNode().getId(), outcomes, refreshed));

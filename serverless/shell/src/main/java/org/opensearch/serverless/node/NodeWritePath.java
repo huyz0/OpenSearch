@@ -368,6 +368,19 @@ public final class NodeWritePath {
         org.opensearch.index.shard.IndexShard shard,
         java.util.List<org.opensearch.serverless.store.WalRecord> records
     ) throws java.io.IOException {
+        appendOrRelease(shardId, shard, records, true);
+    }
+
+    /**
+     * As {@link #appendOrRelease(org.opensearch.core.index.shard.ShardId, org.opensearch.index.shard.IndexShard, java.util.List)},
+     * saying whether the shard's search nodes are pushed the records once they are acknowledged.
+     */
+    void appendOrRelease(
+        org.opensearch.core.index.shard.ShardId shardId,
+        org.opensearch.index.shard.IndexShard shard,
+        java.util.List<org.opensearch.serverless.store.WalRecord> records,
+        boolean tailPush
+    ) throws java.io.IOException {
         final var writerTerm = node.reconciler.writerTerm(shardId);
         if (writerTerm == null || records.isEmpty()) {
             return;
@@ -401,7 +414,7 @@ public final class NodeWritePath {
             // Acknowledged now: the shard's search nodes may search it before it is published.
             if (node.push != null) {
                 try {
-                    node.push.acked(shardId, records);
+                    node.push.acked(shardId, records, tailPush);
                 } catch (RuntimeException e) {
                     // The write is acknowledged whatever happens here; its readers see it at the next commit.
                     LOG.debug("could not keep acknowledged records of {} for its search nodes", shardId, e);
@@ -610,6 +623,25 @@ public final class NodeWritePath {
      */
     public java.util.List<BulkOutcome> bulkOperations(org.opensearch.core.index.shard.ShardId shardId, java.util.List<BulkOperation> batch)
         throws java.io.IOException {
+        return bulkOperations(shardId, batch, true);
+    }
+
+    /**
+     * Applies a batch whose items may carry conditions, and says whether the shard's search nodes are pushed what it
+     * acknowledges.
+     *
+     * @param shardId the shard to write to
+     * @param batch the operations, in request order
+     * @param tailPush false to leave the batch to the shard's next commit rather than push it to its search nodes; see
+     *     {@link ReaderPush#acked(org.opensearch.core.index.shard.ShardId, java.util.List, boolean)}
+     * @return one outcome per operation, in the same order
+     * @throws java.io.IOException if the shard is not open here, is a reader, or the log append fails
+     */
+    public java.util.List<BulkOutcome> bulkOperations(
+        org.opensearch.core.index.shard.ShardId shardId,
+        java.util.List<BulkOperation> batch,
+        boolean tailPush
+    ) throws java.io.IOException {
         node.ensureStarted();
         final long started = System.nanoTime();
         try {
@@ -617,7 +649,7 @@ public final class NodeWritePath {
             try (org.opensearch.common.lease.Releasable admitted = writeBackpressure.admit()) {
                 final java.util.concurrent.locks.Lock fence = node.fences.enterWritePath(shardId);
                 try (org.opensearch.common.lease.Releasable guard = node.reconciler.writeGuard(shardId)) {
-                    final java.util.List<BulkOutcome> outcomes = bulkOperationsUnderFence(shardId, batch);
+                    final java.util.List<BulkOutcome> outcomes = bulkOperationsUnderFence(shardId, batch, tailPush);
                     timings.add(WriteAckTimings.Step.TOTAL, System.nanoTime() - started);
                     return outcomes;
                 } finally {
@@ -729,7 +761,8 @@ public final class NodeWritePath {
 
     java.util.List<BulkOutcome> bulkOperationsUnderFence(
         org.opensearch.core.index.shard.ShardId shardId,
-        java.util.List<BulkOperation> batch
+        java.util.List<BulkOperation> batch,
+        boolean tailPush
     ) throws java.io.IOException {
         final var shard = node.reconciler.shard(shardId);
         if (shard == null) {
@@ -898,7 +931,7 @@ public final class NodeWritePath {
             }
         }
 
-        appendOrRelease(shardId, shard, applied);
+        appendOrRelease(shardId, shard, applied, tailPush);
         // One local sync for the batch, for the reason index gives: it gives the translog's page back to
         // the request breaker, and costs no object-store request.
         syncIfStillOpen(shard);

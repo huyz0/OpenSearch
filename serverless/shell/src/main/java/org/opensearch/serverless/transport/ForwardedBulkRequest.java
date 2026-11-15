@@ -43,6 +43,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
     private final boolean refresh;
     private final long bytes;
     private boolean steered;
+    private boolean tailPush = true;
 
     /**
      * Creates a forwarded batch.
@@ -171,6 +172,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
         this.refresh = in.readBoolean();
         this.indexUuid = in.readOptionalString();
         this.steered = in.readBoolean();
+        this.tailPush = in.readBoolean();
         this.bytes = counted;
     }
 
@@ -192,6 +194,7 @@ public final class ForwardedBulkRequest extends TransportRequest {
         out.writeBoolean(refresh);
         out.writeOptionalString(indexUuid);
         out.writeBoolean(steered);
+        out.writeBoolean(tailPush);
     }
 
     /**
@@ -261,6 +264,26 @@ public final class ForwardedBulkRequest extends TransportRequest {
     public ForwardedBulkRequest steered() {
         this.steered = true;
         return this;
+    }
+
+    /**
+     * Marks this batch as one whose writes the shard's search nodes see at its next commit, rather than pushed to them as
+     * they are acknowledged; ignored for a batch asked to be refreshed.
+     *
+     * @return this
+     */
+    public ForwardedBulkRequest withoutTailPush() {
+        this.tailPush = false;
+        return this;
+    }
+
+    /**
+     * Whether what the batch acknowledges is pushed to the shard's search nodes; see {@link #withoutTailPush()}.
+     *
+     * @return true to push
+     */
+    public boolean tailPush() {
+        return tailPush || refresh;
     }
 
     /**
