@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.metadata;
+package org.opensearch.serverless.repository;
 
 import org.opensearch.common.blobstore.BlobContainer;
 
@@ -18,14 +18,14 @@ import java.util.Optional;
 /**
  * The snapshot repositories registered in this deployment: one blob per repository, named for it.
  */
-final class RepositoryStore {
+public final class RepositoryStore {
 
     /** Logs under the metadata plane's name, where these messages have always been. */
-    private static final org.apache.logging.log4j.Logger LOGGER = org.apache.logging.log4j.LogManager.getLogger(MetadataPlane.class);
+    private final org.apache.logging.log4j.Logger logger;
 
     /** Lists the snapshots a repository holds. */
     @FunctionalInterface
-    interface SnapshotLister {
+    public interface SnapshotLister {
         /**
          * Lists a repository's snapshots.
          *
@@ -44,10 +44,12 @@ final class RepositoryStore {
      *
      * @param container where the repository records live
      * @param snapshotsOf lists a repository's snapshots, so one still holding any is not deleted
+     * @param logger where unreadable records are reported
      */
-    RepositoryStore(BlobContainer container, SnapshotLister snapshotsOf) {
+    public RepositoryStore(BlobContainer container, SnapshotLister snapshotsOf, org.apache.logging.log4j.Logger logger) {
         this.container = container;
         this.snapshotsOf = snapshotsOf;
+        this.logger = logger;
     }
 
     /**
@@ -58,14 +60,14 @@ final class RepositoryStore {
      * {@code PUT _snapshot/{repo}}.</b> A repository descriptor is unlike an {@link org.opensearch.serverless.cluster.IndexDescriptor} in
      * exactly this respect: re-registering the same name on real OpenSearch updates its settings rather
      * than refusing, and a client written against that API sends a repeat {@code PUT} expecting exactly
-     * that. There is no concurrent-writer race this needs to arbitrate the way {@link MetadataPlane#createIndex} does —
+     * that. There is no concurrent-writer race this needs to arbitrate the way {@code MetadataPlane.createIndex} does —
      * a repository name colliding with another caller's is a coordination question for whoever is running
      * two callers with the same repository name, not one this store needs an answer to.
      *
      * @param descriptor the repository to register
      * @throws IOException if the write fails
      */
-    void putRepository(RepositoryDescriptor descriptor) throws IOException {
+    public void putRepository(RepositoryDescriptor descriptor) throws IOException {
         final var bytes = descriptor.toBytes();
         container.writeBlob(descriptor.name(), bytes.streamInput(), bytes.length(), false);
     }
@@ -77,7 +79,7 @@ final class RepositoryStore {
      * @return the record, or empty if not registered
      * @throws IOException if the read fails
      */
-    Optional<RepositoryDescriptor> describeRepository(String name) throws IOException {
+    public Optional<RepositoryDescriptor> describeRepository(String name) throws IOException {
         if (container.blobExists(name) == false) {
             return Optional.empty();
         }
@@ -99,13 +101,13 @@ final class RepositoryStore {
      * @return every registered repository, skipping — and logging — any record that cannot be read
      * @throws IOException if listing fails
      */
-    List<RepositoryDescriptor> listRepositories() throws IOException {
+    public List<RepositoryDescriptor> listRepositories() throws IOException {
         final List<RepositoryDescriptor> found = new ArrayList<>();
         for (String name : container.listBlobs().keySet()) {
             try (java.io.InputStream in = container.readBlob(name)) {
                 found.add(RepositoryDescriptor.fromStream(in));
             } catch (Exception e) {
-                LOGGER.warn("could not read the repository [" + name + "]; leaving it out of the listing", e);
+                logger.warn("could not read the repository [" + name + "]; leaving it out of the listing", e);
             }
         }
         return found;
@@ -123,7 +125,7 @@ final class RepositoryStore {
      * @throws RepositoryInUseException if it still holds snapshots
      * @throws IOException if listing, the read, or the delete fails
      */
-    boolean deleteRepository(String name) throws IOException {
+    public boolean deleteRepository(String name) throws IOException {
         if (container.blobExists(name) == false) {
             return false;
         }

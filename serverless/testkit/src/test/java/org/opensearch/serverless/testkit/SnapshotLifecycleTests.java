@@ -17,8 +17,8 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.metadata.RepositoryDescriptor;
-import org.opensearch.serverless.metadata.SnapshotRecord;
+import org.opensearch.serverless.repository.RepositoryDescriptor;
+import org.opensearch.serverless.repository.SnapshotRecord;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -111,7 +111,7 @@ public class SnapshotLifecycleTests extends OpenSearchTestCase {
             assertTrue(plane.snapshot("repo", "view").isEmpty());
             assertTrue(plane.liveSnapshots().isEmpty());
             assertTrue(
-                store.blobContainer(org.opensearch.serverless.metadata.RegisterMap.snapshots(BlobPath.cleanPath()))
+                store.blobContainer(org.opensearch.serverless.repository.SnapshotPaths.snapshots(BlobPath.cleanPath()))
                     .listBlobs()
                     .keySet()
                     .stream()
@@ -160,7 +160,7 @@ public class SnapshotLifecycleTests extends OpenSearchTestCase {
                     Map.of(index, new SnapshotRecord.SnapshottedIndex("uuid-index", 1, null, Map.of()))
                 )
             );
-            final var path = org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(BlobPath.cleanPath(), reserved, index, 0);
+            final var path = org.opensearch.serverless.repository.SnapshotPaths.snapshotShardData(BlobPath.cleanPath(), reserved, index, 0);
             final var data = store.blobContainer(path);
             data.writeBlobAtomic("copied", new java.io.ByteArrayInputStream(new byte[] { 1 }), 1L, true);
             assertTrue(data.blobExists("copied"));
@@ -175,21 +175,21 @@ public class SnapshotLifecycleTests extends OpenSearchTestCase {
             final var legacy = snapshot(org.opensearch.common.UUIDs.randomBase64UUID(), false);
             final var bytes = legacy.toBytes();
             try (var input = bytes.streamInput()) {
-                store.blobContainer(org.opensearch.serverless.metadata.RegisterMap.snapshots(BlobPath.cleanPath()))
+                store.blobContainer(org.opensearch.serverless.repository.SnapshotPaths.snapshots(BlobPath.cleanPath()))
                     .writeBlobAtomic(legacy.key(), input, bytes.length(), true);
             }
             final var read = plane.snapshot("repo", "view").orElseThrow();
             assertNull(read.storageGeneration());
             assertEquals(
-                org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(BlobPath.cleanPath(), "repo", "view", "index", 0),
-                org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(BlobPath.cleanPath(), read, "index", 0)
+                org.opensearch.serverless.repository.SnapshotPaths.snapshotShardData(BlobPath.cleanPath(), "repo", "view", "index", 0),
+                org.opensearch.serverless.repository.SnapshotPaths.snapshotShardData(BlobPath.cleanPath(), read, "index", 0)
             );
             assertTrue(plane.deleteSnapshot("repo", "view"));
             final var replacement = plane.createSnapshot(snapshot(org.opensearch.common.UUIDs.randomBase64UUID(), false));
             assertNotNull(replacement.storageGeneration());
             assertNotEquals(
-                org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(BlobPath.cleanPath(), read, "index", 0),
-                org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(BlobPath.cleanPath(), replacement, "index", 0)
+                org.opensearch.serverless.repository.SnapshotPaths.snapshotShardData(BlobPath.cleanPath(), read, "index", 0),
+                org.opensearch.serverless.repository.SnapshotPaths.snapshotShardData(BlobPath.cleanPath(), replacement, "index", 0)
             );
         }
     }
@@ -202,7 +202,7 @@ public class SnapshotLifecycleTests extends OpenSearchTestCase {
                 new SnapshotRecord("repo", "view", firstId, false, 1000L, 2000L, snapshot(firstId, false).indices())
             );
             final var firstFiles = store.blobContainer(
-                org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(BlobPath.cleanPath(), first, "index", 0).add("t=1")
+                org.opensearch.serverless.repository.SnapshotPaths.snapshotShardData(BlobPath.cleanPath(), first, "index", 0).add("t=1")
             );
             firstFiles.writeBlobAtomic("file", new java.io.ByteArrayInputStream(new byte[] { 1 }), 1L, true);
             final AtomicReference<SnapshotRecord> replacement = new AtomicReference<>();
@@ -214,15 +214,19 @@ public class SnapshotLifecycleTests extends OpenSearchTestCase {
                 );
                 replacement.set(next);
                 store.blobContainer(
-                    org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(BlobPath.cleanPath(), next, "index", 0).add("t=1")
+                    org.opensearch.serverless.repository.SnapshotPaths.snapshotShardData(BlobPath.cleanPath(), next, "index", 0).add("t=1")
                 ).writeBlobAtomic("file", new java.io.ByteArrayInputStream(new byte[] { 2 }), 1L, true);
             });
             assertFalse(plane.deleteSnapshot("repo", "view"));
             assertEquals(replacement.get().storageGeneration(), plane.snapshot("repo", "view").orElseThrow().storageGeneration());
             try (
                 var input = store.blobContainer(
-                    org.opensearch.serverless.metadata.RegisterMap.snapshotShardData(BlobPath.cleanPath(), replacement.get(), "index", 0)
-                        .add("t=1")
+                    org.opensearch.serverless.repository.SnapshotPaths.snapshotShardData(
+                        BlobPath.cleanPath(),
+                        replacement.get(),
+                        "index",
+                        0
+                    ).add("t=1")
                 ).readBlob("file")
             ) {
                 assertEquals(2, input.read());

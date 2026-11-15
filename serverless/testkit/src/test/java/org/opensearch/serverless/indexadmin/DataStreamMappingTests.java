@@ -11,7 +11,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.common.xcontent.XContentHelper;
 import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.common.bytes.BytesArray;
-import org.opensearch.serverless.metadata.TemplateResolver;
+import org.opensearch.serverless.template.TemplateResolver;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.Map;

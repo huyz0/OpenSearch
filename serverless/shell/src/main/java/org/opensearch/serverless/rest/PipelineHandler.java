@@ -14,11 +14,11 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.metadata.TemplateStore;
-import org.opensearch.serverless.metadata.TooManyTemplatesException;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.restcore.PendingRestChannel;
 import org.opensearch.serverless.restcore.RestReplies;
+import org.opensearch.serverless.template.TemplateStore;
+import org.opensearch.serverless.template.TooManyTemplatesException;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;

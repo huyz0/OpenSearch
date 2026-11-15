@@ -287,7 +287,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
                             builder.endObject();
                             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
                         }
-                    } catch (org.opensearch.serverless.metadata.TemplateResolver.MissingComponentException e) {
+                    } catch (org.opensearch.serverless.template.TemplateResolver.MissingComponentException e) {
                         // Configuration the caller can fix, so 400 rather than 500.
                         channel.sendResponse(
                             RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_component_template", e.getMessage())
@@ -493,7 +493,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
         MetadataPlane metadata,
         String index,
         IndexCreateRequest create,
-        org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited
+        org.opensearch.serverless.template.TemplateResolver.Inherited inherited
     ) throws IOException, RestReplies.RefusedException {
         return IndexCreation.createIndex(serving, metadata, index, create, inherited);
     }

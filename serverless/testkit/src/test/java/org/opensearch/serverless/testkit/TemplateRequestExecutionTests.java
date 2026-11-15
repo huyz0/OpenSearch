@@ -279,7 +279,7 @@ public class TemplateRequestExecutionTests extends OpenSearchTestCase {
             assertEquals(response.body(), 200, response.statusCode());
             assertEquals(
                 "higher",
-                org.opensearch.serverless.metadata.TemplateResolver.resolve(
+                org.opensearch.serverless.template.TemplateResolver.resolve(
                     metadata.indexTemplates().all(),
                     metadata.componentTemplates().all(),
                     "logs-new"

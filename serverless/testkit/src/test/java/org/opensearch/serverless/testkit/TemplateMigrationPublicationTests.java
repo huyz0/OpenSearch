@@ -12,7 +12,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.core.common.bytes.BytesArray;
-import org.opensearch.serverless.metadata.TemplateStore;
+import org.opensearch.serverless.template.TemplateStore;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.ByteArrayInputStream;

@@ -14,11 +14,13 @@ import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.cluster.Names;
 import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.PointInTime;
 import org.opensearch.serverless.metadata.RegisterMap;
-import org.opensearch.serverless.metadata.SnapshotRecord;
+import org.opensearch.serverless.repository.SnapshotPaths;
+import org.opensearch.serverless.repository.SnapshotRecord;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.SegmentPublisher;
 
@@ -144,7 +146,7 @@ public final class GarbageCollector {
         if (memory == null) {
             return collectShard(plane, indexName, shardId);
         }
-        final String key = indexName + RegisterMap.SHARD_SEPARATOR + shardId;
+        final String key = indexName + Names.KEY_SEPARATOR + shardId;
         final ShardSweep sweep = sweepShard(plane, indexName, shardId, memory.getOrDefault(key, Set.of()));
         if (sweep.candidates().isEmpty()) {
             memory.remove(key);
@@ -364,7 +366,7 @@ public final class GarbageCollector {
         final Set<String> candidates = new HashSet<>();
         // The wall-clock half of the grace, applied only to a graced sweep: an ungraced one is an operator
         // or a deletion, where there is nothing left to be reading.
-        final String shardKey = indexName + RegisterMap.SHARD_SEPARATOR + shardId;
+        final String shardKey = indexName + Names.KEY_SEPARATOR + shardId;
         final CandidateTimes tracked = previousCandidates == null
             ? null
             : firstSeenUnreferenced.compute(
@@ -505,7 +507,7 @@ public final class GarbageCollector {
             for (int shard = 0; shard < index.getValue().numberOfShards(); shard++) {
                 final List<String> orphans = collectShard(plane, index.getKey(), shard, memory);
                 if (orphans.isEmpty() == false) {
-                    into.put(index.getKey() + RegisterMap.SHARD_SEPARATOR + shard, orphans);
+                    into.put(index.getKey() + Names.KEY_SEPARATOR + shard, orphans);
                 }
             }
         }
@@ -624,11 +626,11 @@ public final class GarbageCollector {
     public Set<String> pins() throws IOException {
         final Set<String> pins = new TreeSet<>();
         for (String name : blobStore.blobContainer(RegisterMap.pointsInTime(base)).listBlobs().keySet()) {
-            if (PointInTime.looksLikeAnId(name)) {
+            if (Names.looksLikeAnId(name)) {
                 pins.add("view:" + name);
             }
         }
-        for (String name : blobStore.blobContainer(RegisterMap.snapshots(base)).listBlobs().keySet()) {
+        for (String name : blobStore.blobContainer(SnapshotPaths.snapshots(base)).listBlobs().keySet()) {
             pins.add("snapshot:" + name);
         }
         return pins;
@@ -787,14 +789,14 @@ public final class GarbageCollector {
     }
 
     private static ShardContainer parseShardContainer(String container) {
-        final int last = container.lastIndexOf(RegisterMap.SHARD_SEPARATOR);
-        final int middle = last < 0 ? -1 : container.lastIndexOf(RegisterMap.SHARD_SEPARATOR, last - 1);
+        final int last = container.lastIndexOf(Names.KEY_SEPARATOR);
+        final int middle = last < 0 ? -1 : container.lastIndexOf(Names.KEY_SEPARATOR, last - 1);
         if (middle <= 0 || middle + 1 == last) {
             return null;
         }
         final String index = container.substring(0, middle);
         try {
-            org.opensearch.serverless.metadata.Names.validateIndexOrAlias(index);
+            org.opensearch.serverless.cluster.Names.validateIndexOrAlias(index);
             final int shard = Integer.parseInt(container.substring(last + 1));
             if (shard < 0 || shard >= IndexDescriptor.MAX_SHARDS) {
                 return null;
@@ -883,7 +885,7 @@ public final class GarbageCollector {
 
     /**
      * Whether a snapshot's index entry is a capture still being taken: a shard count and no shards. The
-     * same reading {@code MetadataPlane.capturing} gives the record; kept here so the collector's safety
+     * same reading {@code SnapshotRecord.capturing} gives the record; kept here so the collector's safety
      * argument does not depend on the plane's.
      */
     private static boolean capturing(SnapshotRecord.SnapshottedIndex captured) {

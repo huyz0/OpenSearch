@@ -14,9 +14,9 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.PointInTime;
-import org.opensearch.serverless.metadata.RegisterMap;
-import org.opensearch.serverless.metadata.SnapshotRecord;
 import org.opensearch.serverless.reconcile.GarbageCollector;
+import org.opensearch.serverless.repository.SnapshotPaths;
+import org.opensearch.serverless.repository.SnapshotRecord;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.SegmentPublisher;
 import org.opensearch.test.OpenSearchTestCase;
@@ -58,7 +58,7 @@ public class PinListingRaceTests extends OpenSearchTestCase {
                     Map.of("protected", new SnapshotRecord.SnapshottedIndex("uuid-protected", 1, null, Map.of(0, captured)))
                 );
                 final var bytes = record.toBytes();
-                store.blobContainer(RegisterMap.snapshots(BlobPath.cleanPath()))
+                store.blobContainer(SnapshotPaths.snapshots(BlobPath.cleanPath()))
                     .writeBlob(record.key(), bytes.streamInput(), bytes.length(), true);
             }
             store.onNextListing(pit ? "pits" : "snapshots", () -> {

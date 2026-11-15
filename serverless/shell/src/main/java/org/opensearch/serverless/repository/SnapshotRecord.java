@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.metadata;
+package org.opensearch.serverless.repository;
 
 import org.opensearch.common.xcontent.XContentFactory;
 import org.opensearch.common.xcontent.XContentType;
@@ -15,6 +15,7 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.serverless.cluster.Names;
 import org.opensearch.serverless.store.CommitManifest;
 
 import java.io.IOException;
@@ -28,7 +29,7 @@ import java.util.Map;
  * What a snapshot captured: every named index's shape, and every shard's commit at the moment it was
  * taken.
  *
- * <p><b>The record is the commit, the same reason a {@link PointInTime}'s is.</b> A manifest register
+ * <p><b>The record is the commit, the same reason a {@code PointInTime}'s is.</b> A manifest register
  * holds one value, overwritten on every publish, so "the commit this snapshot named" is not something a
  * pointer could still mean later. Unlike a point in time, this has no expiry — a snapshot is kept until
  * deleted, which is the whole difference between a paging cursor and a backup.
@@ -39,7 +40,7 @@ import java.util.Map;
  * restored index's fresh uuid, preserving the separation between index incarnations.
  *
  * <p><b>An index entry with a shard count and no {@code shards} is a capture in progress</b> (see
- * {@code MetadataPlane.capturing}): the record is written naming every index before any manifest is
+ * {@link #capturing}): the record is written naming every index before any manifest is
  * read, and rewritten with the commits once every one has been. Records written before settings were
  * captured have no {@code settings} and parse unchanged.
  */
@@ -115,7 +116,7 @@ public final class SnapshotRecord {
      * @return the record with that lifetime
      */
     public SnapshotRecord withStorageGeneration(String generation) {
-        if (generation != null && PointInTime.looksLikeAnId(generation) == false) {
+        if (generation != null && Names.looksLikeAnId(generation) == false) {
             throw new IllegalArgumentException("invalid snapshot storage generation");
         }
         return new SnapshotRecord(repo, name, uuid, shallow, startTimeMillis, endTimeMillis, indices, generation);
@@ -283,14 +284,14 @@ public final class SnapshotRecord {
      * @return the key
      */
     public String key() {
-        return RegisterMap.snapshotKey(repo, name);
+        return SnapshotPaths.snapshotKey(repo, name);
     }
 
     /**
      * Returns the blobs one shard of one captured index depends on, as {@code term/file} pairs — empty if
      * this snapshot did not capture that index's uuid, or captured it without that shard.
      *
-     * <p>Keyed by uuid rather than by index name on purpose, tighter than {@link PointInTime#referencedBlobs}
+     * <p>Keyed by uuid rather than by index name on purpose, tighter than {@code PointInTime.referencedBlobs}
      * is today: a name can be reused by an unrelated later index (which is why shard storage is keyed by uuid,
      * not by name), and a snapshot durable enough to outlive that reuse must not let a later index's shard be
      * mistaken for the one it actually captured.
@@ -486,7 +487,7 @@ public final class SnapshotRecord {
             final String generation = body.containsKey("storage_generation")
                 ? requiredString(body.get("storage_generation"), "storage_generation")
                 : null;
-            if (generation != null && PointInTime.looksLikeAnId(generation) == false) {
+            if (generation != null && Names.looksLikeAnId(generation) == false) {
                 throw malformed("invalid storage generation");
             }
             return new SnapshotRecord(repo, name, uuid, shallow, startTime, endTime, indices).withStorageGeneration(generation);
@@ -518,5 +519,41 @@ public final class SnapshotRecord {
     @Override
     public String toString() {
         return "SnapshotRecord[" + repo + ":" + name + ", " + indices.size() + " indices]";
+    }
+
+    /**
+     * Reports whether a snapshot record describes a capture that has not finished.
+     *
+     * <p>A snapshot's record is written <em>before</em> its manifests are read, naming every index it will
+     * capture and none of their commits, and rewritten with the commits once every one has been read (and,
+     * for a standard repository, copied). The record in between is the provisional one, and it is what
+     * makes a concurrent index deletion leave the shard data alone: without it, a delete landing after the
+     * manifests were read and before the record existed purged the very blobs a {@code SUCCESS} snapshot
+     * then named, and the first restore was the first anyone heard of it.
+     *
+     * <p>Told apart by shape rather than by a flag: a finished capture records every shard of every index
+     * it names or leaves the index out, so an index with a shard count and no shards can only be one still
+     * being taken.
+     *
+     * @param index an index entry of a snapshot record
+     * @return true while the capture of that index has not finished
+     */
+    public static boolean capturing(SnapshottedIndex index) {
+        return index.shards().isEmpty() && index.numberOfShards() > 0;
+    }
+
+    /**
+     * Reports whether a snapshot is still being taken.
+     *
+     * @param snapshot the record
+     * @return true if any index it names is still being captured
+     */
+    public static boolean inProgress(SnapshotRecord snapshot) {
+        for (SnapshottedIndex index : snapshot.indices().values()) {
+            if (capturing(index)) {
+                return true;
+            }
+        }
+        return false;
     }
 }

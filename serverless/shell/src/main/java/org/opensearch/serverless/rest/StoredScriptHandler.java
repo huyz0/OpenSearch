@@ -17,10 +17,10 @@ import org.opensearch.script.ScriptContext;
 import org.opensearch.script.ScriptModule;
 import org.opensearch.script.StoredScriptSource;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.metadata.StoredScriptStore;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.script.StoredScripts;
+import org.opensearch.serverless.template.StoredScriptStore;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -166,7 +166,7 @@ public final class StoredScriptHandler extends BaseRestHandler {
                         channel.sendResponse(new BytesRestResponse(response.status(), builder));
                     }
                 }
-            } catch (org.opensearch.serverless.metadata.TooManyTemplatesException e) {
+            } catch (org.opensearch.serverless.template.TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_scripts", e.getMessage());
             } catch (IllegalArgumentException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());

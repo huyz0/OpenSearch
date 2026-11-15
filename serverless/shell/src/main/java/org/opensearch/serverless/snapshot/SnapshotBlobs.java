@@ -14,7 +14,7 @@ import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.serverless.cluster.IndexDescriptor;
-import org.opensearch.serverless.metadata.SnapshotRecord;
+import org.opensearch.serverless.repository.SnapshotRecord;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.SegmentPublisher;
 

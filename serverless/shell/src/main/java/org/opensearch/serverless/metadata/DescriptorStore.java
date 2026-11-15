@@ -15,6 +15,7 @@ import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.cluster.Names;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;

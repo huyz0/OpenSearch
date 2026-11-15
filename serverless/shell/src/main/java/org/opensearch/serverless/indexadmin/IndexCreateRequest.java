@@ -44,7 +44,7 @@ final class IndexCreateRequest {
      * @param inherited what templates contributed
      * @return the shard count
      */
-    static int shardsWith(int requested, boolean explicit, org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited) {
+    static int shardsWith(int requested, boolean explicit, org.opensearch.serverless.template.TemplateResolver.Inherited inherited) {
         if (explicit) {
             return requested;
         }
@@ -71,7 +71,7 @@ final class IndexCreateRequest {
      * {@code index.index.refresh_interval} -- a template written the way core's documentation shows it
      * was silently mangled and its shard count ignored.
      */
-    static Settings normalised(org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited) {
+    static Settings normalised(org.opensearch.serverless.template.TemplateResolver.Inherited inherited) {
         if (inherited.settings().isEmpty()) {
             return Settings.EMPTY;
         }
@@ -86,7 +86,7 @@ final class IndexCreateRequest {
      * @return the merged mapping source, or null when there is none
      * @throws IOException if either mapping cannot be read
      */
-    static String mappingWith(String requested, org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited)
+    static String mappingWith(String requested, org.opensearch.serverless.template.TemplateResolver.Inherited inherited)
         throws IOException {
         requested = IndexCreation.normalizeMapping(requested);
         if (inherited.mappings().isEmpty()) {
@@ -101,7 +101,7 @@ final class IndexCreateRequest {
             ).v2();
             // Core layers the request over a template with MergeReason.INDEX_TEMPLATE, where a field definition
             // replaces rather than merges parameter by parameter; mergeMappings is that rule.
-            org.opensearch.serverless.metadata.TemplateResolver.mergeMappings(merged, own);
+            org.opensearch.serverless.template.TemplateResolver.mergeMappings(merged, own);
         }
         try (XContentBuilder builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
             builder.map(merged);
@@ -116,7 +116,7 @@ final class IndexCreateRequest {
      * @param inherited what templates contributed
      * @return the merged settings, or null when there are none
      */
-    static Settings settingsWith(Settings requested, org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited) {
+    static Settings settingsWith(Settings requested, org.opensearch.serverless.template.TemplateResolver.Inherited inherited) {
         if (inherited.settings().isEmpty()) {
             return requested;
         }
