@@ -843,6 +843,10 @@ under lowers it one. `serverless.cost.guardrails` (node) and `index.serverless.c
 
 A collector that sees every node sets levels in the cluster settings, `serverless.cost.tenant_levels` as
 `tenant=level,...`; a node takes the higher of that and its own, and other nodes read it within five minutes.
+`tools/usage_collector.py --nodes host:port,...` is that collector: once a minute it reads every node's usage, adds up
+each tenant's cost across nodes, applies the same rule against its budget, and writes the levels only when they change.
+It keeps nothing on disk and adds no store request beyond that one register write per change; `--dry-run` prints the
+levels instead, and `--self-test` checks the rollup, a node's restart, and the levels without a cluster.
 
 What a level does, when enforced, to that tenant's indices only:
 
