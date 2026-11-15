@@ -76,7 +76,7 @@ public class ServerlessForwardBoundTests extends OpenSearchTestCase {
                     TransportRequestHandler<T> actualHandler
                 ) {
                     return (request, channel, task) -> {
-                        if (SWALLOWING.get() && action.equals(org.opensearch.serverless.transport.ForwardedIndexRequest.ACTION)) {
+                        if (SWALLOWING.get() && action.equals(org.opensearch.serverless.forwarding.ForwardedIndexRequest.ACTION)) {
                             // Received and never answered: a process frozen mid-request, without the
                             // connection going away. Dropping the request is the whole fixture.
                             return;

@@ -11,6 +11,7 @@ import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.index.IndexingPressure;
+import org.opensearch.serverless.forwarding.ForwardedBulkRequest;
 import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.test.OpenSearchTestCase;
 

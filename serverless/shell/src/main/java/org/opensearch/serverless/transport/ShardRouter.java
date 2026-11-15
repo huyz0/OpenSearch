@@ -13,11 +13,22 @@ import org.opensearch.action.support.PlainActionFuture;
 import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.transport.TransportAddress;
-import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.serverless.forwarding.ForwardedBulkRequest;
+import org.opensearch.serverless.forwarding.ForwardedBulkResponse;
+import org.opensearch.serverless.forwarding.ForwardedExplainRequest;
+import org.opensearch.serverless.forwarding.ForwardedExplainResponse;
+import org.opensearch.serverless.forwarding.ForwardedFrozenSearchRequest;
+import org.opensearch.serverless.forwarding.ForwardedGetRequest;
+import org.opensearch.serverless.forwarding.ForwardedGetResponse;
+import org.opensearch.serverless.forwarding.ForwardedIndexRequest;
+import org.opensearch.serverless.forwarding.ForwardedIndexResponse;
+import org.opensearch.serverless.forwarding.ForwardedSearchRequest;
+import org.opensearch.serverless.forwarding.ForwardedSearchResponse;
+import org.opensearch.serverless.forwarding.ForwardedStatsRequest;
+import org.opensearch.serverless.forwarding.ForwardedStatsResponse;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeComponents;
 import org.opensearch.serverless.node.NodeContext;
-import org.opensearch.serverless.write.NotShardOwnerException;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportRequestOptions;
 import org.opensearch.transport.TransportResponseHandler;
@@ -42,7 +53,7 @@ import java.util.function.Supplier;
 public final class ShardRouter {
 
     /** Used only when no metadata plane is attached and the lease TTL is therefore unknown. */
-    private static final long DEFAULT_FORWARD_TIMEOUT_MILLIS = 30_000L;
+    static final long DEFAULT_FORWARD_TIMEOUT_MILLIS = 30_000L;
 
     /**
      * How long a search may wait on a peer.
@@ -512,103 +523,6 @@ public final class ShardRouter {
                 org.opensearch.core.rest.RestStatus.FORBIDDEN
             );
         }
-    }
-
-    ShardId localShard(String index, int shard, String indexUuid) {
-        if (indexUuid == null) {
-            return localShard(index, shard); // compatibility for legacy senders without an incarnation
-        }
-        final var held = node.reconciler().servingShard(new ShardId(index, indexUuid, shard));
-        return held == null ? null : held.shardId();
-    }
-
-    /**
-     * The shard as this node holds it for writing, for the incarnation of the index the sender named.
-     *
-     * @param index the index name
-     * @param shard the shard number
-     * @param indexUuid the uuid the sender resolved, or null to match by name alone
-     * @return the writer shard, or null when this node holds no such writer
-     */
-    ShardId writerShard(String index, int shard, String indexUuid) {
-        ShardId found = localShard(index, shard, indexUuid);
-        if (found == null && node.hibernation().isHibernated(index, shard)) {
-            // Hibernated here: the head names this node, which is why the request came. Woken here and served, rather
-            // than refused so the sender retries against a head that still names this node.
-            found = wakeHibernated(index, shard, indexUuid);
-        }
-        return found == null || node.reconciler().isReader(found) ? null : found;
-    }
-
-    /** Wakes a writer hibernated here, waiting as a steered write waits for its activation; null if it did not open. */
-    ShardId wakeHibernated(String index, int shard, String indexUuid) {
-        try {
-            node.signals().activate(index, shard).get(STEERED_ACTIVATION_WAIT_MILLIS, java.util.concurrent.TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return null;
-        } catch (java.util.concurrent.ExecutionException | java.util.concurrent.TimeoutException e) {
-            return null;
-        }
-        return localShard(index, shard, indexUuid);
-    }
-
-    /**
-     * Refuses a forwarded write for a shard this node holds but no longer owns.
-     *
-     * <p>Holding a shard open is not the same as owning it. A writer that lapsed past its lease and has
-     * not yet run the heartbeat that would notice still has the shard open; a write applied then goes into
-     * a log the successor sealed, acknowledged and never replayed. The node's own check asks the shard-head
-     * it read most recently, and a head older than a lease is no answer at all.
-     */
-    void requireLiveOwnership(ShardId shardId) {
-        if (node.fences().holdsAsWriter(shardId, headAgeBoundMillis()) == false) {
-            throw new NotShardOwnerException(
-                shardId.getIndexName(),
-                shardId.id(),
-                "the shard is open here but no recent shard-head names this node as its writer"
-            );
-        }
-    }
-
-    /** How old a shard-head may be and still count as evidence of ownership: one lease. */
-    private long headAgeBoundMillis() {
-        final MetadataPlane metadata = plane.get();
-        return metadata == null ? DEFAULT_FORWARD_TIMEOUT_MILLIS : Math.max(1_000L, metadata.leaseTtlMillis());
-    }
-
-    /**
-     * Says what this node holds instead of the writer a forward asked for, for the refusal's message.
-     *
-     * <p>And doubts its own ownership when it holds no writer at all. The forward came because a head named this
-     * node; if it still does, nothing else will ever open the shard -- peers forward here while this node's lease
-     * is live -- so the doubt's activation re-takes it and replays its log. If the head names someone else, the
-     * activation finds that out and does nothing.
-     */
-    String whyNotHeld(String index, int shard, String indexUuid) {
-        final ShardId open = localShard(index, shard);
-        if (open == null || node.reconciler().isReader(open)) {
-            node.signals().ownershipDoubted(index, shard);
-        }
-        if (open == null) {
-            return "the shard is not open here";
-        }
-        if (indexUuid != null && indexUuid.equals(open.getIndex().getUUID()) == false) {
-            return "the index was recreated, and the shard open here belongs to the previous incarnation";
-        }
-        if (node.reconciler().isReader(open)) {
-            return "it is open here only as a search reader";
-        }
-        return "the shard-head no longer names this node";
-    }
-
-    ShardId localShard(String index, int shard) {
-        return node.reconciler()
-            .openShards()
-            .stream()
-            .filter(s -> s.getIndexName().equals(index) && s.id() == shard)
-            .findFirst()
-            .orElse(null);
     }
 
     /**
