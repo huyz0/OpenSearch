@@ -74,7 +74,7 @@ public final class NodeStorage {
                 config,
                 new org.opensearch.serverless.engine.ServerlessWriterEngine.ReplayLog() {
                     @Override
-                    public java.util.List<org.opensearch.serverless.store.WalRecord> recordsFor(
+                    public java.util.List<org.opensearch.serverless.nodelog.WalRecord> recordsFor(
                         org.opensearch.core.index.shard.ShardId shardId
                     ) throws java.io.IOException {
                         return node.reconciler == null ? java.util.List.of() : node.reconciler.replayRecordsFor(shardId);
@@ -83,7 +83,7 @@ public final class NodeStorage {
                     @Override
                     public void forEachRecord(
                         org.opensearch.core.index.shard.ShardId shardId,
-                        org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, java.io.IOException> consumer
+                        org.opensearch.common.CheckedConsumer<org.opensearch.serverless.nodelog.WalRecord, java.io.IOException> consumer
                     ) throws java.io.IOException {
                         if (node.reconciler != null) {
                             node.reconciler.forEachReplayRecord(shardId, consumer);
@@ -117,7 +117,7 @@ public final class NodeStorage {
      */
     private org.opensearch.index.mapper.ParsedDocument parsePushed(
         org.opensearch.core.index.shard.ShardId shardId,
-        org.opensearch.serverless.store.WalRecord record
+        org.opensearch.serverless.nodelog.WalRecord record
     ) {
         final org.opensearch.index.IndexService service = node.indicesService.indexService(shardId.getIndex());
         final org.opensearch.index.mapper.DocumentMapper mapper = service == null ? null : service.mapperService().documentMapper();

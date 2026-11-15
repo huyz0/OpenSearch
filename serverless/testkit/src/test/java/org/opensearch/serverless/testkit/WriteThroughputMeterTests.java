@@ -13,9 +13,9 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.store.WalRecord;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.lang.management.ManagementFactory;

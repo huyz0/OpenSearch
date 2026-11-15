@@ -666,7 +666,7 @@ public final class BlobLeaseMembership implements MembershipSource {
      * @return true if the lease names no epochs afterwards
      * @throws IOException if the register cannot be read or written
      */
-    public boolean forgetNodeLog(String nodeId, java.util.List<org.opensearch.serverless.store.NodeLogEpoch> checked) throws IOException {
+    public boolean forgetNodeLog(String nodeId, java.util.List<org.opensearch.serverless.nodelog.NodeLogEpoch> checked) throws IOException {
         final String name = LEASE_PREFIX + nodeId;
         final Optional<BlobRegister> register = container.readRegister(name);
         if (register.isEmpty()) {

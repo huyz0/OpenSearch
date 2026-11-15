@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.store;
+package org.opensearch.serverless.nodelog;
 
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.index.seqno.SequenceNumbers;

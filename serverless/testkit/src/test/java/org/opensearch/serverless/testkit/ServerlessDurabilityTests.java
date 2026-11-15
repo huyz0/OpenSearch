@@ -56,10 +56,10 @@ public class ServerlessDurabilityTests extends OpenSearchTestCase {
 
     /** Isolate the codec from the storage: does a record survive a round trip at all? */
     public void testWalRecordRoundTrip() throws Exception {
-        final var original = new org.opensearch.serverless.store.WalRecord("7", "{\"msg\":\"durable\",\"n\":7}");
+        final var original = new org.opensearch.serverless.nodelog.WalRecord("7", "{\"msg\":\"durable\",\"n\":7}");
         final byte[] bytes = org.opensearch.core.common.bytes.BytesReference.toBytes(original.toBytes());
         logger.info("m10 wal record bytes: {}", new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
-        final var parsed = org.opensearch.serverless.store.WalRecord.fromStream(new java.io.ByteArrayInputStream(bytes));
+        final var parsed = org.opensearch.serverless.nodelog.WalRecord.fromStream(new java.io.ByteArrayInputStream(bytes));
         assertEquals(original.id(), parsed.id());
         assertEquals(original.source(), parsed.source());
     }

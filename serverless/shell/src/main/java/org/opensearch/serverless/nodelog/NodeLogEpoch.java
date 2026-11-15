@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.store;
+package org.opensearch.serverless.nodelog;
 
 /**
  * One epoch of a node's write log as its lease records it: what a successor needs to fence and replay it without a

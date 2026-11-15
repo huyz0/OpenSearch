@@ -19,11 +19,11 @@ import org.opensearch.index.mapper.Uid;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.nodelog.NodeLogBlob;
+import org.opensearch.serverless.nodelog.NodeLogStore;
+import org.opensearch.serverless.nodelog.NodeLogTakeover;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.serverless.store.CommitManifest;
-import org.opensearch.serverless.store.NodeLogBlob;
-import org.opensearch.serverless.store.NodeLogStore;
-import org.opensearch.serverless.store.NodeLogTakeover;
-import org.opensearch.serverless.store.WalRecord;
 
 import java.nio.file.Files;
 import java.nio.file.Path;

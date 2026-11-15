@@ -8,7 +8,7 @@ org.opensearch.serverless.plugins.PluginSettings
 org.opensearch.serverless.node.SearchSettings
 org.opensearch.serverless.node.WriteSettings
 org.opensearch.serverless.store.CacheSettings
-org.opensearch.serverless.store.NodeLogSettings
+org.opensearch.serverless.nodelog.NodeLogSettings
 org.opensearch.serverless.store.ObjectStoreSettings
 org.opensearch.serverless.transport.ReaderPushSettings
 org.opensearch.serverless.transport.ShardRouterSettings

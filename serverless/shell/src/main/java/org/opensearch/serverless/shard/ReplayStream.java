@@ -22,7 +22,7 @@ final class ReplayStream {
     static void forEach(
         ShardReconciler r,
         ShardId shardId,
-        org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> consumer
+        org.opensearch.common.CheckedConsumer<org.opensearch.serverless.nodelog.WalRecord, IOException> consumer
     ) throws IOException {
         if (r.pendingReplay.contains(shardId) == false) {
             return;
@@ -32,7 +32,7 @@ final class ReplayStream {
             final ShardReconciler.NodeLogReplay fromNodeLog = r.pendingNodeLogReplay.get(shardId);
             final ShardReconciler.NodeLogHooks hooks = r.nodeLog;
             if (fromNodeLog != null && hooks != null) {
-                final org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> counting = record -> {
+                final org.opensearch.common.CheckedConsumer<org.opensearch.serverless.nodelog.WalRecord, IOException> counting = record -> {
                     consumer.accept(record);
                     r.logRecordsRead.incrementAndGet();
                 };
@@ -45,9 +45,9 @@ final class ReplayStream {
                 }
             }
             // Last: records a caller handed in for this open, newer than anything the shard's logs hold.
-            final java.util.List<org.opensearch.serverless.store.WalRecord> preloaded = r.preloadedReplay.remove(shardId);
+            final java.util.List<org.opensearch.serverless.nodelog.WalRecord> preloaded = r.preloadedReplay.remove(shardId);
             if (preloaded != null) {
-                for (org.opensearch.serverless.store.WalRecord record : preloaded) {
+                for (org.opensearch.serverless.nodelog.WalRecord record : preloaded) {
                     consumer.accept(record);
                 }
                 // Counted as node-log replay, so the open publishes them before it serves: no log of this shard holds them.

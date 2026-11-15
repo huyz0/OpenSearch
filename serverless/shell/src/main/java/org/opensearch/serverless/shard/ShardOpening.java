@@ -489,7 +489,7 @@ final class ShardOpening {
     }
 
     static void ensureLegacyReplaySucceeded(
-        org.opensearch.serverless.store.WalRecord record,
+        org.opensearch.serverless.nodelog.WalRecord record,
         org.opensearch.index.engine.Engine.Result result
     ) throws IOException {
         if (result.getResultType() != org.opensearch.index.engine.Engine.Result.Type.SUCCESS) {

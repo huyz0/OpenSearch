@@ -357,7 +357,7 @@ public final class ShardOperations {
                     var ignored = node.services()
                         .indexingPressure()
                         .markCoordinatingOperationStarted(
-                            org.opensearch.serverless.store.WalRecord.contentBytes(accepted.id(), null),
+                            org.opensearch.serverless.nodelog.WalRecord.contentBytes(accepted.id(), null),
                             false
                         )
                 ) {

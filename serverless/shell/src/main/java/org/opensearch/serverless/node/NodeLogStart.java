@@ -54,11 +54,11 @@ public final class NodeLogStart {
                     writeOwnLease(plane, epochs);
                 },
                     (shardId, term) -> node.leases.ownsAtTerm(plane, shardId, term),
-                    org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.get(node.settings),
-                    org.opensearch.serverless.store.NodeLogSettings.MAX_BYTES.get(node.settings),
-                    org.opensearch.serverless.store.NodeLogSettings.MAX_RECORDS.get(node.settings)
+                    org.opensearch.serverless.nodelog.NodeLogSettings.WINDOW_MILLIS.get(node.settings),
+                    org.opensearch.serverless.nodelog.NodeLogSettings.MAX_BYTES.get(node.settings),
+                    org.opensearch.serverless.nodelog.NodeLogSettings.MAX_RECORDS.get(node.settings)
                 );
-                final long flushAfter = 2 * org.opensearch.serverless.store.NodeLogSettings.WINDOW_MILLIS.get(node.settings);
+                final long flushAfter = 2 * org.opensearch.serverless.nodelog.NodeLogSettings.WINDOW_MILLIS.get(node.settings);
                 writer.flushLoggedCommitsWith(
                     task -> node.threadPool()
                         .schedule(
@@ -70,15 +70,15 @@ public final class NodeLogStart {
                 writer.runAfterOpensOn(node.threadPool().generic());
                 writer.committer()
                     .hedgeAppends(
-                        org.opensearch.serverless.store.NodeLogSettings.HEDGE_AFTER_MILLIS.get(node.settings),
+                        org.opensearch.serverless.nodelog.NodeLogSettings.HEDGE_AFTER_MILLIS.get(node.settings),
                         node.threadPool().generic()
                     );
                 writer.committer()
                     .admitConcurrently(
-                        org.opensearch.serverless.store.NodeLogSettings.ADMISSION_CONCURRENCY.get(node.settings),
+                        org.opensearch.serverless.nodelog.NodeLogSettings.ADMISSION_CONCURRENCY.get(node.settings),
                         node.threadPool().generic()
                     );
-                writer.committer().flushWhenIdle(org.opensearch.serverless.store.NodeLogSettings.IDLE_FLUSH.get(node.settings));
+                writer.committer().flushWhenIdle(org.opensearch.serverless.nodelog.NodeLogSettings.IDLE_FLUSH.get(node.settings));
                 nodeLogWriter = writer;
             }
             if (node.reconciler != null && nodeLogHooked == false) {
@@ -91,7 +91,7 @@ public final class NodeLogStart {
 
     void writeOwnLease(
         org.opensearch.serverless.metadata.MetadataPlane plane,
-        java.util.List<org.opensearch.serverless.store.NodeLogEpoch> nodeLogEpochs
+        java.util.List<org.opensearch.serverless.nodelog.NodeLogEpoch> nodeLogEpochs
     ) throws java.io.IOException {
         // Stamped from when the renewal began: the lease is valid at least that long after it.
         final long startedAt = plane.clock().getAsLong();

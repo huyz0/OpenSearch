@@ -10,12 +10,12 @@ package org.opensearch.serverless.testkit;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
-import org.opensearch.serverless.store.NodeLogBlob.ShardKey;
-import org.opensearch.serverless.store.NodeLogCommitter;
-import org.opensearch.serverless.store.NodeLogEpoch;
-import org.opensearch.serverless.store.NodeLogStore;
-import org.opensearch.serverless.store.NodeLogTakeover;
-import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.nodelog.NodeLogBlob.ShardKey;
+import org.opensearch.serverless.nodelog.NodeLogCommitter;
+import org.opensearch.serverless.nodelog.NodeLogEpoch;
+import org.opensearch.serverless.nodelog.NodeLogStore;
+import org.opensearch.serverless.nodelog.NodeLogTakeover;
+import org.opensearch.serverless.nodelog.WalRecord;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
