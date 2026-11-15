@@ -165,10 +165,12 @@ public final class ReaderServing {
         node.reconciler.replayLogs();
         node.reconciler.setOwnershipCheck((id, term) -> node.leases.ownsAtTerm(plane, id, term));
         final String openingKey = indexName + "#" + shardNumber;
-        final org.opensearch.core.index.shard.ShardId served = openOrShareReader(plane, indexName, shardNumber, openingKey, known);
+        final ReaderValidation.ReadAhead[] ahead = new ReaderValidation.ReadAhead[1];
+        final org.opensearch.core.index.shard.ShardId served = openOrShareReader(plane, indexName, shardNumber, openingKey, known, ahead);
         requireReaderIncarnation(served, expectedUuid);
         try {
-            validateReader(plane, indexName, shardNumber, served);
+            node.readerValidation.validateReader(plane, indexName, shardNumber, served, ahead[0]);
+            ensureFresh(indexName, shardNumber, served);
         } catch (ShardBehindLogException e) {
             if (e.superseded() == false || node.reconciler.isReader(served)) {
                 throw e;
@@ -270,6 +272,23 @@ public final class ReaderServing {
         String openingKey,
         IndexDescriptor known
     ) throws Exception {
+        return openOrShareReader(plane, indexName, shardNumber, openingKey, known, null);
+    }
+
+    /**
+     * Opens a reader, or waits for the open already under way.
+     *
+     * @param ahead where an open made here leaves the head and register it read, for the reader's first check; null to
+     *     keep nothing
+     */
+    private org.opensearch.core.index.shard.ShardId openOrShareReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        String openingKey,
+        IndexDescriptor known,
+        ReaderValidation.ReadAhead[] ahead
+    ) throws Exception {
         final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> mine =
             new java.util.concurrent.CompletableFuture<>();
         final java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId> running = readerOpens.putIfAbsent(
@@ -287,10 +306,24 @@ public final class ReaderServing {
         final long describedAt = System.nanoTime();
         openingShards.add(openingKey);
         try {
+            // The head beside the descriptor: see ReaderValidation.ReadAhead.
+            final ReaderValidation.ReadAhead readAhead = ahead == null || known != null
+                ? null
+                : ReaderValidation.ReadAhead.start(plane, indexName, shardNumber, fanout());
             final IndexDescriptor descriptor = known != null
                 ? known
                 : plane.describe(indexName).orElseThrow(() -> new IllegalArgumentException("no such index: " + indexName));
-            final org.opensearch.core.index.shard.ShardId opened = openReader(plane, indexName, shardNumber, descriptor, openingKey);
+            final org.opensearch.core.index.shard.ShardId opened = openReader(
+                plane,
+                indexName,
+                shardNumber,
+                descriptor,
+                openingKey,
+                readAhead
+            );
+            if (ahead != null) {
+                ahead[0] = readAhead;
+            }
             if (known == null) {
                 // The read above confirmed the incarnation, so the query this open serves need not read it again.
                 node.fences().confirmIncarnation(descriptor.uuid(), describedAt);
@@ -312,6 +345,25 @@ public final class ReaderServing {
         int shardNumber,
         IndexDescriptor descriptor,
         String openingKey
+    ) throws Exception {
+        return openReader(plane, indexName, shardNumber, descriptor, openingKey, null);
+    }
+
+    private java.util.concurrent.Executor fanout() {
+        try {
+            return node.threadPool().executor(NodeThreadPools.FANOUT_POOL);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private org.opensearch.core.index.shard.ShardId openReader(
+        org.opensearch.serverless.metadata.MetadataPlane plane,
+        String indexName,
+        int shardNumber,
+        IndexDescriptor descriptor,
+        String openingKey,
+        ReaderValidation.ReadAhead readAhead
     ) throws Exception {
         // Readers this node has since let go of are dropped from the record before this one is added,
         // or a search node that cycles through many distinct readers carries every one it ever opened
@@ -355,12 +407,19 @@ public final class ReaderServing {
         if (pushed.isPresent()) {
             manifest = pushed;
         } else {
+            if (readAhead != null) {
+                // The register is read after the head, so the reader's first check can use both.
+                readAhead.head();
+            }
             final java.util.Optional<org.opensearch.serverless.store.CommitManifest> register = plane.segmentPublisher(
                 indexName,
                 descriptor.uuid(),
                 shardNumber
             ).readManifest();
             manifest = node.push() == null ? register : node.push().newerThan(register, indexName, descriptor.uuid(), shardNumber);
+            if (readAhead != null && register.isPresent() && manifest.isPresent() && manifest.get() == register.get()) {
+                readAhead.openedFromRegister(register.get());
+            }
         }
         readerTerms.put(openingKey, manifest.map(org.opensearch.serverless.store.CommitManifest::term).orElse(1L));
         // The union of what this node serves and what it hosts, plus the reader being opened: a view
@@ -377,7 +436,10 @@ public final class ReaderServing {
             shardNumber,
             manifest.orElse(null)
         );
-        if (node.push() != null && manifest.isPresent() && alreadyOpen == false) {
+        // Not of a shard whose head names no owner: nobody is writing it, so nobody holds an acknowledged tail past its
+        // commit or will push one. Asking the node that published it cost a lease read and a call to a node that had let go.
+        final boolean unowned = readAhead != null && readAhead.unowned();
+        if (node.push() != null && manifest.isPresent() && alreadyOpen == false && unowned == false) {
             // What the writer acknowledged past this commit, and its next writes, for the reader's tail overlay. Once per
             // open: a reader already open is subscribed already.
             final var shard = node.reconciler.shard(opened);

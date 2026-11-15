@@ -48,6 +48,9 @@ public final class RoundTripDepthBlobStore implements BlobStore {
     private volatile long delayNanos;
     private final AtomicInteger finished = new AtomicInteger();
     private final AtomicInteger deepest = new AtomicInteger();
+    private volatile long startNanos = System.nanoTime();
+    private volatile boolean recording;
+    private final java.util.List<String> sequence = new java.util.ArrayList<>();
 
     /**
      * Wraps a store, holding no request until a measurement starts.
@@ -68,6 +71,64 @@ public final class RoundTripDepthBlobStore implements BlobStore {
         this.delayNanos = TimeUnit.MILLISECONDS.toNanos(delayMillis);
         finished.set(0);
         deepest.set(0);
+        startNanos = System.nanoTime();
+        synchronized (sequence) {
+            sequence.clear();
+        }
+    }
+
+    /**
+     * Records each request from now on: when it started, its round, the call and who made it.
+     *
+     * @param record true to record
+     */
+    public void record(boolean record) {
+        this.recording = record;
+    }
+
+    /**
+     * Returns the requests recorded since the last reset, in the order they started, one a line.
+     *
+     * @return the sequence; empty unless {@link #record(boolean)} was called
+     */
+    public String sequence() {
+        synchronized (sequence) {
+            return String.join("\n", sequence);
+        }
+    }
+
+    /** The serverless frames below the store wrappers, nearest first: who made a request. */
+    private static String caller() {
+        return StackWalker.getInstance()
+            .walk(
+                frames -> frames.filter(
+                    frame -> frame.getClassName().startsWith("org.opensearch.serverless")
+                        && frame.getClassName()
+                            .matches(
+                                ".*(RoundTripDepthBlobStore|CountingBlobStore|MeteredBlobStore|CommitRegister|MemberAwareRegister).*"
+                            ) == false
+                )
+                    .limit(5)
+                    .map(
+                        frame -> frame.getClassName().substring(frame.getClassName().lastIndexOf('.') + 1)
+                            + "."
+                            + frame.getMethodName()
+                            + ":"
+                            + frame.getLineNumber()
+                    )
+                    .collect(java.util.stream.Collectors.joining(" < "))
+            );
+    }
+
+    /** The container call being made: the first frame of this store's own container. */
+    private static String call() {
+        return StackWalker.getInstance()
+            .walk(
+                frames -> frames.filter(frame -> frame.getClassName().endsWith("$Rounds"))
+                    .findFirst()
+                    .map(StackWalker.StackFrame::getMethodName)
+                    .orElse("?")
+            );
     }
 
     /**
@@ -87,6 +148,19 @@ public final class RoundTripDepthBlobStore implements BlobStore {
     private <T> T rounds(int sequential, CheckedSupplier<T, IOException> request) throws IOException {
         final int round = finished.get() + sequential;
         deepest.accumulateAndGet(round, Math::max);
+        if (recording) {
+            final String line = String.format(
+                java.util.Locale.ROOT,
+                "%5d ms  round %d  %s  %s",
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos),
+                round,
+                call(),
+                caller()
+            );
+            synchronized (sequence) {
+                sequence.add(line);
+            }
+        }
         if (delayNanos > 0) {
             try {
                 TimeUnit.NANOSECONDS.sleep(delayNanos * sequential);

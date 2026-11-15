@@ -398,6 +398,45 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A shard let go of while its writes are fenced gives back a head that still names this node's log: its engine and
+     * its register may not hold what the log does, and the successor rebuilds the shard from the log. A shard published
+     * through everything it had gives back one that names no log.
+     */
+    public void testAHeadLetGoOfNamesTheLogOnlyWhenThePublishDidNotCoverIt() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final GatedBlobStore store = new GatedBlobStore(new FsBlobStore(1024, createTempDir(), false));
+        final MetadataPlane plane = planeOver(store, clock);
+        createAlpha(plane);
+
+        try (ServerlessNode a = new ServerlessNode(nodeSettings("let-go"))) {
+            final BackgroundReconciler loop = new BackgroundReconciler(a, plane);
+            final ShardId onA = hold(a, plane, loop, clock);
+            a.writes().index(onA, "earlier", "{\"msg\":\"earlier\"}");
+            store.failWritesUnder("nodelog/");
+            expectThrows(IOException.class, () -> a.writes().index(onA, "lost", "{\"msg\":\"lost\"}"));
+            assertTrue(a.fences().isWriteFenced(onA));
+            store.failWritesUnder(null);
+            loop.setIdleAfterMillis(1);
+            loop.stopWanting("alpha", 0);
+            loop.releaseIdle(clock.get() + 60_000L);
+            final var fencedHead = plane.heads().read("alpha", 0).orElseThrow();
+            assertNull("let go of", fencedHead.ownerNodeId());
+            assertEquals("a fenced shard's head names its log", List.of(a.localNode().getId()), fencedHead.writers());
+
+            loop.want("alpha", 0);
+            loop.tick(clock.addAndGet(1_000L));
+            final ShardId again = a.reconciler().openShards().iterator().next();
+            assertTrue("history the log holds survives", a.reads().get(again, "earlier").found());
+            a.writes().index(again, "later", "{\"msg\":\"later\"}");
+            loop.stopWanting("alpha", 0);
+            loop.releaseIdle(clock.get() + 120_000L);
+            final var cleanHead = plane.heads().read("alpha", 0).orElseThrow();
+            assertNull("let go of", cleanHead.ownerNodeId());
+            assertEquals("a shard published through names no log", List.of(), cleanHead.writers());
+        }
+    }
+
     // ---------------------------------------------------------------- a store that parks on demand
 
     /**
