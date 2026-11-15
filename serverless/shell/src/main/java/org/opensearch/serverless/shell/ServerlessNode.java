@@ -10,36 +10,28 @@ package org.opensearch.serverless.shell;
 
 import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.NodeConnectionsService;
-import org.opensearch.cluster.node.DiscoveryNode;
 import org.opensearch.cluster.service.ClusterApplier;
-import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.network.NetworkModule;
-import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.io.IOUtils;
-import org.opensearch.core.common.transport.TransportAddress;
-import org.opensearch.env.Environment;
-import org.opensearch.env.NodeEnvironment;
-import org.opensearch.http.HttpServerTransport;
 import org.opensearch.indices.IndicesService;
-import org.opensearch.plugins.PluginsService;
-import org.opensearch.rest.RestController;
 import org.opensearch.search.SearchService;
 import org.opensearch.serverless.cluster.IndexDescriptor;
-import org.opensearch.serverless.cluster.LocalViewProjector;
-import org.opensearch.serverless.cluster.ShardAssignment;
-import org.opensearch.serverless.membership.MembershipSource;
-import org.opensearch.serverless.shard.BeforePublish;
-import org.opensearch.serverless.shard.ShardReconciler;
+import org.opensearch.serverless.node.NodeComponents;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.node.NodePackWiring;
+import org.opensearch.serverless.node.NodeStartup;
+import org.opensearch.serverless.plugins.PluginActions;
+import org.opensearch.serverless.plugins.PluginInjector;
+import org.opensearch.serverless.plugins.ServerlessPlugins;
+import org.opensearch.serverless.rest.SystemIndices;
+import org.opensearch.serverless.transport.ShardRouter;
 import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.Transport;
 import org.opensearch.transport.TransportService;
-import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.Closeable;
-import java.net.InetAddress;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
@@ -56,257 +48,103 @@ import java.util.concurrent.TimeUnit;
  * applier requires a {@link NodeConnectionsService}, and the data plane refuses to activate a primary
  * at term 0.
  */
-public final class ServerlessNode implements Closeable {
+public final class ServerlessNode extends NodeContext implements Closeable {
 
-    static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(ServerlessNode.class);
-
-    /** Accepts writer activation: takes ownership of shards and indexes into them. */
-    public static final String ROLE_INGEST = "ingest";
-
-    /** Accepts reader activation: serves search from object-store-backed segments. */
-    public static final String ROLE_SEARCH = "search";
-
-    /**
-    * Reads a node's roles from its settings.
-    *
-    * <p>Unset means both roles, as one node of a small deployment runs. Set but empty means neither: a node that only
-    * coordinates, taking requests and sending each write to a shard's writer and each search to search nodes, while
-    * holding no shard itself. {@code Settings.getAsList} answers its default for an empty value, which made an empty
-    * setting mean both roles, so the value is split here instead. An unknown role is refused, since a misspelled
-    * {@code search} would otherwise start a node that silently serves nothing.
-    *
-    * @param settings the node settings
-    * @return the roles, possibly empty
-    * @throws IllegalArgumentException if a role is not one this node knows
-    */
-    public static Set<String> rolesFrom(Settings settings) {
-        final String raw = settings.get(NodeSettings.ROLES.getKey());
-        if (raw == null) {
-            return Set.of(ROLE_INGEST, ROLE_SEARCH);
-        }
-        final Set<String> roles = new java.util.TreeSet<>();
-        for (String role : org.opensearch.core.common.Strings.splitStringByCommaToArray(raw)) {
-            final String trimmed = role.trim();
-            if (trimmed.isEmpty()) {
-                continue;
-            }
-            if (trimmed.equals(ROLE_INGEST) == false && trimmed.equals(ROLE_SEARCH) == false) {
-                throw new IllegalArgumentException(
-                    "unknown role ["
-                        + trimmed
-                        + "] in ["
-                        + NodeSettings.ROLES.getKey()
-                        + "]; use ingest, search, both, or an empty value to only coordinate"
-                );
-            }
-            roles.add(trimmed);
-        }
-        return Set.copyOf(roles);
-    }
-
-    /** The store type that reads published segments lazily, a block at a time. */
-    public static final String BLOCK_CACHE_STORE_TYPE = "serverless_block_cache";
-
-    final String nodeName;
-    final Settings settings;
-    final ServerlessPlugins plugins;
-    final ThreadPool threadPool;
-    /** Builds the core services and the shared collaborators the node and its plugins are handed. */
-    final NodeServices services;
-    /** The check that keeps a reader from serving a commit behind the log, and its memo. */
-    final ReaderValidation readerValidation;
-    final NodeEnvironment nodeEnvironment;
-    final ClusterService clusterService;
-    final IndicesService indicesService;
-    final SearchService searchService;
-    final PluginsService pluginsService;
-    org.opensearch.serverless.rest.SystemIndices systemIndices;
-    final RestController restController;
-    final TransportService transportService;
-    final HttpServerTransport httpServerTransport;
-    final NodeClient nodeClient;
-    volatile DiscoveryNode localNode;
-    volatile MembershipSource membershipSource;
-    volatile org.opensearch.serverless.metadata.MetadataPlane metadataPlane;
-    volatile org.opensearch.serverless.transport.ShardRouter router;
-    final Set<String> roles;
-    final org.opensearch.serverless.store.BlockCache blockCache;
-    final Map<String, IndexDescriptor> served = new java.util.concurrent.ConcurrentHashMap<>();
-    final Set<Map.Entry<String, Integer>> readerShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
-    /** The descriptors of the indices this node holds writer shards of, as last read; the reader half is {@link #served}. */
-    final Map<String, IndexDescriptor> hosted = new java.util.concurrent.ConcurrentHashMap<>();
-    /** The term each writer shard was acquired at, keyed {@code index#shard}; pruned to what is open when a view is projected. */
-    final Map<String, ShardAssignment> writerAssignments = new java.util.concurrent.ConcurrentHashMap<>();
-    /**
-     * One fence per shard. The write path holds the read side from applying an operation to the engine
-     * until it is acknowledged; anything that gives the shard away -- an idle release, a lost head, a
-     * lapsed lease -- holds the write side from before the publish until after the close. See
-     * {@link WriteFences#underShardFence}.
-     */
-    final Map<org.opensearch.core.index.shard.ShardId, java.util.concurrent.locks.ReentrantReadWriteLock> shardFences =
-        new java.util.concurrent.ConcurrentHashMap<>();
-    /**
-     * This node's write log: one log for the whole node, written once per window, started with the first metadata plane
-     * it writes through. See {@link NodeLogWriter}.
-     */
-    volatile NodeLogWriter nodeLogWriter;
-
-    /** Whether the reconciler has been given {@link #nodeLogWriter}, which may start before the reconciler exists. */
-    volatile boolean nodeLogHooked;
-
-    /** How many writes may wait on the object store at once; see WriteBackpressure. */
-    final org.opensearch.serverless.store.WriteBackpressure writeBackpressure;
-    /** Bounds how many writes apply to the engine at once; see {@link WritePools}. */
-    final WritePools writePools;
-    final int writeBackpressureMax;
-
-    /**
-     * How much of its room the write path's limiter is giving writes now: its limit over its most, in (0, 1]. Below 1 the
-     * store has been slow to take appends, and other work on the store should give way.
-     *
-     * @return the share
-     */
-    public double writeHeadroom() {
-        return Math.min(1.0, Math.max(0.0, writeBackpressure.stats().limit() / (double) Math.max(1, writeBackpressureMax)));
-    }
-
-    /**
-     * Writer shards whose log could not be appended to. Still open and still readable; refusing writes;
-     * reopened from the log by the next heartbeat that reaches the store. See {@link NodeWritePath#appendOrRelease}.
-     */
-    final Set<org.opensearch.core.index.shard.ShardId> writeFenced = java.util.concurrent.ConcurrentHashMap.newKeySet();
-
-    volatile org.opensearch.serverless.reconcile.ReconcileSignals signals = org.opensearch.serverless.reconcile.ReconcileSignals.NONE;
-    volatile LocalViewProjector projector;
-    volatile ShardReconciler reconciler;
-    volatile boolean started;
-
-    /** Writes this node's documents. */
-    final NodeWritePath writes = new NodeWritePath(this);
-
-    /** Fences this node's writes. */
-    final WriteFences fences = new WriteFences(this);
-    final WriterHibernation hibernation = new WriterHibernation();
-
-    /** Grows mappings for this node's writes. */
-    final MappingGrowthPath mappings = new MappingGrowthPath(this);
-
-    /** Keeps this node's lease and heads current. */
-    final NodeLeases leases = new NodeLeases(this);
-
-    /** Activates this node's writers. */
-    final WriterActivation activation = new WriterActivation(this);
-
-    /** Serves this node's readers. */
-    final ReaderServing readerServing = new ReaderServing(this);
-
-    /** Builds this node's engines and directories. */
-    final NodeStorage storage = new NodeStorage(this);
+    /** The plugins' own indices, which the request path refuses. */
+    SystemIndices systemIndices;
 
     /** Wires this node's REST and transport layers. */
     final NodeWiring wiring = new NodeWiring(this);
 
-    /** Keeps this node's index descriptors current. */
-    final DescriptorRefresh descriptorRefresh = new DescriptorRefresh(this);
+    @Override
+    protected void beforeAcceptingRequests() {
+        pluginActionNames = wiring.declaredPluginActionNames();
+    }
 
-    /** Reads this node's documents. */
-    final NodeDocumentReads reads = new NodeDocumentReads(this);
-
-    /** Starts this node. */
-    final NodeStartup startup = new NodeStartup(this);
-
+    private PluginActions pluginActions = PluginActions.none();
+    /** Core's injector for plugin objects, once the node has started with plugins installed; null otherwise. */
+    PluginInjector pluginInjector;
     /**
-     * Writes documents on this node: single index and delete operations and batches.
+     * The names of every action the installed plugins declare, known before any of them is built.
      *
-     * @return the NodeWritePath
+     * <p><b>Why not ask {@link #pluginActions}.</b> A {@code HandledTransportAction} registers its own
+     * transport handler from its constructor, and those constructors run inside {@code
+     * NodeWiring#buildPluginActions()} -- which cannot run until {@code createComponents} has, which cannot run
+     * until the node has started, which is after {@code acceptIncomingRequests()}. So each plugin action
+     * becomes reachable over the transport strictly before the registry naming it exists, and a check
+     * that consulted the registry would wave those requests through for the whole of that window: the
+     * duration of every plugin's {@code createComponents} plus the construction loop.
+     *
+     * <p>The names do not need any of that. They come off {@code ActionPlugin#getActions()}, which is a
+     * list of descriptors, so this is filled in before the transport accepts anything and the window
+     * closes. Volatile because it is written on the starting thread and read on transport threads.
      */
-    public NodeWritePath writes() {
-        return writes;
+    volatile java.util.Set<String> pluginActionNames = Set.of();
+
+    /** {@return the actions the plugins provide} */
+    public PluginActions pluginActions() {
+        return pluginActions;
+    }
+
+    @Override
+    protected void transportBound() {
+        final ShardRouter router = new ShardRouter(this, transportService, this::metadataPlane);
+        attach(ShardRouter.class, router);
+        router.statsDocument((builder, plane) -> org.opensearch.serverless.rest.StatsHandler.describe(builder, this, plane));
+        router.registerHandlers();
+        attach(org.opensearch.serverless.transport.CacheWarmCopy.Answers.class, new org.opensearch.serverless.warm.WarmAnswers(this));
+        org.opensearch.serverless.transport.CacheWarmCopy.of(this).registerHandlers();
+        org.opensearch.serverless.transport.NewestCommits.of(this).registerHandlers();
+        router.commitPush().registerHandlers();
+        router.tailPush().registerHandlers();
+        router.tailOverlays().registerHandlers();
+        push = router.readerPush();
     }
 
     /**
-     * Reads documents held on this node: get and explain.
+     * Returns this node's shard router, which forwards work to the node that owns a shard.
      *
-     * @return the NodeDocumentReads
+     * @return the router, or null before the transport has bound
      */
-    public NodeDocumentReads reads() {
-        return reads;
+    public ShardRouter router() {
+        return ShardRouter.of(this);
     }
 
-    /**
-     * The writers this node has closed for idleness while keeping their heads.
-     *
-     * @return the WriterHibernation
-     */
-    public WriterHibernation hibernation() {
-        return hibernation;
+    @Override
+    protected void afterStarted() {
+        // After createComponents, because a plugin's action almost always takes one of its own components,
+        // and before onNodeStarted, because a plugin told the node is up may immediately call its own
+        // action.
+        pluginActions = wiring.buildPluginActions();
+        // The plugins' lifecycle components, then the services their injector built, as core starts them.
+        for (Object component : plugins.components()) {
+            if (component instanceof org.opensearch.common.lifecycle.LifecycleComponent lifecycle) {
+                pluginLifecycle.add(lifecycle);
+            }
+        }
+        if (pluginInjector != null) {
+            pluginLifecycle.addAll(pluginInjector.services());
+        }
+        pluginLifecycle.forEach(org.opensearch.common.lifecycle.LifecycleComponent::start);
+        // And then tell them the node is up. A plugin that has to read its own index cannot do it while
+        // components are being built; this is the event it waits for. Deferred until the node also has its
+        // metadata plane, if it has none yet.
+        notifyPluginsStarted();
     }
 
-    /**
-     * Decides whether a write may go ahead on this node: the shard fence, its incarnation, and the lease and head.
-     *
-     * @return the WriteFences
-     */
-    public WriteFences fences() {
-        return fences;
+    @Override
+    protected ClusterState withPluginOwners(ClusterState view) {
+        return pluginIndices().withOwners(view);
     }
 
-    /**
-     * Keeps this node's lease and heads current.
-     *
-     * @return the NodeLeases
-     */
-    public NodeLeases leases() {
-        return leases;
+    @Override
+    protected java.util.Collection<IndexDescriptor> pluginDescriptors() {
+        return pluginIndices().descriptors();
     }
 
-    /**
-     * Starts this node, and owns its write log.
-     *
-     * @return the NodeStartup
-     */
-    public NodeStartup startup() {
-        return startup;
-    }
-
-    /**
-     * Activates writers on this node and opens frozen views.
-     *
-     * @return the WriterActivation
-     */
-    public WriterActivation activation() {
-        return activation;
-    }
-
-    /**
-     * Serves shards as readers on this node.
-     *
-     * @return the ReaderServing
-     */
-    public ReaderServing readers() {
-        return readerServing;
-    }
-
-    /**
-     * The services this node builds on demand for its handlers: registries, scripts, pipelines, the client, and the rest.
-     *
-     * @return the services
-     */
-    public NodeServices services() {
-        return services;
-    }
-
-    /** Tracks this node's standing in the fleet. */
-    final NodeCapacity nodeCapacity = new NodeCapacity(this);
-
-    /**
-     * Tracks this node's standing in the fleet: capacity and refusals at the cap, the fleet's size, and where a takeover
-     * or a hand-off should go.
-     *
-     * @return the tracker
-     */
-    public NodeCapacity nodeCapacity() {
-        return nodeCapacity;
+    @Override
+    protected ClusterState withPluginAliases(ClusterState projected, java.util.Collection<IndexDescriptor> descriptors) {
+        return pluginIndices().withAliases(ViewAliases.with(projected, descriptors, metadataPlane(), this));
     }
 
     /**
@@ -331,107 +169,10 @@ public final class ServerlessNode implements Closeable {
      * @throws Exception if the node cannot be built
      */
     public ServerlessNode(Settings settings, java.util.List<org.opensearch.plugins.Plugin> plugins) throws Exception {
-        // A node says it is one, before any plugin is constructed, exactly as core's Node does. Plugins read
-        // client.type in their constructors to tell a node from a transport client, and with it unset the
-        // security plugin decides it is a client and turns off its REST filter and its HTTP transport.
-        settings = Settings.builder()
-            .put(settings)
-            .put(org.opensearch.transport.client.Client.CLIENT_TYPE_SETTING_S.getKey(), "node")
-            .build();
-        // Plugins first, before the settings are settled, because a plugin gets to contribute to them.
-        //
-        // The order is load-bearing. PluginsService is built from what the caller supplied, so a plugin is
-        // constructed with the operator's configuration; updatedSettings then layers each plugin's
-        // additionalSettings underneath it, so an explicit setting always beats a plugin's; and the shell's
-        // own defaults go underneath both, so they apply only when nobody else had an opinion. Putting the
-        // shell's transport choice on top -- which is where it used to be -- would have made
-        // additionalSettings decorative for the one thing plugins most use it for.
-        this.pluginsService = NodeServices.buildPluginsService(settings, new Environment(settings, null));
-        final java.util.List<org.opensearch.plugins.Plugin> installed = new java.util.ArrayList<>(
-            pluginsService.filterPlugins(org.opensearch.plugins.Plugin.class)
-        );
-        // Ones handed to this constructor come after the installed ones, so an operator's installation is
-        // not silently outranked by something a test or an embedder passed in.
-        installed.addAll(plugins);
-        this.plugins = new ServerlessPlugins(installed);
-        this.settings = NodeServices.withShellDefaults(this.plugins.settingsWith(settings));
-        this.searchSettings = new SearchSettings(this.settings);
-        settings = this.settings;
-
-        this.nodeName = settings.get("node.name", "serverless-node");
-        this.views = new LocalViewApplier(
-            nodeName,
-            () -> localNode.getId(),
-            this::clusterService,
-            () -> membershipSource,
-            () -> metadataPlane,
-            startup::projectView
-        );
-        // Only with plugins installed: the shell's own code never asks for a cluster manager, so a node without
-        // plugins keeps a view that names none.
-        this.views.decorateWith(view -> pluginIndices().withOwners(view));
-        this.views.namesClusterManager(this.plugins.plugins().isEmpty() == false);
-        // Role is a runtime attribute a node advertises, not a topology decision baked into a
-        // cluster. One binary; an operator gets asymmetric scaling from two Deployments differing by one
-        // environment variable, and role switching under load stays a policy question.
-        this.roles = rolesFrom(settings);
-        this.blockCache = NodeComponents.blockCache(settings);
-        this.writeBackpressureMax = WriteSettings.BACKPRESSURE_MAX_IN_FLIGHT.get(settings);
-        this.writePools = WritePools.of(settings);
-        this.writeBackpressure = NodeComponents.writeBackpressure(settings, writeBackpressureMax);
-        // Refused here, at construction, rather than on the first shard it takes.
-        this.nodeLogCommitCheckpointMillis = LogCommitCheckpoint.nodeValue(settings);
-        this.logCommitCheckpointMillis = nodeLogCommitCheckpointMillis;
-        // Rebuilt from the settled settings, so anything a plugin contributed is visible to everything
-        // below.
-        final Environment environment = new Environment(settings, null);
-        final ClusterSettings clusterSettings = new ClusterSettings(settings, this.plugins.clusterSettings());
-
-        // A pool of its own for fanned-out shard work. The coordinator of a search waits on GENERIC for
-        // its shard tasks; when those tasks also ran on GENERIC, enough concurrent searches parked every
-        // thread waiting for tasks no thread was free to run. A forwarded search handler ran on SEARCH and
-        // blocked on the query phase forked to SEARCH, with the same shape. Both now run here, and this
-        // pool waits on nothing that runs on it.
-        this.threadPool = NodeThreadPools.build(settings, this.plugins.executorBuilders(settings));
-        this.services = new NodeServices(settings, this.plugins, threadPool, () -> metadataPlane, () -> this, this::indicesService);
-        this.readerValidation = new ReaderValidation(
-            () -> localNode.getId(),
-            () -> reconciler,
-            () -> signals,
-            threadPool,
-            readerServing::forgetReader
-        );
-        this.readerValidation.setLiveOwnerCheckMillis(SearchSettings.READER_CHECK_LIVE_OWNER_MILLIS.get(settings));
-        // An open fetches the blocks it will read concurrently rather than one round trip at a time, on GENERIC as
-        // the log replay's reads do; the opening thread reads too, so a busy pool costs width only.
-        blockCache.prefetchingWith(threadPool.generic());
+        super(settings, plugins);
+        services.clientFactory(() -> new ServerlessClient(this.settings, threadPool, () -> this, this::metadataPlane));
         boolean success = false;
-        NodeEnvironment openedEnvironment = null;
         try {
-            // Held in a local as well, because the failure path below cannot read a blank final -- and it
-            // has to close this one thing above all others: NodeEnvironment holds node.lock.
-            openedEnvironment = new NodeEnvironment(settings, environment);
-            this.nodeEnvironment = openedEnvironment;
-            this.localNode = NodeComponents.discoveryNode(
-                nodeName,
-                nodeEnvironment.nodeId(),
-                new TransportAddress(InetAddress.getLoopbackAddress(), 0),
-                roles
-            );
-            this.clusterService = services.buildClusterService(clusterSettings, localNode);
-            this.indicesService = services.buildIndicesService(
-                environment,
-                clusterSettings,
-                pluginsService,
-                nodeEnvironment,
-                clusterService,
-                storage.engineFactoryProviders(),
-                storage.directoryFactories()
-            );
-            org.opensearch.serverless.schema.SharedAnalysis.install(indicesService);
-            this.searchService = services.buildSearchService(clusterSettings, clusterService, indicesService);
-
-            this.nodeClient = NodeComponents.nodeClient(settings, threadPool, services);
             // The plugins build their components here, before the REST controller, the network module and the
             // transport exist -- the order a classic node uses, and the one plugins are written for. Each of
             // those asks the plugins for something (a request wrapper, REST handlers, transport interceptors),
@@ -440,7 +181,20 @@ public final class ServerlessNode implements Closeable {
             // handlers all dereference one, and failed with the old order of components last. What a plugin
             // reaches through its client still waits for the node to start: the client refuses until then.
             try {
-                this.plugins.createComponents(this, environment);
+                this.plugins.createComponents(
+                    new org.opensearch.serverless.plugins.PluginHost(
+                        nodeClient(),
+                        clusterService(),
+                        threadPool(),
+                        services.resourceWatcherService(),
+                        services.scriptService(),
+                        services.searchXContentRegistry(),
+                        environment,
+                        nodeEnvironment(),
+                        services.namedWriteableRegistry(),
+                        services.indexNameExpressionResolver()
+                    )
+                );
             } catch (Exception e) {
                 throw new IllegalStateException("a plugin failed to start; the node will not serve", e);
             }
@@ -454,12 +208,13 @@ public final class ServerlessNode implements Closeable {
             }
             services.identityService().initializeIdentityAwarePlugins(identityAware);
             // Before the controller, because every handler it registers is wrapped in this.
-            this.systemIndices = new org.opensearch.serverless.rest.SystemIndices(this.plugins.systemIndexPatterns(settings));
+            this.systemIndices = new SystemIndices(this.plugins.systemIndexPatterns(this.settings));
+            this.systemIndex = systemIndices::contains;
             this.restController = wiring.buildRestController(clusterSettings);
             final NetworkModule networkModule = services.buildNetworkModule(clusterSettings, restController);
             final Transport transport = networkModule.getTransportSupplier().get();
             this.transportService = new TransportService(
-                settings,
+                this.settings,
                 transport,
                 null,
                 threadPool,
@@ -473,135 +228,9 @@ public final class ServerlessNode implements Closeable {
             success = true;
         } finally {
             if (success == false) {
-                // The node environment too, not just the thread pool. It was missing, and a constructor
-                // that threw after taking node.lock leaked the file handle for the life of the process --
-                // which on a real node means the data directory stays locked and a restart cannot use it.
-                // Found by a test that makes construction fail on purpose; nothing before it did.
-                IOUtils.closeWhileHandlingException(openedEnvironment);
-                ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+                closeAfterFailedConstruction();
             }
         }
-    }
-
-    /**
-     * The store type that makes a reader lazy.
-     *
-     * <p>Registered on every node; whether a shard uses it is decided per shard when it is opened, by
-     * {@code ShardReconciler}. A writer keeps a local copy it can merge into; a reader reads blocks.
-     */
-    /**
-     * Where a shard's bytes live, which is not always where its index identity says.
-     *
-     * <p>A frozen view is opened as an index of its own, because a node cannot hold two shards with the
-     * same identity and it may well already be serving the live one. That synthetic identity has a uuid
-     * nothing ever wrote under, so the path has to come from the index it is a view <em>of</em> — carried
-     * as a setting on the shard the reader opens.
-     *
-     * <p>Absent for every ordinary shard, which is the overwhelming majority, and then this is the index's
-     * own uuid exactly as before.
-     */
-    static String storageUuidOf(org.opensearch.index.IndexSettings indexSettings) {
-        final String source = indexSettings.getSettings().get(NodeSettings.STORAGE_UUID.getKey());
-        return source == null ? indexSettings.getIndex().getUUID() : source;
-    }
-
-    /**
-    * The frozen view a shard is serving, if it is serving one.
-    *
-    * <p>A view is opened as an index of its own whose uuid is the view's identifier, and it is the only
-    * kind of shard that carries {@link org.opensearch.serverless.shell.NodeSettings#STORAGE_UUID} — so the presence of that setting is what
-    * distinguishes one, and its own uuid is the identifier.
-    */
-    static String frozenViewIdOf(org.opensearch.index.IndexSettings indexSettings) {
-        return indexSettings.getSettings().get(NodeSettings.STORAGE_UUID.getKey()) == null ? null : indexSettings.getIndex().getUUID();
-    }
-
-    /**
-     * Returns this node's block cache, whose counters say how much was actually fetched.
-     *
-     * @return the block cache
-     */
-    public org.opensearch.serverless.store.BlockCache blockCache() {
-        return blockCache;
-    }
-
-    /**
-     * The memory tier writers put freshly flushed segment files in, and the count of what they write to local disk.
-     *
-     * @return the tier
-     */
-    public org.opensearch.serverless.store.LocalSegmentTier localSegments() {
-        return storage.localSegments();
-    }
-
-    /**
-     * Registers who hears about writes and about ownership going wrong.
-     *
-     * <p>Optional. A node with no signals set still converges through the backstop pass; it just does so
-     * on the clock's schedule rather than on its own evidence.
-     *
-     * @param signals the listener, or null to go back to hearing nothing
-     */
-    public void setSignals(org.opensearch.serverless.reconcile.ReconcileSignals signals) {
-        this.signals = signals == null ? org.opensearch.serverless.reconcile.ReconcileSignals.NONE : signals;
-    }
-
-    /**
-     * The index settings this node validates against: core's, the shell's own and those its plugins declare.
-     *
-     * @return the settings
-     */
-    public org.opensearch.common.settings.IndexScopedSettings indexScopedSettings() {
-        return services.indexScopedSettings();
-    }
-
-    /**
-     * Returns the signal sink, so callers on the request path can report what they saw.
-     *
-     * @return the signals, never null
-     */
-    public org.opensearch.serverless.reconcile.ReconcileSignals signals() {
-        return signals;
-    }
-
-    /**
-     * The mapping and settings versions of the descriptor this node writes an index under, or null if it writes none.
-     *
-     * @param indexName the index
-     * @return the mapping version and the settings version, or null
-     */
-    public long[] hostedDescriptorVersions(String indexName) {
-        final IndexDescriptor descriptor = hosted.get(indexName);
-        return descriptor == null ? null : new long[] { descriptor.mappingVersion(), descriptor.settingsVersion() };
-    }
-
-    /**
-    * Gives this node's REST surface a metadata plane to read and write.
-    *
-    * <p>Set after construction because the plane is a deployment-level object and the REST routes are
-    * registered while the node is still being built. Until it is set, the admin endpoints answer 503
-    * saying exactly that, rather than answering as though nothing existed.
-    *
-    * @param plane the metadata plane, or null
-    */
-    public void setMetadataPlane(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        this.metadataPlane = plane;
-        if (plane != null) {
-            setMembershipSource(plane.membership());
-            // Members are owned through their bucket's head on every node, whatever its settings: nodes that disagreed
-            // on which head owns an index could both take it.
-            plane.bucketHeads().register(localNode.getId(), () -> reconciler().openShards());
-            plane.buckets().configure(settings);
-            try {
-                // Publish the lease immediately. It is this node's entry in the address book that peers
-                // use to forward writes here, so a node that has not renewed yet is not merely invisible
-                // -- it is unroutable, and a client's write would be refused with nowhere to send it.
-                renewOwnLease(plane);
-            } catch (java.io.IOException e) {
-                logger.warn("could not publish this node's lease; peers will not be able to route to it", e);
-            }
-        }
-        notifyPluginsStarted();
     }
 
     private final java.util.concurrent.atomic.AtomicBoolean pluginsNotified = new java.util.concurrent.atomic.AtomicBoolean();
@@ -615,304 +244,17 @@ public final class ServerlessNode implements Closeable {
      * node starts first and is given its plane straight after, so telling the plugins at start told them too
      * early, and the security plugin gave up on its configuration.
      */
+    @Override
+    protected void afterPlaneSet() {
+        notifyPluginsStarted();
+    }
+
     void notifyPluginsStarted() {
         if (started && metadataPlane != null && pluginsNotified.compareAndSet(false, true)) {
             pluginIndices().start(metadataPlane);
             pluginClusterSettings().start(metadataPlane);
             plugins.onNodeStarted(localNode);
         }
-    }
-
-    /**
-     * Returns this deployment's cluster name.
-     *
-     * <p>A name, and only a name: there is no cluster object behind it. It is reported because every
-     * OpenSearch response that carries one carries it, and a client reading it should find what it
-     * configured.
-     *
-     * @return the configured cluster name
-     */
-    public String clusterName() {
-        return org.opensearch.cluster.ClusterName.CLUSTER_NAME_SETTING.get(settings).value();
-    }
-
-    final java.util.Map<String, long[]> appliedDescriptorVersions = new java.util.concurrent.ConcurrentHashMap<>();
-
-    /**
-     * Past this many shards, head sightings older than a lease are dropped. See {@link ShardHeadSightings}.
-     */
-    public static final int DEFAULT_RECENT_HEADS_PRUNE_ABOVE = ShardHeadSightings.DEFAULT_RECENT_HEADS_PRUNE_ABOVE;
-
-    /** The shard heads this node has read lately. */
-    final ShardHeadSightings sightings = new ShardHeadSightings(() -> metadataPlane);
-
-    /**
-     * Returns the shard heads this node has read lately, for routing hints and for readers in the same pass.
-     *
-     * @return the head sightings
-     */
-    public ShardHeadSightings sightings() {
-        return sightings;
-    }
-
-    /**
-     * What a publish does to the plane's digest rollups before its manifest is written: widen the shard's entry, unless
-     * the publishing writer's own mark already keeps the shard from being ruled out.
-     */
-    static BeforePublish widensRollupsOf(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        return (id, shards, term, digest) -> plane.rollups()
-            .widenUnlessMarked(id.getIndexName(), id.getIndex().getUUID(), shards, id.id(), term, digest);
-    }
-
-    /** When each open index's descriptor was last read, by the refresh or by the fence, in {@link System#nanoTime} terms. */
-    final java.util.Map<String, Long> descriptorReadAtNanos = new java.util.concurrent.ConcurrentHashMap<>();
-
-    volatile long descriptorRefreshIntervalMillis = 0L;
-
-    /** The cluster's segment placement as last read from its register, or null; see {@link SegmentPlacement}. */
-    volatile String clusterSegmentPlacement;
-
-    /** The cluster's bucket policy as last read with the segment placement, or null when unset. */
-    volatile String clusterBucketPolicy;
-
-    /**
-     * Returns whether a new index with these settings is grouped into a bucket while small: the index's setting, else
-     * the cluster's, else this node's default.
-     *
-     * @param indexSettings the new index's settings
-     * @return true to group it
-     */
-    public boolean bucketsNewIndex(Settings indexSettings) {
-        return org.opensearch.serverless.bucket.BucketPolicy.wanted(
-            indexSettings,
-            clusterBucketPolicy,
-            org.opensearch.serverless.bucket.BucketSettings.enabled(settings)
-        );
-    }
-
-    volatile long clusterSegmentPlacementReadAtNanos;
-    volatile boolean clusterSegmentPlacementRead;
-
-    /** The node's own checkpoint age for log commits, and the one in force; see {@link LogCommitCheckpoint}. */
-    volatile long nodeLogCommitCheckpointMillis = org.opensearch.serverless.store.CommitStaging.DEFAULT_MAX_STAGED_MILLIS;
-    volatile long logCommitCheckpointMillis = org.opensearch.serverless.store.CommitStaging.DEFAULT_MAX_STAGED_MILLIS;
-
-    /** The planes whose pack ledger this node has looked at for packs to collect; see {@link NodePackWiring}. */
-    final java.util.Set<org.opensearch.serverless.metadata.MetadataPlane> packLedgersChecked = java.util.Collections.newSetFromMap(
-        new java.util.IdentityHashMap<>()
-    );
-
-    /**
-     * Sets how long the descriptors of open indices go between re-reads when nothing else has read them;
-     * zero re-reads them on every pass, which is the library default. See
-     * {@code ServerlessBootstrap#DESCRIPTOR_REFRESH_INTERVAL}.
-     *
-     * @param millis the interval
-     * @return this, for chaining
-     */
-    public ServerlessNode setDescriptorRefreshIntervalMillis(long millis) {
-        this.descriptorRefreshIntervalMillis = Math.max(0L, millis);
-        return this;
-    }
-
-    void renewOwnLease(org.opensearch.serverless.metadata.MetadataPlane plane) throws java.io.IOException {
-        // Through the log, which names its epochs and writes under the lock a new epoch's recording takes.
-        startup.nodeLog(plane).renew();
-    }
-
-    /**
-     * Returns this node's write log, once it has started it.
-     *
-     * @return the log, or null
-     */
-    public NodeLogWriter nodeLogWriter() {
-        return nodeLogWriter;
-    }
-
-    /**
-     * Until when, by the plane's clock, this node's own lease is known valid: the start of its last successful
-     * renewal plus the TTL. Its own, not the membership's, which several nodes in one test share.
-     */
-    volatile long ownLeaseValidUntilMillis = 0L;
-
-    /** Shards being opened right now, by index and number: no concurrent view may drop their bookkeeping. */
-    final java.util.Set<String> openingShards = java.util.concurrent.ConcurrentHashMap.newKeySet();
-
-    /**
-     * Reader opens in flight, by index and number, so concurrent callers for one shard share one open.
-     *
-     * <p>Every item of a multi-get over a shard nobody owns needs the same reader, and they arrive together.
-     * Each used to open it for itself: one won the shard lock and the rest failed "failed to obtain in-memory
-     * shard lock", which a client reads as documents missing. The fleet run found it as acknowledged writes
-     * that were absent on first read-back and present on the second.
-     */
-    final Map<String, java.util.concurrent.CompletableFuture<org.opensearch.core.index.shard.ShardId>> readerOpens =
-        new java.util.concurrent.ConcurrentHashMap<>();
-
-    /** Applies the node-local view and counts its cost; see {@link LocalViewApplier}. */
-    final LocalViewApplier views;
-
-    ClusterState projectAndApply(java.util.Collection<IndexDescriptor> extra, java.util.Collection<ShardAssignment> opening)
-        throws Exception {
-        return views.projectAndApply(extra, opening);
-    }
-
-    /**
-     * The local views activations have projected and applied: milliseconds projecting, milliseconds applying, and how many
-     * -- fewer than the activations when they were batched.
-     *
-     * @return projecting, applying, then the count
-     */
-    public long[] localViewMillis() {
-        return views.localViewMillis();
-    }
-
-    /**
-     * Returns this node's shard router, which forwards work to the node that owns a shard.
-     *
-     * @return the router, or null before {@link NodeStartup#start()}
-     */
-    public org.opensearch.serverless.transport.ShardRouter router() {
-        return router;
-    }
-
-    /**
-     * Supplies the membership view the health endpoint reports. Optional: a node with none reports that
-     * it can see one member, itself, which is true.
-     *
-     * @param source the membership source, or null
-     */
-    public void setMembershipSource(MembershipSource source) {
-        this.membershipSource = source;
-    }
-
-    PluginActions pluginActions = PluginActions.none();
-
-    /** Core's injector for plugin objects, once the node has started with plugins installed; null otherwise. */
-    PluginInjector pluginInjector;
-
-    /**
-     * The names of every action the installed plugins declare, known before any of them is built.
-     *
-     * <p><b>Why not ask {@link #pluginActions}.</b> A {@code HandledTransportAction} registers its own
-     * transport handler from its constructor, and those constructors run inside {@link
-     * NodeWiring#buildPluginActions()} -- which cannot run until {@code createComponents} has, which cannot run
-     * until the node has started, which is after {@code acceptIncomingRequests()}. So each plugin action
-     * becomes reachable over the transport strictly before the registry naming it exists, and a check
-     * that consulted the registry would wave those requests through for the whole of that window: the
-     * duration of every plugin's {@code createComponents} plus the construction loop.
-     *
-     * <p>The names do not need any of that. They come off {@code ActionPlugin#getActions()}, which is a
-     * list of descriptors, so this is filled in before the transport accepts anything and the window
-     * closes. Volatile because it is written on the starting thread and read on transport threads.
-     */
-    volatile Set<String> pluginActionNames = Set.of();
-
-    /**
-     * Returns the actions the plugins provide.
-     *
-     * @return the registry, empty on a node whose plugins declared none
-     */
-    public PluginActions pluginActions() {
-        return pluginActions;
-    }
-
-    /** The search settings this node was started with. */
-    final SearchSettings searchSettings;
-
-    /**
-     * Returns the search settings this node was started with: fan-out width, pattern caps and rollup use.
-     *
-     * @return the search settings
-     */
-    public SearchSettings searchSettings() {
-        return searchSettings;
-    }
-
-    /**
-     * Sets how long between periodic head verifications; zero verifies on every pass, as this used to.
-     *
-     * @param millis the interval
-     * @return this, for chaining
-     */
-    public ServerlessNode setHeadVerifyIntervalMillis(long millis) {
-        this.leases().headVerifyIntervalMillis = Math.max(0L, millis);
-        return this;
-    }
-
-    /** How long a reader's check stands before the shard's head is read again, by default. See {@link ReaderValidation}. */
-    public static final long READER_CHECK_MILLIS = ReaderValidation.READER_CHECK_MILLIS;
-
-    /**
-     * Sets how long a reader's check stands before its head is read again; zero reads it on every check. For tests.
-     *
-     * @param millis the window
-     */
-    public void setReaderCheckMillis(long millis) {
-        readerValidation.setReaderCheckMillis(millis);
-    }
-
-    /**
-     * Returns what the write back-pressure is doing: its limit, writes in flight, append time and refusals.
-     *
-     * @return the stats
-     */
-    public org.opensearch.serverless.store.WriteBackpressure.Stats writeBackpressure() {
-        return writeBackpressure.stats();
-    }
-
-    /**
-     * What a reader open refused at this node's shard cap says, so a coordinator can tell a full node, which another
-     * node may stand in for, from a shard nobody can open.
-     */
-    public static final String AT_THE_CAP = " shards, the cap; ";
-
-    final Map<org.opensearch.core.index.Index, MappingGrowthPath.MappingGrowth> mappingGrowth =
-        new java.util.concurrent.ConcurrentHashMap<>();
-
-    /** How many compare-and-swaps one mapping growth attempts before failing the write. */
-    static final int MAPPING_GROWTH_ATTEMPTS = 5;
-
-    void growMapping(org.opensearch.core.index.shard.ShardId shardId, org.opensearch.index.mapper.Mapping addition)
-        throws java.io.IOException {
-        mappings.growMapping(shardId, addition);
-    }
-
-    /**
-     * Returns the node's settings.
-     *
-     * @return the settings this node was started with
-     */
-    public Settings settings() {
-        return settings;
-    }
-
-    /**
-     * Reports whether an index belongs to a plugin, and is therefore not reachable through REST.
-     *
-     * @param index the index name
-     * @return true if it is a system index
-     */
-    public boolean isSystemIndex(String index) {
-        return systemIndices != null && systemIndices.contains(index);
-    }
-
-    /**
-     * Returns the plugins this node is running.
-     *
-     * @return the plugin host
-     */
-    public ServerlessPlugins plugins() {
-        return plugins;
-    }
-
-    /**
-     * Returns the roles this node advertises.
-     *
-     * @return the roles
-     */
-    public Set<String> roles() {
-        return roles;
     }
 
     private PluginNodeAnswers.Monitors monitors;
@@ -925,16 +267,6 @@ public final class ServerlessNode implements Closeable {
             indexAdmin = new PluginIndexAdmin(this);
         }
         return indexAdmin;
-    }
-
-    private PluginClusterSettings pluginClusterSettings;
-
-    /** The plugins' dynamic settings applied from the cluster settings register, built the first time they are asked for. */
-    public synchronized PluginClusterSettings pluginClusterSettings() {
-        if (pluginClusterSettings == null) {
-            pluginClusterSettings = new PluginClusterSettings(this, plugins.pluginNodeSettings());
-        }
-        return pluginClusterSettings;
     }
 
     private PluginIndicesView pluginIndices;
@@ -957,177 +289,6 @@ public final class ServerlessNode implements Closeable {
             monitors = new PluginNodeAnswers.Monitors(this);
         }
         return monitors;
-    }
-
-    /**
-     * Returns this node's shard reconciler.
-     *
-     * @return the reconciler, or null before {@link NodeStartup#start()}
-     */
-    public ShardReconciler reconciler() {
-        return reconciler;
-    }
-
-    /**
-     * Returns this node's view projector.
-     *
-     * @return the projector, or null before {@link NodeStartup#start()}
-     */
-    public LocalViewProjector projector() {
-        return projector;
-    }
-
-    /**
-     * Remembers the plane this node is serving.
-     *
-     * <p>The block-cache directory factory is handed a location and settings, not a metadata plane, so
-     * it has to reach one through the node. A node that had only ever been given a plane as a method
-     * argument would build local-only directories and silently serve nothing — which is how this was
-     * found.
-     */
-    void adopt(org.opensearch.serverless.metadata.MetadataPlane plane) {
-        if (metadataPlane == null) {
-            metadataPlane = plane;
-        }
-    }
-
-    final java.util.Map<String, Long> readerTerms = new java.util.concurrent.ConcurrentHashMap<>();
-
-    /** This node's per-shard bookkeeping around its reconciler. */
-    final NodeShards shards = new NodeShards(this);
-
-    /**
-     * Returns this node's per-shard bookkeeping: marking used, publishing and releasing shards.
-     *
-     * @return the shard bookkeeping
-     */
-    public NodeShards shards() {
-        return shards;
-    }
-
-    /** The transport secrets as last read, re-read at most once per lease TTL. */
-    final TransportSecretCache transportSecrets = new TransportSecretCache(() -> metadataPlane);
-
-    /**
-     * Returns this node's cache of the transport secrets its nodes present to one another.
-     *
-     * @return the transport secret cache
-     */
-    public TransportSecretCache secrets() {
-        return transportSecrets;
-    }
-
-    void ensureStarted() {
-        if (started == false) {
-            throw new IllegalStateException("node " + nodeName + " has not been started");
-        }
-    }
-
-    /**
-     * Returns the address the HTTP layer actually bound to.
-     *
-     * @return the bound HTTP address
-     */
-    public org.opensearch.core.common.transport.BoundTransportAddress boundHttpAddress() {
-        return httpServerTransport.boundAddress();
-    }
-
-    /**
-     * Returns the address the transport layer actually bound to.
-     *
-     * @return the bound transport address
-     */
-    public org.opensearch.core.common.transport.BoundTransportAddress boundTransportAddress() {
-        return transportService.boundAddress();
-    }
-
-    /**
-     * Hands this node a new node-local view. The shell is the second caller of
-     * {@link ClusterApplier#onNewClusterState}; {@code Coordinator} is the first, and is absent here.
-     *
-     * @param state the projected view for this node
-     * @param timeout how long to wait for the state to be applied
-     * @throws Exception if application fails or times out
-     */
-    public void applyLocalView(ClusterState state, TimeValueLike timeout) throws Exception {
-        views.applyLocalView(state, timeout);
-    }
-
-    // ---------------------------------------------------------------- shard fences and the local view
-
-    static String shardKey(String indexName, int shardNumber) {
-        return indexName + "#" + shardNumber;
-    }
-
-    /** Of two copies of one descriptor, the one with the newer mapping and settings. */
-    static IndexDescriptor newerOf(IndexDescriptor a, IndexDescriptor b) {
-        if (b.mappingVersion() != a.mappingVersion()) {
-            return b.mappingVersion() > a.mappingVersion() ? b : a;
-        }
-        return b.settingsVersion() >= a.settingsVersion() ? b : a;
-    }
-
-    /**
-     * Returns this node's identity as the data plane sees it.
-     *
-     * @return the local discovery node
-     */
-    public DiscoveryNode localNode() {
-        return localNode;
-    }
-
-    /**
-     * Returns the cluster service. Its state is a node-local view, not a consensus object.
-     *
-     * @return the cluster service
-     */
-    public ClusterService clusterService() {
-        return clusterService;
-    }
-
-    /**
-     * Returns the indices service.
-     *
-     * @return the indices service
-     */
-    public IndicesService indicesService() {
-        return indicesService;
-    }
-
-    /**
-     * Returns the search service.
-     *
-     * @return the search service
-     */
-    public SearchService searchService() {
-        return searchService;
-    }
-
-    /**
-     * Returns the thread pool.
-     *
-     * @return the thread pool
-     */
-    public ThreadPool threadPool() {
-        return threadPool;
-    }
-
-    /**
-     * Returns the node environment, which owns the data paths.
-     *
-     * @return the node environment
-     */
-    public NodeEnvironment nodeEnvironment() {
-        return nodeEnvironment;
-    }
-
-    /**
-     * Reports whether the node has been started.
-     *
-     * @return true once {@link NodeStartup#start()} has been called and before {@link #close()}
-     */
-    public boolean isStarted() {
-        return started;
     }
 
     @Override

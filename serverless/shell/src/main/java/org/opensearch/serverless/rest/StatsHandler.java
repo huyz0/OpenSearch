@@ -15,9 +15,10 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.Capacity;
-import org.opensearch.serverless.shell.FleetSize;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.Capacity;
+import org.opensearch.serverless.node.FleetSize;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.Fanout;
 import org.opensearch.serverless.store.MeteredBlobStore;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -63,7 +64,7 @@ import java.util.function.Supplier;
  */
 public final class StatsHandler extends BaseRestHandler {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
     /**
@@ -71,7 +72,7 @@ public final class StatsHandler extends BaseRestHandler {
      *
      * @param node supplies the node being asked about
      */
-    public StatsHandler(Supplier<ServerlessNode> node) {
+    public StatsHandler(Supplier<NodeContext> node) {
         this(node, () -> null);
     }
 
@@ -81,7 +82,7 @@ public final class StatsHandler extends BaseRestHandler {
      * @param node supplies the node being asked about
      * @param plane supplies the metadata plane, for the object store's counters and this node's lease
      */
-    public StatsHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public StatsHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -98,7 +99,7 @@ public final class StatsHandler extends BaseRestHandler {
 
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         final MetadataPlane metadata = plane.get();
         final String nodes = request.param("nodes");
         final String[] targets = nodes == null ? new String[] { serving.localNode().getId() } : nodes.split(",");
@@ -132,7 +133,7 @@ public final class StatsHandler extends BaseRestHandler {
                                 );
                             }
                         },
-                        org.opensearch.serverless.shell.ActionGate.opaque()
+                        org.opensearch.serverless.action.ActionGate.opaque()
                     );
                 channel.sendResponse(response);
             } catch (Exception e) {
@@ -165,7 +166,7 @@ public final class StatsHandler extends BaseRestHandler {
      */
     private org.opensearch.rest.RestResponse fleet(
         org.opensearch.rest.RestChannel channel,
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         String nodes
     ) throws IOException {
@@ -285,7 +286,7 @@ public final class StatsHandler extends BaseRestHandler {
     }
 
     private static Answered ask(
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         org.opensearch.serverless.membership.NodeLease lease,
         String localId
@@ -308,11 +309,16 @@ public final class StatsHandler extends BaseRestHandler {
             }
         }
         try {
-            final var peer = serving.router().peer(lease.nodeId());
+            final var peer = org.opensearch.serverless.transport.ShardRouter.of(serving).peer(lease.nodeId());
             if (peer.isEmpty()) {
                 return new Answered(lease.nodeId(), lease.name(), null, "its lease names an address this node could not reach");
             }
-            return new Answered(lease.nodeId(), lease.name(), serving.router().forwardStats(peer.get()).statistics(), null);
+            return new Answered(
+                lease.nodeId(),
+                lease.name(),
+                org.opensearch.serverless.transport.ShardRouter.of(serving).forwardStats(peer.get()).statistics(),
+                null
+            );
         } catch (Exception e) {
             return new Answered(lease.nodeId(), lease.name(), null, describeFailure(e));
         }
@@ -335,7 +341,7 @@ public final class StatsHandler extends BaseRestHandler {
      * @param metadata the metadata plane, or null when there is none
      * @throws IOException if writing fails
      */
-    public static void describe(XContentBuilder builder, ServerlessNode serving, MetadataPlane metadata) throws IOException {
+    public static void describe(XContentBuilder builder, NodeContext serving, MetadataPlane metadata) throws IOException {
         {
             builder.field("node", serving.localNode().getId());
             builder.field("name", serving.localNode().getName());
@@ -487,8 +493,8 @@ public final class StatsHandler extends BaseRestHandler {
      * Bytes this node sent to and read back from peers since it started, by whether they left its zone: the
      * traffic the clouds bill. Only cross-zone bytes are broken down by action, since those are the ones to chase.
      */
-    private static void zoneTraffic(XContentBuilder builder, ServerlessNode serving) throws IOException {
-        final var router = serving.router();
+    private static void zoneTraffic(XContentBuilder builder, NodeContext serving) throws IOException {
+        final var router = org.opensearch.serverless.transport.ShardRouter.of(serving);
         builder.startObject("zone_traffic");
         builder.field("zone", router.localZone());
         final var meter = router.zoneTraffic();
@@ -530,7 +536,7 @@ public final class StatsHandler extends BaseRestHandler {
     }
 
     /** The block cache's hit rate and what it has actually pulled from the store. */
-    private static void blockCache(XContentBuilder builder, ServerlessNode serving) throws IOException {
+    private static void blockCache(XContentBuilder builder, NodeContext serving) throws IOException {
         final var cache = serving.blockCache();
         builder.startObject("block_cache");
         builder.field("hits", cache.hits());
@@ -540,7 +546,7 @@ public final class StatsHandler extends BaseRestHandler {
     }
 
     /** What this node's writers have written to local disk, and what its memory tier for fresh segments holds. */
-    private static void localSegments(XContentBuilder builder, ServerlessNode serving) throws IOException {
+    private static void localSegments(XContentBuilder builder, NodeContext serving) throws IOException {
         final var stats = serving.localSegments().stats();
         builder.startObject("local_segments");
         builder.field("memory_enabled", serving.localSegments().enabled());
@@ -560,7 +566,7 @@ public final class StatsHandler extends BaseRestHandler {
     }
 
     /** What the three drivers have done, when a scheduler is driving this node. */
-    private static void scheduler(XContentBuilder builder, ServerlessNode serving) throws IOException {
+    private static void scheduler(XContentBuilder builder, NodeContext serving) throws IOException {
         if (serving.signals() instanceof org.opensearch.serverless.reconcile.ReconcileScheduler scheduler) {
             final var counts = scheduler.counts();
             builder.startObject("scheduler");
@@ -604,7 +610,7 @@ public final class StatsHandler extends BaseRestHandler {
      * <p>The number an operator needs before shards vanish: a lease that is about to lapse under a healthy
      * node is a renewal that is taking too long, and it is invisible until the peers start stealing.
      */
-    private static void lease(XContentBuilder builder, ServerlessNode serving, MetadataPlane metadata) throws IOException {
+    private static void lease(XContentBuilder builder, NodeContext serving, MetadataPlane metadata) throws IOException {
         if (metadata == null) {
             return;
         }
@@ -628,7 +634,7 @@ public final class StatsHandler extends BaseRestHandler {
      * and when it was last asked for anything. The per-node list the fleet-wide view deliberately does
      * not offer, and it is cheap because it is read from memory.
      */
-    private static void heldShards(XContentBuilder builder, ServerlessNode serving, Set<ShardId> readers, Set<ShardId> frozen)
+    private static void heldShards(XContentBuilder builder, NodeContext serving, Set<ShardId> readers, Set<ShardId> frozen)
         throws IOException {
         final List<ShardId> held = new ArrayList<>(serving.reconciler().heldShards());
         held.sort(Comparator.comparing(ShardId::getIndexName).thenComparing(s -> s.getIndex().getUUID()).thenComparingInt(ShardId::id));

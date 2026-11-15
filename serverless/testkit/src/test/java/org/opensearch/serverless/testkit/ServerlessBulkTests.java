@@ -143,7 +143,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
             final java.util.Set<Integer> touched = new java.util.HashSet<>();
             for (int i = 0; i < documents; i++) {
                 body.append(indexLine(String.valueOf(i), i));
-                touched.add(org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor, String.valueOf(i)));
+                touched.add(org.opensearch.serverless.ops.DocumentRouting.shardFor(descriptor, String.valueOf(i)));
             }
             // Sixty ids over three shards will hit all three, but asserting against a computed set rather
             // than against 3 keeps the test honest if the hash ever changes.
@@ -466,7 +466,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
             final java.util.Set<Integer> touched = new java.util.HashSet<>();
             for (int i = 0; i < documents; i++) {
                 body.append(indexLine("f" + i, i));
-                touched.add(org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor, "f" + i));
+                touched.add(org.opensearch.serverless.ops.DocumentRouting.shardFor(descriptor, "f" + i));
             }
             assertEquals("the fixture must span both shards, or nothing is forwarded", 2, touched.size());
 
@@ -517,7 +517,7 @@ public class ServerlessBulkTests extends OpenSearchTestCase {
     }
 
     private static int shardOf(IndexDescriptor descriptor, String id) {
-        return org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor, id);
+        return org.opensearch.serverless.ops.DocumentRouting.shardFor(descriptor, id);
     }
 
     /** Finds ids that route to one particular shard, so a batch can be aimed at a chosen node. */

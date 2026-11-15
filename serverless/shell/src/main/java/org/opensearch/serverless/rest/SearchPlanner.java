@@ -12,7 +12,12 @@ import org.opensearch.rest.RestRequest;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.DocumentRouting;
+import org.opensearch.serverless.ops.SearchFanout;
+import org.opensearch.serverless.ops.SearchGate;
+import org.opensearch.serverless.ops.SearchRendering;
+import org.opensearch.serverless.ops.SearchRules;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -28,10 +33,10 @@ final class SearchPlanner {
     /** The handler's own logger, so moving the planning here changes no logger name. */
     private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(SearchHandler.class);
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
-    SearchPlanner(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    SearchPlanner(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -58,7 +63,7 @@ final class SearchPlanner {
         boolean counting
     ) throws IOException {
         final MetadataPlane metadata = plane.get();
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         // Parameters core parsed into the request rather than into the source, each answered on its own
         // terms. Three change what the answer would be, and are refused. The rest are hints a classic
         // coordinator may already decline to follow -- which replica, whether to cache, how many shards
@@ -147,9 +152,9 @@ final class SearchPlanner {
         // source is the one every shard must be asked with.
         final SearchSourceBuilder source = pipelined == null ? parsedSource : pipelined.source();
 
-        SearchHandler.applyDefaults(source, counting);
+        SearchRules.applyDefaults(source, counting);
 
-        final String unsupported = SearchHandler.whatCannotBeMerged(source);
+        final String unsupported = SearchRules.whatCannotBeMerged(source);
         if (unsupported != null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_search", unsupported)
@@ -293,7 +298,7 @@ final class SearchPlanner {
         final long nowMillis = System.currentTimeMillis();
         // Filters can replace or broaden the query. Pruning on the original query before they run
         // would silently remove indices the admitted query needs, so defer query-dependent pruning.
-        final SearchHandler.Resolution resolved = SearchHandler.resolveIndices(
+        final IndexResolution resolved = SearchIndexResolver.resolveIndices(
             metadata,
             serving,
             index,
@@ -380,7 +385,7 @@ final class SearchPlanner {
 
     void respondFrozen(
         org.opensearch.rest.RestChannel channel,
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         org.opensearch.serverless.metadata.PointInTime pit,
         SearchSourceBuilder source,
@@ -392,7 +397,7 @@ final class SearchPlanner {
         final long startNanos = System.nanoTime();
         final org.opensearch.serverless.shard.SearchOutcome outcome;
         try {
-            outcome = SearchHandler.gated(
+            outcome = SearchGate.gated(
                 serving,
                 java.util.List.of(pit.index()),
                 source,
@@ -430,7 +435,7 @@ final class SearchPlanner {
 
     void respond(
         org.opensearch.rest.RestChannel channel,
-        ServerlessNode serving,
+        NodeContext serving,
         MetadataPlane metadata,
         java.util.Map<String, IndexDescriptor> indices,
         java.util.List<String> skipped,
@@ -444,7 +449,7 @@ final class SearchPlanner {
         final long startNanos = System.nanoTime();
         // Filtered here for the same reason DocumentHandler is: this handler formats over the shared
         // fan-out rather than going through ShardOperations, so the gate has to meet it where it works.
-        final var outcome = SearchHandler.gated(
+        final var outcome = SearchGate.gated(
             serving,
             indices.keySet(),
             source,

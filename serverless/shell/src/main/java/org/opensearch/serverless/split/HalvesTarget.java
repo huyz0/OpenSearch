@@ -8,12 +8,12 @@
 package org.opensearch.serverless.split;
 
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.serverless.node.NodeWritePath;
 import org.opensearch.serverless.routing.UnitLayout;
-import org.opensearch.serverless.shell.BulkOperation;
-import org.opensearch.serverless.shell.BulkOutcome;
-import org.opensearch.serverless.shell.NodeWritePath;
-import org.opensearch.serverless.shell.WriteHold;
-import org.opensearch.serverless.shell.WriteOutcome;
+import org.opensearch.serverless.write.BulkOperation;
+import org.opensearch.serverless.write.BulkOutcome;
+import org.opensearch.serverless.write.WriteHold;
+import org.opensearch.serverless.write.WriteOutcome;
 
 import java.io.IOException;
 import java.util.ArrayList;

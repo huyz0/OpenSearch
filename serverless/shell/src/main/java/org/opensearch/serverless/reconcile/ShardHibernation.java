@@ -8,7 +8,7 @@
 package org.opensearch.serverless.reconcile;
 
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.serverless.shell.WriterHibernation;
+import org.opensearch.serverless.node.WriterHibernation;
 
 import java.util.Map;
 import java.util.Optional;

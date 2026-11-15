@@ -20,13 +20,16 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.search.fetch.subphase.FetchSourceContext;
+import org.opensearch.serverless.action.ActionGate;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.DocumentRouting;
+import org.opensearch.serverless.ops.Fanout;
+import org.opensearch.serverless.ops.ResponseMemory;
+import org.opensearch.serverless.ops.ShardOperations;
 import org.opensearch.serverless.shard.NoSuchIndexException;
 import org.opensearch.serverless.shard.NotHereException;
-import org.opensearch.serverless.shard.ShardOperations;
 import org.opensearch.serverless.shard.SystemIndexException;
-import org.opensearch.serverless.shell.ActionGate;
-import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -38,7 +41,7 @@ import java.util.function.Supplier;
 
 /** Multi-get with native parsing, admitted request execution and native response filtering. */
 public final class MultiGetHandler extends BaseRestHandler {
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
     /**
@@ -46,7 +49,7 @@ public final class MultiGetHandler extends BaseRestHandler {
      * @param node the serving node
      * @param plane the metadata plane
      */
-    public MultiGetHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public MultiGetHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -109,7 +112,7 @@ public final class MultiGetHandler extends BaseRestHandler {
             );
         }
         final MetadataPlane metadata = plane.get();
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
@@ -143,7 +146,7 @@ public final class MultiGetHandler extends BaseRestHandler {
         });
     }
 
-    private static MultiGetResponse fetch(ServerlessNode serving, MetadataPlane metadata, MultiGetRequest request, ResponseBudget budget)
+    private static MultiGetResponse fetch(NodeContext serving, MetadataPlane metadata, MultiGetRequest request, ResponseBudget budget)
         throws Exception {
         final var validation = request.validate();
         if (validation != null) {

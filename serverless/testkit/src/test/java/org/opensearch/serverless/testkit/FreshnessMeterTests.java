@@ -45,7 +45,7 @@ import java.util.concurrent.TimeUnit;
     S3ClientThreads.class })
 public class FreshnessMeterTests extends OpenSearchTestCase {
 
-    private static final long TTL = ServerlessBootstrap.DEFAULT_LEASE_TTL_MILLIS;
+    private static final long TTL = org.opensearch.serverless.node.NodeSettings.DEFAULT_LEASE_TTL_MILLIS;
     private static final long WINDOW = 250;
     private static final long REQUEST_MILLIS = 20;
     private static final int TAIL_EVERY = 50;
@@ -74,8 +74,8 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
     /** Starts a node's background loop and scheduler with the intervals and spacing a bootstrapped node uses. */
     private static ReconcileScheduler scheduled(ServerlessNode node, MetadataPlane plane, BackgroundReconciler loop) {
         loop.setLazyPublish(
-            ServerlessBootstrap.DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS,
-            ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS,
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS,
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS,
             WINDOW
         );
         final ReconcileScheduler scheduler = new ReconcileScheduler(
@@ -87,8 +87,8 @@ public class FreshnessMeterTests extends OpenSearchTestCase {
             ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
         );
         scheduler.setPublishSpacing(
-            ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL,
-            ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MIN_INTERVAL,
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS
         );
         node.setSignals(scheduler);
         return scheduler.start();

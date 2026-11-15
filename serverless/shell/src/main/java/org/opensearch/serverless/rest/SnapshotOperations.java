@@ -24,7 +24,7 @@ import org.opensearch.serverless.metadata.RepositoryDescriptor;
 import org.opensearch.serverless.metadata.RepositoryMissingException;
 import org.opensearch.serverless.metadata.SnapshotAlreadyExistsException;
 import org.opensearch.serverless.metadata.SnapshotRecord;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.SegmentPublisher;
 
@@ -139,7 +139,7 @@ final class SnapshotOperations {
         final boolean shallow = repoDescriptor.get().shallowByDefault();
         final long startTime = metadata.clock().getAsLong();
         final BlobStore blobStore = metadata.blobStore();
-        final ServerlessNode serving = handler.node.get();
+        final NodeContext serving = handler.node.get();
 
         // Every index described first: what the provisional record needs, and where a name is refused
         // before anything has been written.
@@ -431,7 +431,7 @@ final class SnapshotOperations {
         if (MetadataPlane.inProgress(record)) {
             throw new SnapshotHandler.SnapshotInProgressException(repo, snapshot);
         }
-        final ServerlessNode serving = handler.node.get();
+        final NodeContext serving = handler.node.get();
 
         final List<String> requested = body.containsKey("indices")
             ? SnapshotRequestBodies.readIndices(body.get("indices"))

@@ -13,12 +13,12 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.index.shard.IndexShard;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.node.NodeLogWriter;
 import org.opensearch.serverless.routing.UnitLayout;
-import org.opensearch.serverless.shell.NodeLogWriter;
-import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.shell.WriteHold;
 import org.opensearch.serverless.store.NodeLogCommitter;
 import org.opensearch.serverless.store.WalRecord;
+import org.opensearch.serverless.write.WriteHold;
 
 import java.io.IOException;
 import java.nio.file.Path;
@@ -76,7 +76,7 @@ public final class UnitSplitMover {
     public record Moved(IndexDescriptor after, UnitSplitBuilder.Built built, int leftTail, int rightTail, long heldMillis) {
     }
 
-    private final ServerlessNode node;
+    private final NodeContext node;
     private final MetadataPlane plane;
     private long holdMillis = DEFAULT_HOLD_MILLIS;
     private long pinMillis = DEFAULT_PIN_MILLIS;
@@ -88,7 +88,7 @@ public final class UnitSplitMover {
      * @param node the node that holds the units it splits
      * @param plane the metadata plane
      */
-    public UnitSplitMover(ServerlessNode node, MetadataPlane plane) {
+    public UnitSplitMover(NodeContext node, MetadataPlane plane) {
         this.node = node;
         this.plane = plane;
     }

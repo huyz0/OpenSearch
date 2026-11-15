@@ -62,11 +62,11 @@ public final class AliasHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the node, for its action gate and system-index list
      */
-    public AliasHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public AliasHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this(plane, node, false);
     }
 
-    private AliasHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node, boolean forPlugins) {
+    private AliasHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node, boolean forPlugins) {
         this.plane = plane;
         this.node = node;
         this.forPlugins = forPlugins;
@@ -83,13 +83,13 @@ public final class AliasHandler extends BaseRestHandler {
      * @param node supplies the node
      * @return the handler
      */
-    public static AliasHandler forPlugins(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public static AliasHandler forPlugins(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         return new AliasHandler(plane, node, true);
     }
 
     private final boolean forPlugins;
 
-    final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    final Supplier<org.opensearch.serverless.node.NodeContext> node;
     /** Applies the alias changes this handler parsed. */
     final AliasUpdates updates = new AliasUpdates(this);
 
@@ -126,7 +126,7 @@ public final class AliasHandler extends BaseRestHandler {
                     };
                 final var response = serving == null
                     ? capture.apply(request)
-                    : serving.services().actionGate().run(action, request, capture, org.opensearch.serverless.shell.ActionGate.opaque());
+                    : serving.services().actionGate().run(action, request, capture, org.opensearch.serverless.action.ActionGate.opaque());
                 if (response == null) {
                     throw new UnsupportedOperationException("a cached alias action response is not supported");
                 }

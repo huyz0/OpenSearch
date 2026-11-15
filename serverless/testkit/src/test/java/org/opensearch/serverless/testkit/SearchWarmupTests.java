@@ -15,10 +15,10 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.SearchReadiness;
-import org.opensearch.serverless.shell.SearchWarmup;
+import org.opensearch.serverless.node.SearchReadiness;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.transport.CacheWarmCopy;
+import org.opensearch.serverless.warm.SearchWarmup;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.List;
@@ -46,7 +46,7 @@ public class SearchWarmupTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", roles)
             .put("serverless.block_cache.block_size", 4096)
-            .put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), warmOnJoin)
+            .put(org.opensearch.serverless.node.SearchSettings.WARM_ON_JOIN.getKey(), warmOnJoin)
             .build();
     }
 

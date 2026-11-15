@@ -14,9 +14,9 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.FleetSize;
+import org.opensearch.serverless.node.NodeCapacity;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
-import org.opensearch.serverless.shell.FleetSize;
-import org.opensearch.serverless.shell.NodeCapacity;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 

@@ -191,7 +191,7 @@ public class ServerlessQueryTests extends OpenSearchTestCase {
         final List<String> found = new ArrayList<>();
         for (int i = 0; found.size() < howMany; i++) {
             final String candidate = "aimed-" + i;
-            if (org.opensearch.serverless.rest.DocumentRouting.shardFor(descriptor, candidate) == shard) {
+            if (org.opensearch.serverless.ops.DocumentRouting.shardFor(descriptor, candidate) == shard) {
                 found.add(candidate);
             }
         }

@@ -23,7 +23,8 @@ import org.opensearch.serverless.cluster.AliasRecord;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.DescriptorResolution;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.SearchFanout;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -54,7 +55,7 @@ public final class RolloverHandler extends BaseRestHandler {
 
     private static final java.util.Set<String> BODY_FIELDS = java.util.Set.of("conditions", "settings", "mappings", "aliases");
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
 
     /**
@@ -63,7 +64,7 @@ public final class RolloverHandler extends BaseRestHandler {
      * @param node supplies the node
      * @param plane supplies the metadata plane
      */
-    public RolloverHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public RolloverHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
     }
@@ -95,7 +96,7 @@ public final class RolloverHandler extends BaseRestHandler {
             request.param(hint);
         }
         final MetadataPlane metadata = plane.get();
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
@@ -130,7 +131,7 @@ public final class RolloverHandler extends BaseRestHandler {
                         RolloverAction.NAME,
                         nativeRequest,
                         admitted -> rollover(serving, metadata, admittedAsk((RolloverRequest) admitted)),
-                        org.opensearch.serverless.shell.ActionGate.identity(RolloverResponse.class)
+                        org.opensearch.serverless.action.ActionGate.identity(RolloverResponse.class)
                     );
                 try (XContentBuilder builder = channel.newBuilder()) {
                     response.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
@@ -204,7 +205,7 @@ public final class RolloverHandler extends BaseRestHandler {
         );
     }
 
-    private RolloverResponse rollover(ServerlessNode serving, MetadataPlane metadata, Ask ask) throws Exception {
+    private RolloverResponse rollover(NodeContext serving, MetadataPlane metadata, Ask ask) throws Exception {
         final DescriptorResolution resolved = metadata.resolveForAliasMutation(ask.target());
         if (resolved.alias() == null) {
             throw new IndexAdminHandler.RefusedException(

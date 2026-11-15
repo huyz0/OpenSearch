@@ -13,10 +13,9 @@ import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.WriteFences;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
-import org.opensearch.serverless.shell.ServerlessBootstrap;
 import org.opensearch.serverless.shell.ServerlessNode;
-import org.opensearch.serverless.shell.WriteFences;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.net.URI;
@@ -80,7 +79,7 @@ public class ServerlessDescriptorPropagationTests extends OpenSearchTestCase {
         final ServerlessNode node = new ServerlessNode(nodeSettings(name));
         node.startup().start();
         node.setMetadataPlane(plane);
-        node.setDescriptorRefreshIntervalMillis(ServerlessBootstrap.DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS);
+        node.setDescriptorRefreshIntervalMillis(org.opensearch.serverless.node.NodeSettings.DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS);
         return node;
     }
 

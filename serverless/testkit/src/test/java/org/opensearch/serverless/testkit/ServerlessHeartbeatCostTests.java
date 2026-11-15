@@ -17,9 +17,9 @@ import org.opensearch.serverless.membership.BlobLeaseMembership;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.ShardHead;
+import org.opensearch.serverless.node.NodeLeases;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.TickResult;
-import org.opensearch.serverless.shell.NodeLeases;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 

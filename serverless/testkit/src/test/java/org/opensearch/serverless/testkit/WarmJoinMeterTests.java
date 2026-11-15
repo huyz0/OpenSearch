@@ -16,9 +16,9 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.cluster.ReaderPlacement;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.SearchDrain;
-import org.opensearch.serverless.shell.SearchWarmup;
 import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.warm.SearchDrain;
+import org.opensearch.serverless.warm.SearchWarmup;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
@@ -50,8 +50,8 @@ public class WarmJoinMeterTests extends OpenSearchTestCase {
             .put("transport.port", "0")
             .put("serverless.roles", roles)
             .put("serverless.block_cache.block_size", 16 * 1024)
-            .put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), warm)
-            .put(org.opensearch.serverless.shell.SearchSettings.DRAIN_SETTLE.getKey(), "0ms")
+            .put(org.opensearch.serverless.node.SearchSettings.WARM_ON_JOIN.getKey(), warm)
+            .put(org.opensearch.serverless.node.SearchSettings.DRAIN_SETTLE.getKey(), "0ms")
             .build();
     }
 

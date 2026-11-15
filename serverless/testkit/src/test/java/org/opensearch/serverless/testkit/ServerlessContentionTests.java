@@ -47,11 +47,11 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
      * A publish is staged in the node log and reaches the register only at a checkpoint, a minute by default. The zombie
      * test checkpoints every two seconds, so both the successor's publishes and the zombie's stale one reach it in time.
      */
-    private static final String CHECKPOINT = org.opensearch.serverless.shell.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey();
-    private static final String MIN_INTERVAL = org.opensearch.serverless.shell.WriteSettings.PUBLISH_MIN_INTERVAL_MILLIS.getKey();
+    private static final String CHECKPOINT = org.opensearch.serverless.node.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey();
+    private static final String MIN_INTERVAL = org.opensearch.serverless.node.WriteSettings.PUBLISH_MIN_INTERVAL_MILLIS.getKey();
 
     private Map<String, String> settings() {
-        return Map.of(org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(), TTL);
+        return Map.of(org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(), TTL);
     }
 
     /**
@@ -322,9 +322,9 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
                 store,
                 createTempDir(),
                 Map.of(
-                    org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(),
+                    org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(),
                     TTL,
-                    org.opensearch.serverless.shell.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(),
+                    org.opensearch.serverless.node.WriteSettings.PUBLISH_DEBOUNCE_MILLIS.getKey(),
                     "10000",
                     PACKS,
                     "false",
@@ -339,7 +339,7 @@ public class ServerlessContentionTests extends OpenSearchTestCase {
                 store,
                 createTempDir(),
                 Map.of(
-                    org.opensearch.serverless.shell.NodeSettings.LEASE_TTL_MILLIS.getKey(),
+                    org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(),
                     TTL,
                     PACKS,
                     "false",

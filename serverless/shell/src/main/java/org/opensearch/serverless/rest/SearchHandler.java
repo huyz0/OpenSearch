@@ -14,9 +14,10 @@ import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.search.builder.SearchSourceBuilder;
-import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.ops.SearchGate;
+import org.opensearch.serverless.ops.SearchRendering;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
 
@@ -40,7 +41,7 @@ import java.util.function.Supplier;
  */
 public final class SearchHandler extends BaseRestHandler {
 
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
     private final SearchPlanner planner;
 
@@ -50,7 +51,7 @@ public final class SearchHandler extends BaseRestHandler {
      * @param node supplies the node serving the request
      * @param plane supplies the metadata plane
      */
-    public SearchHandler(Supplier<ServerlessNode> node, Supplier<MetadataPlane> plane) {
+    public SearchHandler(Supplier<NodeContext> node, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.plane = plane;
         this.planner = new SearchPlanner(node, plane);
@@ -99,53 +100,6 @@ public final class SearchHandler extends BaseRestHandler {
         return RESPONSE_PARAMS;
     }
 
-    /**
-     * What resolving the names in a request produced: the indices to fan out over, or the refusal.
-     *
-     * @param indices each index and its shard count, in request order
-     * @param skipped names {@code ignore_unavailable} dropped, so the answer can say so
-     * @param status the refusal's status, or null when the names resolved
-     * @param type the refusal's error type, or null
-     * @param reason the refusal's reason, or null
-     * @param prunedShards shards of pattern matches the digest rollups ruled out, which are not in {@code indices}
-     * @param judged indices the rollups already found may match, which the fan-out need not check shard by shard
-     */
-    public record Resolution(java.util.LinkedHashMap<String, IndexDescriptor> indices, java.util.List<String> skipped, RestStatus status,
-        String type, String reason, int prunedShards, java.util.Set<String> judged) {
-
-        /**
-         * A resolution with nothing ruled out by the rollups.
-         *
-         * @param indices each index and its shard count, in request order
-         * @param skipped names {@code ignore_unavailable} dropped
-         * @param status the refusal's status, or null
-         * @param type the refusal's error type, or null
-         * @param reason the refusal's reason, or null
-         */
-        public Resolution(
-            java.util.LinkedHashMap<String, IndexDescriptor> indices,
-            java.util.List<String> skipped,
-            RestStatus status,
-            String type,
-            String reason
-        ) {
-            this(indices, skipped, status, type, reason, 0, java.util.Set.of());
-        }
-
-        static Resolution refuse(RestStatus status, String type, String reason) {
-            return new Resolution(null, null, status, type, reason);
-        }
-
-        /**
-         * Reports whether the names could not be resolved.
-         *
-         * @return true when this carries a refusal rather than indices
-         */
-        public boolean refused() {
-            return status != null;
-        }
-    }
-
     @Override
     protected RestChannelConsumer prepareRequest(RestRequest request, NodeClient client) throws IOException {
         final boolean counting = request.path().endsWith("/_count");
@@ -160,7 +114,7 @@ public final class SearchHandler extends BaseRestHandler {
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
 
         // Core's own request parser, for the same reason q= uses core's own query-string parser: it is
         // what these parameters mean in OpenSearch. This handler used to read six of them by hand and let
@@ -252,33 +206,6 @@ public final class SearchHandler extends BaseRestHandler {
     }
 
     /**
-     * The defaults a request gets where its body did not speak.
-     *
-     * <p>Shared with {@code _msearch}, so a search inside a batch is the same search it would be on its
-     * own. {@code track_total_hits} is left exactly as the caller set it -- this used to force it on after
-     * parsing, so a caller asking for a cheaper count got the expensive one and was told {@code eq}.
-     *
-     * @param source the parsed search
-     * @param counting whether this is a {@code _count}, which fetches nothing and counts everything
-     */
-    public static void applyDefaults(SearchSourceBuilder source, boolean counting) {
-        if (counting) {
-            // A count asks how many, not which. Fetching hits to throw them away would make the cheap
-            // question cost the same as the expensive one, and a count is exact by definition.
-            source.size(0);
-            source.from(0);
-            source.trackTotalHits(true);
-            return;
-        }
-        if (source.size() < 0) {
-            source.size(10);
-        }
-        if (source.from() < 0) {
-            source.from(0);
-        }
-    }
-
-    /**
      * Turns the names in a request into the indices to fan out over.
      *
      * <p>Extracted from the request path so {@code _msearch} resolves a line the way {@code _search}
@@ -307,7 +234,7 @@ public final class SearchHandler extends BaseRestHandler {
      * @return the indices and their shard counts, or the refusal
      * @throws IOException if a register cannot be read
      */
-    public static Resolution resolveIndices(MetadataPlane metadata, ServerlessNode serving, String index, boolean ignoreUnavailable)
+    public static IndexResolution resolveIndices(MetadataPlane metadata, NodeContext serving, String index, boolean ignoreUnavailable)
         throws IOException {
         return SearchIndexResolver.resolveIndices(metadata, serving, index, ignoreUnavailable);
     }
@@ -327,9 +254,9 @@ public final class SearchHandler extends BaseRestHandler {
      * @return the indices and their shard counts, or the refusal
      * @throws IOException if a register cannot be read
      */
-    public static Resolution resolveIndices(
+    public static IndexResolution resolveIndices(
         MetadataPlane metadata,
-        ServerlessNode serving,
+        NodeContext serving,
         String index,
         boolean ignoreUnavailable,
         boolean throughRequestPath
@@ -357,9 +284,9 @@ public final class SearchHandler extends BaseRestHandler {
      * @return the indices and their shard counts, or the refusal
      * @throws IOException if a register cannot be read
      */
-    public static Resolution resolveIndices(
+    public static IndexResolution resolveIndices(
         MetadataPlane metadata,
-        ServerlessNode serving,
+        NodeContext serving,
         String index,
         boolean ignoreUnavailable,
         boolean throughRequestPath,
@@ -367,65 +294,6 @@ public final class SearchHandler extends BaseRestHandler {
         long nowMillis
     ) throws IOException {
         return SearchIndexResolver.resolveIndices(metadata, serving, index, ignoreUnavailable, throughRequestPath, source, nowMillis);
-    }
-
-    /**
-     * Names the part of a search this cannot answer correctly across shards, or null if it can.
-     *
-     * <p><b>Refused rather than ignored, and the distinction is the whole of the allowlist rule.</b> Every feature below
-     * parses happily and runs happily on a single shard; what none of them survives is being run on
-     * several shards and having the answers concatenated. An aggregation needs a reduce step this does
-     * not have — returning one shard's buckets as if they were the index's would be a number that is
-     * wrong and looks right, which is the worst thing this system could hand anybody. A sort needs the
-     * merge to compare sort values rather than scores. {@code search_after} and {@code collapse} need
-     * coordination across shards that does not exist here.
-     *
-     * <p>Cheap to lift later, one at a time, and each will need its own merge and its own test. Until
-     * then the honest answer to "can you do this" is no.
-     *
-     * @param source the parsed search
-     * @return why it cannot be served, or null
-     */
-    public static String whatCannotBeMerged(SearchSourceBuilder source) {
-        if (source.searchAfter() != null) {
-            // The two things that make a cursor a cursor. Without a sort there is no order for "after" to
-            // be after, and OpenSearch's own answer to search_after with from is the same refusal: the
-            // cursor is the offset, and having both is a request that means two different things at once.
-            if (source.sorts() == null || source.sorts().isEmpty()) {
-                return "search_after needs a sort: without one there is no order for a cursor to be a position in";
-            }
-            if (source.from() > 0) {
-                return "search_after and from cannot both be given: the cursor is the offset";
-            }
-            if (source.searchAfter().length != source.sorts().size()) {
-                return "search_after must carry one value per sort key, and this carries "
-                    + source.searchAfter().length
-                    + " for "
-                    + source.sorts().size();
-            }
-        }
-        if (source.collapse() != null) {
-            return "collapse is not supported: it would have to be applied across shards, not within one";
-        }
-        if (source.suggest() != null) {
-            return "suggest is not supported";
-        }
-        if (source.profile()) {
-            return "profile is not supported";
-        }
-        if (source.slice() != null) {
-            // Refused here rather than left to fail on the shard, where Lucene's own message -- "slice
-            // cannot be used outside of a scroll context or PIT context" -- names two things this surface
-            // does not have in the terms core has them.
-            return "slice is not supported: a sliced search partitions one scroll or point-in-time context, and a "
-                + "search here runs over each shard's own reader rather than over a context it could partition";
-        }
-        if (source.indexBoosts() != null && source.indexBoosts().isEmpty() == false) {
-            // The per-index boost is fixed at 1.0 where each shard's request is built, so accepting one
-            // would rank a multi-index search as if it had not been given.
-            return "indices_boost is not supported: every shard is queried at the same boost";
-        }
-        return null;
     }
 
     /**
@@ -450,7 +318,7 @@ public final class SearchHandler extends BaseRestHandler {
      *     through carrying the plugin's status
      */
     public static <T> T gated(
-        ServerlessNode serving,
+        NodeContext serving,
         java.util.Collection<String> indices,
         SearchSourceBuilder source,
         org.opensearch.common.CheckedFunction<SearchSourceBuilder, T, Exception> work
@@ -471,7 +339,7 @@ public final class SearchHandler extends BaseRestHandler {
      * @throws IOException if the search fails
      */
     public static <T> T gated(
-        ServerlessNode serving,
+        NodeContext serving,
         org.opensearch.action.search.SearchRequest nativeRequest,
         java.util.Collection<String> indices,
         SearchSourceBuilder source,
@@ -493,7 +361,7 @@ public final class SearchHandler extends BaseRestHandler {
      * @throws IOException if the search fails
      */
     public static <T> T gated(
-        ServerlessNode serving,
+        NodeContext serving,
         java.util.Collection<String> indices,
         SearchSourceBuilder source,
         Boolean partialResults,
@@ -515,7 +383,7 @@ public final class SearchHandler extends BaseRestHandler {
      * @throws IOException if the search fails
      */
     public static <T> T gatedRequest(
-        ServerlessNode serving,
+        NodeContext serving,
         org.opensearch.action.search.SearchRequest nativeRequest,
         java.util.Collection<String> indices,
         SearchSourceBuilder source,
@@ -525,7 +393,7 @@ public final class SearchHandler extends BaseRestHandler {
     }
 
     static <T> T gated(
-        ServerlessNode serving,
+        NodeContext serving,
         org.opensearch.action.search.SearchRequest nativeRequest,
         java.util.Collection<String> indices,
         SearchSourceBuilder source,
@@ -562,6 +430,26 @@ public final class SearchHandler extends BaseRestHandler {
         String pitId
     ) {
         return SearchRendering.toResponse(outcome, source, tookMillis, pitId);
+    }
+
+    /**
+     * The defaults a request gets where its body did not speak; see {@link org.opensearch.serverless.ops.SearchRules#applyDefaults}.
+     *
+     * @param source the parsed search
+     * @param counting whether this is a {@code _count}
+     */
+    public static void applyDefaults(SearchSourceBuilder source, boolean counting) {
+        org.opensearch.serverless.ops.SearchRules.applyDefaults(source, counting);
+    }
+
+    /**
+     * Names the part of a search this cannot answer correctly across shards, or null if it can.
+     *
+     * @param source the parsed search
+     * @return why it cannot be served, or null
+     */
+    public static String whatCannotBeMerged(SearchSourceBuilder source) {
+        return org.opensearch.serverless.ops.SearchRules.whatCannotBeMerged(source);
     }
 
 }

@@ -15,8 +15,9 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.common.transport.TransportAddress;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.NodeComponents;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeComponents;
+import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.write.NotShardOwnerException;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.TransportRequestOptions;
 import org.opensearch.transport.TransportResponseHandler;
@@ -58,7 +59,7 @@ public final class ShardRouter {
      */
     private static final TimeValue SEARCH_FORWARD_TIMEOUT = TimeValue.timeValueSeconds(30);
 
-    final ServerlessNode node;
+    final NodeContext node;
     final TransportService transportService;
     final Supplier<MetadataPlane> plane;
     final TransportAuthenticator authenticator;
@@ -71,7 +72,36 @@ public final class ShardRouter {
     private final TailOverlays tailOverlays;
     private final RefreshVisibility refreshVisibility;
     private final boolean compressCrossZone;
+    private final RouterReaderPush readerPush = new RouterReaderPush(this);
+    /** Writes this node's stats document for a forwarded stats request; set by the layer that defines the document. */
+    volatile StatsDocument statsDocument;
     private final String localZone;
+
+    /** Writes this node's stats, into an object already started, for a forwarded stats request. */
+    @FunctionalInterface
+    public interface StatsDocument {
+        /**
+         * @param builder the builder
+         * @param plane the node's plane
+         * @throws java.io.IOException if it cannot be written
+         */
+        void describe(org.opensearch.core.xcontent.XContentBuilder builder, MetadataPlane plane) throws java.io.IOException;
+    }
+
+    /** @param node a node @return the router attached to it, or null before its transport has bound */
+    public static ShardRouter of(NodeContext node) {
+        return node.part(ShardRouter.class);
+    }
+
+    /** @return what the node's lower layers push through this router */
+    public org.opensearch.serverless.node.ReaderPush readerPush() {
+        return readerPush;
+    }
+
+    /** @param document how a forwarded stats request is answered */
+    public void statsDocument(StatsDocument document) {
+        this.statsDocument = document;
+    }
 
     /**
      * Creates a router for one node.
@@ -80,7 +110,7 @@ public final class ShardRouter {
      * @param transportService its transport service
      * @param plane supplies the metadata plane
      */
-    public ShardRouter(ServerlessNode node, TransportService transportService, Supplier<MetadataPlane> plane) {
+    public ShardRouter(NodeContext node, TransportService transportService, Supplier<MetadataPlane> plane) {
         this.node = node;
         this.transportService = transportService;
         this.plane = plane;
@@ -191,37 +221,37 @@ public final class ShardRouter {
         transportService.registerRequestHandler(
             ForwardedIndexRequest.ACTION,
             // Not WRITE: see FORWARDED_WRITE_POOL for the deadlock that was.
-            org.opensearch.serverless.shell.NodeThreadPools.FORWARDED_WRITE_POOL,
+            org.opensearch.serverless.node.NodeThreadPools.FORWARDED_WRITE_POOL,
             ForwardedIndexRequest::new,
             handlers::handleIndex
         );
         transportService.registerRequestHandler(
             ForwardedBulkRequest.ACTION,
-            org.opensearch.serverless.shell.NodeThreadPools.FORWARDED_WRITE_POOL,
+            org.opensearch.serverless.node.NodeThreadPools.FORWARDED_WRITE_POOL,
             ForwardedBulkRequest::new,
             handlers::handleBulk
         );
         transportService.registerRequestHandler(
             ForwardedGetRequest.ACTION,
-            org.opensearch.serverless.shell.NodeThreadPools.FORWARDED_READ_POOL,
+            org.opensearch.serverless.node.NodeThreadPools.FORWARDED_READ_POOL,
             ForwardedGetRequest::new,
             handlers::handleGet
         );
         transportService.registerRequestHandler(
             ForwardedSearchRequest.ACTION,
-            org.opensearch.serverless.shell.NodeThreadPools.FANOUT_POOL,
+            org.opensearch.serverless.node.NodeThreadPools.FANOUT_POOL,
             ForwardedSearchRequest::new,
             handlers::handleSearch
         );
         transportService.registerRequestHandler(
             ForwardedExplainRequest.ACTION,
-            org.opensearch.serverless.shell.NodeThreadPools.FANOUT_POOL,
+            org.opensearch.serverless.node.NodeThreadPools.FANOUT_POOL,
             ForwardedExplainRequest::new,
             handlers::handleExplain
         );
         transportService.registerRequestHandler(
             ForwardedFrozenSearchRequest.ACTION,
-            org.opensearch.serverless.shell.NodeThreadPools.FANOUT_POOL,
+            org.opensearch.serverless.node.NodeThreadPools.FANOUT_POOL,
             ForwardedFrozenSearchRequest::new,
             handlers::handleFrozenSearch
         );

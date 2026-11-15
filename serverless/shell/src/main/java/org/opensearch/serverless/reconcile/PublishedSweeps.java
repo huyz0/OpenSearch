@@ -71,7 +71,9 @@ final class PublishedSweeps {
                     // the next pass finds the commit still superseded and tries again.
                     continue;
                 }
-                final var looks = reconciler.node.router() == null ? null : reconciler.node.router().commitPush().registerLooks();
+                final var looks = org.opensearch.serverless.transport.ShardRouter.of(reconciler.node) == null
+                    ? null
+                    : org.opensearch.serverless.transport.ShardRouter.of(reconciler.node).commitPush().registerLooks();
                 if (looks != null && looks.skippable(shardId, opened.get())) {
                     // Its live writer pushes this node every commit it publishes; see ReaderRegisterLooks.
                     continue;
@@ -87,7 +89,7 @@ final class PublishedSweeps {
                     }
                     // A writer that stages commits is asked for the newest: the register alone would hold the reader
                     // back by up to a checkpoint, or let it go for being newer than the register.
-                    final var current = reconciler.node.router() == null
+                    final var current = org.opensearch.serverless.transport.ShardRouter.of(reconciler.node) == null
                         ? register
                         : org.opensearch.serverless.transport.NewestCommits.of(reconciler.node)
                             .newerThan(register, shardId.getIndexName(), shardId.getIndex().getUUID(), shardId.id());

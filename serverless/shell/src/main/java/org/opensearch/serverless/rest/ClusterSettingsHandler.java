@@ -18,7 +18,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.ClusterConfig;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.ServerlessNode;
+import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -42,7 +42,7 @@ import java.util.function.Supplier;
 public final class ClusterSettingsHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<ServerlessNode> node;
+    private final Supplier<NodeContext> node;
 
     /**
      * Creates the handler.
@@ -50,7 +50,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the node, for the read and write action gates
      */
-    public ClusterSettingsHandler(Supplier<MetadataPlane> plane, Supplier<ServerlessNode> node) {
+    public ClusterSettingsHandler(Supplier<MetadataPlane> plane, Supplier<NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -83,7 +83,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
         }
 
         if (request.method() == RestRequest.Method.GET) {
-            final ServerlessNode reader = node.get();
+            final NodeContext reader = node.get();
             if (reader == null) {
                 return channel -> channel.sendResponse(
                     IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable")
@@ -122,7 +122,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                                 .build();
                             return new org.opensearch.action.admin.cluster.state.ClusterStateResponse(clusterName, state, false);
                         },
-                            org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.serverless.action.ActionGate.identity(
                                 org.opensearch.action.admin.cluster.state.ClusterStateResponse.class
                             )
                         );
@@ -151,7 +151,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
 
         final var content = request.hasContent() ? request.content() : null;
         final var mediaType = request.getMediaType();
-        final ServerlessNode serving = node.get();
+        final NodeContext serving = node.get();
         if (serving == null) {
             return channel -> channel.sendResponse(
                 IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable")
@@ -213,10 +213,10 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
                     }
-                    final Object placement = flat.get(org.opensearch.serverless.shell.NodeSettings.SEGMENT_PLACEMENT_CLUSTER.getKey());
+                    final Object placement = flat.get(org.opensearch.serverless.node.NodeSettings.SEGMENT_PLACEMENT_CLUSTER.getKey());
                     if (placement != null) {
                         try {
-                            org.opensearch.serverless.shell.SegmentPlacement.check(String.valueOf(placement));
+                            org.opensearch.serverless.node.SegmentPlacement.check(String.valueOf(placement));
                         } catch (IllegalArgumentException e) {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
@@ -239,12 +239,10 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
                     }
-                    final Object checkpoint = flat.get(
-                        org.opensearch.serverless.shell.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey()
-                    );
+                    final Object checkpoint = flat.get(org.opensearch.serverless.node.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey());
                     if (checkpoint != null) {
                         try {
-                            org.opensearch.serverless.shell.LogCommitCheckpoint.check(node.get(), checkpoint);
+                            org.opensearch.serverless.node.LogCommitCheckpoint.check(node.get(), checkpoint);
                         } catch (IllegalArgumentException e) {
                             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
                         }
@@ -258,13 +256,13 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                     }
                     final Settings written = metadata.clusterConfig().update(flat);
                     // This node's next publishes follow at once; the others within their next read of the register.
-                    org.opensearch.serverless.shell.SegmentPlacement.applyCluster(node.get(), written);
+                    org.opensearch.serverless.node.SegmentPlacement.applyCluster(node.get(), written);
                     // And this node's plugins see their settings change when the write returns, as on a classic node.
                     if (node.get() != null) {
                         node.get().pluginClusterSettings().apply(written);
                     }
                     return nativeResponse(written);
-                }, org.opensearch.serverless.shell.ActionGate.identity(ClusterUpdateSettingsResponse.class));
+                }, org.opensearch.serverless.action.ActionGate.identity(ClusterUpdateSettingsResponse.class));
                 try (var builder = channel.newBuilder()) {
                     result.toXContent(builder, channel.request());
                     channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));

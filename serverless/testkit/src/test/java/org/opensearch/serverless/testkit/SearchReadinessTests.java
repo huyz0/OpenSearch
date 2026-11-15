@@ -14,7 +14,7 @@ import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.cluster.ReaderPlacement;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.SearchReadiness;
+import org.opensearch.serverless.node.SearchReadiness;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.test.OpenSearchTestCase;
 
@@ -38,7 +38,7 @@ public class SearchReadinessTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", "search")
-            .put(org.opensearch.serverless.shell.SearchSettings.WARM_ON_JOIN.getKey(), warmOnJoin)
+            .put(org.opensearch.serverless.node.SearchSettings.WARM_ON_JOIN.getKey(), warmOnJoin)
             .build();
     }
 

@@ -447,7 +447,7 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
         // sweep, and this test is about the graced one a schedule runs.
         final Set<String> watched = gc.sweepShard(plane, "alpha", 0, Set.of()).candidates();
         assertTrue("the blob must be a candidate for this test to mean anything: " + watched, watched.contains("t=1/_z.cfs"));
-        clock.addAndGet(GarbageCollector.DEFAULT_MINIMUM_UNREFERENCED_MILLIS + 1);
+        clock.addAndGet(org.opensearch.serverless.node.NodePackCollector.DEFAULT_MINIMUM_UNREFERENCED_MILLIS + 1);
 
         // A freeze begins: the marker names the index and holds nothing yet.
         final String pitId = UUIDs.randomBase64UUID();

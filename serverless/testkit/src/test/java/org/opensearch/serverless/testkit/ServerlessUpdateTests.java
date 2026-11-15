@@ -173,7 +173,7 @@ public class ServerlessUpdateTests extends OpenSearchTestCase {
             send(http, "PUT", "/alpha?shards=1", MAPPING);
             node.activation().activateWriter(metadata, "alpha", 0);
             send(http, "PUT", "/alpha/_doc/1", "{\"n\":1}");
-            final var before = new org.opensearch.serverless.shard.ShardOperations(node, metadata).get("alpha", "1").document();
+            final var before = new org.opensearch.serverless.ops.ShardOperations(node, metadata).get("alpha", "1").document();
             send(http, "PUT", "/alpha/_doc/1", "{\"n\":2}");
             final String condition = "\"if_seq_no\":" + before.seqNo() + ",\"if_primary_term\":" + before.primaryTerm();
             final var stale = send(http, "POST", "/alpha/_update/1", "{\"doc\":{\"n\":99}," + condition + "}");

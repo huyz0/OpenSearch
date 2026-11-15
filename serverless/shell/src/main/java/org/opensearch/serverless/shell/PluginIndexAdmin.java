@@ -80,11 +80,11 @@ final class PluginIndexAdmin {
 
     PluginIndexAdmin(ServerlessNode node) {
         this.node = node;
-        this.mappings = new org.opensearch.serverless.rest.MappingUpdateHandler(() -> node.metadataPlane, () -> node);
-        this.settings = new org.opensearch.serverless.rest.SettingsUpdateHandler(() -> node.metadataPlane, () -> node);
-        this.indices = new org.opensearch.serverless.rest.IndexAdminHandler(() -> node.metadataPlane, () -> node);
-        this.aliases = org.opensearch.serverless.rest.AliasHandler.forPlugins(() -> node.metadataPlane, () -> node);
-        this.rollover = new org.opensearch.serverless.rest.RolloverHandler(() -> node, () -> node.metadataPlane);
+        this.mappings = new org.opensearch.serverless.rest.MappingUpdateHandler(() -> node.metadataPlane(), () -> node);
+        this.settings = new org.opensearch.serverless.rest.SettingsUpdateHandler(() -> node.metadataPlane(), () -> node);
+        this.indices = new org.opensearch.serverless.rest.IndexAdminHandler(() -> node.metadataPlane(), () -> node);
+        this.aliases = org.opensearch.serverless.rest.AliasHandler.forPlugins(() -> node.metadataPlane(), () -> node);
+        this.rollover = new org.opensearch.serverless.rest.RolloverHandler(() -> node, () -> node.metadataPlane());
     }
 
     // ---- reads
@@ -240,7 +240,7 @@ final class PluginIndexAdmin {
                 "/" + index + "/_mapping",
                 Map.of("index", index),
                 request.source(),
-                node.nodeClient
+                node.nodeClient()
             ),
             index
         );
@@ -258,7 +258,7 @@ final class PluginIndexAdmin {
                 "/" + index + "/_settings",
                 Map.of("index", index),
                 body.toString(),
-                node.nodeClient
+                node.nodeClient()
             ),
             index
         );
@@ -274,7 +274,7 @@ final class PluginIndexAdmin {
                 "/" + index,
                 Map.of("index", index),
                 null,
-                node.nodeClient
+                node.nodeClient()
             );
             if (answer.ok() == false) {
                 throw answer.failure(index);
@@ -288,7 +288,7 @@ final class PluginIndexAdmin {
         final XContentBuilder body = JsonXContent.contentBuilder();
         request.toXContent(body, ToXContent.EMPTY_PARAMS);
         return acknowledged(
-            InProcessRest.call(aliases, RestRequest.Method.POST, "/_aliases", Map.of(), body.toString(), node.nodeClient),
+            InProcessRest.call(aliases, RestRequest.Method.POST, "/_aliases", Map.of(), body.toString(), node.nodeClient()),
             null
         );
     }
@@ -311,7 +311,7 @@ final class PluginIndexAdmin {
             path,
             params,
             rolloverBody(request),
-            node.nodeClient
+            node.nodeClient()
         );
         if (answer.ok() == false) {
             throw answer.failure(target);

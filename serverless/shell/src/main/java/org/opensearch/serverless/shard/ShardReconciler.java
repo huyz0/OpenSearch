@@ -598,7 +598,7 @@ public final class ShardReconciler {
 
     /** The given index, served from the block-cache directory: published segments remote, own output local. */
     static IndexMetadata onBlockCache(IndexMetadata indexMetadata) {
-        final String storeType = org.opensearch.serverless.shell.ServerlessNode.BLOCK_CACHE_STORE_TYPE;
+        final String storeType = org.opensearch.serverless.store.BlockCache.STORE_TYPE;
         if (storeType.equals(indexMetadata.getSettings().get("index.store.type"))) {
             return indexMetadata;
         }

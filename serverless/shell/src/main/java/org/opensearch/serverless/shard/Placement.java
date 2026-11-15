@@ -18,7 +18,7 @@ public final class Placement {
     private final String owner;
     private final String uuid;
 
-    Placement(ShardId local, int shard, String owner, String uuid) {
+    public Placement(ShardId local, int shard, String owner, String uuid) {
         this.local = local;
         this.shard = shard;
         this.owner = owner;

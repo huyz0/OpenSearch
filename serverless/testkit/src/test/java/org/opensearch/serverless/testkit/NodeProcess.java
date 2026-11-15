@@ -122,7 +122,7 @@ final class NodeProcess implements Closeable {
         // A restart reuses the home, and the previous process's file names the ports it had: waiting on that one
         // returned at once, with a node that was not up at an address nobody was listening on.
         java.nio.file.Files.deleteIfExists(readyFile);
-        settings.put(org.opensearch.serverless.shell.NodeSettings.READY_FILE_PROPERTY, readyFile.toString());
+        settings.put(org.opensearch.serverless.node.NodeSettings.READY_FILE_PROPERTY, readyFile.toString());
         settings.putAll(extra);
         settings.forEach((k, v) -> command.add("-D" + k + "=" + v));
 

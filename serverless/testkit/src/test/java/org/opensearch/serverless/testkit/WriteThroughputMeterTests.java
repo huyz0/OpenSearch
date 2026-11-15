@@ -292,7 +292,10 @@ public class WriteThroughputMeterTests extends OpenSearchTestCase {
         final BackgroundReconciler loop = new BackgroundReconciler(node, plane).setMaxShardsHeld(shards * 2)
             .setActivationConcurrency(
                 Integer.parseInt(
-                    System.getProperty("tests.tput.activation", String.valueOf(BackgroundReconciler.DEFAULT_ACTIVATION_CONCURRENCY))
+                    System.getProperty(
+                        "tests.tput.activation",
+                        String.valueOf(org.opensearch.serverless.node.ActivationSettings.DEFAULT_ACTIVATION_CONCURRENCY)
+                    )
                 )
             );
         for (int i = 0; i < shards; i++) {
@@ -631,11 +634,9 @@ public class WriteThroughputMeterTests extends OpenSearchTestCase {
                 if (cadence.equals("node")) {
                     // A node built directly re-reads every head and descriptor on each renewal; a running one every five
                     // minutes. Without this, those reads are most of the GETs the meter counts.
-                    node.setHeadVerifyIntervalMillis(
-                        org.opensearch.serverless.shell.ServerlessBootstrap.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS
-                    );
+                    node.setHeadVerifyIntervalMillis(org.opensearch.serverless.node.NodeSettings.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS);
                     node.setDescriptorRefreshIntervalMillis(
-                        org.opensearch.serverless.shell.ServerlessBootstrap.DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS
+                        org.opensearch.serverless.node.NodeSettings.DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS
                     );
                     // Driven as a running node drives it (ServerlessBootstrap's wiring with its defaults): lazy publish on the
                     // log's window, edge publishes spaced out, lease renewals and the backstop on their own timers.

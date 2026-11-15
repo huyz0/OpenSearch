@@ -221,7 +221,7 @@ final class DirtyPublishing {
      * they are published, so publishing less often costs no freshness. Unchanged when overlays are off for the shard.
      */
     private long overlaidAge(org.opensearch.index.shard.IndexShard shard, long maxAge) {
-        final var router = reconciler.node.router();
+        final var router = org.opensearch.serverless.transport.ShardRouter.of(reconciler.node);
         if (router == null || router.tailOverlays().onFor(shard.indexSettings().getSettings()) == false) {
             return maxAge;
         }
@@ -289,7 +289,7 @@ final class DirtyPublishing {
 
     java.util.concurrent.ExecutorService publishPool() {
         try {
-            return reconciler.node.threadPool().executor(org.opensearch.serverless.shell.NodeThreadPools.PUBLISH_POOL);
+            return reconciler.node.threadPool().executor(org.opensearch.serverless.node.NodeThreadPools.PUBLISH_POOL);
         } catch (RuntimeException e) {
             return null;
         }

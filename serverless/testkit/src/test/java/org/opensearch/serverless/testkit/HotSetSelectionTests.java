@@ -15,9 +15,10 @@ import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.cluster.HotShardSpread;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.shell.CacheHotSet;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.store.BlockCache;
+import org.opensearch.serverless.transport.HotSetResponse;
+import org.opensearch.serverless.warm.CacheHotSet;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
@@ -50,7 +51,7 @@ public class HotSetSelectionTests extends OpenSearchTestCase {
             .build();
     }
 
-    private static int keys(List<CacheHotSet.HotShard> hot) {
+    private static int keys(List<HotSetResponse.HotShard> hot) {
         return hot.stream().mapToInt(h -> h.keys().size()).sum();
     }
 
@@ -91,7 +92,7 @@ public class HotSetSelectionTests extends OpenSearchTestCase {
             final var members = plane.membership().refresh();
             final HotShardSpread spread = HotShardSpread.of(peer, peer.settings());
 
-            final List<CacheHotSet.HotShard> all = CacheHotSet.forJoiner(peer, members, joiner, spread, 0L, Long.MAX_VALUE);
+            final List<HotSetResponse.HotShard> all = CacheHotSet.forJoiner(peer, members, joiner, spread, 0L, Long.MAX_VALUE);
             assumeTrue("the joiner ranks first for some shard", all.isEmpty() == false);
             final int offered = keys(all);
             assertTrue(offered > 0);
@@ -103,7 +104,7 @@ public class HotSetSelectionTests extends OpenSearchTestCase {
             for (int i = 0; i < 50; i++) {
                 cache.get(stale);
             }
-            final List<CacheHotSet.HotShard> withStale = CacheHotSet.forJoiner(peer, members, joiner, spread, 0L, Long.MAX_VALUE);
+            final List<HotSetResponse.HotShard> withStale = CacheHotSet.forJoiner(peer, members, joiner, spread, 0L, Long.MAX_VALUE);
             assertEquals(offered, keys(withStale));
             assertTrue(withStale.stream().noneMatch(h -> h.keys().contains(stale)));
 
@@ -118,7 +119,7 @@ public class HotSetSelectionTests extends OpenSearchTestCase {
             );
 
             // Within a budget of a few blocks, the most read come first.
-            final List<CacheHotSet.HotShard> budgeted = CacheHotSet.forJoiner(peer, members, joiner, spread, 0L, 3 * 4096L);
+            final List<HotSetResponse.HotShard> budgeted = CacheHotSet.forJoiner(peer, members, joiner, spread, 0L, 3 * 4096L);
             final List<String> chosen = new ArrayList<>();
             budgeted.forEach(h -> chosen.addAll(h.keys()));
             logger.info("HOTSET|offered {} of {} resident; budget of 3 blocks chose {}", offered, cache.stats().blocksResident(), chosen);

@@ -252,7 +252,7 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
         final var metadata = plane(clock, createTempDir());
         try (var node = running(metadata, clock, "script-upsert-copy")) {
             final var source = java.util.Map.<String, Object>of("nested", java.util.Map.of("n", 1));
-            final var result = new org.opensearch.serverless.shard.ShardOperations(node, metadata).update(
+            final var result = new org.opensearch.serverless.ops.ShardOperations(node, metadata).update(
                 "alpha",
                 "immutable",
                 null,
@@ -275,7 +275,7 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
         final var clock = new AtomicLong(1_000L);
         final var metadata = plane(clock, createTempDir());
         try (var node = running(metadata, clock, "update-outcome-cas")) {
-            final var operations = new org.opensearch.serverless.shard.ShardOperations(node, metadata);
+            final var operations = new org.opensearch.serverless.ops.ShardOperations(node, metadata);
             final var before = operations.get("alpha", "1").document();
             assertEquals(200, call("PUT", "/alpha/_doc/1", "{\"msg\":\"newer\",\"n\":99}").status());
             final String path = "/alpha/_update/1?if_seq_no=" + before.seqNo() + "&if_primary_term=" + before.primaryTerm();
@@ -304,7 +304,7 @@ public class ServerlessScriptTests extends OpenSearchTestCase {
                 port = via.boundHttpAddress().publishAddress().getPort();
                 final String id = "removed-" + port;
                 assertEquals(201, call("PUT", "/alpha/_doc/" + id, "{\"n\":1}").status());
-                final var before = new org.opensearch.serverless.shard.ShardOperations(via, metadata).get("alpha", id).document();
+                final var before = new org.opensearch.serverless.ops.ShardOperations(via, metadata).get("alpha", id).document();
                 final var response = call(
                     "POST",
                     "/alpha/_update/" + id + "?if_seq_no=" + before.seqNo() + "&if_primary_term=" + before.primaryTerm(),

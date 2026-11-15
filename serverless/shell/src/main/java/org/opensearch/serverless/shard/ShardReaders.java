@@ -196,7 +196,7 @@ final class ShardReaders {
      * continues. So the view is opened as an index whose uuid is the view's identifier, which makes it a
      * different shard as far as everything below here is concerned. The bytes still live under the real
      * index's uuid, which is why the shard carries
-     * {@link org.opensearch.serverless.shell.NodeSettings#STORAGE_UUID}.
+     * {@link org.opensearch.serverless.store.CacheSettings#STORAGE_UUID}.
      *
      * <p><b>And why the manifest is passed in rather than read.</b> Reading it here would read the current
      * one, which is the thing this exists not to do.
@@ -230,8 +230,8 @@ final class ShardReaders {
                 org.opensearch.common.settings.Settings.builder()
                     .put(indexMetadata.getSettings())
                     .put(IndexMetadata.SETTING_INDEX_UUID, viewId)
-                    .put("index.store.type", org.opensearch.serverless.shell.ServerlessNode.BLOCK_CACHE_STORE_TYPE)
-                    .put(org.opensearch.serverless.shell.NodeSettings.STORAGE_UUID.getKey(), indexMetadata.getIndexUUID())
+                    .put("index.store.type", org.opensearch.serverless.store.BlockCache.STORE_TYPE)
+                    .put(org.opensearch.serverless.store.CacheSettings.STORAGE_UUID.getKey(), indexMetadata.getIndexUUID())
                     .build()
             )
             .build();

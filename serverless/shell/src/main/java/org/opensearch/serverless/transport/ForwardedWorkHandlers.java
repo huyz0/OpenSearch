@@ -10,6 +10,7 @@ package org.opensearch.serverless.transport;
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.serverless.shard.ShardExplain;
 import org.opensearch.serverless.shard.ShardQuery;
+import org.opensearch.serverless.write.NotShardOwnerException;
 import org.opensearch.transport.TransportChannel;
 
 /**
@@ -42,7 +43,7 @@ final class ForwardedWorkHandlers {
                     // The same document as the REST endpoint, authorized by this receiving node's filters.
                     try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
                         builder.startObject();
-                        org.opensearch.serverless.rest.StatsHandler.describe(builder, router.node, router.plane.get());
+                        router.statsDocument.describe(builder, router.plane.get());
                         builder.endObject();
                         return new ForwardedStatsResponse(
                             router.node.localNode().getId(),
@@ -50,7 +51,7 @@ final class ForwardedWorkHandlers {
                         );
                     }
                 },
-                org.opensearch.serverless.shell.ActionGate.opaque()
+                org.opensearch.serverless.action.ActionGate.opaque()
             );
         channel.sendResponse(response);
     }
@@ -111,7 +112,7 @@ final class ForwardedWorkHandlers {
             );
         }
         router.requireLiveOwnership(shardId);
-        final org.opensearch.serverless.shell.WriteOutcome outcome;
+        final org.opensearch.serverless.write.WriteOutcome outcome;
         if (request.deletion()) {
             outcome = router.node.writes().delete(shardId, request.id(), request.routing(), request.ifSeqNo(), request.ifPrimaryTerm());
         } else {

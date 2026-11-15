@@ -46,7 +46,7 @@ import java.util.concurrent.TimeUnit;
 @com.carrotsearch.randomizedtesting.annotations.TimeoutSuite(millis = 7_200_000)
 public class BackgroundRequestMeterTests extends OpenSearchTestCase {
 
-    private static final long TTL = ServerlessBootstrap.DEFAULT_LEASE_TTL_MILLIS;
+    private static final long TTL = org.opensearch.serverless.node.NodeSettings.DEFAULT_LEASE_TTL_MILLIS;
     private static final long WINDOW = 250;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"keyword\"},\"n\":{\"type\":\"long\"}}}";
     private static final int WRITE_EVERY_SECONDS = 10;
@@ -68,11 +68,11 @@ public class BackgroundRequestMeterTests extends OpenSearchTestCase {
 
     /** Starts a node's loop and scheduler the way {@link ServerlessBootstrap} does. */
     private static ReconcileScheduler scheduled(ServerlessNode node, MetadataPlane plane, BackgroundReconciler loop) {
-        node.setHeadVerifyIntervalMillis(ServerlessBootstrap.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS);
+        node.setHeadVerifyIntervalMillis(org.opensearch.serverless.node.NodeSettings.DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS);
         node.setDescriptorRefreshIntervalMillis(300_000L);
         loop.setLazyPublish(
-            ServerlessBootstrap.DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS,
-            ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS,
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS,
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS,
             WINDOW
         );
         final ReconcileScheduler scheduler = new ReconcileScheduler(
@@ -84,10 +84,12 @@ public class BackgroundRequestMeterTests extends OpenSearchTestCase {
             ReconcileScheduler.DEFAULT_BACKSTOP_INTERVAL
         );
         scheduler.setPublishSpacing(
-            ReconcileScheduler.DEFAULT_PUBLISH_MIN_INTERVAL,
-            ReconcileScheduler.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MIN_INTERVAL,
+            org.opensearch.serverless.node.WriteSettings.DEFAULT_PUBLISH_MAX_UNPUBLISHED_OPERATIONS
         );
-        scheduler.setJanitorInterval(TimeValue.timeValueMillis(ServerlessBootstrap.DEFAULT_JANITOR_INTERVAL_MILLIS));
+        scheduler.setJanitorInterval(
+            TimeValue.timeValueMillis(org.opensearch.serverless.node.NodeSettings.DEFAULT_JANITOR_INTERVAL_MILLIS)
+        );
         node.setSignals(scheduler);
         return scheduler.start();
     }

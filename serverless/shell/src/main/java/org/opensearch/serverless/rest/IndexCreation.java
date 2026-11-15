@@ -56,7 +56,7 @@ final class IndexCreation {
      * @throws Exception if validation or metadata persistence fails
      */
     public static IndexDescriptor createIndex(
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         MetadataPlane metadata,
         org.opensearch.action.admin.indices.create.CreateIndexRequest request
     ) throws Exception {
@@ -141,7 +141,7 @@ final class IndexCreation {
      * @throws IOException if a register cannot be read or written
      */
     static IndexDescriptor createIndex(
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         MetadataPlane metadata,
         String index,
         IndexCreateRequest create
@@ -177,7 +177,7 @@ final class IndexCreation {
      * @throws IndexAdminHandler.RefusedException if the merged settings are ones core would refuse, or this design cannot honour
      */
     static IndexDescriptor createIndex(
-        org.opensearch.serverless.shell.ServerlessNode serving,
+        org.opensearch.serverless.node.NodeContext serving,
         MetadataPlane metadata,
         String index,
         IndexCreateRequest create,
@@ -354,10 +354,10 @@ final class IndexCreation {
             }
         }
         // So is the segment placement.
-        final String placement = given.get(org.opensearch.serverless.shell.NodeSettings.SEGMENT_PLACEMENT_INDEX.getKey());
+        final String placement = given.get(org.opensearch.serverless.node.NodeSettings.SEGMENT_PLACEMENT_INDEX.getKey());
         if (placement != null) {
             try {
-                org.opensearch.serverless.shell.SegmentPlacement.check(placement);
+                org.opensearch.serverless.node.SegmentPlacement.check(placement);
             } catch (IllegalArgumentException e) {
                 throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
             }
@@ -371,7 +371,7 @@ final class IndexCreation {
             }
         }
         final Settings settings = org.opensearch.serverless.routing.ShardMode.without(given)
-            .filter(key -> org.opensearch.serverless.shell.NodeSettings.SEGMENT_PLACEMENT_INDEX.getKey().equals(key) == false)
+            .filter(key -> org.opensearch.serverless.node.NodeSettings.SEGMENT_PLACEMENT_INDEX.getKey().equals(key) == false)
             .filter(key -> org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey().equals(key) == false)
             .filter(key -> org.opensearch.serverless.bucket.BucketSettings.INDEX_POLICY.getKey().equals(key) == false)
             .filter(key -> org.opensearch.serverless.bucket.BucketSettings.GROUP.getKey().equals(key) == false);
@@ -398,7 +398,7 @@ final class IndexCreation {
     }
 
     /** The index settings a node validates against: core's plus its plugins', or core's alone without a node. */
-    static org.opensearch.common.settings.IndexScopedSettings scopedFor(org.opensearch.serverless.shell.ServerlessNode serving) {
+    static org.opensearch.common.settings.IndexScopedSettings scopedFor(org.opensearch.serverless.node.NodeContext serving) {
         return serving == null ? org.opensearch.common.settings.IndexScopedSettings.DEFAULT_SCOPED_SETTINGS : serving.indexScopedSettings();
     }
 }

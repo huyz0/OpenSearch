@@ -50,7 +50,7 @@ import java.util.function.Supplier;
 public final class CatalogHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    private final Supplier<org.opensearch.serverless.node.NodeContext> node;
 
     /**
      * Creates the handler without a node; reads then run on the calling thread and past the gate.
@@ -67,7 +67,7 @@ public final class CatalogHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the serving node, for its thread pool and its action gate
      */
-    public CatalogHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public CatalogHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }

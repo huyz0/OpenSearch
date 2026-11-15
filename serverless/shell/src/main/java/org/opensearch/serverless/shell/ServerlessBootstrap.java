@@ -13,9 +13,14 @@ import org.apache.logging.log4j.Logger;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.node.ActivationSettings;
+import org.opensearch.serverless.node.NodeSettings;
+import org.opensearch.serverless.node.WriteSettings;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.reconcile.ReconcileScheduler;
 import org.opensearch.serverless.store.NodeLogCommitter;
+import org.opensearch.serverless.warm.SearchDrain;
+import org.opensearch.serverless.warm.SearchWarmup;
 
 import java.io.Closeable;
 import java.nio.file.Path;
@@ -80,20 +85,6 @@ public final class ServerlessBootstrap implements Closeable {
         }
     }
 
-    /** The default for {@link org.opensearch.serverless.shell.ActivationSettings#HIBERNATE_AFTER_MILLIS}: off until it is measured to cost nothing it saves. */
-    public static final long DEFAULT_HIBERNATE_AFTER_MILLIS = 0L;
-
-    /** The production head-verification interval; see {@link org.opensearch.serverless.shell.NodeSettings#HEAD_VERIFY_INTERVAL_MILLIS}. */
-    public static final long DEFAULT_HEAD_VERIFY_INTERVAL_MILLIS = 3_600_000L;
-
-    /** The production janitor interval; see {@link org.opensearch.serverless.shell.NodeSettings#JANITOR_INTERVAL_MILLIS}. */
-    public static final long DEFAULT_JANITOR_INTERVAL_MILLIS = 60_000L;
-
-    /** The production descriptor refresh interval; see {@link org.opensearch.serverless.shell.NodeSettings#DESCRIPTOR_REFRESH_INTERVAL_MILLIS}. */
-    public static final long DEFAULT_DESCRIPTOR_REFRESH_INTERVAL_MILLIS = 300_000L;
-    /** The default {@link org.opensearch.serverless.shell.WriteSettings#NODE_LOG_PUBLISH_MAX_AGE_MILLIS}: a second, as core refreshes an index that sets no interval. */
-    public static final long DEFAULT_NODE_LOG_PUBLISH_MAX_AGE_MILLIS = 1_000L;
-
     /** The first token of the readiness line, so the file is self-describing. */
     public static final String READY_MARKER = "SERVERLESS_READY";
 
@@ -101,9 +92,6 @@ public final class ServerlessBootstrap implements Closeable {
      * Where {@code opensearch.keystore} lives. Defaults to {@code path.home/config}, as for a real node.
      */
     public static final String CONFIG_PATH = "path.conf";
-
-    /** The default lease TTL: long enough to survive a slow object store, short enough to fail over. */
-    public static final long DEFAULT_LEASE_TTL_MILLIS = 30_000L;
 
     /** The providers the blob-store conformance suite has actually been run against. */
     static final String TESTED_PROVIDERS = "the filesystem container, MinIO, SeaweedFS and RustFS";

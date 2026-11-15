@@ -44,7 +44,7 @@ import java.util.function.Supplier;
 public final class TemplateHandler extends BaseRestHandler {
 
     private final Supplier<MetadataPlane> plane;
-    private final Supplier<org.opensearch.serverless.shell.ServerlessNode> node;
+    private final Supplier<org.opensearch.serverless.node.NodeContext> node;
 
     /**
      * Creates the handler.
@@ -52,7 +52,7 @@ public final class TemplateHandler extends BaseRestHandler {
      * @param plane supplies the metadata plane
      * @param node supplies the serving node
      */
-    public TemplateHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.shell.ServerlessNode> node) {
+    public TemplateHandler(Supplier<MetadataPlane> plane, Supplier<org.opensearch.serverless.node.NodeContext> node) {
         this.plane = plane;
         this.node = node;
     }
@@ -161,7 +161,7 @@ public final class TemplateHandler extends BaseRestHandler {
                         concreteName(selected.name());
                         return put(store, false, selected.name(), json(selected.indexTemplate()), selected.create());
                     },
-                        org.opensearch.serverless.shell.ActionGate.identity(
+                        org.opensearch.serverless.action.ActionGate.identity(
                             org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
                         )
                     );
@@ -187,7 +187,7 @@ public final class TemplateHandler extends BaseRestHandler {
                         concreteName(selected);
                         return delete(store, selected);
                     },
-                        org.opensearch.serverless.shell.ActionGate.identity(
+                        org.opensearch.serverless.action.ActionGate.identity(
                             org.opensearch.action.support.clustermanager.AcknowledgedResponse.class
                         )
                     );
@@ -214,7 +214,7 @@ public final class TemplateHandler extends BaseRestHandler {
                                 }
                                 return new org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.Response(found);
                             },
-                            org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.serverless.action.ActionGate.identity(
                                 org.opensearch.action.admin.indices.template.get.GetComponentTemplateAction.Response.class
                             )
                         );
@@ -247,7 +247,7 @@ public final class TemplateHandler extends BaseRestHandler {
                                     found
                                 );
                             },
-                            org.opensearch.serverless.shell.ActionGate.identity(
+                            org.opensearch.serverless.action.ActionGate.identity(
                                 org.opensearch.action.admin.indices.template.get.GetComposableIndexTemplateAction.Response.class
                             )
                         );

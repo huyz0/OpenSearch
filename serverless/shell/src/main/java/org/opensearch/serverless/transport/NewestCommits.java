@@ -41,7 +41,7 @@ public final class NewestCommits {
 
     private final ShardRouter router;
 
-    private NewestCommits(ShardRouter router) {
+    NewestCommits(ShardRouter router) {
         this.router = router;
     }
 
@@ -51,8 +51,8 @@ public final class NewestCommits {
      * @param node the node
      * @return the lookup
      */
-    public static NewestCommits of(org.opensearch.serverless.shell.ServerlessNode node) {
-        return new NewestCommits(node.router());
+    public static NewestCommits of(org.opensearch.serverless.node.NodeContext node) {
+        return new NewestCommits(ShardRouter.of(node));
     }
 
     /** Registers the handler that answers readers. Called once, at startup, after the router's own. */
