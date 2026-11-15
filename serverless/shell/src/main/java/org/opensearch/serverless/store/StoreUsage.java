@@ -126,6 +126,20 @@ public final class StoreUsage {
     }
 
     /**
+     * Records work that is not a store request against an index: documents written, searches, bytes pushed.
+     *
+     * @param index the index
+     * @param kind what is counted; a request kind is refused, since only the store counts requests
+     * @param amount how much
+     */
+    public void record(String index, IndexUsage.Kind kind, long amount) {
+        if (kind.isRequest() || kind == IndexUsage.Kind.BYTES_READ || kind == IndexUsage.Kind.BYTES_WRITTEN) {
+            throw new IllegalArgumentException(kind + " is counted by the store");
+        }
+        of(index).add(kind, amount);
+    }
+
+    /**
      * Charges an amount to whoever should pay for it, by the rules in the class comment.
      *
      * @param owner the index the container or key names, or null if it names none

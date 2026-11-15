@@ -32,7 +32,7 @@ def structureBaselineDir = file("${rootDir}/serverless/structure-baseline")
 def structureLayers = [
   settings: 0,
   store: 1, routing: 1, schema: 1, pipeline: 1,
-  ingest: 2, membership: 2,
+  ingest: 2, membership: 2, usage: 2,
   cluster: 3,
   bucket: 4,
   metadata: 5,

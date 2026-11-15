@@ -116,6 +116,14 @@ public final class ServerlessNode extends NodeContext implements Closeable {
         // and before onNodeStarted, because a plugin told the node is up may immediately call its own
         // action.
         pluginActions = wiring.buildPluginActions();
+        final org.opensearch.serverless.usage.Guardrails guardrails = part(org.opensearch.serverless.usage.Guardrails.class);
+        if (guardrails != null && guardrails.mode() != org.opensearch.serverless.usage.UsageSettings.Mode.OFF) {
+            threadPool().scheduleWithFixedDelay(
+                guardrails::tick,
+                org.opensearch.common.unit.TimeValue.timeValueMillis(org.opensearch.serverless.usage.Guardrails.TICK_MILLIS),
+                org.opensearch.threadpool.ThreadPool.Names.GENERIC
+            );
+        }
         // The plugins' lifecycle components, then the services their injector built, as core starts them.
         for (Object component : plugins.components()) {
             if (component instanceof org.opensearch.common.lifecycle.LifecycleComponent lifecycle) {

@@ -152,7 +152,7 @@ public final class SearchGate {
         if (nativeRequest == null && partialResults != null) {
             visible.allowPartialSearchResults(partialResults);
         }
-        try {
+        try (org.opensearch.common.lease.Releasable counted = searching(serving, indices)) {
             return gate.run(
                 org.opensearch.action.search.SearchAction.NAME,
                 // Every index the search covers, so a filter evaluating privileges sees all of them
@@ -222,6 +222,12 @@ public final class SearchGate {
         } catch (Exception e) {
             throw new IOException(e);
         }
+    }
+
+    // Counts the search, and its time, for each index it covers.
+    private static org.opensearch.common.lease.Releasable searching(NodeContext serving, java.util.Collection<String> indices) {
+        final org.opensearch.serverless.usage.Guardrails guardrails = serving.part(org.opensearch.serverless.usage.Guardrails.class);
+        return guardrails == null ? () -> {} : guardrails.searching(indices);
     }
 
     public static boolean selectsShards(String preference) {
