@@ -168,6 +168,19 @@ public final class NodeLogBlob {
     public record Header(String nodeId, long epoch, long ordinal, long trimPoint, List<Slice> slices, Map<ShardKey, List<Range>> index,
         long bodyOffset) implements Entry {
         /**
+         * Returns each index's bytes in this blob, which is how the blob's PUT is shared between them.
+         *
+         * @return index name to its slices' bytes
+         */
+        public Map<String, Long> bytesByIndex() {
+            final Map<String, Long> bytes = new java.util.HashMap<>();
+            for (Slice slice : slices) {
+                bytes.merge(slice.shard().indexName(), (long) slice.length(), Long::sum);
+            }
+            return bytes;
+        }
+
+        /**
          * Returns this blob's slices for one shard, in body order.
          *
          * @param shard the shard

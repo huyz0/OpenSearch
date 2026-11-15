@@ -42,6 +42,10 @@ public final class ObjectStores {
 
     private ObjectStores() {}
 
+    private static StoreUsage usage(Settings settings) {
+        return ObjectStoreSettings.METERING.get(settings) ? new StoreUsage(ObjectStoreSettings.METERING_MAX_INDICES.get(settings)) : null;
+    }
+
     /**
      * Builds the blob store a node should use.
      *
@@ -58,7 +62,7 @@ public final class ObjectStores {
             if (path == null || path.isBlank()) {
                 throw new IllegalArgumentException("serverless.store.path is required for a filesystem store");
             }
-            return new ObjectStoreHandle(new MeteredBlobStore(new FsBlobStore(8192, Path.of(path), false)), null);
+            return new ObjectStoreHandle(new MeteredBlobStore(new FsBlobStore(8192, Path.of(path), false), usage(settings)), null);
         }
         if ("s3".equals(type) == false) {
             throw new IllegalArgumentException("unknown " + ObjectStoreSettings.TYPE.getKey() + ": " + type + "; expected fs or s3");
@@ -129,7 +133,7 @@ public final class ObjectStores {
             // that is not started, and the failure reads as a store problem rather than a lifecycle one.
             blobStoreRepository.start();
             final ObjectStoreHandle handle = new ObjectStoreHandle(
-                new MeteredBlobStore(blobStoreRepository.blobStore()),
+                new MeteredBlobStore(blobStoreRepository.blobStore(), usage(settings)),
                 threadPool,
                 created,
                 plugin

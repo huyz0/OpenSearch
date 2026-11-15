@@ -488,12 +488,10 @@ public final class NodeLogCommitter {
         IOException failure = null;
         final long putting = System.nanoTime();
         try {
-            final NodeLogStore.HedgeOutcome hedged = store.appendHedged(
-                epoch,
-                ordinal,
-                encoded.bytes(),
-                hedgeDelayNanos(encoded.bytes().length),
-                hedgeExecutor
+            // One PUT for every shard in the window: each index pays its share of the blob's bytes.
+            final NodeLogStore.HedgeOutcome hedged = StoreUsage.split(
+                encoded.header().bytesByIndex(),
+                () -> store.appendHedged(epoch, ordinal, encoded.bytes(), hedgeDelayNanos(encoded.bytes().length), hedgeExecutor)
             );
             if (hedged != NodeLogStore.HedgeOutcome.NONE) {
                 timings.hedges.increment();
