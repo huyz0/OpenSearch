@@ -16,6 +16,11 @@ import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.http.HttpChunk;
 import org.opensearch.rest.StreamingRestChannel;
+import org.opensearch.serverless.documents.BulkBodyParser;
+import org.opensearch.serverless.documents.BulkDispatch;
+import org.opensearch.serverless.documents.BulkItem;
+import org.opensearch.serverless.documents.BulkMemoryBudget;
+import org.opensearch.serverless.documents.BulkNative;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 
@@ -66,7 +71,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
     private final long startedAt = System.nanoTime();
 
     /** Every operation's outcome so far, sources dropped once applied. */
-    private final List<BulkHandler.Item> outcomes = new ArrayList<>();
+    private final List<BulkItem> outcomes = new ArrayList<>();
 
     // Guarded by this.
     private byte[] buffer = new byte[64 * 1024];
@@ -245,9 +250,9 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
         final BulkBodyParser.Prefix prefix;
         try {
             prefix = BulkBodyParser.parsePrefix(slice, sliceLength, last, firstLine, request.defaultIndex(), request.routing());
-            final List<BulkHandler.Item> items = prefix.items();
+            final List<BulkItem> items = prefix.items();
             if (items.isEmpty() == false) {
-                for (BulkHandler.Item item : items) {
+                for (BulkItem item : items) {
                     if (item.pipeline == null) {
                         item.pipeline = request.defaultPipeline();
                     }
@@ -278,20 +283,20 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
         int sliceLength,
         int firstLine,
         BulkBodyParser.Prefix prefix,
-        List<BulkHandler.Item> pending,
+        List<BulkItem> pending,
         long deadline,
         int attempt,
         Releasable done
     ) {
-        final List<BulkHandler.Item> refused = new ArrayList<>();
+        final List<BulkItem> refused = new ArrayList<>();
         try {
             if (pending.isEmpty() == false) {
-                BulkHandler.pushTo(pending, request.tailPush());
+                BulkNative.pushTo(pending, request.tailPush());
                 final boolean sliceRefreshed = handler.dispatcher().dispatch(serving, pending, request.refresh());
                 synchronized (this) {
                     refreshed &= sliceRefreshed;
                 }
-                for (BulkHandler.Item item : pending) {
+                for (BulkItem item : pending) {
                     if (BulkDispatch.THROTTLED.equals(item.errorType)) {
                         refused.add(item);
                     }
@@ -311,7 +316,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
                     return;
                 }
             }
-            for (BulkHandler.Item item : refused) {
+            for (BulkItem item : refused) {
                 item.clearRefusal();
             }
             // 50 ms doubling to a second: soon after the store catches up, without spinning while it does not.
@@ -327,8 +332,8 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
                 );
             return;
         }
-        final List<BulkHandler.Item> items = prefix.items();
-        for (BulkHandler.Item item : items) {
+        final List<BulkItem> items = prefix.items();
+        for (BulkItem item : items) {
             // The outcome stays for the response; the source does not.
             item.operation = item.operation.withSource("");
         }
@@ -368,7 +373,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
     }
 
     private void respond() {
-        final List<BulkHandler.Item> all;
+        final List<BulkItem> all;
         final boolean allRefreshed;
         synchronized (this) {
             if (finished) {
