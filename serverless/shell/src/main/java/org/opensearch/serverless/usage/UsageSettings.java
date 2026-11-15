@@ -119,6 +119,29 @@ public final class UsageSettings implements SettingsProvider {
      */
     public static final Setting<String> TENANT_LEVELS = Setting.simpleString("serverless.cost.tenant_levels", Property.NodeScope);
 
+    /**
+     * The most of a node's search slots one tenant takes while they are all busy; zero turns the fair share off. A quarter
+     * by default: it only bites when the node is saturated, so a lone tenant on a quiet node is never held back.
+     */
+    public static final Setting<Double> SEARCH_TENANT_SHARE = Setting.doubleSetting(
+        "serverless.cost.search.tenant_share",
+        0.25,
+        0.0,
+        1.0,
+        Property.NodeScope
+    );
+
+    /** How many searches a node runs at once before the fair share applies; zero takes the search pool's size. */
+    public static final Setting<Integer> SEARCH_SLOTS = Setting.intSetting("serverless.cost.search.slots", 0, 0, Property.NodeScope);
+
+    /** The longest a search or write is held back; past it, it goes ahead, or is refused where a level says so. */
+    public static final Setting<Long> MAX_WAIT_MILLIS = Setting.longSetting(
+        "serverless.cost.max_wait_millis",
+        1_000L,
+        0L,
+        Property.NodeScope
+    );
+
     /** Used by {@link java.util.ServiceLoader}. */
     public UsageSettings() {}
 
@@ -133,7 +156,10 @@ public final class UsageSettings implements SettingsProvider {
             SMALL_BUDGET,
             STANDARD_BUDGET,
             LARGE_BUDGET,
-            TENANT_LEVELS
+            TENANT_LEVELS,
+            SEARCH_TENANT_SHARE,
+            SEARCH_SLOTS,
+            MAX_WAIT_MILLIS
         );
     }
 }

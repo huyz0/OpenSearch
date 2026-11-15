@@ -175,12 +175,12 @@ public class GuardrailsTests extends OpenSearchTestCase {
         assertFalse(observing.tenants().containsKey("quiet"));
     }
 
-    public void testNoUsageMeansNoLevels() {
+    public void testNoUsageMeansNoLevels() throws IOException {
         final Guardrails guardrails = new Guardrails(Settings.EMPTY, BucketSettings.GROUP::get, () -> null, now::get);
         guardrails.tick();
         guardrails.wrote("a", 5);
         guardrails.pushed("a", 5);
-        guardrails.searching(List.of("a")).close();
+        guardrails.admitSearch(List.of("a")).close();
         assertNull(guardrails.usage());
         assertTrue(guardrails.tenants().isEmpty());
     }
@@ -190,10 +190,10 @@ public class GuardrailsTests extends OpenSearchTestCase {
         guardrails.wrote("a", 3);
         guardrails.wrote("a", 0);
         guardrails.pushed("a", 120);
-        try (Releasable search = guardrails.searching(List.of("a", "b"))) {
+        try (Releasable search = guardrails.admitSearch(List.of("a", "b"))) {
             assertEquals("counted when it ends", 0L, store.usage().of("a").get(IndexUsage.Kind.QUERIES));
         }
-        guardrails.searching(List.of()).close();
+        guardrails.admitSearch(List.of()).close();
         assertEquals(3L, store.usage().of("a").get(IndexUsage.Kind.DOCS));
         assertEquals(120L, store.usage().of("a").get(IndexUsage.Kind.PUSH_BYTES));
         assertEquals(1L, store.usage().of("a").get(IndexUsage.Kind.QUERIES));
@@ -210,7 +210,7 @@ public class GuardrailsTests extends OpenSearchTestCase {
         expectThrows(IllegalArgumentException.class, () -> UsageSettings.INDEX_TIER.get(tier("huge")));
         assertEquals(UsageSettings.Mode.ENFORCE, UsageSettings.Mode.parse(" Enforce "));
         assertEquals("", UsageSettings.INDEX_MODE.get(Settings.EMPTY));
-        assertEquals(9, new UsageSettings().settings().size());
+        assertEquals(12, new UsageSettings().settings().size());
     }
 
     public void testLevelsSetFromOutsideParseAndTheHigherHolds() throws IOException {

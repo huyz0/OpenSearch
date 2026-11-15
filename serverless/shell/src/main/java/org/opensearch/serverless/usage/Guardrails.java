@@ -15,14 +15,18 @@ import org.opensearch.serverless.store.StoreUsage;
 import org.opensearch.serverless.usage.UsageSettings.Mode;
 import org.opensearch.serverless.usage.UsageSettings.Tier;
 
+import java.io.IOException;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
+import java.util.function.IntSupplier;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
@@ -41,8 +45,12 @@ import java.util.function.Supplier;
  *
  * <p><b>What each level does</b>, only in {@link Mode#ENFORCE} and only to that tenant's indices: at one and above, its
  * shards publish {@link #PUBLISH_STRETCH} times less often. Writes are still pushed to search nodes as they are
- * acknowledged, which costs no store request, so searches see them as soon as before. In {@link Mode#OBSERVE}, the
+ * acknowledged, which costs no store request, so searches see them as soon as before. At two and above, its searches
+ * wait while half the node's search slots are taken. In {@link Mode#OBSERVE}, the
  * default, levels are only computed and reported. Nothing here sends a request to the store or another node.
+ *
+ * <p><b>Fair share</b> holds whatever the mode, and only while the node runs as many searches as it has slots: no
+ * tenant takes more than {@link UsageSettings#SEARCH_TENANT_SHARE} of them while others wait.
  */
 public final class Guardrails {
 
@@ -67,6 +75,7 @@ public final class Guardrails {
     private final ConcurrentHashMap<String, Tenant> tenants = new ConcurrentHashMap<>();
     private volatile Map<String, Integer> external = Map.of();
     private long lastTickMillis = -1L;
+    private final SearchAdmission searches;
 
     /**
      * Creates a node's guardrails.
@@ -77,6 +86,25 @@ public final class Guardrails {
      * @param clock milliseconds
      */
     public Guardrails(Settings settings, Function<Settings, String> groupOf, Supplier<StoreUsage> usage, LongSupplier clock) {
+        this(settings, groupOf, usage, () -> Integer.MAX_VALUE, clock);
+    }
+
+    /**
+     * Creates a node's guardrails.
+     *
+     * @param settings the node's settings
+     * @param groupOf an index's bucket group from its settings, empty or null for none
+     * @param usage the store's per-index usage, or a supplier of null when metering is off
+     * @param searchSlots how many searches the node runs at once, when {@link UsageSettings#SEARCH_SLOTS} is unset
+     * @param clock milliseconds
+     */
+    public Guardrails(
+        Settings settings,
+        Function<Settings, String> groupOf,
+        Supplier<StoreUsage> usage,
+        IntSupplier searchSlots,
+        LongSupplier clock
+    ) {
         this.nodeMode = Mode.parse(UsageSettings.MODE.get(settings));
         this.defaultTier = Tier.parse(UsageSettings.DEFAULT_TIER.get(settings));
         this.tierBudgets = new long[] {
@@ -86,6 +114,12 @@ public final class Guardrails {
         this.groupOf = groupOf;
         this.usage = usage;
         this.clock = clock;
+        final int slots = UsageSettings.SEARCH_SLOTS.get(settings);
+        this.searches = new SearchAdmission(
+            UsageSettings.SEARCH_TENANT_SHARE.get(settings),
+            UsageSettings.MAX_WAIT_MILLIS.get(settings),
+            slots > 0 ? () -> slots : searchSlots
+        );
     }
 
     /** What the guardrails know of an index: its tenant, and how the tenant is budgeted. */
@@ -305,24 +339,47 @@ public final class Guardrails {
     }
 
     /**
-     * Starts counting a search over indices: one query for each, and its time shared between them when it ends.
+     * Admits a search over indices and counts it: one query for each, and its time shared between them when it ends.
+     * While the node's search slots are all taken, a tenant holding its share of them waits; a tenant at level two or
+     * above, when enforced, waits while half are taken; see {@link SearchAdmission}.
      *
      * @param searched the indices it covers
      * @return ends the search
+     * @throws IOException if interrupted while waiting
      */
-    public Releasable searching(Collection<String> searched) {
-        final StoreUsage store = usage.get();
-        if (store == null || searched.isEmpty()) {
+    public Releasable admitSearch(Collection<String> searched) throws IOException {
+        if (searched.isEmpty()) {
             return () -> {};
         }
+        final Set<String> searchTenants = new HashSet<>();
+        boolean lowPriority = false;
+        for (String index : searched) {
+            final IndexInfo info = info(index);
+            searchTenants.add(info.tenant());
+            lowPriority |= enforcedAt(info, 2);
+        }
+        final Releasable admitted = searches.admit(searchTenants, lowPriority, false);
+        final StoreUsage store = usage.get();
         final long started = System.nanoTime();
         return () -> {
-            final long each = (System.nanoTime() - started) / searched.size();
-            for (String index : searched) {
-                store.record(index, IndexUsage.Kind.QUERIES, 1L);
-                store.record(index, IndexUsage.Kind.SEARCH_NANOS, each);
+            admitted.close();
+            if (store != null) {
+                final long each = (System.nanoTime() - started) / searched.size();
+                for (String index : searched) {
+                    store.record(index, IndexUsage.Kind.QUERIES, 1L);
+                    store.record(index, IndexUsage.Kind.SEARCH_NANOS, each);
+                }
             }
         };
+    }
+
+    /**
+     * Returns how many searches this node is running now, for tests.
+     *
+     * @return searches admitted and not yet ended
+     */
+    public int searchesInFlight() {
+        return searches.inFlight();
     }
 
     // ---- reporting
