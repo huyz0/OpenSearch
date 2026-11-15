@@ -43,8 +43,12 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"keyword\"},\"n\":{\"type\":\"long\"}}}";
     private static final String INDEX = "fresh";
 
+    /** Whether the nodes take batches as streams, as they do by default, or whole. */
+    private boolean streaming = true;
+
     private Settings nodeSettings(String name, String roles, String mode) {
         final Settings.Builder builder = Settings.builder()
+            .put(org.opensearch.serverless.node.BulkSettings.STREAMING.getKey(), streaming)
             .put("node.name", name)
             .put("cluster.name", "serverless-refresh-visibility")
             .put("path.home", createTempDir())
@@ -189,6 +193,80 @@ public class RefreshVisibilityTests extends OpenSearchTestCase {
                 assertFalse("search nodes see only commits: " + put.body(), put.body().contains("\"forced_refresh\":true"));
             }
         );
+    }
+
+    public void testABatchAskedNotToBePushedIsSearchedFromTheNextCommit() throws Exception {
+        for (boolean streamed : new boolean[] { true, false }) {
+            streaming = streamed;
+            withNodes(null, Settings.EMPTY, (plane, writer, reader, join) -> {
+                final var push = writer.router().tailPush();
+                // The seed write may still be lingering on its way to the search node.
+                Thread.sleep(1_500);
+                final long pushedBefore = push.counts()[0];
+                final List<String> ids = new ArrayList<>();
+                for (ServerlessNode via : new ServerlessNode[] { writer, reader }) {
+                    final String prefix = "load-" + streamed + "-" + via.localNode().getName();
+                    final Response bulk = send(via, "POST", "/_bulk?tail_overlay=false", bulk(prefix, 5));
+                    assertEquals(bulk.body(), 200, bulk.status());
+                    assertFalse(bulk.body(), bulk.body().contains("\"errors\":true"));
+                    assertFalse(bulk.body(), bulk.body().contains("\"forced_refresh\":true"));
+                    for (int i = 0; i < 5; i++) {
+                        ids.add(prefix + i);
+                    }
+                }
+                // Past the writer's linger: had the batches been pushed, the search node would hold them by now.
+                Thread.sleep(1_500);
+                for (String id : ids) {
+                    assertEquals("not pushed, so not searched before the commit: " + id, 0L, hits(reader, id));
+                }
+                assertEquals("nothing of the batches was pushed", pushedBefore, push.counts()[0]);
+                assertEquals(10L, push.recordsLeftToCommit());
+                assertEquals(
+                    "the search node is still pushed to",
+                    java.util.Set.of(reader.localNode().getId()),
+                    push.subscribersOf(shard(writer))
+                );
+
+                // Not a gap: the next write that is pushed is searched on the search node as before, and refreshed.
+                final Response after = send(
+                    writer,
+                    "PUT",
+                    "/" + INDEX + "/_doc/after-" + streamed + "?refresh=true",
+                    doc("after-" + streamed)
+                );
+                assertEquals(after.body(), 201, after.status());
+                assertTrue(after.body(), after.body().contains("\"forced_refresh\":true"));
+                assertEquals(1L, hits(reader, "after-" + streamed));
+
+                // The next commit holds the batches, and the search node opens it.
+                writer.shards().publishShard(shard(writer), plane.heads().read(INDEX, 0).orElseThrow().term());
+                assertBusy(() -> {
+                    for (String id : ids) {
+                        assertEquals(id, 1L, hits(reader, id));
+                    }
+                });
+                assertEquals(1L, hits(reader, "after-" + streamed));
+            });
+        }
+    }
+
+    public void testARefreshingBatchIsPushedEvenWhenAskedNotToBe() throws Exception {
+        withNodes(null, Settings.EMPTY, (plane, writer, reader, join) -> {
+            for (ServerlessNode via : new ServerlessNode[] { writer, reader }) {
+                final String prefix = "refreshed-" + via.localNode().getName();
+                final Response bulk = send(via, "POST", "/_bulk?refresh=true&tail_overlay=false", bulk(prefix, 5));
+                assertEquals(bulk.body(), 200, bulk.status());
+                assertTrue(bulk.body(), bulk.body().contains("\"forced_refresh\":true"));
+                for (int i = 0; i < 5; i++) {
+                    assertEquals(prefix + i, 1L, hits(reader, prefix + i));
+                }
+            }
+            assertEquals(0L, writer.router().tailPush().recordsLeftToCommit());
+        });
+    }
+
+    private static org.opensearch.core.index.shard.ShardId shard(ServerlessNode writer) {
+        return writer.reconciler().writerShard(new org.opensearch.core.index.shard.ShardId(INDEX, "uuid-fresh-0000000000", 0)).shardId();
     }
 
     private static String doc(String id) {

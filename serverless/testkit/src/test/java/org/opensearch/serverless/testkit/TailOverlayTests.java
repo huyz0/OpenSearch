@@ -170,6 +170,49 @@ public class TailOverlayTests extends OpenSearchTestCase {
         );
     }
 
+    public void testTurningTheIndexSettingOffOnALiveIndexStopsThePushesAtTheWritersNextHeartbeat() throws Exception {
+        withNodes(null, (plane, store, writer, reader, shardId, term) -> {
+            writer.writes().index(shardId, "a", "{\"msg\":\"published\",\"n\":1}");
+            writer.shards().publishShard(shardId, term);
+            assertEquals(1L, hits(reader, plane, "msg", "published"));
+            assertBusy(() -> assertEquals(1, writer.router().tailPush().subscribersOf(shardId).size()));
+            writer.writes().index(shardId, "b", "{\"msg\":\"live\",\"n\":2}");
+            assertBusy(() -> assertEquals(1L, hits(reader, plane, "msg", "live")), 10, TimeUnit.SECONDS);
+            // Counted once its answer is back, which can be after the search node indexed it.
+            assertBusy(() -> assertEquals(1L, writer.router().tailPush().counts()[0]));
+
+            // Off on the live index, as PUT _settings writes it: the writer takes it at its next heartbeat.
+            setOverlay(plane, writer, "false");
+            final long pushed = writer.router().tailPush().counts()[0];
+            writer.writes().index(shardId, "c", "{\"msg\":\"quiet\",\"n\":3}");
+            Thread.sleep(500);
+            assertEquals("not pushed while off", pushed, writer.router().tailPush().counts()[0]);
+            assertTrue(writer.router().tailPush().subscribersOf(shardId).isEmpty());
+            assertEquals(0L, hits(reader, plane, "msg", "quiet"));
+            assertEquals("what was pushed before stays", 1L, hits(reader, plane, "msg", "live"));
+
+            // Back on: the search node subscribes again when it opens the next commit, and is pushed from then.
+            setOverlay(plane, writer, "true");
+            writer.shards().publishShard(shardId, term);
+            assertBusy(() -> assertEquals(1L, hits(reader, plane, "msg", "quiet")), 10, TimeUnit.SECONDS);
+            assertBusy(() -> assertEquals(1, writer.router().tailPush().subscribersOf(shardId).size()), 10, TimeUnit.SECONDS);
+            writer.writes().index(shardId, "d", "{\"msg\":\"again\",\"n\":4}");
+            assertBusy(() -> assertEquals(1L, hits(reader, plane, "msg", "again")), 10, TimeUnit.SECONDS);
+        });
+    }
+
+    /** Sets the index's tail overlay in its descriptor, and has the writer heartbeat, which applies it. */
+    private static void setOverlay(MetadataPlane plane, ServerlessNode writer, String value) throws Exception {
+        final long generation = plane.descriptorGeneration("tail");
+        final IndexDescriptor current = plane.describe("tail").orElseThrow();
+        final Settings settings = Settings.builder()
+            .put(current.extraSettings())
+            .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey(), value)
+            .build();
+        assertTrue(plane.updateDescriptor(current.withSettings(settings), generation).isPresent());
+        writer.leases().heartbeat(plane);
+    }
+
     public void testTheIndexSettingWinsOverTheClusterAndTheClusterOverTheNode() {
         final Settings on = Settings.builder()
             .put(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey(), "true")

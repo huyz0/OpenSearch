@@ -226,6 +226,7 @@ public final class TailPush {
     private final AtomicBoolean flushScheduled = new AtomicBoolean();
     private final AtomicLong keptBytes = new AtomicLong();
     private final AtomicLong recordsPushed = new AtomicLong();
+    private final AtomicLong recordsLeftToCommit = new AtomicLong();
     private final AtomicLong messagesSent = new AtomicLong();
     private final AtomicLong sendFailures = new AtomicLong();
     private final AtomicLong fetchesServed = new AtomicLong();
@@ -264,6 +265,22 @@ public final class TailPush {
      * @param records the records, each with its sequence number
      */
     public void acked(ShardId shardId, List<WalRecord> records) {
+        acked(shardId, records, true);
+    }
+
+    /**
+     * Takes records this node has just acknowledged, as {@link #acked(ShardId, List)} does, unless the write asked for
+     * them not to be pushed: then they are neither kept nor pushed, and the shard's search nodes see them when they open
+     * a commit holding them. Each document such a write touches is served as the commit, or the last write pushed, has
+     * it until then. It is not a gap: what a search node holds is still every pushed write past its commit, so the
+     * pushes to it go on, and so does a grant, which never covers a write that was not pushed; a write asked to be
+     * refreshed is always pushed.
+     *
+     * @param shardId the shard
+     * @param records the records, each with its sequence number
+     * @param push false to leave them to the next commit
+     */
+    public void acked(ShardId shardId, List<WalRecord> records, boolean push) {
         if (records.isEmpty()) {
             return;
         }
@@ -272,6 +289,13 @@ public final class TailPush {
             if (kept.containsKey(shardId)) {
                 drop(shardId);
             }
+            return;
+        }
+        if (push == false) {
+            // Begun at these records if nothing is kept yet, as for a pushed write, so a search node opening on an
+            // older commit is still told it is missing what came before them.
+            kept.computeIfAbsent(shardId, ignored -> newKept(shardId, lowest(records) - 1));
+            recordsLeftToCommit.addAndGet(records.size());
             return;
         }
         final Kept shard = kept.computeIfAbsent(shardId, ignored -> newKept(shardId, lowest(records) - 1));
@@ -692,6 +716,11 @@ public final class TailPush {
             lowest = Math.min(lowest, record.seqNo());
         }
         return lowest;
+    }
+
+    /** @return records acknowledged by writes that asked not to be pushed, which search nodes see at the next commit */
+    public long recordsLeftToCommit() {
+        return recordsLeftToCommit.get();
     }
 
     /** @return refreshing writes that waited for search nodes, and those of them not confirmed by every node */

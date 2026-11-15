@@ -287,6 +287,19 @@ unpublished record of every shard is, so a successor reads it without a listing.
   commit's. Because searches no longer wait for publishes, a shard with overlays on whose index sets no
   `refresh_interval` is published after `serverless.search.tail_overlay.publish_max_age_millis` (10 seconds by default)
   rather than the node's one second, which cuts publish PUTs. A shard with overlays off keeps the node's age.
+- **Loading without the tail overlay.** A large load (a backfill, a reindex done with `_bulk`) sends every byte it
+  writes to each search node serving its shards again, which nothing caps but the writer's memory for what it keeps
+  (16 MB a shard, 256 MB a node). Two ways to leave a load to commits instead:
+  - Per request: `POST _bulk?tail_overlay=false`. The batch is acknowledged as before, but neither kept nor pushed;
+    search nodes find it when they open the shard's next commit (within
+    `serverless.search.tail_overlay.publish_max_age_millis`, 10 seconds, when the index sets no `refresh_interval`).
+    Other writes to the same shards are pushed as usual, so a search node stays live for them meanwhile. A document
+    the batch rewrites shows the version the commit, or the last pushed write, has until then. A batch sent with
+    `refresh=true` or `refresh=wait_for` is pushed anyway, since that is what makes it visible on return.
+  - Per index, on a live index: `PUT /<index>/_settings {"index.serverless.tail_overlay": false}`. Each writer stops
+    pushing the index at its next heartbeat; search nodes keep what they were pushed, and serve commits from then on.
+    Set it back to `true` and search nodes are pushed again from the next commit they open. While it is off,
+    `refresh=true` answers `forced_refresh: false`, as it does for any index with the overlay off.
 - **`refresh=true` and `refresh=wait_for` on search nodes.** Both spellings mean the same here: the writer refreshes
   its own copy, then waits until every search node serving the shard has taken the write into its overlay, at most
   500 ms, before it answers. A search node that opens the shard waits for the writer's answer to its fetch before it
