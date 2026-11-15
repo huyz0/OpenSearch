@@ -107,6 +107,11 @@ If something here looks like a hang, measure before concluding.
 real assembled plugin, `tlsTest` does a real handshake. `s3Test` needs a live S3-compatible endpoint
 (RustFS, MinIO or SeaweedFS) and assume-skips without one.
 
+What the key paths cost in object-store requests and sequential round trips (take, write, publish, an idle hour held,
+release, cold search) is pinned in [request-budgets.md](request-budgets.md) and checked by `RequestBudgetTests` in
+`:serverless:testkit:test`: a change that adds a request fails, and one that saves a request fails until the table
+records the saving.
+
 ### Running against RustFS
 
 RustFS is the S3-compatible store this project tests on; there is no AWS account behind any of it, so
