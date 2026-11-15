@@ -46,8 +46,9 @@ public interface ReaderPush {
      *
      * @param shardId the shard
      * @param records the records just acknowledged
+     * @param push false when the write asked to be left to the next commit: the records are neither kept nor pushed
      */
-    void acked(ShardId shardId, List<WalRecord> records);
+    void acked(ShardId shardId, List<WalRecord> records, boolean push);
 
     /**
      * Makes a refreshed shard visible as far as the refresh mode promises.

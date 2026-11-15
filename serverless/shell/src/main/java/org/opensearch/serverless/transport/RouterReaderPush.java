@@ -44,8 +44,8 @@ final class RouterReaderPush implements ReaderPush {
     }
 
     @Override
-    public void acked(ShardId shardId, List<WalRecord> records) {
-        router.tailPush().acked(shardId, records);
+    public void acked(ShardId shardId, List<WalRecord> records, boolean push) {
+        router.tailPush().acked(shardId, records, push);
     }
 
     @Override

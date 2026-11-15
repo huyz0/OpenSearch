@@ -50,7 +50,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
     private static final Logger logger = LogManager.getLogger(BulkStream.class);
 
     /** The parameters every slice is applied with. */
-    record Request(String defaultIndex, String routing, String defaultPipeline, boolean refresh) {
+    record Request(String defaultIndex, String routing, String defaultPipeline, boolean refresh, boolean tailPush) {
     }
 
     private final BulkHandler handler;
@@ -286,6 +286,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
         final List<BulkHandler.Item> refused = new ArrayList<>();
         try {
             if (pending.isEmpty() == false) {
+                BulkHandler.pushTo(pending, request.tailPush());
                 final boolean sliceRefreshed = handler.dispatcher().dispatch(serving, pending, request.refresh());
                 synchronized (this) {
                     refreshed &= sliceRefreshed;

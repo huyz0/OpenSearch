@@ -184,6 +184,7 @@ public final class BulkHandler extends BaseRestHandler {
     private RestChannelConsumer prepareStreaming(RestRequest request, NodeContext serving) {
         final String defaultIndex = request.param("index");
         final var refreshPolicy = WriteRequest.RefreshPolicy.parse(request.param("refresh", "false"));
+        final boolean tailPush = tailPush(request);
         final String defaultPipeline = request.param("pipeline");
         final String routing = DocumentRouting.normalize(request.param("routing"));
         final boolean requireAlias = request.paramAsBoolean("require_alias", false);
@@ -227,7 +228,7 @@ public final class BulkHandler extends BaseRestHandler {
                 (org.opensearch.rest.StreamingRestChannel) channel,
                 serving,
                 metadata,
-                new BulkStream.Request(defaultIndex, routing, defaultPipeline, refreshPolicy != WriteRequest.RefreshPolicy.NONE),
+                new BulkStream.Request(defaultIndex, routing, defaultPipeline, refreshPolicy != WriteRequest.RefreshPolicy.NONE, tailPush),
                 budget(serving),
                 Math.max(64 * 1024, BulkSettings.SLICE_BYTES.get(settings).getBytes()),
                 org.opensearch.http.HttpTransportSettings.SETTING_HTTP_MAX_CONTENT_LENGTH.get(settings).getBytes(),
@@ -293,6 +294,7 @@ public final class BulkHandler extends BaseRestHandler {
         final String defaultIndex = request.param("index");
         final var refreshPolicy = WriteRequest.RefreshPolicy.parse(request.param("refresh", "false"));
         final boolean refresh = refreshPolicy != WriteRequest.RefreshPolicy.NONE;
+        final boolean tailPush = tailPush(request);
         final String timeout = request.param("timeout");
         final var activeShards = org.opensearch.action.support.ActiveShardCount.parseString(request.param("wait_for_active_shards"));
         final String defaultPipeline = request.param("pipeline");
@@ -355,6 +357,7 @@ public final class BulkHandler extends BaseRestHandler {
                 item.pipeline = defaultPipeline;
             }
         }
+        pushTo(items, tailPush);
         final NodeContext serving = node.get();
         // The coordinator runs on GENERIC and the per-shard groups run on WRITE. It used to be the other
         // way round for a moment, with both on WRITE, which is a deadlock waiting for enough concurrent
@@ -441,6 +444,7 @@ public final class BulkHandler extends BaseRestHandler {
                             );
                         }
                         final List<Item> admittedItems = admittedItems(selected, batch.rejected());
+                        pushTo(admittedItems, items.isEmpty() || items.get(0).tailPush);
                         dispatcher.route(serving, metadata, admittedItems);
                         dispatcher.shape(serving, metadata, admittedItems);
                         final boolean selectedRefresh = selected.getRefreshPolicy() != WriteRequest.RefreshPolicy.NONE;
@@ -470,6 +474,29 @@ public final class BulkHandler extends BaseRestHandler {
     }
 
     /** Gives filters the actual inputs before any ingest configuration is read or executed. */
+    /** The request parameter that leaves a batch's writes to the next commit rather than push them to search nodes. */
+    static final String TAIL_OVERLAY_PARAM = "tail_overlay";
+
+    /**
+     * Reads {@code tail_overlay}: {@code false} has the batch's writes searched on the search nodes from the shard's next
+     * commit, rather than pushed to them as they are acknowledged -- for a large load, whose pushes would otherwise be
+     * every byte of it sent again to each search node serving its shards. A batch asked to be refreshed is pushed
+     * anyway, since that is what makes it visible on return. True, the default, changes nothing.
+     *
+     * @param request the request
+     * @return false to leave the batch to the next commit
+     */
+    static boolean tailPush(RestRequest request) {
+        return request.paramAsBoolean(TAIL_OVERLAY_PARAM, true);
+    }
+
+    /** Marks every item with whether its writes are pushed to search nodes. */
+    static void pushTo(List<Item> items, boolean tailPush) {
+        for (Item item : items) {
+            item.tailPush = tailPush;
+        }
+    }
+
     static NativeBatch bulkRequestFor(List<Item> items, WriteRequest.RefreshPolicy refreshPolicy, String pipeline) {
         final var request = new BulkRequest().pipeline(pipeline).setRefreshPolicy(refreshPolicy);
         final Map<DocWriteRequest<?>, Item> rejected = new java.util.IdentityHashMap<>();
@@ -768,6 +795,8 @@ public final class BulkHandler extends BaseRestHandler {
         boolean requireAbsent;
         long ifSeqNo = org.opensearch.index.seqno.SequenceNumbers.UNASSIGNED_SEQ_NO;
         long ifPrimaryTerm = 0L;
+        /** Whether what this item writes is pushed to its shard's search nodes, or left to the shard's next commit. */
+        boolean tailPush = true;
 
         Item(String action, String index, WalRecord operation) {
             this.action = action;
