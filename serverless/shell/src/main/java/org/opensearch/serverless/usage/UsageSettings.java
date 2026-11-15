@@ -113,11 +113,27 @@ public final class UsageSettings implements SettingsProvider {
     /** The large tier's budget, in cost units a minute. */
     public static final Setting<Long> LARGE_BUDGET = Setting.longSetting("serverless.cost.tier.large", 2_000L, 1L, Property.NodeScope);
 
+    /**
+     * Levels set from outside for tenants whose total across nodes is over budget, as {@code tenant=level} pairs separated
+     * by commas, in the {@code cluster/config} register. A tenant's level on a node is the higher of this and its own.
+     */
+    public static final Setting<String> TENANT_LEVELS = Setting.simpleString("serverless.cost.tenant_levels", Property.NodeScope);
+
     /** Used by {@link java.util.ServiceLoader}. */
     public UsageSettings() {}
 
     @Override
     public List<Setting<?>> settings() {
-        return List.of(MODE, INDEX_MODE, DEFAULT_TIER, INDEX_TIER, INDEX_BUDGET, SMALL_BUDGET, STANDARD_BUDGET, LARGE_BUDGET);
+        return List.of(
+            MODE,
+            INDEX_MODE,
+            DEFAULT_TIER,
+            INDEX_TIER,
+            INDEX_BUDGET,
+            SMALL_BUDGET,
+            STANDARD_BUDGET,
+            LARGE_BUDGET,
+            TENANT_LEVELS
+        );
     }
 }

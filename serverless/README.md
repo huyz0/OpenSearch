@@ -840,3 +840,13 @@ Every 10 s the node adds up each tenant's cost here against its budget, in cost 
 or `index.serverless.cost.budget`. A minute over raises it to level 1, two more minutes over to 2, then 3; five minutes
 under lowers it one. `serverless.cost.guardrails` (node) and `index.serverless.cost.guardrails` (index, wins) are `off`,
 `observe` (the default: levels are computed and reported, nothing is slowed) or `enforce`.
+
+A collector that sees every node can set levels in the cluster settings, `serverless.cost.tenant_levels` as
+`tenant=level,...`; a node takes the higher of that and its own, and other nodes read it within five minutes.
+
+What a level does, when enforced, to that tenant's indices only:
+
+- **Level 1 and above**: its shards publish four times less often. Writes are still pushed to search nodes as they are
+  acknowledged, which costs no store request, so searches see them as soon as before; only the commits are fewer. On a
+  test node publishing every second, a tenant at level 1 paid half the PUTs of its neighbour written at the same rate
+  (`PublishStretchNodeTests`; the rest is both indices' equal share of the node log).
