@@ -36,13 +36,21 @@ import java.util.function.Supplier;
  * minutes, down one. A tenant's budget is its tier's, {@link UsageSettings#INDEX_BUDGET} overriding it, and when its
  * indices disagree, the largest.
  *
- * <p>In {@link Mode#OBSERVE}, the default, levels are only computed and reported. Nothing here sends a request to the
- * store or another node.
+ * <p>This node sees only its own share of a tenant, so a level can also be set from outside, by a collector that sees
+ * every node ({@link UsageSettings#TENANT_LEVELS}); the higher of the two holds.
+ *
+ * <p><b>What each level does</b>, only in {@link Mode#ENFORCE} and only to that tenant's indices: at one and above, its
+ * shards publish {@link #PUBLISH_STRETCH} times less often. Writes are still pushed to search nodes as they are
+ * acknowledged, which costs no store request, so searches see them as soon as before. In {@link Mode#OBSERVE}, the
+ * default, levels are only computed and reported. Nothing here sends a request to the store or another node.
  */
 public final class Guardrails {
 
     /** How often levels are recomputed. */
     public static final long TICK_MILLIS = 10_000L;
+
+    /** How much longer a tenant at level one or above waits to publish. */
+    public static final int PUBLISH_STRETCH = 4;
 
     private static final long LEVEL_UP_AFTER_MILLIS = 60_000L;
     private static final long NEXT_LEVEL_AFTER_MILLIS = 120_000L;
@@ -57,6 +65,7 @@ public final class Guardrails {
 
     private final ConcurrentHashMap<String, IndexInfo> indices = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Tenant> tenants = new ConcurrentHashMap<>();
+    private volatile Map<String, Integer> external = Map.of();
     private long lastTickMillis = -1L;
 
     /**
@@ -136,14 +145,69 @@ public final class Guardrails {
     }
 
     /**
-     * Returns a tenant's level on this node.
+     * Returns a tenant's level: the higher of this node's and the one set from outside.
      *
      * @param tenant the tenant
-     * @return 0 to 3
+     * @return 0 to 4
      */
     public int level(String tenant) {
         final Tenant state = tenants.get(tenant);
-        return state == null ? 0 : state.level;
+        return Math.max(state == null ? 0 : state.level, external.getOrDefault(tenant, 0));
+    }
+
+    private boolean enforcedAt(IndexInfo info, int minLevel) {
+        return info.mode() == Mode.ENFORCE && level(info.tenant()) >= minLevel;
+    }
+
+    /**
+     * Applies the cluster's settings: the levels set from outside.
+     *
+     * @param cluster the {@code cluster/config} register's settings
+     */
+    public void applyCluster(Settings cluster) {
+        external = parseLevels(UsageSettings.TENANT_LEVELS.get(cluster));
+    }
+
+    /**
+     * Parses {@code tenant=level,...}, leaving out pairs that do not parse.
+     *
+     * @param value the setting's value
+     * @return tenant to level, 0 to 4
+     */
+    public static Map<String, Integer> parseLevels(String value) {
+        if (value == null || value.isBlank()) {
+            return Map.of();
+        }
+        final Map<String, Integer> levels = new HashMap<>();
+        for (String pair : value.split(",")) {
+            final int eq = pair.lastIndexOf('=');
+            if (eq <= 0) {
+                continue;
+            }
+            try {
+                final int level = Integer.parseInt(pair.substring(eq + 1).trim());
+                final String tenant = pair.substring(0, eq).trim();
+                if (tenant.isEmpty() == false && level >= 0 && level <= 4) {
+                    levels.put(tenant, level);
+                }
+            } catch (NumberFormatException e) {
+                // Left out: a bad pair must not stop the others.
+            }
+        }
+        return Map.copyOf(levels);
+    }
+
+    // ---- level one
+
+    /**
+     * Returns how long an index's oldest unpublished write may get: stretched for a tenant at level one or above.
+     *
+     * @param index the index
+     * @param ageMillis the age it would otherwise publish at; less than zero (never by age) is kept
+     * @return the age
+     */
+    public long publishAge(String index, long ageMillis) {
+        return ageMillis >= 0 && enforcedAt(info(index), 1) ? ageMillis * PUBLISH_STRETCH : ageMillis;
     }
 
     // ---- levels
@@ -280,6 +344,8 @@ public final class Guardrails {
             final Tenant tenant = entry.getValue();
             final Map<String, Object> line = new LinkedHashMap<>();
             line.put("level", level(entry.getKey()));
+            line.put("local_level", tenant.level);
+            line.put("set_level", external.getOrDefault(entry.getKey(), 0));
             line.put("tier", tiers.getOrDefault(entry.getKey(), defaultTier.name().toLowerCase(Locale.ROOT)));
             line.put("budget_per_minute", budgets.getOrDefault(entry.getKey(), tierBudgets[defaultTier.ordinal()]));
             line.put("cost_per_minute", Math.round(tenant.costPerMinute * 100d) / 100d);

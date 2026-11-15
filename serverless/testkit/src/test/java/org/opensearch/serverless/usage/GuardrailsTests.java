@@ -210,6 +210,58 @@ public class GuardrailsTests extends OpenSearchTestCase {
         expectThrows(IllegalArgumentException.class, () -> UsageSettings.INDEX_TIER.get(tier("huge")));
         assertEquals(UsageSettings.Mode.ENFORCE, UsageSettings.Mode.parse(" Enforce "));
         assertEquals("", UsageSettings.INDEX_MODE.get(Settings.EMPTY));
-        assertEquals(8, new UsageSettings().settings().size());
+        assertEquals(9, new UsageSettings().settings().size());
+    }
+
+    public void testLevelsSetFromOutsideParseAndTheHigherHolds() throws IOException {
+        assertEquals(Map.of("a", 2, "b b", 4), Guardrails.parseLevels(" a=2, b b=4 ,bad, =3, c=9, d=x"));
+        assertEquals(Map.of(), Guardrails.parseLevels(""));
+        assertEquals(Map.of(), Guardrails.parseLevels(null));
+        final Guardrails guardrails = guardrails(Settings.EMPTY);
+        guardrails.note("a", tier("small"));
+        baseline(guardrails, "a");
+        for (int i = 0; i < 7; i++) {
+            tenSeconds(guardrails, "a", 10);
+        }
+        assertEquals(1, guardrails.level("a"));
+        guardrails.applyCluster(Settings.builder().put(UsageSettings.TENANT_LEVELS.getKey(), "a=3,z=2").build());
+        assertEquals(3, guardrails.level("a"));
+        assertEquals("a tenant this node has not seen", 2, guardrails.level("z"));
+        assertEquals(1, guardrails.tenants().get("a").get("local_level"));
+        assertEquals(3, guardrails.tenants().get("a").get("set_level"));
+        guardrails.applyCluster(Settings.builder().put(UsageSettings.TENANT_LEVELS.getKey(), "a=0").build());
+        assertEquals("its own level when the outside one is lower", 1, guardrails.level("a"));
+        guardrails.applyCluster(Settings.EMPTY);
+        assertEquals(0, guardrails.level("z"));
+    }
+
+    public void testPublishesStretchOnlyWhenEnforcedAtLevelOne() throws IOException {
+        final Settings levels = Settings.builder().put(UsageSettings.TENANT_LEVELS.getKey(), "over=1").build();
+        final Guardrails enforcing = guardrails(Settings.builder().put(UsageSettings.MODE.getKey(), "enforce").build());
+        enforcing.applyCluster(levels);
+        assertEquals(1_000L * Guardrails.PUBLISH_STRETCH, enforcing.publishAge("over", 1_000L));
+        assertEquals("never by age stays never", -1L, enforcing.publishAge("over", -1L));
+        assertEquals(0L, enforcing.publishAge("over", 0L));
+        assertEquals("under budget", 1_000L, enforcing.publishAge("under", 1_000L));
+        enforcing.note("over", Settings.builder().put(UsageSettings.INDEX_MODE.getKey(), "observe").build());
+        assertEquals("the index's mode wins", 1_000L, enforcing.publishAge("over", 1_000L));
+
+        final Guardrails observing = guardrails(Settings.EMPTY);
+        observing.applyCluster(levels);
+        assertEquals("observe only reports", 1_000L, observing.publishAge("over", 1_000L));
+        observing.note("over", Settings.builder().put(UsageSettings.INDEX_MODE.getKey(), "enforce").build());
+        assertEquals(1_000L * Guardrails.PUBLISH_STRETCH, observing.publishAge("over", 1_000L));
+    }
+
+    public void testALevelReachedLocallyStretchesPublishes() throws IOException {
+        final Guardrails guardrails = guardrails(Settings.builder().put(UsageSettings.MODE.getKey(), "enforce").build());
+        guardrails.note("a", tier("small"));
+        baseline(guardrails, "a");
+        for (int i = 0; i < 6; i++) {
+            tenSeconds(guardrails, "a", 10);
+        }
+        assertEquals(500L, guardrails.publishAge("a", 500L));
+        tenSeconds(guardrails, "a", 10);
+        assertEquals(2_000L, guardrails.publishAge("a", 500L));
     }
 }
