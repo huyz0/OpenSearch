@@ -241,7 +241,7 @@ final class SearchShardCalls {
             org.opensearch.serverless.transport.ShardRouter.of(serving)
                 .forwardSearch(
                     peer.get(),
-                    new org.opensearch.serverless.transport.ForwardedSearchRequest(index, shard, perShard, descriptor.uuid(), nowInMillis)
+                    new org.opensearch.serverless.forwarding.ForwardedSearchRequest(index, shard, perShard, descriptor.uuid(), nowInMillis)
                 )
         );
     }
@@ -345,7 +345,7 @@ final class SearchShardCalls {
                     org.opensearch.serverless.transport.ShardRouter.of(serving)
                         .forwardFrozenSearch(
                             peer.get(),
-                            new org.opensearch.serverless.transport.ForwardedFrozenSearchRequest(pit, shard, perShard, nowInMillis)
+                            new org.opensearch.serverless.forwarding.ForwardedFrozenSearchRequest(pit, shard, perShard, nowInMillis)
                         )
                 );
             } catch (Exception e) {

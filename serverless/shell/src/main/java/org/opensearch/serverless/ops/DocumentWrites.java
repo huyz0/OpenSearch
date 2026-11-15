@@ -280,7 +280,7 @@ final class DocumentWrites {
             final var ack = org.opensearch.serverless.transport.ShardRouter.of(node)
                 .forwardIndex(
                     peer.get(),
-                    new org.opensearch.serverless.transport.ForwardedIndexRequest(
+                    new org.opensearch.serverless.forwarding.ForwardedIndexRequest(
                         index,
                         placement.uuid(),
                         placement.shard(),

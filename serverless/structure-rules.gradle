@@ -42,14 +42,15 @@ def structureLayers = [
   plugins: 9,
   node: 10,
   split: 11,
-  transport: 12,
-  reconcile: 13,
-  ops: 14, warm: 14,
-  documents: 15, restcore: 15,
-  alias: 16, snapshot: 16,
-  indexadmin: 17,
-  rest: 18,
-  shell: 19
+  forwarding: 12,
+  transport: 13,
+  reconcile: 14,
+  ops: 15, warm: 15,
+  documents: 16, restcore: 16,
+  alias: 17, snapshot: 17,
+  indexadmin: 18,
+  rest: 19,
+  shell: 20
 ]
 def maxClassLines = 1000
 def maxPackageFiles = 40

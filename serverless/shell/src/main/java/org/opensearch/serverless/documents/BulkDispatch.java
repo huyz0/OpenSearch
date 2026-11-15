@@ -343,7 +343,7 @@ public final class BulkDispatch {
             final var response = org.opensearch.serverless.transport.ShardRouter.of(serving)
                 .forwardBulk(
                     peer.get(),
-                    forwarded(org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh), group)
+                    forwarded(org.opensearch.serverless.forwarding.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh), group)
                 );
             record(group, response.outcomes(), response.ownerNodeId());
             return refresh == false || response.refreshed();
@@ -358,8 +358,8 @@ public final class BulkDispatch {
         return group.get(0).tailPush;
     }
 
-    private static org.opensearch.serverless.transport.ForwardedBulkRequest forwarded(
-        org.opensearch.serverless.transport.ForwardedBulkRequest request,
+    private static org.opensearch.serverless.forwarding.ForwardedBulkRequest forwarded(
+        org.opensearch.serverless.forwarding.ForwardedBulkRequest request,
         List<BulkItem> group
     ) {
         return tailPush(group) ? request : request.withoutTailPush();
@@ -417,7 +417,7 @@ public final class BulkDispatch {
                 .forwardBulk(
                     peer.get(),
                     forwarded(
-                        org.opensearch.serverless.transport.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh).steered(),
+                        org.opensearch.serverless.forwarding.ForwardedBulkRequest.of(index, uuid, shard, operations, refresh).steered(),
                         group
                     )
                 );

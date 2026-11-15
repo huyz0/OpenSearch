@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.transport;
+package org.opensearch.serverless.forwarding;
 
 import org.apache.lucene.search.Explanation;
 import org.opensearch.core.common.io.stream.StreamInput;

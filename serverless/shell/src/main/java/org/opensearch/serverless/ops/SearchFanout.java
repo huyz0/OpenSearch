@@ -621,7 +621,7 @@ public final class SearchFanout {
             );
         }
 
-        ShardAnswer(org.opensearch.serverless.transport.ForwardedSearchResponse answer) {
+        ShardAnswer(org.opensearch.serverless.forwarding.ForwardedSearchResponse answer) {
             this(
                 answer.total(),
                 answer.hits(),

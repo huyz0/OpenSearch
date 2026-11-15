@@ -9,6 +9,7 @@ package org.opensearch.serverless.transport;
 
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.serverless.forwarding.ForwardedFrozenSearchRequest;
 import org.opensearch.serverless.metadata.PointInTime;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.test.OpenSearchTestCase;

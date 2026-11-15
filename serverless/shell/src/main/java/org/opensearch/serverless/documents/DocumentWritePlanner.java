@@ -252,7 +252,7 @@ public final class DocumentWritePlanner {
                             .markCoordinatingOperationStarted(inFlightBytes, false)
                     ) {
                         String forwardTarget = owner;
-                        org.opensearch.serverless.transport.ForwardedIndexResponse ack;
+                        org.opensearch.serverless.forwarding.ForwardedIndexResponse ack;
                         try {
                             ack = DocumentForwarding.forwardTo(
                                 serving,
