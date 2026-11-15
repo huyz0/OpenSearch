@@ -149,8 +149,9 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
     }
 
     /**
-     * The dead writer's lease is judged once for all its shards, then read once more a shard: each shard's replay reads it
-     * again after its head moved, so a later epoch of that writer is one its ownership check refuses. By design.
+     * The dead writer's lease is judged once for all its shards, and read once more after its log is fenced, to find a trim
+     * point it recorded past the fence. Then it is read once more a shard: each shard's replay reads it again after its
+     * head moved, so a later epoch of that writer is one its ownership check refuses. By design.
      */
     public void testTakingACrashedWritersShards() throws Exception {
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
@@ -172,12 +173,12 @@ public class TakeoverRequestCountTests extends OpenSearchTestCase {
                 survivor.leases().renewLease(plane);
                 plane.membership().refresh();
                 takeAll("crashed", store, survivor, plane, clock);
-                // The dead writer's lease is judged and revoked once for all its shards taken together, then read once a
-                // shard by its replay: not read twice per shard and swapped by each.
+                // The dead writer's lease is judged and revoked once for all its shards taken together, read again once
+                // after the fence, then once a shard by its replay: not read twice per shard and swapped by each.
                 final String where = store.byPlace();
                 assertTrue(
-                    "no lease is read more than once, then once a shard\n" + where,
-                    mostOfOnePlace(where, "REGISTER_GET cluster/members/") <= SHARDS + 1
+                    "no lease is read more than twice, then once a shard\n" + where,
+                    mostOfOnePlace(where, "REGISTER_GET cluster/members/") <= SHARDS + 2
                 );
                 assertTrue("and revoked once\n" + where, count(where, "REGISTER_CAS cluster/members/") <= 2);
                 for (ShardId shardId : survivor.reconciler().openShards()) {
