@@ -73,7 +73,7 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
             ConditionalBlobContainer.of(store.blobContainer(shard))
                 .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
             final BlobContainer snapshots = store.blobContainer(
-                org.opensearch.serverless.metadata.RegisterMap.snapshots(BlobPath.cleanPath())
+                org.opensearch.serverless.repository.SnapshotPaths.snapshots(BlobPath.cleanPath())
             );
             snapshots.writeBlobAtomic("repo#damaged", new java.io.ByteArrayInputStream(new byte[] { 0 }), 1L, true);
             snapshots.writeBlobAtomic("operator-note", new java.io.ByteArrayInputStream(new byte[] { 0 }), 1L, true);
@@ -112,7 +112,7 @@ public class ServerlessSnapshotConsistencyTests extends OpenSearchTestCase {
             ConditionalBlobContainer.of(store.blobContainer(shard))
                 .createRegisterIfAbsent(SegmentPublisher.MANIFEST, new CommitManifest(2L, Map.of()).toBytes());
             final BlobContainer snapshots = store.blobContainer(
-                org.opensearch.serverless.metadata.RegisterMap.snapshots(BlobPath.cleanPath())
+                org.opensearch.serverless.repository.SnapshotPaths.snapshots(BlobPath.cleanPath())
             );
             final var collector = new org.opensearch.serverless.reconcile.GarbageCollector(store, BlobPath.cleanPath());
             for (String body : malformed) {

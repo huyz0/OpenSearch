@@ -37,11 +37,11 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.action.ActionGate;
+import org.opensearch.serverless.cluster.Names;
 import org.opensearch.serverless.metadata.MetadataPlane;
-import org.opensearch.serverless.metadata.Names;
-import org.opensearch.serverless.metadata.RepositoryDescriptor;
-import org.opensearch.serverless.metadata.RepositoryInUseException;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.repository.RepositoryDescriptor;
+import org.opensearch.serverless.repository.RepositoryInUseException;
 import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 

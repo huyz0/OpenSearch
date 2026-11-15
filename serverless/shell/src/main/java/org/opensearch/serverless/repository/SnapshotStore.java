@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.metadata;
+package org.opensearch.serverless.repository;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -17,6 +17,7 @@ import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.serverless.cluster.Names;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -33,13 +34,19 @@ import java.util.Objects;
 import java.util.Optional;
 
 /** CAS state for reusable snapshot names; discovery and copied files have unique lifetime identities. */
-final class SnapshotStore {
+public final class SnapshotStore {
     private static final Logger LOGGER = LogManager.getLogger(SnapshotStore.class);
     private static final BytesReference RELEASED = new BytesArray("{\"_released\":true}");
     private final BlobContainer inventory;
     private final ConditionalBlobContainer states;
 
-    SnapshotStore(BlobContainer inventory, BlobContainer states) {
+    /**
+     * Creates the store.
+     *
+     * @param inventory the container of snapshot records
+     * @param states the container of the snapshot-name registers, which must take conditional writes
+     */
+    public SnapshotStore(BlobContainer inventory, BlobContainer states) {
         this.inventory = inventory;
         this.states = ConditionalBlobContainer.of(states);
     }
@@ -87,7 +94,7 @@ final class SnapshotStore {
     }
 
     private Optional<State> state(String repo, String name) throws IOException {
-        final String key = RegisterMap.snapshotKey(repo, name);
+        final String key = SnapshotPaths.snapshotKey(repo, name);
         final var current = states.readRegister(hash(key));
         if (current.isPresent()) {
             return Optional.of(decode(key, current.get()));
@@ -106,7 +113,7 @@ final class SnapshotStore {
         if (key.equals(legacy.key()) == false) {
             throw new IOException("snapshot identity does not match its key");
         }
-        states.createRegisterIfAbsent(hash(key), encode(key, legacy, MetadataPlane.inProgress(legacy) == false));
+        states.createRegisterIfAbsent(hash(key), encode(key, legacy, SnapshotRecord.inProgress(legacy) == false));
         final var adopted = states.readRegister(hash(key));
         if (adopted.isEmpty()) {
             throw new IOException("snapshot state disappeared");
@@ -254,7 +261,7 @@ final class SnapshotStore {
             && parts[0].length() == 67
             && isHash(parts[0].substring(3))
             && isHash(parts[1])
-            && PointInTime.looksLikeAnId(parts[2]);
+            && Names.looksLikeAnId(parts[2]);
         final String keyHash = currentLayout ? parts[1] : hash(marker);
         final var known = states.readRegister(keyHash);
         if (known.isPresent()) {

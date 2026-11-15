@@ -35,7 +35,7 @@ def structureLayers = [
   nodelog: 2, usage: 2,
   ingest: 3, membership: 3,
   cluster: 4,
-  bucket: 5,
+  bucket: 5, template: 5, repository: 5,
   metadata: 6,
   engine: 7, script: 7, write: 7, action: 7,
   shard: 8,

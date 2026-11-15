@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.metadata;
+package org.opensearch.serverless.repository;
 
 import org.opensearch.core.common.bytes.BytesArray;
 import org.opensearch.serverless.store.CommitManifest;

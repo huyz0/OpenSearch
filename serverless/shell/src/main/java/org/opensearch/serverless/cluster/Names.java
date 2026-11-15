@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.metadata;
+package org.opensearch.serverless.cluster;
 
 import org.opensearch.core.common.Strings;
 
@@ -27,6 +27,12 @@ public final class Names {
 
     /** The longest a name may be, in bytes, which is core's limit and the filesystem's. */
     public static final int MAX_BYTES = 255;
+
+    /**
+     * What joins the parts of a register or container key: an index name and a shard number, a repository and a
+     * snapshot name. It is safe because no name this class accepts can hold it.
+     */
+    public static final String KEY_SEPARATOR = "#";
 
     private Names() {}
 
@@ -174,4 +180,38 @@ public final class Names {
         }
     }
 
+    /**
+     * Reports whether a blob name is one this system would have written a record under.
+     *
+     * <p><b>Why a name check exists at all.</b> A record that cannot be read is treated as live — refusing
+     * to delete data you cannot account for is the safe direction, and a half-written record must not have
+     * its files swept out from under the caller who is about to use it. But "unreadable means it pins
+     * everything" turns any stray object in this container into a deployment-wide off switch for the
+     * garbage collector: one file left by a console, a backup tool, or a test filesystem, and nothing is
+     * ever reclaimed again, silently.
+     *
+     * <p>So the two cases are separated by the only evidence available before parsing: the name. A
+     * truncated record this system wrote still has the name this system gave it, so the conservative
+     * treatment still covers the case it exists for. Something with a name we would never mint is not ours
+     * and does not get to speak for our data.
+     *
+     * <p>The shape is {@link org.opensearch.common.UUIDs#randomBase64UUID}'s: twenty-two base64url characters
+     * with no padding.
+     *
+     * @param name the blob name
+     * @return true if it could be a record this system wrote
+     */
+    public static boolean looksLikeAnId(String name) {
+        if (name == null || name.length() != 22) {
+            return false;
+        }
+        for (int i = 0; i < name.length(); i++) {
+            final char c = name.charAt(i);
+            final boolean allowed = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_';
+            if (allowed == false) {
+                return false;
+            }
+        }
+        return true;
+    }
 }

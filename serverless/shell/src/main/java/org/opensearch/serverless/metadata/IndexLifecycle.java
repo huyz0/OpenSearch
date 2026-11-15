@@ -10,6 +10,7 @@ package org.opensearch.serverless.metadata;
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.repository.SnapshotRecord;
 
 import java.io.IOException;
 import java.util.List;
@@ -159,46 +160,10 @@ final class IndexLifecycle {
             for (SnapshotRecord.SnapshottedIndex index : snapshot.indices().values()) {
                 // A capture still in flight has named the index and not yet its commits: it is reading
                 // those manifests now, or copying the blobs they name. Everything of the index is held
-                // until the record is finished -- see capturing() for why that is the same as a pin.
-                if (index.uuid().equals(uuid) && capturing(index) && shard < index.numberOfShards()) {
+                // until the record is finished -- see SnapshotRecord.capturing for why that is the same as a pin.
+                if (index.uuid().equals(uuid) && SnapshotRecord.capturing(index) && shard < index.numberOfShards()) {
                     return true;
                 }
-            }
-        }
-        return false;
-    }
-
-    /**
-     * Reports whether a snapshot record describes a capture that has not finished.
-     *
-     * <p>A snapshot's record is written <em>before</em> its manifests are read, naming every index it will
-     * capture and none of their commits, and rewritten with the commits once every one has been read (and,
-     * for a standard repository, copied). The record in between is the provisional one, and it is what
-     * makes a concurrent index deletion leave the shard data alone: without it, a delete landing after the
-     * manifests were read and before the record existed purged the very blobs a {@code SUCCESS} snapshot
-     * then named, and the first restore was the first anyone heard of it.
-     *
-     * <p>Told apart by shape rather than by a flag: a finished capture records every shard of every index
-     * it names or leaves the index out, so an index with a shard count and no shards can only be one still
-     * being taken.
-     *
-     * @param index an index entry of a snapshot record
-     * @return true while the capture of that index has not finished
-     */
-    public static boolean capturing(SnapshotRecord.SnapshottedIndex index) {
-        return index.shards().isEmpty() && index.numberOfShards() > 0;
-    }
-
-    /**
-     * Reports whether a snapshot is still being taken.
-     *
-     * @param snapshot the record
-     * @return true if any index it names is still being captured
-     */
-    public static boolean inProgress(SnapshotRecord snapshot) {
-        for (SnapshotRecord.SnapshottedIndex index : snapshot.indices().values()) {
-            if (capturing(index)) {
-                return true;
             }
         }
         return false;

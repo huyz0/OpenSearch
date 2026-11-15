@@ -16,18 +16,20 @@ import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.cluster.Names;
 import org.opensearch.serverless.metadata.DescriptorStore;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.PointInTime;
 import org.opensearch.serverless.metadata.RegisterMap;
-import org.opensearch.serverless.metadata.SnapshotRecord;
-import org.opensearch.serverless.metadata.TemplateCache;
-import org.opensearch.serverless.metadata.TemplateResolver;
-import org.opensearch.serverless.metadata.TemplateStore;
 import org.opensearch.serverless.reconcile.GarbageCollector;
+import org.opensearch.serverless.repository.SnapshotPaths;
+import org.opensearch.serverless.repository.SnapshotRecord;
 import org.opensearch.serverless.store.BlockCache;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.SegmentPublisher;
+import org.opensearch.serverless.template.TemplateCache;
+import org.opensearch.serverless.template.TemplateResolver;
+import org.opensearch.serverless.template.TemplateStore;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.ByteArrayInputStream;
@@ -273,7 +275,7 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
             Map.of("alpha", new SnapshotRecord.SnapshottedIndex("uuid-alpha-snapshot0", 1, MAPPING, Map.of(0, frozen)))
         );
         final var record = snapshot.toBytes();
-        store.blobContainer(RegisterMap.snapshots(base)).writeBlob(snapshot.key(), record.streamInput(), record.length(), true);
+        store.blobContainer(SnapshotPaths.snapshots(base)).writeBlob(snapshot.key(), record.streamInput(), record.length(), true);
         plane.createPointInTime(
             new PointInTime(UUIDs.randomBase64UUID(), "alpha", "uuid-alpha-viewed000", clock.get() + 600_000L, Map.of(0, frozen))
         );
@@ -594,7 +596,7 @@ public class ServerlessStoreInvariantTests extends OpenSearchTestCase {
 
         // A record with the name this system would mint and bytes it cannot read: torn by a crash.
         final String torn = UUIDs.randomBase64UUID();
-        assertTrue("the fixture needs a name the plane treats as its own", PointInTime.looksLikeAnId(torn));
+        assertTrue("the fixture needs a name the plane treats as its own", Names.looksLikeAnId(torn));
         final BlobContainer pits = store.blobContainer(RegisterMap.pointsInTime(base));
         write(pits, torn, "{\"id\":\"" + torn + "\",\"index\":");
         assertEquals("the plane stands in a placeholder for it", 1, plane.livePointsInTime(clock.get()).size());

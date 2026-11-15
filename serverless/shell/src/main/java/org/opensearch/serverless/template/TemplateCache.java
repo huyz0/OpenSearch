@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.metadata;
+package org.opensearch.serverless.template;
 
 /**
  * A node's copy of one store's contents, valid while the marker has not moved.

@@ -16,6 +16,7 @@ import org.opensearch.common.xcontent.XContentType;
 import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.serverless.cluster.Names;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -118,7 +119,7 @@ public final class ReclaimQueue {
             + "}").getBytes(StandardCharsets.UTF_8);
         final String bucket = BUCKET.format(Instant.ofEpochMilli(nowMillis + delayMillis));
         blobStore.blobContainer(path.add(bucket))
-            .writeBlob(intent.name() + RegisterMap.SHARD_SEPARATOR + intent.uuid(), new ByteArrayInputStream(body), body.length, false);
+            .writeBlob(intent.name() + Names.KEY_SEPARATOR + intent.uuid(), new ByteArrayInputStream(body), body.length, false);
     }
 
     /** Handles one due intent. */

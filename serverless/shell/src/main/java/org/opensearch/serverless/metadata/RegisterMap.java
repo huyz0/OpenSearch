@@ -9,6 +9,7 @@
 package org.opensearch.serverless.metadata;
 
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.serverless.cluster.Names;
 
 /**
  * Where each register lives.
@@ -38,9 +39,6 @@ import org.opensearch.common.blobstore.BlobPath;
  * unchanged; only who holds the separator moves.
  */
 public final class RegisterMap {
-
-    /** Separator between index name and shard number in a head's blob name. Invalid in index names. */
-    public static final String SHARD_SEPARATOR = "#";
 
     private RegisterMap() {}
 
@@ -241,103 +239,6 @@ public final class RegisterMap {
     }
 
     /**
-     * Returns where snapshot repository descriptors live.
-     *
-     * @param base the deployment root
-     * @return the repositories container
-     */
-    public static BlobPath repositories(BlobPath base) {
-        return base.add("repositories");
-    }
-
-    /**
-     * Returns the container path holding snapshot records.
-     *
-     * <p>Its own container, the same reasoning as {@link #pointsInTime}: the collector and the delete
-     * path both have to list every live one, and a listing that also stepped over every repository or
-     * index descriptor would make their cost depend on a population they have nothing to do with.
-     *
-     * @param base the deployment's base path
-     * @return the snapshots container path
-     */
-    public static BlobPath snapshots(BlobPath base) {
-        return base.add("snapshots");
-    }
-
-    /**
-     * Returns the authoritative snapshot-name registers, excluded from active discovery listings.
-     *
-     * @param base the deployment base
-     * @return snapshot state path
-     */
-    public static BlobPath snapshotStates(BlobPath base) {
-        return base.add("snapshot-states");
-    }
-
-    /**
-     * Returns one snapshot lifetime's copied data root.
-     *
-     * @param base the deployment base
-     * @param generation the unique storage lifetime
-     * @return the lifetime's storage path
-     */
-    public static BlobPath snapshotData(BlobPath base, String generation) {
-        if (PointInTime.looksLikeAnId(generation) == false) {
-            throw new IllegalArgumentException("invalid snapshot storage generation");
-        }
-        return base.add("snapshot-data-v2").add(generation);
-    }
-
-    /**
-     * Resolves copied shard storage, retaining name-based paths for legacy records.
-     *
-     * @param base the deployment base
-     * @param snapshot the captured record
-     * @param index the captured index name
-     * @param shard the captured shard
-     * @return its copied data path
-     */
-    public static BlobPath snapshotShardData(BlobPath base, SnapshotRecord snapshot, String index, int shard) {
-        return snapshot.storageGeneration() == null
-            ? snapshotShardData(base, snapshot.repo(), snapshot.name(), index, shard)
-            : snapshotData(base, snapshot.storageGeneration()).add(index).add(Integer.toString(shard));
-    }
-
-    /**
-     * Returns the blob name one snapshot is stored under: a repository and a name, joined the same way a
-     * shard-head joins an index name and a shard number.
-     *
-     * @param repo the repository
-     * @param name the snapshot name
-     * @return the blob name
-     */
-    public static String snapshotKey(String repo, String name) {
-        return repo + SHARD_SEPARATOR + name;
-    }
-
-    /**
-     * Returns the legacy name-based path for one captured shard. New captures use
-     * {@link #snapshotShardData(BlobPath, SnapshotRecord, String, int)} and a unique storage lifetime.
-     *
-     * <p>A shallow snapshot references a live shard's own blobs directly ({@link #shardData}), which is
-     * what makes it free to take and what makes it depend on that shard's own storage continuing to exist.
-     * A standard snapshot exists precisely to not depend on that: its bytes are copied here, under the
-     * repository and snapshot's own names rather than any live index's, so the snapshot's lifecycle is
-     * entirely its own — deleting the index it was taken from, or the garbage collector sweeping that
-     * index's shard, never touches this path at all, because neither one lists it.
-     *
-     * @param base the deployment's base path
-     * @param repo the repository
-     * @param snapshot the snapshot name
-     * @param indexName the captured index's name, at capture time
-     * @param shardId the shard number
-     * @return the container path
-     */
-    public static BlobPath snapshotShardData(BlobPath base, String repo, String snapshot, String indexName, int shardId) {
-        return base.add("snapshot-data").add(repo + SHARD_SEPARATOR + snapshot).add(indexName + SHARD_SEPARATOR + shardId);
-    }
-
-    /**
      * Returns the container path holding one shard's published segments.
      *
      * <p>A container per shard rather than a shared one with prefixed names: segment files are listed
@@ -360,7 +261,7 @@ public final class RegisterMap {
      * @return the shard data container path
      */
     public static BlobPath shardData(BlobPath base, String indexName, String uuid, int shardId) {
-        return base.add("segments").add(indexName + SHARD_SEPARATOR + uuid + SHARD_SEPARATOR + shardId);
+        return base.add("segments").add(indexName + Names.KEY_SEPARATOR + uuid + Names.KEY_SEPARATOR + shardId);
     }
 
     /**
@@ -391,7 +292,7 @@ public final class RegisterMap {
      * @return the blob name
      */
     public static String assignmentBlob(String indexName, int shardId) {
-        return indexName + SHARD_SEPARATOR + shardId;
+        return indexName + Names.KEY_SEPARATOR + shardId;
     }
 
     /**
@@ -423,7 +324,7 @@ public final class RegisterMap {
      * @return the blob name
      */
     public static String shardHeadBlob(String indexName, int shardId) {
-        final String name = indexName + SHARD_SEPARATOR + shardId;
+        final String name = indexName + Names.KEY_SEPARATOR + shardId;
         final int bucket = org.opensearch.cluster.routing.Murmur3HashFunction.hash(name) & 0xFF;
         return (bucket < 0x10 ? "0" : "") + Integer.toHexString(bucket) + "-" + name;
     }

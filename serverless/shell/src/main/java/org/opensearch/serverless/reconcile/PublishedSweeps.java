@@ -212,7 +212,7 @@ final class PublishedSweeps {
             // per shard: at a hundred published shards and a thousand views that was a hundred thousand reads
             // a pass.
             final java.util.List<org.opensearch.serverless.metadata.PointInTime> views;
-            final java.util.List<org.opensearch.serverless.metadata.SnapshotRecord> snapshots;
+            final java.util.List<org.opensearch.serverless.repository.SnapshotRecord> snapshots;
             try {
                 views = reconciler.plane.livePointsInTime(reconciler.plane.clock().getAsLong());
                 snapshots = reconciler.plane.liveSnapshots();

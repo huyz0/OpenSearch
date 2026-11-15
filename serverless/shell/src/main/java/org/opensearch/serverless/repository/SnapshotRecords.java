@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.metadata;
+package org.opensearch.serverless.repository;
 
 import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
@@ -16,20 +16,37 @@ import java.util.Optional;
 
 /**
  * Creates, finishes, lists and deletes snapshot records, and deletes a snapshot's captured files with it. Split out
- * of {@link MetadataPlane}, which keeps the public entry points.
+ * of {@code MetadataPlane}, which keeps the public entry points.
  */
-final class SnapshotRecords {
+public final class SnapshotRecords {
 
     private final SnapshotStore snapshotStore;
     private final BlobStore blobStore;
     private final BlobPath base;
-    private final MetadataPlane plane;
+    private final RepositoryStore repositories;
+    private final org.apache.logging.log4j.Logger logger;
 
-    SnapshotRecords(SnapshotStore snapshotStore, BlobStore blobStore, BlobPath base, MetadataPlane plane) {
+    /**
+     * Creates the snapshot operations over their stores.
+     *
+     * @param snapshotStore the snapshot records and name registers
+     * @param blobStore the store holding the data snapshots copy
+     * @param base the deployment's base path
+     * @param repositories the registered repositories, which a new snapshot must name
+     * @param logger where failures to clear a deleted snapshot's data are reported
+     */
+    public SnapshotRecords(
+        SnapshotStore snapshotStore,
+        BlobStore blobStore,
+        BlobPath base,
+        RepositoryStore repositories,
+        org.apache.logging.log4j.Logger logger
+    ) {
         this.snapshotStore = snapshotStore;
         this.blobStore = blobStore;
         this.base = base;
-        this.plane = plane;
+        this.repositories = repositories;
+        this.logger = logger;
     }
 
     /**
@@ -42,7 +59,7 @@ final class SnapshotRecords {
      * @throws IOException if reservation or discovery publication fails
      */
     public SnapshotRecord createSnapshot(SnapshotRecord snapshot) throws IOException {
-        if (plane.describeRepository(snapshot.repo()).isEmpty()) {
+        if (repositories.describeRepository(snapshot.repo()).isEmpty()) {
             throw new RepositoryMissingException(snapshot.repo());
         }
         return snapshotStore.create(snapshot);
@@ -93,7 +110,16 @@ final class SnapshotRecords {
         return deleteSnapshot(expected.repo(), expected.name(), expected);
     }
 
-    boolean deleteSnapshot(String repo, String name, SnapshotRecord expected) throws IOException {
+    /**
+     * Deletes a snapshot only if it is still the given record, then clears the data it copied.
+     *
+     * @param repo the repository
+     * @param name the snapshot name
+     * @param expected the record the caller read
+     * @return whether this call deleted it
+     * @throws IOException if the state or marker operation fails
+     */
+    public boolean deleteSnapshot(String repo, String name, SnapshotRecord expected) throws IOException {
         final var removed = snapshotStore.remove(repo, name, expected);
         if (removed.isEmpty()) {
             return false;
@@ -103,19 +129,19 @@ final class SnapshotRecords {
         if (record.shallow() == false) {
             if (record.storageGeneration() != null) {
                 try {
-                    blobStore.blobContainer(RegisterMap.snapshotData(base, record.storageGeneration())).delete();
+                    blobStore.blobContainer(SnapshotPaths.snapshotData(base, record.storageGeneration())).delete();
                 } catch (Exception failure) {
                     cleared = false;
-                    MetadataPlane.LOGGER.warn("could not clear storage for deleted snapshot " + record.key(), failure);
+                    logger.warn("could not clear storage for deleted snapshot " + record.key(), failure);
                 }
             } else {
                 for (var index : record.indices().entrySet()) {
                     for (int shard = 0; shard < index.getValue().numberOfShards(); shard++) {
                         try {
-                            blobStore.blobContainer(RegisterMap.snapshotShardData(base, record, index.getKey(), shard)).delete();
+                            blobStore.blobContainer(SnapshotPaths.snapshotShardData(base, record, index.getKey(), shard)).delete();
                         } catch (Exception failure) {
                             cleared = false;
-                            MetadataPlane.LOGGER.warn("could not clear legacy snapshot storage for " + record.key(), failure);
+                            logger.warn("could not clear legacy snapshot storage for " + record.key(), failure);
                         }
                     }
                 }
