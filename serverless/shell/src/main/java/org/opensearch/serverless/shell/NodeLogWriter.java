@@ -612,18 +612,6 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
         this.background = background;
     }
 
-    /**
-     * Records in the shard's head that its own write log is quiet.
-     *
-     * @param shardId the shard
-     * @param term the term this node holds it at
-     * @throws IOException if the head cannot be read or written
-     */
-    @Override
-    public void shardLogQuiet(ShardId shardId, long term) throws IOException {
-        plane.heads().markShardLogQuiet(shardId.getIndexName(), shardId.id(), nodeId, term);
-    }
-
     private NodeLogTakeover takeoverOf(
         String predecessor,
         NodeLogStore log,

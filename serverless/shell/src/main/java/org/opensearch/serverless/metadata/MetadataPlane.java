@@ -168,16 +168,6 @@ public final class MetadataPlane {
         return clock;
     }
 
-    /** Returns the write-ahead log for one shard. */
-    public org.opensearch.serverless.store.WalStore walStore(String indexName, int shardId) throws IOException {
-        return paths.walStore(indexName, shardId);
-    }
-
-    /** Returns the write-ahead log for one shard, for a caller that already knows the index's uuid. */
-    public org.opensearch.serverless.store.WalStore walStore(String indexName, String uuid, int shardId) {
-        return paths.walStore(indexName, uuid, shardId);
-    }
-
     /** Returns where one shard's bytes live. */
     public BlobPath shardData(String indexName, int shardId) throws IOException {
         return paths.shardData(indexName, shardId);
@@ -600,12 +590,6 @@ public final class MetadataPlane {
     /** Attempts to take ownership of a shard of one incarnation of an index. */
     public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid) throws IOException {
         return activation.activate(indexName, shardId, nodeId, ephemeralId, indexUuid);
-    }
-
-    /** Attempts to take ownership of a shard of one incarnation of an index, saying which write log the taker writes. */
-    public Acquisition activate(String indexName, int shardId, String nodeId, String ephemeralId, String indexUuid, boolean writesNodeLog)
-        throws IOException {
-        return activation.activate(indexName, shardId, nodeId, ephemeralId, indexUuid, writesNodeLog);
     }
 
     /** Forgets a node's claim on a shard. */

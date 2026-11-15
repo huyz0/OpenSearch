@@ -83,7 +83,7 @@ final class ShardRelease {
         final IndexShard shard = reconciler.open.remove(shardId);
         reconciler.readers.remove(shardId);
         reconciler.readerCommits.remove(shardId);
-        reconciler.walCache.remove(shardId);
+        reconciler.writerTerms.remove(shardId);
         reconciler.publisherCache.remove(shardId);
         reconciler.publishing.forget(shardId);
         reconciler.lastUsed.remove(shardId);

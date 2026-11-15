@@ -23,8 +23,6 @@ import org.opensearch.serverless.metadata.RegisterMap;
 import org.opensearch.serverless.reconcile.BackgroundReconciler;
 import org.opensearch.serverless.shell.ServerlessNode;
 import org.opensearch.serverless.shell.WriteOutcome;
-import org.opensearch.serverless.store.WalRecord;
-import org.opensearch.serverless.store.WalStore;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.io.IOException;
@@ -198,7 +196,7 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             clock.addAndGet(idleAfter + 1);
             final GatedBlobStore.Gate beforeRelease = store.arm(GatedBlobStore.Point.BEFORE_CAS, "shards/");
             final GatedBlobStore.Gate afterRelease = store.arm(GatedBlobStore.Point.AFTER_CAS, "shards/");
-            final GatedBlobStore.Gate append = store.arm(GatedBlobStore.Point.WRITE_BLOB, "wal/t=");
+            final GatedBlobStore.Gate append = store.arm(GatedBlobStore.Point.WRITE_BLOB, "nodelog/");
 
             final AtomicReference<Exception> tickFailure = new AtomicReference<>();
             final Thread tick = new Thread(() -> {
@@ -322,164 +320,6 @@ public class ServerlessFenceTests extends OpenSearchTestCase {
             );
             assertFalse(s.reads().get(onS, "skewed").found());
         }
-    }
-
-    // ---------------------------------------------------------------- the seal's own term
-
-    /**
-     * A seal never bounds the sealer's own term.
-     *
-     * <p>A shard released locally and reopened at the same term seals again at that term, and its
-     * container already holds records. Writing that term into the seal was a latent loss: the records
-     * the reopened writer went on to acknowledge were bounded by that listing if a later sealer's write
-     * succeeded and its delete of the older seal did not, because seals merge by taking the minimum.
-     */
-    public void testASealNeverBoundsTheSealersOwnTerm() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final MetadataPlane plane = planeOver(new FsBlobStore(1024, createTempDir(), false), clock);
-        createAlpha(plane);
-        final WalStore log = plane.walStore("alpha", "uuid-alpha-00000000", 0);
-
-        log.append(1L, List.of(new WalRecord("a", "{\"msg\":\"a\"}"), new WalRecord("b", "{\"msg\":\"b\"}")));
-        final Map<Long, String> reopened = log.sealAt(1L);
-        // Slot 1 is the fence the writer placed before its first append; its records start at 2.
-        assertEquals("the reopened writer's own records replay", "00000000000000000002", reopened.get(1L));
-        assertFalse("the sealer's own term must not be written into the seal", log.sealedPosition().containsKey(1L));
-
-        // The reopened writer goes on; a successor at the next term seals, and every record replays.
-        log.append(1L, List.of(new WalRecord("c", "{\"msg\":\"c\"}")));
-        final Map<Long, String> successor = plane.walStore("alpha", "uuid-alpha-00000000", 0).sealAt(2L);
-        assertEquals("records the reopened writer acknowledged after its own seal must replay", "00000000000000000003", successor.get(1L));
-        assertEquals("00000000000000000003", log.sealedPosition().get(1L));
-    }
-
-    /**
-     * A seal deletes only what it merged.
-     *
-     * <p><b>The bug this pins.</b> {@code sealAt} used to compute the seals it supersedes from a listing
-     * taken <em>after</em> writing its own — so a seal that a concurrent lower-term sealer landed in the
-     * window between the merge and the write was deleted without ever having been merged. Seals merge by
-     * taking the lowest recorded position per term, so the one dropped that way was the <em>tighter</em>
-     * bound; losing it widens the cutoff, and the records between the two bounds replay as though they had
-     * been acknowledged. That is exactly the zombie history a seal exists to exclude.
-     *
-     * <p>The interleaving is forced rather than raced for: the store below lets the intruding sealer land
-     * its blob at the instant the sealer under test has finished listing, which is the one moment that
-     * produces the fault.
-     */
-    public void testASealDoesNotDeleteASealItNeverMerged() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final FsBlobStore backing = new FsBlobStore(1024, createTempDir(), false);
-        final AtomicReference<BlobContainer> sealsContainer = new AtomicReference<>();
-        final AtomicBoolean intruded = new AtomicBoolean();
-
-        // A lower-term sealer that lands its seal for term 1 at a tighter position than the sealer under
-        // test is about to record, in the window after that sealer has read the container.
-        final Runnable intruder = () -> {
-            if (intruded.compareAndSet(false, true) == false) {
-                return;
-            }
-            final byte[] body = "1 00000000000000000001\n".getBytes(java.nio.charset.StandardCharsets.UTF_8);
-            try {
-                sealsContainer.get().writeBlob("seal-00000000000000000005", new java.io.ByteArrayInputStream(body), body.length, false);
-            } catch (IOException e) {
-                throw new AssertionError("the intruding sealer could not write its seal", e);
-            }
-        };
-
-        final BlobStore store = new BlobStore() {
-            @Override
-            public void validateKey(BlobPath path, String blobName) {
-                backing.validateKey(path, blobName);
-            }
-
-            @Override
-            public BlobContainer blobContainer(BlobPath path) {
-                final BlobContainer inner = backing.blobContainer(path);
-                if (path.buildAsString().endsWith("seals/") == false) {
-                    return inner;
-                }
-                sealsContainer.compareAndSet(null, backing.blobContainer(path));
-                return new DelegatingBlobContainer(inner) {
-                    @Override
-                    public Map<String, org.opensearch.common.blobstore.BlobMetadata> listBlobs() throws IOException {
-                        final Map<String, org.opensearch.common.blobstore.BlobMetadata> listed = super.listBlobs();
-                        intruder.run();
-                        return listed;
-                    }
-                };
-            }
-
-            @Override
-            public void close() throws IOException {
-                backing.close();
-            }
-        };
-
-        final MetadataPlane plane = planeOver(store, clock);
-        createAlpha(plane);
-        final WalStore log = plane.walStore("alpha", "uuid-alpha-00000000", 0);
-        log.append(1L, List.of(new WalRecord("a", "{\"msg\":\"a\"}")));
-        log.append(1L, List.of(new WalRecord("b", "{\"msg\":\"b\"}")));
-
-        // The sealer under test would record term 1 at ...0002, having listed two records.
-        log.sealAt(7L);
-        assertTrue("the intruding sealer must actually have landed its seal", intruded.get());
-
-        // The merged bound is the intruder's, because it is the lower of the two. Before the fix its seal
-        // had been deleted by the time this read it, and the answer was the looser ...0002.
-        assertEquals(
-            "a seal written between the merge and the write must survive, so its tighter bound still counts",
-            "00000000000000000001",
-            log.sealedPosition().get(1L)
-        );
-    }
-
-    /**
-     * A zombie's late records cannot accumulate: the takeover fences its term, so they are refused rather
-     * than written, and the successor's first publish reclaims everything in the term but the fence.
-     *
-     * <p><b>The leak this used to pin.</b> A writer that had lost the shard went on appending under its old
-     * term for up to a lease, all of it after the one drop that would have taken it, and nothing collected
-     * it. A re-scan on a timer bounded it. With the log fenced at the takeover there is nothing to collect: the
-     * late append is refused by the store at the fence. See {@code serverless/rfc-fencing-closure.md}.
-     */
-    public void testAZombiesLateRecordsAreReclaimedByALaterPublish() throws Exception {
-        final AtomicLong clock = new AtomicLong(1_000L);
-        final FsBlobStore store = new FsBlobStore(1024, createTempDir(), false);
-        final MetadataPlane plane = planeOver(store, clock);
-        createAlpha(plane);
-        final BlobPath shardBase = RegisterMap.shardData(BlobPath.cleanPath(), "alpha", "uuid-alpha-00000000", 0);
-
-        final WalStore zombie = new WalStore(store, shardBase, Long.MAX_VALUE);
-        zombie.append(1L, List.of(new WalRecord("old", "{\"msg\":\"old\"}")));
-        assertEquals(1, recordsUnderTerm(store, shardBase, 1L));
-
-        // The takeover at term 2 fences term 1, and the successor publishes there.
-        final WalStore successor = new WalStore(store, shardBase, Long.MAX_VALUE);
-        successor.fenceOlderTerms(2L);
-        successor.append(2L, List.of(new WalRecord("new", "{\"msg\":\"new\"}")));
-        successor.onPublished(2L);
-        assertEquals("the first drop takes every record of the fenced term", 0, recordsUnderTerm(store, shardBase, 1L));
-
-        // The zombie, still appending under the term it has lost: refused at the fence, so nothing lands.
-        expectThrows(java.io.IOException.class, () -> zombie.append(1L, List.of(new WalRecord("zombie", "{\"msg\":\"zombie\"}"))));
-        successor.onPublished(2L);
-        assertEquals("nothing for a later publish to collect", 0, recordsUnderTerm(store, shardBase, 1L));
-    }
-
-    /** How many WAL records sit under one term, read straight off the store. */
-    private static int recordsUnderTerm(BlobStore store, BlobPath shardBase, long term) throws IOException {
-        final BlobContainer container = store.blobContainer(shardBase.add("wal").add("t=" + term));
-        int records = 0;
-        for (Map.Entry<String, org.opensearch.common.blobstore.BlobMetadata> blob : container.listBlobs().entrySet()) {
-            // A blob of no bytes is a fence, not a record.
-            final String name = blob.getKey();
-            if (name.matches("\\d{20}") && blob.getValue().length() > 0) {
-                records++;
-            }
-        }
-        return records;
     }
 
     // ---------------------------------------------------------------- forwarded writes ask the head

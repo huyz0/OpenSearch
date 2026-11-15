@@ -135,7 +135,8 @@ public final class ShardReconciler {
         this.nodePackPlacement = placement;
     }
 
-    volatile java.util.function.Function<ShardId, org.opensearch.serverless.store.WalStore> walStores;
+    /** Whether a writer open here replays the shard's logs; unset, a writer opens from its commit alone. */
+    volatile boolean replaysLogs;
 
     /** Whether this node still owns a shard at a term, asked by a writer after it fences its own term. */
     volatile java.util.function.BiPredicate<ShardId, Long> ownsAtTerm;
@@ -149,7 +150,8 @@ public final class ShardReconciler {
         this.ownsAtTerm = ownsAtTerm;
     }
 
-    final Map<ShardId, org.opensearch.serverless.store.WalStore> walCache = new ConcurrentHashMap<>();
+    /** Per writer shard, the term its open began. */
+    final Map<ShardId, WriterTerm> writerTerms = new ConcurrentHashMap<>();
     /** One publisher per open shard, so it can remember the generation of its own last publish. */
     final Map<ShardId, SegmentPublisher> publisherCache = new ConcurrentHashMap<>();
 
@@ -198,33 +200,24 @@ public final class ShardReconciler {
     }
 
     /**
-     * Supplies the write-ahead log for each shard. Without one, writes are durable only once published.
-     *
-     * <p>Keyed on the {@link ShardId} rather than on a name and a number, because a shard's storage is
-     * located by the index's uuid and a {@code ShardId} carries it. Passing the name alone meant the plane
-     * had to read the descriptor back to find the uuid, on a path that already knew it.
-     *
-     * @param walStores shard to WAL store
+     * Has writer opens replay the shard's logs: the node logs its head names, and records handed in for the open. Without
+     * it, a writer opens from its commit alone, and its writes are durable only once published.
      */
-    public void setWalStores(java.util.function.Function<ShardId, org.opensearch.serverless.store.WalStore> walStores) {
-        this.walStores = walStores;
+    public void replayLogs() {
+        this.replaysLogs = true;
     }
 
     /**
-     * Returns the WAL for a shard, or null if none is configured.
+     * Returns the term a writer shard's open began here, or null when writer opens replay no logs.
      *
      * @param shardId the shard
-     * @return the WAL store, or null
+     * @return its writer term, or null
      */
-    public org.opensearch.serverless.store.WalStore wal(ShardId shardId) {
-        if (walStores == null) {
+    public WriterTerm writerTerm(ShardId shardId) {
+        if (replaysLogs == false) {
             return null;
         }
-        // Memoized, and it has to be. A WalStore carries the append ordinal that orders records within a
-        // term, and the snapshot that makes truncation lag a publish cycle. Building a fresh one per
-        // call restarts the ordinal at 1, so every append overwrites the same blob and the log holds
-        // exactly the last write -- which is what happened, and what the end-to-end test caught.
-        return walCache.computeIfAbsent(shardId, walStores);
+        return writerTerms.computeIfAbsent(shardId, id -> new WriterTerm());
     }
 
     /** Per writer shard, the lock that keeps a commit from landing between an apply and its append. */
@@ -431,18 +424,15 @@ public final class ShardReconciler {
     }
 
     /**
-     * The log a shard currently being opened should replay, for the moments its engine is being built.
+     * The shards being opened right now as writers, for the moments their engines are being built.
      *
-     * <p><b>Why the engine cannot simply ask for the shard's log.</b> Every shard on this node has one --
-     * a reader and a frozen view included -- and replaying into either of those would be wrong: a reader
-     * serves a published commit and owns no history, and a view is a snapshot of one. Only the reconciler
-     * knows which of the three it is opening, and it knows it only for the duration of that open. So the
-     * answer is armed here, immediately before the engine is constructed, and disarmed the moment the
-     * shard is open; an engine that asks at any other time is told there is nothing to replay, which is
-     * the truthful answer.
+     * <p><b>Why the engine cannot simply ask for the shard's logs.</b> A reader and a frozen view are opened through the
+     * same engine, and replaying into either would be wrong: a reader serves a published commit and owns no history, and
+     * a view is a snapshot of one. Only the reconciler knows which it is opening, and only for the duration of that open.
+     * So a replay is armed here immediately before the engine is constructed, and disarmed the moment the shard is open;
+     * an engine that asks at any other time is told there is nothing to replay, which is the truthful answer.
      */
-    final java.util.concurrent.ConcurrentHashMap<ShardId, org.opensearch.serverless.store.WalStore> pendingReplay =
-        new java.util.concurrent.ConcurrentHashMap<>();
+    final java.util.Set<ShardId> pendingReplay = ConcurrentHashMap.newKeySet();
 
     /**
      * Returns the records the shard currently being opened should replay, if any.
@@ -502,9 +492,6 @@ public final class ShardReconciler {
     final java.util.concurrent.ConcurrentHashMap<ShardId, org.opensearch.serverless.engine.ReplaySpool> replayedRecords =
         new java.util.concurrent.ConcurrentHashMap<>();
 
-    /** Per index and shard, the term at which a takeover has just fenced every older term of the log. */
-    final java.util.concurrent.ConcurrentHashMap<String, Long> olderTermsFenced = new java.util.concurrent.ConcurrentHashMap<>();
-
     /** What a shard's open and publish need of the node's per-node write log, when it writes one. */
     public interface NodeLogHooks extends LoggedCommitHooks {
         /**
@@ -551,16 +538,6 @@ public final class ShardReconciler {
          * @throws IOException if the head cannot be read or written
          */
         void replayedAndPublished(ShardId shardId, long term, java.util.concurrent.Callable<Boolean> settle) throws IOException;
-
-        /**
-         * Records in the shard's head that its own write log is quiet: every term of it closed, and whatever it held
-         * published. Owners that write their node's log then open it without listing it.
-         *
-         * @param shardId the shard
-         * @param term the term this node holds it at
-         * @throws IOException if the head cannot be read or written
-         */
-        void shardLogQuiet(ShardId shardId, long term) throws IOException;
     }
 
     volatile NodeLogHooks nodeLog;
@@ -573,32 +550,6 @@ public final class ShardReconciler {
      */
     public void setNodeLog(NodeLogHooks nodeLog) {
         this.nodeLog = nodeLog;
-    }
-
-    /** Per index and shard, the term at which this node took a head that said the shard's own log is quiet. */
-    final java.util.concurrent.ConcurrentHashMap<String, Long> shardLogQuietAt = new java.util.concurrent.ConcurrentHashMap<>();
-
-    /**
-     * Shards whose own log this node closed and replayed records from at open, by the term it holds them at: the first
-     * publish at that term holds those records, and then the head can say the log is quiet.
-     */
-    final java.util.concurrent.ConcurrentHashMap<ShardId, Long> shardLogQuietOnPublish = new java.util.concurrent.ConcurrentHashMap<>();
-
-    /**
-     * Records whether the head this node just took says the shard's own log is quiet, so the open that follows -- at
-     * that term -- neither fences nor replays it. One use: the open consumes it.
-     *
-     * @param indexName the index
-     * @param shard the shard
-     * @param term the term taken
-     * @param quiet whether the head says the shard's own log is quiet
-     */
-    public void noteShardLogQuiet(String indexName, int shard, long term, boolean quiet) {
-        if (quiet) {
-            shardLogQuietAt.put(indexName + "#" + shard, term);
-        } else {
-            shardLogQuietAt.remove(indexName + "#" + shard);
-        }
     }
 
     /** Per index and shard, the nodes the head named when it was taken: whose node logs the open replays. */
@@ -628,18 +579,6 @@ public final class ShardReconciler {
         } else {
             nodeLogWriters.put(indexName + "#" + shard, List.copyOf(writers));
         }
-    }
-
-    /**
-     * Records that a takeover has fenced every term older than {@code term}, so the open that follows it -- at
-     * that term -- need not list the log again to find them fenced. One use: the open consumes it.
-     *
-     * @param indexName the index
-     * @param shard the shard
-     * @param term the term taken
-     */
-    public void noteOlderTermsFenced(String indexName, int shard, long term) {
-        olderTermsFenced.put(indexName + "#" + shard, term);
     }
 
     /**

@@ -52,20 +52,20 @@ public class BucketOwnershipTests extends OpenSearchTestCase {
     public void testJoiningAHeldBucketCostsNoWrite() throws Exception {
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final ShardHeadStore heads = plane(store).heads();
-            final Acquisition first = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a", true);
+            final Acquisition first = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a");
             assertTrue(first.acquired());
             assertEquals("a member's head is shown as its own", "logs-a", first.head().indexName());
             assertEquals("uuid-a", first.head().indexUuid());
             openOnA.add(shard("logs-a", "uuid-a"));
 
             store.reset();
-            final Acquisition second = heads.acquire("logs-b", 0, "node-a", "eph-a", "uuid-b", true);
+            final Acquisition second = heads.acquire("logs-b", 0, "node-a", "eph-a", "uuid-b");
             assertTrue(second.acquired());
             assertEquals("joining must not move the bucket's term", first.head().term(), second.head().term());
             assertEquals("joining a held bucket costs no write", 0, store.registerWrites() + store.blobWrites());
             assertEquals("uuid-b", second.head().indexUuid());
 
-            final Acquisition solo = heads.acquire("solo", 0, "node-a", "eph-a", "uuid-solo", true);
+            final Acquisition solo = heads.acquire("solo", 0, "node-a", "eph-a", "uuid-solo");
             assertTrue("an index outside buckets keeps its own head", solo.acquired());
             assertEquals("solo", heads.read("solo", 0).orElseThrow().indexName());
         }
@@ -74,8 +74,8 @@ public class BucketOwnershipTests extends OpenSearchTestCase {
     public void testAnotherNodeIsRefusedWhileTheBucketIsHeld() throws Exception {
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final ShardHeadStore heads = plane(store).heads();
-            assertTrue(heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a", true).acquired());
-            final Acquisition other = heads.acquire("logs-b", 0, "node-b", "eph-b", "uuid-b", true);
+            assertTrue(heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a").acquired());
+            final Acquisition other = heads.acquire("logs-b", 0, "node-b", "eph-b", "uuid-b");
             assertFalse("a held bucket refuses every member to another node", other.acquired());
             assertEquals("node-a", other.head().ownerNodeId());
             assertEquals("logs-b", other.head().indexName());
@@ -85,8 +85,8 @@ public class BucketOwnershipTests extends OpenSearchTestCase {
     public void testOnlyTheLastOpenMemberGivesTheHeadBack() throws Exception {
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final ShardHeadStore heads = plane(store).heads();
-            final long term = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a", true).head().term();
-            heads.acquire("logs-b", 0, "node-a", "eph-a", "uuid-b", true);
+            final long term = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a").head().term();
+            heads.acquire("logs-b", 0, "node-a", "eph-a", "uuid-b");
             openOnA.add(shard("logs-a", "uuid-a"));
             openOnA.add(shard("logs-b", "uuid-b"));
 
@@ -107,29 +107,29 @@ public class BucketOwnershipTests extends OpenSearchTestCase {
     public void testATakeoverMovesTheWholeBucket() throws Exception {
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final ShardHeadStore heads = plane(store).heads();
-            final long term = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a", true).head().term();
+            final long term = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a").head().term();
             clock.addAndGet(TTL + 1);
 
             store.reset();
-            final Acquisition taken = heads.acquire("logs-a", 0, "node-b", "eph-b", "uuid-a", true);
+            final Acquisition taken = heads.acquire("logs-a", 0, "node-b", "eph-b", "uuid-a");
             assertTrue("a lapsed owner's bucket can be taken", taken.acquired());
             assertEquals(term + 1, taken.head().term());
             assertEquals("node-a", taken.previousOwner());
             assertTrue("the dead owner's log is named for replay", taken.head().writers().contains("node-a"));
             assertEquals("one swap moves the bucket", 1, store.registerWrites());
 
-            final Acquisition sibling = heads.acquire("logs-b", 0, "node-b", "eph-b", "uuid-b", true);
+            final Acquisition sibling = heads.acquire("logs-b", 0, "node-b", "eph-b", "uuid-b");
             assertTrue(sibling.acquired());
             assertEquals("the sibling came along at the same term", term + 1, sibling.head().term());
             assertEquals("node-b", heads.read("logs-b", 0).orElseThrow().ownerNodeId());
-            assertFalse("the old owner holds nothing of it", heads.acquire("logs-b", 0, "node-a", "eph-a2", "uuid-b", true).acquired());
+            assertFalse("the old owner holds nothing of it", heads.acquire("logs-b", 0, "node-a", "eph-a2", "uuid-b").acquired());
         }
     }
 
     public void testMembersTakenTogetherCostOneWrite() throws Exception {
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final ShardHeadStore heads = plane(store).heads();
-            final long term = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a", true).head().term();
+            final long term = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a").head().term();
             assertTrue(heads.release("logs-a", 0, "node-a", term, "uuid-a", "eph-a", "node-a"));
             store.reset();
             final java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(8);
@@ -137,9 +137,7 @@ public class BucketOwnershipTests extends OpenSearchTestCase {
                 final List<java.util.concurrent.Future<Acquisition>> takes = new java.util.ArrayList<>();
                 for (int i = 0; i < 16; i++) {
                     final boolean a = i % 2 == 0;
-                    takes.add(
-                        pool.submit(() -> heads.acquire(a ? "logs-a" : "logs-b", 0, "node-a", "eph-a", a ? "uuid-a" : "uuid-b", true))
-                    );
+                    takes.add(pool.submit(() -> heads.acquire(a ? "logs-a" : "logs-b", 0, "node-a", "eph-a", a ? "uuid-a" : "uuid-b")));
                 }
                 for (java.util.concurrent.Future<Acquisition> take : takes) {
                     assertTrue(take.get().acquired());
@@ -154,7 +152,7 @@ public class BucketOwnershipTests extends OpenSearchTestCase {
     public void testADeadOwnersBucketIsGivenBackOnce() throws Exception {
         try (CountingBlobStore store = new CountingBlobStore(new FsBlobStore(8192, createTempDir(), false))) {
             final ShardHeadStore heads = plane(store).heads();
-            final long term = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a", true).head().term();
+            final long term = heads.acquire("logs-a", 0, "node-a", "eph-a", "uuid-a").head().term();
             clock.addAndGet(TTL + 1);
             final ShardHeadStore.Abandoned abandoned = heads.releaseAbandoned("logs-b", 0, "node-a").orElseThrow();
             assertEquals("logs-b", abandoned.released().indexName());

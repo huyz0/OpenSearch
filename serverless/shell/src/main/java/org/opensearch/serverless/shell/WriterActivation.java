@@ -47,9 +47,7 @@ public final class WriterActivation {
         node.adopt(plane);
         node.reconciler.setSegmentPublishers(NodePackWiring.publishers(node, plane));
         node.reconciler.setBeforePublish(ServerlessNode.widensRollupsOf(plane));
-        node.reconciler.setWalStores(
-            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(node.threadPool().generic())
-        );
+        node.reconciler.replayLogs();
         node.reconciler.setOwnershipCheck((id, term) -> node.leases.ownsAtTerm(plane, id, term));
         final IndexDescriptor descriptor = plane.describe(pit.index())
             .orElseThrow(() -> new IllegalArgumentException("no such index: " + pit.index()));
@@ -122,9 +120,7 @@ public final class WriterActivation {
         node.adopt(plane);
         node.reconciler.setSegmentPublishers(NodePackWiring.publishers(node, plane));
         node.reconciler.setBeforePublish(ServerlessNode.widensRollupsOf(plane));
-        node.reconciler.setWalStores(
-            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(node.threadPool().generic())
-        );
+        node.reconciler.replayLogs();
         node.reconciler.setOwnershipCheck((id, term) -> node.leases.ownsAtTerm(plane, id, term));
         // Writers open here are carried over unread when the periodic head check ran within two of its intervals (it and
         // resync run on the same cadence, so one interval is often just missed) and the head last seen for each names this
@@ -234,9 +230,7 @@ public final class WriterActivation {
         node.adopt(plane);
         node.reconciler.setSegmentPublishers(NodePackWiring.publishers(node, plane));
         node.reconciler.setBeforePublish(ServerlessNode.widensRollupsOf(plane));
-        node.reconciler.setWalStores(
-            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(node.threadPool().generic())
-        );
+        node.reconciler.replayLogs();
         node.reconciler.setOwnershipCheck((id, term) -> node.leases.ownsAtTerm(plane, id, term));
         {
             // The lease first, and it has to be first. Under batched liveness a shard-head is not
@@ -293,7 +287,7 @@ public final class WriterActivation {
         final org.opensearch.serverless.metadata.Acquisition woken = wake(plane, indexName, shardNumber, described.get());
         final org.opensearch.serverless.metadata.Acquisition acquisition = woken != null
             ? woken
-            : plane.activate(indexName, shardNumber, node.localNode.getId(), node.localNode.getEphemeralId(), described.get().uuid(), true);
+            : plane.activate(indexName, shardNumber, node.localNode.getId(), node.localNode.getEphemeralId(), described.get().uuid());
         node.nodeCapacity().activationPhases[1].addAndGet(System.nanoTime() - acquiringAt);
         if (acquisition.acquired() == false) {
             // The winner's head is the freshest routing fact this node has, and it was paid for: a
@@ -313,16 +307,12 @@ public final class WriterActivation {
         final String openingKey = ServerlessNode.shardKey(indexName, shardNumber);
         node.writerAssignments.put(openingKey, assignment);
         node.openingShards.add(openingKey);
-        // The takeover fenced every older term at the swap, so the open need not list them again.
-        node.reconciler.noteOlderTermsFenced(indexName, shardNumber, acquisition.head().term());
         // Whose node logs the open replays: every node the head names as holding what was not published.
         final NodeLogWriter nodeLog = node.startup().nodeLog(plane);
         if (nodeLog != null) {
             nodeLog.noteHeadMoved(indexName, shardNumber);
         }
         node.reconciler.noteNodeLogWriters(indexName, shardNumber, acquisition.head().writers());
-        // And whether the shard's own log has anything for the open to close or replay.
-        node.reconciler.noteShardLogQuiet(indexName, shardNumber, acquisition.head().term(), acquisition.head().shardLogQuiet());
         try {
             // Marked before the shard opens, so no coordinator rules it out while it can hold refreshed
             // documents its published digest does not describe.

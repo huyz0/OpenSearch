@@ -246,28 +246,12 @@ final class ReaderValidation {
             return;
         }
         // Nobody is writing it -- no owner, a dead one, or this node named with nothing open. The commit has to be the
-        // published one first: a writer that replayed the log and published replaced it, and trimmed the log behind
-        // its own commit, so a listing finds nothing past this one and it would be served one write short. A fleet
+        // published one first: a writer that replayed the log and published replaced it, and let go of the log behind
+        // its own commit, so the log holds nothing past this one and it would be served one write short. A fleet
         // run found exactly that, answered complete.
-        final var log = plane.walStore(indexName, shardId.getIndex().getUUID(), shardNumber);
-        // The log's listing does not depend on the manifest's answer, so it runs alongside the manifest read rather than
-        // after it: both start after the head read, which is what the check needs of them -- a writer that published
-        // after it had to take the head first. Only a commit recording how far it reaches is answered by a listing.
-        final java.util.concurrent.CompletableFuture<Boolean> landed = commit.walOrdinal() >= 0L
-            ? java.util.concurrent.CompletableFuture.supplyAsync(() -> {
-                try {
-                    return log.landedPast(commit.term(), commit.walOrdinal());
-                } catch (java.io.IOException e) {
-                    throw new java.io.UncheckedIOException(e);
-                }
-            }, threadPool.generic())
-            : null;
         final var published = plane.segmentPublisher(indexName, shardId.getIndex().getUUID(), shardNumber).readManifest();
         // A commit its writer staged after the register is not superseded by it: the writer is gone and had published it.
         if (published.isPresent() && sameCommit(commit, published.get()) == false && commit.stagedAfter(published.get()) == false) {
-            if (landed != null) {
-                landed.cancel(false);
-            }
             readerChecks.remove(key);
             // Let go now if no query holds it, so the retry opens the current commit; one that does is let go by the
             // reconciler's next refresh, and refuses until then.
@@ -281,23 +265,10 @@ final class ReaderValidation {
             }
             throw ShardBehindLogException.superseded(indexName, shardNumber);
         }
-        // Then it has to cover the log on its own. One that does not say how far it reaches covers none of its own
-        // term.
-        boolean behind;
-        if (landed != null) {
-            // How far the commit reaches is recorded: a listing answers.
-            behind = awaitListing(landed);
-        } else {
-            // Published before that was recorded. Treating such a commit as covering none of its term made every
-            // one ever written look behind -- the log keeps a term's highest record after a publish -- and a fleet
-            // reopened on old manifests took over its whole population on the first searches. The records say.
-            final org.opensearch.index.shard.IndexShard opened = reconciler.get().shard(shardId);
-            final long committed = opened == null ? -1L : opened.seqNoStats().getMaxSeqNo();
-            behind = log.maxSeqNoFromTerm(commit.term()) > committed;
-        }
-        if (behind == false && head.isPresent()) {
-            // A write that went to a node's write log rather than the shard's own is in neither listing: the writers the
-            // head names, and a dead owner, hold such records until a successor replays and publishes them.
+        boolean behind = false;
+        if (head.isPresent()) {
+            // Then it has to cover the node logs: the writers the head names, and a dead owner, hold acknowledged records
+            // until a successor replays and publishes them.
             final java.util.List<String> nodeLogs = new java.util.ArrayList<>(head.get().writers());
             if (owner != null && nodeLogs.contains(owner) == false) {
                 nodeLogs.add(owner);
@@ -317,25 +288,6 @@ final class ReaderValidation {
             throw new ShardBehindLogException(indexName, shardNumber);
         }
         readerChecks.put(key, new ReaderCheck(commit, departed, null, null, Long.MIN_VALUE, headTerm, now));
-    }
-
-    /** The answer of a log listing run alongside the reader check, its failure rethrown as the check's. */
-    private static boolean awaitListing(java.util.concurrent.CompletableFuture<Boolean> landed) throws java.io.IOException {
-        try {
-            return landed.get();
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new java.io.IOException("interrupted listing the log for a reader check", e);
-        } catch (java.util.concurrent.ExecutionException e) {
-            final Throwable cause = e.getCause();
-            if (cause instanceof java.io.UncheckedIOException unchecked) {
-                throw unchecked.getCause();
-            }
-            if (cause instanceof RuntimeException runtime) {
-                throw runtime;
-            }
-            throw new java.io.IOException("listing the log for a reader check failed", cause);
-        }
     }
 
     /**

@@ -383,7 +383,7 @@ public class ServerlessTemplateTests extends OpenSearchTestCase {
      * deployment with "stored template [extra0] could not be read". An operator or another tool leaving a file
      * in that container would do the same in production, and the failure would look nothing like its cause.
      *
-     * <p>The rule is the one {@code WalStore} and the point-in-time store already follow: absent, foreign and
+     * <p>The rule is the one the node log and the point-in-time store already follow: absent, foreign and
      * corrupt are three different answers.
      */
     public void testAForeignFileAmongTheTemplatesIsNotOneOfThem() throws Exception {

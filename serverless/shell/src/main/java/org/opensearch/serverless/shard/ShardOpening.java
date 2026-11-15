@@ -189,15 +189,11 @@ final class ShardOpening {
                 lap.run();
 
                 List<String> armedWriters = null;
-                // Whether this open closed the shard's own log and replayed it, as a writer of its node's log: once what it
-                // replayed is published, the head can say the log is quiet, and later opens skip it.
-                boolean closedShardLog = false;
-                if (replayWal && reconciler.walStores != null) {
+                if (replayWal && reconciler.replaysLogs) {
                     // Armed for exactly the window in which the engine is built and recovery runs, which is
                     // the only window in which core will accept operations carrying their own sequence
                     // numbers.
-                    final org.opensearch.serverless.store.WalStore log = reconciler.wal(shardId);
-                    reconciler.pendingReplay.put(shardId, log);
+                    reconciler.pendingReplay.add(shardId);
                     if (reconciler.nodeLog != null) {
                         armedWriters = reconciler.nodeLogWriters.remove(shardId.getIndexName() + "#" + shardId.id());
                         reconciler.pendingNodeLogReplay.put(
@@ -205,31 +201,10 @@ final class ShardOpening {
                             new ShardReconciler.NodeLogReplay(armedWriters == null ? List.of() : armedWriters, shardHeadTerm)
                         );
                     }
-                    // Fence the log before recovery reads anything: every older term, so a predecessor that has
-                    // not noticed it lost this shard can write nothing after what is replayed here, and this
-                    // term, so an earlier writer of it -- the instance a same-term reopen replaced -- can write
-                    // nothing either. Whatever either of them landed is before a fence and is replayed; nothing
-                    // can land after one. See WalStore#establish and serverless/rfc-fencing-closure.md.
-                    //
-                    // The takeover fenced the older terms already, at the compare-and-swap; doing it again here
-                    // costs a listing for a term already fenced, and covers a shard reopened without passing
-                    // through an acquisition.
-                    final Long fencedAt = reconciler.olderTermsFenced.remove(shardId.getIndexName() + "#" + shardId.id());
-                    // Unless the head this node took says the shard's own log is quiet and this node writes its node's
-                    // log: then every term of the shard's log is closed and published already, and nothing will be written
-                    // there at this term, so there is nothing to fence or replay -- and the listings that would find so are
-                    // most of what an open cost in listings.
-                    final Long quietAt = reconciler.shardLogQuietAt.remove(shardId.getIndexName() + "#" + shardId.id());
+                    // Begun before recovery reads anything, then confirmed: a head taken and superseded before this open
+                    // got here -- by another owner, or by an index recreated under the same name -- stops this writer.
                     final java.util.function.BiPredicate<ShardId, Long> check = reconciler.ownsAtTerm;
-                    if (reconciler.nodeLog != null && quietAt != null && quietAt == shardHeadTerm) {
-                        log.beginQuiet(shardHeadTerm, check == null ? null : () -> check.test(shardId, shardHeadTerm));
-                    } else {
-                        if (fencedAt == null || fencedAt != shardHeadTerm) {
-                            log.fenceOlderTerms(shardHeadTerm);
-                        }
-                        log.establish(shardHeadTerm, check == null ? null : () -> check.test(shardId, shardHeadTerm));
-                        closedShardLog = reconciler.nodeLog != null;
-                    }
+                    reconciler.writerTerm(shardId).begin(shardHeadTerm, check == null ? null : () -> check.test(shardId, shardHeadTerm));
                 }
                 lap.run();
                 if (logged != null) {
@@ -291,7 +266,7 @@ final class ShardOpening {
                     nodes
                 );
 
-                if (replayWal && reconciler.walStores != null) {
+                if (replayWal && reconciler.replaysLogs) {
                     replayRecordsWithoutSequenceIdentity(shard, shardId);
                 }
                 if (replayWal == false) {
@@ -315,19 +290,6 @@ final class ShardOpening {
                         reconciler.publishedThroughAtOpen.put(shardId, restoredCheckpoint);
                     } else {
                         reconciler.publishedThroughAtOpen.remove(shardId);
-                    }
-                }
-                if (closedShardLog) {
-                    if (shard.seqNoStats().getMaxSeqNo() <= restoredCheckpoint) {
-                        // Nothing replayed past the commit: the shard's own log holds nothing it lacks.
-                        try {
-                            reconciler.nodeLog.shardLogQuiet(shardId, shardHeadTerm);
-                        } catch (IOException | RuntimeException e) {
-                            // The next owner closes the shard's log again, which costs listings, never records.
-                            ShardReconciler.logger.debug("could not record that " + shardId + "'s own log is quiet", e);
-                        }
-                    } else {
-                        reconciler.shardLogQuietOnPublish.put(shardId, shardHeadTerm);
                     }
                 }
                 reconciler.open.put(shardId, shard);
@@ -476,14 +438,11 @@ final class ShardOpening {
      */
     void replayRecordsWithoutSequenceIdentity(IndexShard shard, ShardId shardId) throws IOException {
         final var retained = reconciler.replayedRecords.remove(shardId);
-        try (
-            var spool = retained != null
-                ? retained
-                : org.opensearch.serverless.engine.ReplaySpool.captureExclusive(
-                    shard.shardPath().getDataPath().resolve("wal-replay"),
-                    consumer -> reconciler.wal(shardId).forEachReplayableAfterFencing(consumer)
-                )
-        ) {
+        if (retained == null) {
+            // The engine retains what it replayed whenever there was anything; nothing retained, nothing to apply.
+            return;
+        }
+        try (var spool = retained) {
             final int[] replayed = { 0 };
             spool.forEachLegacy(record -> {
                 if (record.isDeletion()) {
