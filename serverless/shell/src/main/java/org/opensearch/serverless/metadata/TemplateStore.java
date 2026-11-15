@@ -89,7 +89,7 @@ public final class TemplateStore {
      * with "stored template [extra0] could not be read". An operator or another tool leaving a file here
      * would do the same in production.
      *
-     * <p>The rule is {@code WalStore}'s: a name this system did not mint is somebody else's file and is left
+     * <p>The rule: a name this system did not mint is somebody else's file and is left
      * alone; a name it did mint that will not parse is corruption and is reported. Absent, foreign and corrupt
      * are three different answers. The indexed form never lists at all, which closes the door for good.
      */

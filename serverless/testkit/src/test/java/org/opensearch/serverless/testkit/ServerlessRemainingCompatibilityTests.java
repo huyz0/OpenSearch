@@ -583,15 +583,7 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
             if (expectedStatus == 400) {
                 final Response got = send(f.node(), "GET", "/" + backing + "/_doc/timestamp-case", null);
                 assertEquals(got.body(), 404, got.status());
-                final var descriptor = f.plane().describe(backing).orElseThrow();
-                assertTrue(
-                    "invalid source must never enter the durable replay log",
-                    f.plane()
-                        .walStore(backing, descriptor.uuid(), 0)
-                        .replayable()
-                        .stream()
-                        .noneMatch(record -> record.id().equals("timestamp-case"))
-                );
+                assertNotLogged(f, backing, "timestamp-case");
             }
         }
     }
@@ -621,14 +613,18 @@ public class ServerlessRemainingCompatibilityTests extends OpenSearchTestCase {
             );
             assertEquals(wrongField.body(), 400, wrongField.status());
             assertFalse(f.node().reads().get(f.node().reconciler().openShards().iterator().next(), "invalid").found());
-            final var descriptor = f.plane().describe(".ds-events-000001").orElseThrow();
-            assertTrue(
-                f.plane()
-                    .walStore(descriptor.name(), descriptor.uuid(), 0)
-                    .replayable()
-                    .stream()
-                    .noneMatch(record -> record.id().equals("invalid"))
-            );
+            assertNotLogged(f, ".ds-events-000001", "invalid");
+        }
+    }
+
+    /** Invalid source must never enter the durable replay log: no shard of the index this node holds logged it. */
+    private static void assertNotLogged(Fixture f, String index, String id) throws java.io.IOException {
+        for (org.opensearch.core.index.shard.ShardId shard : f.node().reconciler().openShards()) {
+            if (shard.getIndexName().equals(index) == false) {
+                continue;
+            }
+            final long term = f.plane().heads().read(index, shard.id()).orElseThrow().term();
+            f.node().nodeLogWriter().forEachRecordSince(shard, term, -1L, record -> assertNotEquals("logged " + id, id, record.id()));
         }
     }
 }

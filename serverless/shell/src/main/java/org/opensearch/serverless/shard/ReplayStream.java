@@ -24,17 +24,11 @@ final class ReplayStream {
         ShardId shardId,
         org.opensearch.common.CheckedConsumer<org.opensearch.serverless.store.WalRecord, IOException> consumer
     ) throws IOException {
-        final var log = r.pendingReplay.get(shardId);
-        if (log == null) {
+        if (r.pendingReplay.contains(shardId) == false) {
             return;
         }
         final long readingAt = System.nanoTime();
         try {
-            log.forEachReplayableAfterFencing(record -> {
-                consumer.accept(record);
-                r.logRecordsRead.incrementAndGet();
-            });
-            // After the shard's own log, which holds what was written before the node log was: oldest first.
             final ShardReconciler.NodeLogReplay fromNodeLog = r.pendingNodeLogReplay.get(shardId);
             final ShardReconciler.NodeLogHooks hooks = r.nodeLog;
             if (fromNodeLog != null && hooks != null) {

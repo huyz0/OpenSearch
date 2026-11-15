@@ -356,13 +356,13 @@ public final class NodeWritePath {
         org.opensearch.index.shard.IndexShard shard,
         java.util.List<org.opensearch.serverless.store.WalRecord> records
     ) throws java.io.IOException {
-        final var wal = node.reconciler.wal(shardId);
-        if (wal == null || records.isEmpty()) {
+        final var writerTerm = node.reconciler.writerTerm(shardId);
+        if (writerTerm == null || records.isEmpty()) {
             return;
         }
         final long leaseChecking = System.nanoTime();
         node.fences.ensureOwnLeaseIsStillValid(shardId);
-        if (wal.begun(shard.getOperationPrimaryTerm()) == false) {
+        if (writerTerm.begun(shard.getOperationPrimaryTerm()) == false) {
             // Not this term's writer: only a writer's open begins its term, after confirming the head names it. Appending
             // anyway would begin the term here, unchecked, and fence the real writer's records off behind this one.
             node.writeFenced.add(shardId);
@@ -566,7 +566,7 @@ public final class NodeWritePath {
      * <p><b>Ordering within the batch is preserved</b>, and it has to be. A batch that writes a document
      * and then deletes it must leave it gone, and one that deletes and then rewrites must leave it
      * present. Since a record's kind travels with it, replay reproduces the same sequence — see
-     * {@link org.opensearch.serverless.store.WalStore#append(long, java.util.List)}.
+     * {@link org.opensearch.serverless.store.NodeLogBlob}.
      *
      * <p><b>A failed operation does not roll back the ones before it</b>, exactly as in classic
      * OpenSearch: a bulk is a batch, not a transaction. The failure is reported for its own item and the

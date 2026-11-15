@@ -17,13 +17,17 @@ import org.opensearch.serverless.store.WalRecord;
 import org.opensearch.test.OpenSearchTestCase;
 
 import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Run with -Poptions.forkOptions.memoryMaximumSize=512m: durable history must not need an equally large heap to recover. */
 public class WalRecoveryMemoryTests extends OpenSearchTestCase {
     public void testRecoveryStreamsHistoryLargerThanTheHeap() throws Exception {
         assumeTrue("run with -Poptions.forkOptions.memoryMaximumSize=512m", Runtime.getRuntime().maxMemory() <= 768L * 1024 * 1024);
+        final var clock = new AtomicLong(1_000L);
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
-            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), () -> 1000L, 30_000L);
+            final var plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, 30_000L);
             final var descriptor = new IndexDescriptor(
                 "recovery-memory",
                 "uuid-recovery-memory",
@@ -32,15 +36,27 @@ public class WalRecoveryMemoryTests extends OpenSearchTestCase {
                 null
             );
             plane.createIndex(descriptor);
-            final var wal = plane.walStore(descriptor.name(), descriptor.uuid(), 0);
             final String source = "{\"payload\":\"" + "x".repeat(128 * 1024) + "\"}";
-            for (int offset = 0; offset < 5120; offset += 32) {
-                final var batch = new ArrayList<WalRecord>();
-                for (int i = offset; i < offset + 32; i++) {
-                    batch.add(new WalRecord("doc-" + i, source, i, 1L, 1L));
+            // Planted a batch at a time, one blob each, so the planting itself never holds the history.
+            final Iterable<List<WalRecord>> batches = () -> new Iterator<>() {
+                int offset = 0;
+
+                @Override
+                public boolean hasNext() {
+                    return offset < 5120;
                 }
-                wal.append(1L, batch);
-            }
+
+                @Override
+                public List<WalRecord> next() {
+                    final var batch = new ArrayList<WalRecord>();
+                    for (int i = offset; i < offset + 32; i++) {
+                        batch.add(new WalRecord("doc-" + i, source, i, 1L, 1L));
+                    }
+                    offset += 32;
+                    return batch;
+                }
+            };
+            PlantedNodeLog.plant(plane, descriptor, 0, clock, 30_000L, batches);
             final var settings = Settings.builder()
                 .put("node.name", "wal-recovery-memory")
                 .put("path.home", createTempDir())

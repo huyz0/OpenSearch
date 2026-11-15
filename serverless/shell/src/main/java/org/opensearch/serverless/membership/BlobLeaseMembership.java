@@ -489,8 +489,8 @@ public final class BlobLeaseMembership implements MembershipSource {
      * last published, less the margin, so the interval in which a zombie can still write is bounded by
      * the TTL rather than by however long it takes the zombie to notice. It does <em>not</em> make writing
      * safe: the check and the write are not atomic, so a long enough pause between them lands a write
-     * after the deadline passed. Closing that needs a fence at the log, which is what the replay cutoff in
-     * {@code WalStore#replayable(Map)} is for. This bounds; that fences.
+     * after the deadline passed. Closing that needs a fence at the log, which is what a successor's fence of the
+     * node log, before it replays it, is for. This bounds; that fences.
      *
      * <p><b>Before the first renewal this answers true</b>, because a node that has never published a
      * lease has no deadline to have missed, and refusing writes on that basis would break a node that

@@ -137,9 +137,7 @@ public final class ReaderServing {
         node.adopt(plane);
         node.reconciler.setSegmentPublishers(NodePackWiring.publishers(node, plane));
         node.reconciler.setBeforePublish(ServerlessNode.widensRollupsOf(plane));
-        node.reconciler.setWalStores(
-            id -> plane.walStore(id.getIndexName(), id.getIndex().getUUID(), id.id()).readingWith(node.threadPool().generic())
-        );
+        node.reconciler.replayLogs();
         node.reconciler.setOwnershipCheck((id, term) -> node.leases.ownsAtTerm(plane, id, term));
         final String openingKey = indexName + "#" + shardNumber;
         final org.opensearch.core.index.shard.ShardId served = openOrShareReader(plane, indexName, shardNumber, openingKey, known);

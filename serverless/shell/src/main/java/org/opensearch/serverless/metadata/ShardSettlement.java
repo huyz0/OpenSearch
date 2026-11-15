@@ -54,12 +54,10 @@ final class ShardSettlement {
      * fleet that had crashed a few times could not rule 47,000 indices out of a search for next month.
      *
      * <p><b>How, safely.</b> The head is given back on the owner's behalf the way a takeover takes it -- the owner must
-     * not be live, its lease is revoked, the term moves on -- and the older terms are sealed, so a writer that was
-     * not as dead as it looked can no longer add history. Only then is the log compared with the published commit:
-     * if nothing landed past what the commit covers, every acknowledged write is published, and the mark and the claim
-     * go. Otherwise the shard is left unowned and marked, and the caller should have it taken and replayed. A commit
-     * published before commits recorded how far into the log they reach cannot be judged by a listing, and counts as
-     * needing a replay.
+     * not be live, its lease is revoked, the term moves on. Only then are the node logs the head names compared with
+     * the published commit: if none holds a record past what the commit covers, every acknowledged write is published,
+     * and the mark and the claim go. Otherwise the shard is left unowned and marked, and the caller should have it taken
+     * and replayed.
      *
      * @param indexName the index
      * @param shard the shard number
@@ -84,12 +82,9 @@ final class ShardSettlement {
             plane.forgetAssignment(deadNodeId, indexName, shard);
             return MetadataPlane.Settled.RELEASED_CLEAN;
         }
-        final org.opensearch.serverless.store.WalStore log = plane.walStore(indexName, uuid, shard);
-        log.fenceOlderTerms(abandoned.get().released().term());
         final Optional<org.opensearch.serverless.store.CommitManifest> commit = plane.segmentPublisher(indexName, uuid, shard)
             .readManifest();
-        if (unpublished(indexName, uuid, shard, commit, log)
-            || nodeLogHolds(abandoned.get().released().writers(), indexName, uuid, shard, abandoned.get().released().term(), commit)) {
+        if (nodeLogHolds(abandoned.get().released().writers(), indexName, uuid, shard, abandoned.get().released().term(), commit)) {
             return MetadataPlane.Settled.NEEDS_REPLAY;
         }
         // Widened to the published commit as the mark goes: the dead writer's publishes skipped the rollup under it.
@@ -130,8 +125,7 @@ final class ShardSettlement {
         final String uuid = descriptor.get().uuid();
         final Optional<org.opensearch.serverless.store.CommitManifest> commit = plane.segmentPublisher(indexName, uuid, shard)
             .readManifest();
-        if (unpublished(indexName, uuid, shard, commit, plane.walStore(indexName, uuid, shard))
-            || nodeLogHolds(head.get().writers(), indexName, uuid, shard, head.get().term(), commit)) {
+        if (nodeLogHolds(head.get().writers(), indexName, uuid, shard, head.get().term(), commit)) {
             return MetadataPlane.Settled.NEEDS_REPLAY;
         }
         // A writer that takes the shard meanwhile marks it at a higher term first, which this clear leaves alone. Widened
@@ -145,34 +139,6 @@ final class ShardSettlement {
                 commit.map(org.opensearch.serverless.store.CommitManifest::digest).orElse(null)
             );
         return MetadataPlane.Settled.RELEASED_CLEAN;
-    }
-
-    /**
-     * Whether the shard's log holds a write its published commit does not cover. A commit that records how far into
-     * the log it reaches is judged by a listing; an older one by its commit point's highest sequence number against
-     * the log's, as a reader judges it; one that records neither counts as behind.
-     */
-    boolean unpublished(String indexName, String uuid, int shard, org.opensearch.serverless.store.WalStore log) throws IOException {
-        return unpublished(indexName, uuid, shard, plane.segmentPublisher(indexName, uuid, shard).readManifest(), log);
-    }
-
-    /** The same, judged against a manifest the caller has already read. */
-    boolean unpublished(
-        String indexName,
-        String uuid,
-        int shard,
-        Optional<org.opensearch.serverless.store.CommitManifest> commit,
-        org.opensearch.serverless.store.WalStore log
-    ) throws IOException {
-        final org.opensearch.serverless.store.SegmentPublisher publisher = plane.segmentPublisher(indexName, uuid, shard);
-        if (commit.isEmpty()) {
-            return log.landedPast(0L, -1L);
-        }
-        if (commit.get().walOrdinal() >= 0L) {
-            return log.landedPast(commit.get().term(), commit.get().walOrdinal());
-        }
-        final java.util.OptionalLong committed = publisher.committedMaxSeqNo(commit.get());
-        return committed.isEmpty() || log.maxSeqNoFromTerm(commit.get().term()) > committed.getAsLong();
     }
 
     /**
@@ -362,9 +328,6 @@ final class ShardSettlement {
             if (plane.segmentPublisher(indexName, uuid, shard).readManifest().isPresent()) {
                 return false;
             }
-            if (plane.walStore(indexName, uuid, shard).landedPast(0L, -1L)) {
-                return false;
-            }
             if (head.isPresent() && nodeLogHolds(head.get().writers(), indexName, uuid, shard, head.get().term(), Optional.empty())) {
                 return false;
             }
@@ -398,16 +361,15 @@ final class ShardSettlement {
                 // Marked by its writer, so never ruled out; the writer's clear widens the entry when it lets go.
                 return List.of();
             }
-            if (unpublished(indexName, uuid, shard, plane.walStore(indexName, uuid, shard))
-                || (head.isPresent()
-                    && nodeLogHolds(
-                        head.get().writers(),
-                        indexName,
-                        uuid,
-                        shard,
-                        head.get().term(),
-                        plane.segmentPublisher(indexName, uuid, shard).readManifest()
-                    ))) {
+            if (head.isPresent()
+                && nodeLogHolds(
+                    head.get().writers(),
+                    indexName,
+                    uuid,
+                    shard,
+                    head.get().term(),
+                    plane.segmentPublisher(indexName, uuid, shard).readManifest()
+                )) {
                 replay.add(shard);
                 continue;
             }

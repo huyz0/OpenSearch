@@ -410,6 +410,15 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
         }
     }
 
+    private static java.util.Set<String> nodeLogBlobs(Path root) throws java.io.IOException {
+        try (var paths = java.nio.file.Files.walk(root)) {
+            return paths.filter(java.nio.file.Files::isRegularFile)
+                .map(path -> root.relativize(path).toString())
+                .filter(path -> path.startsWith("nodelog"))
+                .collect(java.util.stream.Collectors.toSet());
+        }
+    }
+
     /**
      * A sweep must not eat the log: reclaiming records is the publish path's job, on the publish path's rule.
      *
@@ -419,12 +428,10 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
      * tell that from a sweep having eaten it. It also asserted that no collected name contained
      * {@code "wal"}, which never could: the collector names what it deletes {@code t=N/blob}.
      *
-     * <p>Made honest, it says less than it looks like it says. The sweep skips any container whose term is
-     * at or above the live manifest's, so the <em>only</em> log records it could ever reach are ones under
-     * a term a publish has already superseded — exactly the ones {@code WalStore} itself deletes, for the
-     * same reason. Collecting them would lose nothing. What is defended here is therefore ownership rather
-     * than data: two components must not both be reclaiming the log, because only one of them states a rule
-     * for when that is safe. No canary can turn this into a lost write, and it should not be read as one.
+     * <p>Made honest, it says less than it looks like it says. The log is every writer's node log, which lives
+     * outside every shard's data, so a sweep of one shard has no business near it. What is defended here is
+     * ownership rather than data: two components must not both be reclaiming the log, because only one of them
+     * states a rule for when that is safe.
      */
     public void testAGarbageCollectionSweepDoesNotTouchTheWriteAheadLog() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
@@ -459,51 +466,23 @@ public class ServerlessDeleteTests extends OpenSearchTestCase {
             loopB.tick(clock.get() + 1_000);
 
             // A write under the successor's own term, which lands in its node log, outside the shard: the sweep must
-            // leave the shard's documents whole.
+            // leave both the shard's documents and that log whole.
             b.writes().index(b.reconciler().openShards().iterator().next(), "postsweep", "{\"msg\":\"postsweep\",\"n\":3}");
-            // And a record in the shard's own log under the DEAD writer's term -- the only kind of log record the
-            // sweep's term guard would let it reach at all, so the one that can tell a sweep that stays out of wal/
-            // from one that does not.
-            plane.walStore("alpha", 0).append(1, new org.opensearch.serverless.store.WalRecord("zombie", "{\"msg\":\"zombie\"}"));
 
-            final long recordsBefore = walRecords(store, plane);
-            assertEquals("the shard's own log should hold the stale record before the sweep", 1, recordsBefore);
+            final java.util.Set<String> logBefore = nodeLogBlobs(objectStore);
+            assertFalse("the successor's write should be in its node log before the sweep", logBefore.isEmpty());
 
             final var collected = gc.collectShard(plane, "alpha", 0);
-            logger.info("wal + gc: swept {} blobs after failover", collected.size());
-            assertFalse(
-                "the sweep collected something named like a log record: " + collected,
-                collected.stream().anyMatch(name -> name.substring(name.indexOf('/') + 1).matches("\\d{20}"))
-            );
+            logger.info("log + gc: swept {} blobs after failover", collected.size());
 
-            // Directly observable, rather than trusting the returned list. The log lives at wal/t=N,
-            // one level deeper than the sweep looks, so it is protected by nesting as well as by the
-            // term-name check -- and a sweep later made recursive would sail past both. This is what
-            // notices that. Counted before and after, because a count that is merely non-zero is also
-            // satisfied by a sweep that took some of them.
-            final long recordsLeft = walRecords(store, plane);
-            logger.info("wal + gc: {} of {} log record(s) survive the sweep", recordsLeft, recordsBefore);
-            assertEquals("the sweep collected write-ahead log records", recordsBefore, recordsLeft);
+            // Directly observable, rather than trusting the returned list: a sweep later made recursive, or rooted one
+            // level too high, would reach the node logs, and this is what notices that.
+            assertEquals("the sweep collected node log blobs", logBefore, nodeLogBlobs(objectStore));
 
             final ShardId recovered = b.reconciler().openShards().iterator().next();
             b.reconciler().shard(recovered).refresh("test");
             assertEquals("the unpublished write survived the sweep, and the deletion applied", 1, hits(b, recovered, "msg", "waltest"));
         }
-    }
-
-    /** How many write-ahead log records exist for alpha/0, across every term. */
-    private static long walRecords(FsBlobStore store, MetadataPlane plane) throws Exception {
-        final var walRoot = store.blobContainer(plane.shardData("alpha", 0).add("wal"));
-        long records = 0;
-        for (var termDir : walRoot.children().values()) {
-            // A blob of no bytes is a fence, not a record.
-            records += termDir.listBlobs()
-                .entrySet()
-                .stream()
-                .filter(e -> e.getKey().matches("\\d{20}") && e.getValue().length() > 0)
-                .count();
-        }
-        return records;
     }
 
     private int hits(ServerlessNode node, ShardId shardId, String field, String value) throws Exception {

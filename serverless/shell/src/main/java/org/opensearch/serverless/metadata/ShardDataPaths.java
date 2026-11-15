@@ -39,29 +39,6 @@ final class ShardDataPaths {
     }
 
     /**
-     * Returns the write-ahead log for one shard.
-     *
-     * @param indexName the index
-     * @param shardId the shard number
-     * @return the WAL store
-     */
-    public org.opensearch.serverless.store.WalStore walStore(String indexName, int shardId) throws IOException {
-        return walStore(indexName, uuidOf(indexName), shardId);
-    }
-
-    /**
-     * Returns the write-ahead log for one shard, for a caller that already knows the index's uuid.
-     *
-     * @param indexName the index
-     * @param uuid the index's uuid
-     * @param shardId the shard number
-     * @return the WAL store
-     */
-    public org.opensearch.serverless.store.WalStore walStore(String indexName, String uuid, int shardId) {
-        return new org.opensearch.serverless.store.WalStore(blobStore, RegisterMap.shardData(base, indexName, uuid, shardId));
-    }
-
-    /**
      * Returns where one shard's bytes live.
      *
      * <p>Resolving the uuid costs a descriptor read, which is why every caller on a hot path takes the

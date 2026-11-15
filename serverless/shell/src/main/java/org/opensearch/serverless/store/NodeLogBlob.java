@@ -34,7 +34,7 @@ import java.util.TreeMap;
  * however many shards were written in it.
  *
  * <p><b>Layout.</b> A fixed prefix (magic, format version, header length), then the header, then the body. The body is
- * one slice per (shard, term), each in the newline-delimited {@link WalRecord} encoding the per-shard log uses, so a
+ * one slice per (shard, term), each in the newline-delimited {@link WalRecord} encoding, so a
  * slice parses with the same code. The header lists this blob's slices with their offsets into the body, and carries a
  * <em>running index</em>: for every shard with records the node has not yet published, the ordinals of this epoch that
  * hold them. The last blob before a fence therefore says where every unpublished record of every shard is, and a
