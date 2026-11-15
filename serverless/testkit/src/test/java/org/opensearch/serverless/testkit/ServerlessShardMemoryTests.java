@@ -100,6 +100,29 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
         return runtime.totalMemory() - runtime.freeMemory();
     }
 
+    /**
+     * The heap once it has stopped falling: the lowest of repeated {@link #usedHeapBytes} readings, taken until three
+     * in a row find nothing lower.
+     *
+     * <p>Work a shard open starts in the background is still live for a second or so after the open returns. A
+     * reader node read straight after opening 100 shards measured up to 1.1 MB above where it settled a second
+     * later, about half the real gap to a writer, while a writer node read the same either way. Noise of that kind
+     * only ever adds heap, so the floor is the reading to trust.
+     */
+    private static long settledHeapBytes() {
+        long lowest = usedHeapBytes();
+        for (int readings = 1, sinceLower = 0; sinceLower < 3 && readings < 30; readings++) {
+            final long reading = usedHeapBytes();
+            if (reading < lowest) {
+                lowest = reading;
+                sinceLower = 0;
+            } else {
+                sinceLower++;
+            }
+        }
+        return lowest;
+    }
+
     /** {@code /proc/self/fd} is Linux-only; every other platform's equivalent is not a directory listing. */
     private static boolean fileDescriptorCountingIsAvailable() {
         return Files.isDirectory(PathUtils.get("/proc/self/fd"));
@@ -285,20 +308,20 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mem-writer-cmp" + suffix, "ingest"))) {
             node.startup().start();
             node.setMetadataPlane(plane);
-            final long baseline = usedHeapBytes();
+            final long baseline = settledHeapBytes();
             openWriterShards(node, plane, "alpha", 0, COMPARISON_BATCH);
-            writerCost = usedHeapBytes() - baseline;
+            writerCost = settledHeapBytes() - baseline;
         }
 
         final long readerCost;
         try (ServerlessNode node = new ServerlessNode(nodeSettings("mem-reader-cmp" + suffix, "search"))) {
             node.startup().start();
             node.setMetadataPlane(plane);
-            final long baseline = usedHeapBytes();
+            final long baseline = settledHeapBytes();
             for (int shard = 0; shard < COMPARISON_BATCH; shard++) {
                 node.readers().serveAsReader(plane, "alpha", shard);
             }
-            readerCost = usedHeapBytes() - baseline;
+            readerCost = settledHeapBytes() - baseline;
             assertEquals("every shard must actually have opened as a reader", COMPARISON_BATCH, node.reconciler().readerShards().size());
         }
 
@@ -314,13 +337,13 @@ public class ServerlessShardMemoryTests extends OpenSearchTestCase {
      * <p>Both are measured in the same JVM, one after the other, rather than compared across two separate
      * test runs, so JVM-to-JVM noise cannot be mistaken for the difference this is actually about.
      *
-     * <p><b>Three independent trials, majority rules, not one.</b> A single heap snapshot inside a shared
-     * test JVM is close enough to the real gap between these two (roughly 50 KB against roughly 67 KB at
-     * this batch size) that background allocation from unrelated threads can occasionally swing the sign
-     * of one measurement — this test was flaky at exactly that margin before trials were added. Three
-     * independent runs, agreeing on direction at least twice, is what tells a real 25%-ish structural
-     * difference apart from noise of comparable size to it without either hiding a genuine regression
-     * behind noise tolerance or chasing single-run precision heap accounting cannot actually offer.
+     * <p><b>Settled readings.</b> Settled, a reader shard costs about 37 KB against a writer's 55 KB at this batch
+     * size. A reading taken straight after the reader opens also counts work those opens left running for a second
+     * or so, up to 1.1 MB over the batch, which put the two inside each other's noise in a full suite run. Each
+     * reading is the heap once it stops falling; see {@link #settledHeapBytes}.
+     *
+     * <p><b>Three independent trials, majority rules, not one,</b> so allocation by unrelated threads in a shared
+     * test JVM cannot decide the result on its own.
      */
     public void testAReaderShardCostsLessHeapThanAWriterShard() throws Exception {
         final int trials = 3;
