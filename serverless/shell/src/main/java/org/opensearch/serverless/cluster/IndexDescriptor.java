@@ -276,7 +276,7 @@ public final class IndexDescriptor {
         String bucket
     ) {
         if (bucket != null) {
-            org.opensearch.serverless.bucket.BucketIds.validate(bucket);
+            BucketIds.validate(bucket);
             if (numberOfShards != 1 || layout != null) {
                 throw new IllegalArgumentException(
                     "["

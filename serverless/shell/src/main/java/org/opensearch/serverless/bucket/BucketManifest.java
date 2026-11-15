@@ -15,6 +15,7 @@ import org.opensearch.core.xcontent.DeprecationHandler;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.core.xcontent.XContentParser;
+import org.opensearch.serverless.cluster.BucketIds;
 import org.opensearch.serverless.store.CommitManifest;
 
 import java.io.IOException;

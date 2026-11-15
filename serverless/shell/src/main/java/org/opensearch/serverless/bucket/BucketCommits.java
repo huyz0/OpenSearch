@@ -11,6 +11,7 @@ package org.opensearch.serverless.bucket;
 import org.opensearch.common.blobstore.BlobRegister;
 import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.core.common.bytes.BytesReference;
+import org.opensearch.serverless.cluster.BucketIds;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.CommitRegister;
 import org.opensearch.serverless.store.StoreUsage;

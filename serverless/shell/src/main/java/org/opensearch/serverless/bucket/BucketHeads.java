@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.bucket;
 
+import org.opensearch.serverless.cluster.BucketIds;
+
 import java.io.IOException;
 import java.util.Optional;
 
