@@ -224,10 +224,22 @@ public final class SearchGate {
         }
     }
 
-    // Counts the search, and its time, for each index it covers.
-    private static org.opensearch.common.lease.Releasable searching(NodeContext serving, java.util.Collection<String> indices) {
+    // Admits the search by its tenants' share of the node, and counts it, and its time, for each index it covers.
+    private static org.opensearch.common.lease.Releasable searching(NodeContext serving, java.util.Collection<String> indices)
+        throws IOException {
         final org.opensearch.serverless.usage.Guardrails guardrails = serving.part(org.opensearch.serverless.usage.Guardrails.class);
-        return guardrails == null ? () -> {} : guardrails.searching(indices);
+        if (guardrails == null) {
+            return () -> {};
+        }
+        // A search node writes nothing, so learns an index's tenant here, from the view's settings.
+        final var view = serving.clusterService() == null ? null : serving.clusterService().state().metadata();
+        for (String index : indices) {
+            final var metadata = view == null ? null : view.index(index);
+            if (metadata != null) {
+                guardrails.note(index, metadata.getSettings());
+            }
+        }
+        return guardrails.admitSearch(indices);
     }
 
     public static boolean selectsShards(String preference) {
