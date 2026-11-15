@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.documents;
 
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.core.rest.RestStatus;
@@ -15,9 +15,9 @@ import org.opensearch.serverless.write.WriteOutcome;
 /**
  * What a single-document write produced or why it was refused: the result with its routing facts, the typed
  * refusals, how a failed forward is classified, and the options a write may not carry. Split out of
- * {@link DocumentHandler}.
+ * the REST document handler.
  */
-final class DocumentWriteOutcomes {
+public final class DocumentWriteOutcomes {
 
     private DocumentWriteOutcomes() {}
 
@@ -46,16 +46,16 @@ final class DocumentWriteOutcomes {
     }
 
     /** The result and the routing facts that belong only to an actual execution. */
-    static final class WriteResult {
-        final ShardId shardId;
-        final String id;
-        final String owner;
-        final boolean deletion;
-        final WriteOutcome outcome;
-        final boolean refreshed;
-        final String droppedBy;
+    public static final class WriteResult {
+        public final ShardId shardId;
+        public final String id;
+        public final String owner;
+        public final boolean deletion;
+        public final WriteOutcome outcome;
+        public final boolean refreshed;
+        public final String droppedBy;
         final boolean requireAbsent;
-        org.opensearch.action.DocWriteResponse response;
+        public org.opensearch.action.DocWriteResponse response;
 
         WriteResult(
             ShardId shardId,
@@ -132,7 +132,7 @@ final class DocumentWriteOutcomes {
         }
     }
 
-    static org.opensearch.serverless.action.ActionGate.ResponseView<WriteResult> writeView(boolean deletion) {
+    public static org.opensearch.serverless.action.ActionGate.ResponseView<WriteResult> writeView(boolean deletion) {
         return new org.opensearch.serverless.action.ActionGate.ResponseView<>() {
             @Override
             public org.opensearch.core.action.ActionResponse show(WriteResult result) {
@@ -156,8 +156,8 @@ final class DocumentWriteOutcomes {
         };
     }
 
-    static final class WriteRefusal extends org.opensearch.OpenSearchStatusException {
-        final String type;
+    public static final class WriteRefusal extends org.opensearch.OpenSearchStatusException {
+        public final String type;
 
         WriteRefusal(RestStatus status, String type, String reason) {
             super(reason, status);

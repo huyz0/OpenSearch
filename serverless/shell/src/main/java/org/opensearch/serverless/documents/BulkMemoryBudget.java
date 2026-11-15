@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.documents;
 
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.threadpool.Scheduler;
@@ -31,7 +31,7 @@ import java.util.function.Consumer;
  * <p>A request larger than the whole budget is granted the whole budget when it reaches the front, so it waits for the
  * node to be otherwise idle rather than forever.
  */
-final class BulkMemoryBudget {
+public final class BulkMemoryBudget {
 
     private final long capacity;
     private final int maxHolders;
@@ -42,7 +42,7 @@ final class BulkMemoryBudget {
 
     private static final class Waiter {
         final long bytes;
-        final Runnable granted;
+        public final Runnable granted;
         final Consumer<Exception> timedOut;
         Scheduler.ScheduledCancellable timeout;
         boolean done;
@@ -54,14 +54,14 @@ final class BulkMemoryBudget {
         }
     }
 
-    BulkMemoryBudget(long capacity, int maxHolders, ThreadPool threadPool) {
+    public BulkMemoryBudget(long capacity, int maxHolders, ThreadPool threadPool) {
         this.capacity = Math.max(1L, capacity);
         this.maxHolders = Math.max(1, maxHolders);
         this.threadPool = threadPool;
     }
 
     /** The bytes a request is granted: what it asked for, or the whole budget if it asked for more. */
-    long granted(long bytes) {
+    public long granted(long bytes) {
         return Math.min(Math.max(1L, bytes), capacity);
     }
 
@@ -73,7 +73,7 @@ final class BulkMemoryBudget {
      * @param granted run on {@code GENERIC} once granted; the holder must then {@link #release} {@link #granted(long)}
      * @param timedOut run on {@code GENERIC} if not granted in time
      */
-    void acquire(long bytes, TimeValue waitAtMost, Runnable granted, Consumer<Exception> timedOut) {
+    public void acquire(long bytes, TimeValue waitAtMost, Runnable granted, Consumer<Exception> timedOut) {
         final Waiter waiter = new Waiter(granted(bytes), granted, timedOut);
         final boolean now;
         synchronized (this) {
@@ -116,7 +116,7 @@ final class BulkMemoryBudget {
      *
      * @param bytes what {@link #granted(long)} returned for the request
      */
-    void release(long bytes) {
+    public void release(long bytes) {
         synchronized (this) {
             used = Math.max(0L, used - bytes);
             holders = Math.max(0, holders - 1);

@@ -13,11 +13,13 @@ import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.serverless.documents.DocumentWriteOutcomes;
+import org.opensearch.serverless.documents.DocumentWriteOutcomes.WriteRefusal;
+import org.opensearch.serverless.documents.DocumentWriteOutcomes.WriteResult;
+import org.opensearch.serverless.documents.DocumentWritePlanner;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.DocumentRouting;
-import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteRefusal;
-import org.opensearch.serverless.rest.DocumentWriteOutcomes.WriteResult;
 import org.opensearch.serverless.write.WriteOutcome;
 import org.opensearch.transport.client.node.NodeClient;
 

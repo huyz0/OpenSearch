@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.documents;
 
 import org.opensearch.common.UUIDs;
 import org.opensearch.common.xcontent.XContentType;
@@ -24,9 +24,9 @@ import java.util.List;
 
 /**
  * Splits a bulk body into its operations: action lines and sources, with the fields this system refuses named
- * before anything is written. Split out of {@link BulkHandler}.
+ * before anything is written. Parsed here for the REST bulk handler.
  */
-final class BulkBodyParser {
+public final class BulkBodyParser {
 
     private BulkBodyParser() {}
 
@@ -40,7 +40,7 @@ final class BulkBodyParser {
      * request the client did not send. Problems with an individual, well-formed action — an unsupported
      * one — become a failed item instead, and the rest of the batch proceeds.
      */
-    static List<BulkHandler.Item> parse(byte[] body, String defaultIndex) throws BadRequest, IOException {
+    static List<BulkItem> parse(byte[] body, String defaultIndex) throws BadRequest, IOException {
         return parse(body, defaultIndex, null);
     }
 
@@ -52,8 +52,8 @@ final class BulkBodyParser {
      * @param defaultRouting the routing from the path, or null
      * @return the items, in request order
      */
-    static List<BulkHandler.Item> parse(byte[] body, String defaultIndex, String defaultRouting) throws BadRequest, IOException {
-        final List<BulkHandler.Item> items = new ArrayList<>();
+    public static List<BulkItem> parse(byte[] body, String defaultIndex, String defaultRouting) throws BadRequest, IOException {
+        final List<BulkItem> items = new ArrayList<>();
         // Line bounds into the body rather than a copy of each line: a large batch held the body twice over that way.
         final int[] lines = lineBounds(body);
         final int count = lines.length / 2;
@@ -86,7 +86,7 @@ final class BulkBodyParser {
     }
 
     /** The operations parsed from the front of a body still arriving, and how much of it they took. */
-    record Prefix(List<BulkHandler.Item> items, int consumedBytes, int consumedLines) {
+    public record Prefix(List<BulkItem> items, int consumedBytes, int consumedLines) {
     }
 
     /**
@@ -102,9 +102,9 @@ final class BulkBodyParser {
      * @param defaultRouting the routing from the path, or null
      * @return the operations and how many bytes and lines they took
      */
-    static Prefix parsePrefix(byte[] buffer, int length, boolean last, int firstLine, String defaultIndex, String defaultRouting)
+    public static Prefix parsePrefix(byte[] buffer, int length, boolean last, int firstLine, String defaultIndex, String defaultRouting)
         throws BadRequest, IOException {
-        final List<BulkHandler.Item> items = new ArrayList<>();
+        final List<BulkItem> items = new ArrayList<>();
         int position = 0;
         int lines = 0;
         while (position < length) {
@@ -367,11 +367,11 @@ final class BulkBodyParser {
             this.needsSource = "index".equals(name) || "create".equals(name) || "update".equals(name);
         }
 
-        BulkHandler.Item toItem() {
+        BulkItem toItem() {
             // Only index/create may generate an id. A missing delete id is a failed item and must
             // never become a deletion of a newly generated, unrelated id.
             final String documentId = id != null ? id : "delete".equals(name) || "update".equals(name) ? "" : UUIDs.base64UUID();
-            final BulkHandler.Item item = new BulkHandler.Item(
+            final BulkItem item = new BulkItem(
                 name,
                 index,
                 ("delete".equals(name) ? WalRecord.deletion(documentId) : new WalRecord(documentId, source == null ? "" : source))
@@ -448,7 +448,7 @@ final class BulkBodyParser {
     }
 
     /** A body that cannot be split into operations at all. */
-    static final class BadRequest extends Exception {
+    public static final class BadRequest extends Exception {
         BadRequest(String message) {
             super(message);
         }
