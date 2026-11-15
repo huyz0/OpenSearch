@@ -13,6 +13,7 @@ import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.CommitRegister;
+import org.opensearch.serverless.store.StoreUsage;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -154,7 +155,16 @@ public final class BucketCommits {
                     return results;
                 }
                 registerWrites.incrementAndGet();
-                final Optional<Long> generation = store.swap(next, read.generation());
+                // One swap for every member it advances: they share it equally.
+                final Map<String, Long> advanced = new LinkedHashMap<>();
+                for (Map.Entry<String, BlobRegisterCasResult> result : results.entrySet()) {
+                    if (result.getValue().applied()) {
+                        next.member(result.getKey()).ifPresent(member -> advanced.put(member.indexName(), 1L));
+                    }
+                }
+                final BucketManifest swapped = next;
+                final BucketStore.Read expected = read;
+                final Optional<Long> generation = StoreUsage.split(advanced, () -> store.swap(swapped, expected.generation()));
                 if (generation.isPresent()) {
                     written.put(bucketId, new BucketStore.Read(next, generation.get()));
                     return results;
