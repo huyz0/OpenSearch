@@ -255,7 +255,7 @@ public final class NodeWritePath {
         // returning. It is also the order classic OpenSearch uses internally: Lucene, then the translog,
         // then fsync.
         final org.opensearch.index.engine.Engine.IndexResult result;
-        try (org.opensearch.common.lease.Releasable gate = writePools.enterApply()) {
+        try (org.opensearch.common.lease.Releasable gate = writePools.enterApply(shard, 1)) {
             result = shard.applyIndexOperationOnPrimary(
                 requireAbsent
                     ? org.opensearch.common.lucene.uid.Versions.MATCH_DELETED
@@ -545,7 +545,7 @@ public final class NodeWritePath {
         node.shards().markUsed(shardId);
         // Apply, then log -- the same reordering, for the same reason, as the index path above.
         final org.opensearch.index.engine.Engine.DeleteResult result;
-        try (org.opensearch.common.lease.Releasable gate = writePools.enterApply()) {
+        try (org.opensearch.common.lease.Releasable gate = writePools.enterApply(shard, 1)) {
             result = shard.applyDeleteOperationOnPrimary(
                 org.opensearch.common.lucene.uid.Versions.MATCH_ANY,
                 id,
@@ -800,7 +800,7 @@ public final class NodeWritePath {
             org.opensearch.index.mapper.Mapping required = null;
             // One permit for the pass, not one per item: core's write pool applied a shard's whole bulk on one thread, and
             // a permit taken per document had thousands of writers queue on the gate ten times a request each.
-            try (org.opensearch.common.lease.Releasable gate = writePools.enterApply()) {
+            try (org.opensearch.common.lease.Releasable gate = writePools.enterApply(shard, 0)) {
                 for (int i = from; i < batch.size(); i++) {
                     final BulkOperation item = batch.get(i);
                     final org.opensearch.serverless.store.WalRecord operation = item.record();
@@ -931,6 +931,7 @@ public final class NodeWritePath {
             }
         }
 
+        writePools.wrote(shard, applied.size());
         appendOrRelease(shardId, shard, applied, tailPush);
         // One local sync for the batch, for the reason index gives: it gives the translog's page back to
         // the request breaker, and costs no object-store request.
