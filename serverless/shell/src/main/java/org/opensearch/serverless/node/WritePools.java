@@ -11,6 +11,8 @@ package org.opensearch.serverless.node;
 import org.opensearch.common.lease.Releasable;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.OpenSearchExecutors;
+import org.opensearch.index.shard.IndexShard;
+import org.opensearch.serverless.usage.Guardrails;
 
 import java.util.concurrent.Semaphore;
 
@@ -51,9 +53,11 @@ public final class WritePools {
     public static final String POOL = "serverless_write";
 
     private final Semaphore gate;
+    private final Guardrails guardrails;
 
-    private WritePools(Semaphore gate) {
+    private WritePools(Semaphore gate, Guardrails guardrails) {
         this.gate = gate;
+        this.guardrails = guardrails;
     }
 
     /**
@@ -63,9 +67,20 @@ public final class WritePools {
      * @return the gate
      */
     public static WritePools of(Settings settings) {
+        return of(settings, null);
+    }
+
+    /**
+     * Builds the gate for a node, counting each write's documents for its index.
+     *
+     * @param settings the node settings
+     * @param guardrails the node's cost guardrails, or null for none
+     * @return the gate
+     */
+    public static WritePools of(Settings settings, Guardrails guardrails) {
         // Not fair: a fair gate hands each released permit to the longest waiter, a thread switch per apply, and with
         // thousands of writers queued that handing-over, not CPU, was what bounded a node's bulk rate.
-        return new WritePools(new Semaphore(applyPermits(settings), false));
+        return new WritePools(new Semaphore(applyPermits(settings), false), guardrails);
     }
 
     /**
@@ -97,6 +112,33 @@ public final class WritePools {
      */
     public static int defaultMaxInFlight(Settings settings) {
         return Math.max(MIN_IN_FLIGHT, IN_FLIGHT_PER_CORE * OpenSearchExecutors.allocatedProcessors(settings));
+    }
+
+    /**
+     * Takes a permit to apply documents to a shard, counting them for its index.
+     *
+     * @param shard the shard written to
+     * @param docs how many documents the apply writes
+     * @return gives the permit back
+     * @throws java.io.IOException if interrupted while waiting, before anything was applied
+     */
+    public Releasable enterApply(IndexShard shard, int docs) throws java.io.IOException {
+        wrote(shard, docs);
+        return enterApply();
+    }
+
+    /**
+     * Counts documents written to a shard for its index.
+     *
+     * @param shard the shard
+     * @param docs how many
+     */
+    public void wrote(IndexShard shard, int docs) {
+        if (guardrails != null) {
+            final String index = shard.shardId().getIndexName();
+            guardrails.note(index, shard.indexSettings().getSettings());
+            guardrails.wrote(index, docs);
+        }
     }
 
     /**

@@ -826,3 +826,17 @@ Nothing is uploaded: the counters live in the heap, about 200 bytes an index. Ch
 the test JVM, against 0.04 store requests per document at 1,000-2,000 docs/s, so about 3 ns per document. On the write
 meter (1,000 shards, 20 ms store latency, two runs each way), p99, CPU per document, live heap and store requests
 moved within run-to-run noise.
+
+### Usage endpoint and tenant levels
+
+`GET /_serverless/usage` gives each index's totals on this node since it started: requests by kind, bytes, cost units
+(PUT and LIST 1, CAS 1.08, GET 0.08), documents written, searches coordinated and their time, and bytes kept for
+pushing to search nodes. `started_millis` changes when the node restarts, so a collector subtracts its last answer and
+nothing is kept on the node for whoever asks. `?top=N` keeps only the N costliest indices, plus `_node` and `_other`.
+
+The same answer has each tenant's level. A tenant is the index's `index.serverless.bucket_group`, or the index itself.
+Every 10 s the node adds up each tenant's cost here against its budget, in cost units a minute: the tier's
+(`index.serverless.cost.tier` small 20, standard 200, large 2,000; node default `serverless.cost.default_tier`, large),
+or `index.serverless.cost.budget`. A minute over raises it to level 1, two more minutes over to 2, then 3; five minutes
+under lowers it one. `serverless.cost.guardrails` (node) and `index.serverless.cost.guardrails` (index, wins) are `off`,
+`observe` (the default: levels are computed and reported, nothing is slowed) or `enforce`.

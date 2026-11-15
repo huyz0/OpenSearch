@@ -299,6 +299,7 @@ public final class TailPush {
             return;
         }
         final Kept shard = kept.computeIfAbsent(shardId, ignored -> newKept(shardId, lowest(records) - 1));
+        long pushedBytes = 0L;
         synchronized (shard) {
             for (WalRecord record : records) {
                 if (record.seqNo() <= shard.publishedThrough) {
@@ -312,6 +313,7 @@ public final class TailPush {
                 final long bytes = WalRecord.contentBytes(record.id(), record.source());
                 shard.bytes += bytes;
                 keptBytes.addAndGet(bytes);
+                pushedBytes += bytes;
             }
             while (shard.records.size() > MAX_KEPT_PER_SHARD || shard.bytes > MAX_KEPT_BYTES_PER_SHARD) {
                 final WalRecord dropped = shard.records.pollFirst();
@@ -323,6 +325,10 @@ public final class TailPush {
             // Queued under the shard's lock, so positions follow the queue's order.
             shard.position += records.size();
             queue.add(new Acked(shardId, records, shard.position));
+        }
+        final org.opensearch.serverless.usage.Guardrails guardrails = router.node.part(org.opensearch.serverless.usage.Guardrails.class);
+        if (guardrails != null) {
+            guardrails.pushed(shardId.getIndexName(), pushedBytes);
         }
         if (flushScheduled.compareAndSet(false, true)) {
             router.node.threadPool().schedule(this::flush, TimeValue.timeValueMillis(lingerMillis), ThreadPool.Names.GENERIC);
