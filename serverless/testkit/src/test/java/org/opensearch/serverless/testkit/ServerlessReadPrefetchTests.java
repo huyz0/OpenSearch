@@ -32,6 +32,7 @@ import org.opensearch.common.blobstore.BlobPath;
 import org.opensearch.common.blobstore.BlobStore;
 import org.opensearch.common.blobstore.fs.FsBlobStore;
 import org.opensearch.common.blobstore.support.FilterBlobContainer;
+import org.opensearch.serverless.shard.StoredFieldsPrefetch;
 import org.opensearch.serverless.store.BlockCache;
 import org.opensearch.serverless.store.BlockCacheDirectory;
 import org.opensearch.serverless.store.CommitManifest;
@@ -305,6 +306,94 @@ public class ServerlessReadPrefetchTests extends OpenSearchTestCase {
         }
     }
 
+    /**
+     * A cold fetch of one hit from each of many segments, as the fetch phase runs it: with every hit's stored fields
+     * announced before the first is read, the blocks are fetched together rather than one segment after another, for
+     * the same requests.
+     */
+    public void testAColdFetchOfHitsInManySegmentsWaitsForFewerRoundTrips() throws Exception {
+        final LatencyInjectingBlobStore store = new LatencyInjectingBlobStore(new FsBlobStore(1 << 20, createTempDir(), false), 0);
+        final CommitManifest manifest = publishSegments(store, 1_024);
+        store.setDelayMillis(10);
+        final ExecutorService helpers = Executors.newFixedThreadPool(16);
+        try {
+            final int block = BlockCache.DEFAULT_BLOCK_SIZE;
+            fetch(store, manifest, new BlockCache(block, 65_536).prefetchingWith(helpers).prefetchingReads(true), true);
+            Timed without = null;
+            Timed with = null;
+            for (int round = 0; round < 3; round++) {
+                final Timed off = fetch(
+                    store,
+                    manifest,
+                    new BlockCache(block, 65_536).prefetchingWith(helpers).prefetchingReads(true),
+                    false
+                );
+                final Timed on = fetch(
+                    store,
+                    manifest,
+                    new BlockCache(block, 65_536).prefetchingWith(helpers).prefetchingReads(true),
+                    true
+                );
+                without = without == null || off.millis() < without.millis() ? off : without;
+                with = with == null || on.millis() < with.millis() ? on : with;
+            }
+            assertTrue("the fetch must reach the store, or there is nothing to measure", without.requests() >= SEGMENTS);
+            logger.info(
+                "cold fetch of one hit in each of {} segments at 10 ms a request: read one after another {} ms, {} requests; "
+                    + "announced first {} ms, {} requests",
+                SEGMENTS,
+                without.millis(),
+                without.requests(),
+                with.millis(),
+                with.requests()
+            );
+            assertEquals("the same documents", without.topDoc(), with.topDoc());
+            assertTrue(
+                "announcing must not add requests: " + with.requests() + " against " + without.requests(),
+                with.requests() <= without.requests()
+            );
+            assertTrue(
+                "the cold fetch must wait less: " + with.millis() + " ms against " + without.millis() + " ms",
+                with.millis() * 2 < without.millis()
+            );
+        } finally {
+            helpers.shutdownNow();
+            assertTrue(helpers.awaitTermination(10, TimeUnit.SECONDS));
+        }
+    }
+
+    /** Reads the stored fields of one document in every segment, announcing them all first if asked, as the fetch phase does. */
+    private Timed fetch(LatencyInjectingBlobStore store, CommitManifest manifest, BlockCache cache, boolean announce) throws Exception {
+        try (
+            BlockCacheDirectory directory = BlockCacheDirectory.create(new ByteBuffersDirectory(), store, SHARD, cache, "logs#0", manifest);
+            DirectoryReader reader = DirectoryReader.open(directory)
+        ) {
+            assertEquals(SEGMENTS, reader.leaves().size());
+            store.drain();
+            final long startedAt = System.nanoTime();
+            final java.util.List<org.apache.lucene.index.StoredFields> fields = new java.util.ArrayList<>();
+            for (org.apache.lucene.index.LeafReaderContext leaf : reader.leaves()) {
+                fields.add(leaf.reader().storedFields());
+            }
+            final int doc = DOCS_PER_SEGMENT / 2 + 7;
+            if (announce) {
+                // Through the fetch phase's listener: top-level ids, each announced to its own segment.
+                final int[] hits = new int[reader.leaves().size()];
+                for (int i = 0; i < hits.length; i++) {
+                    hits[i] = reader.leaves().get(i).docBase + doc;
+                }
+                StoredFieldsPrefetch.announce(reader.leaves(), hits);
+            }
+            int checksum = 0;
+            for (org.apache.lucene.index.StoredFields each : fields) {
+                checksum = 31 * checksum + each.document(doc).get("_id").hashCode();
+            }
+            final long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt);
+            final java.util.List<LatencyInjectingBlobStore.Request> requests = store.drain();
+            return new Timed(millis, requests.size(), fields.size(), checksum);
+        }
+    }
+
     private static final int SEGMENTS = 12;
     private static final int DOCS_PER_SEGMENT = 2_000;
 
@@ -328,11 +417,35 @@ public class ServerlessReadPrefetchTests extends OpenSearchTestCase {
         }
     }
 
+    /** A body that varies from document to document, as sources do, so stored-field chunks do not compress to nothing. */
+    private static String body(int id, int bytes) {
+        final java.util.Random random = new java.util.Random(id);
+        final StringBuilder text = new StringBuilder(bytes);
+        while (text.length() < bytes) {
+            text.append(Integer.toString(random.nextInt(), 36)).append(' ');
+        }
+        return text.toString();
+    }
+
     /** Writes {@link #SEGMENTS} segments, half of them compound, and publishes every file, as a writer would. */
     private CommitManifest publishSegments(LatencyInjectingBlobStore store) throws Exception {
+        return publishSegments(store, 0);
+    }
+
+    /**
+     * As {@link #publishSegments(LatencyInjectingBlobStore)}, each document also storing a body of about this many bytes
+     * that compresses as little as a typical source does.
+     */
+    private CommitManifest publishSegments(LatencyInjectingBlobStore store, int bodyBytes) throws Exception {
         final java.nio.file.Path path = createTempDir();
         try (Directory local = new NIOFSDirectory(path)) {
-            try (IndexWriter writer = new IndexWriter(local, new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE))) {
+            // The production codec, not the test framework's random one: what a hint reaches depends on the stored-fields
+            // format, and a randomly chosen one may not pass hints on at all.
+            final IndexWriterConfig config = new IndexWriterConfig().setMergePolicy(NoMergePolicy.INSTANCE);
+            if (bodyBytes > 0) {
+                config.setCodec(org.apache.lucene.tests.util.TestUtil.getDefaultCodec());
+            }
+            try (IndexWriter writer = new IndexWriter(local, config)) {
                 int id = 0;
                 for (int segment = 0; segment < SEGMENTS; segment++) {
                     writer.getConfig().setUseCompoundFile(segment % 2 == 0);
@@ -353,6 +466,9 @@ public class ServerlessReadPrefetchTests extends OpenSearchTestCase {
                                 Field.Store.YES
                             )
                         );
+                        if (bodyBytes > 0) {
+                            doc.add(new org.apache.lucene.document.StoredField("body", body(id, bodyBytes)));
+                        }
                         writer.addDocument(doc);
                     }
                     writer.commit();
