@@ -238,6 +238,10 @@ tasks.named('processTestResources').configure {
   from(project(':rest-api-spec').file('src/main/resources/rest-api-spec/api')) {
     into 'rest-api-spec/api'
   }
+  // The request budgets the gate tests hold measurements to (RequestBudgets). One table, read where the tests run.
+  from(rootProject.file('serverless/request-budgets.md')) {
+    into 'org/opensearch/serverless/testkit'
+  }
 }
 
 apply from: "${rootDir}/serverless/forbidden-references.gradle"
