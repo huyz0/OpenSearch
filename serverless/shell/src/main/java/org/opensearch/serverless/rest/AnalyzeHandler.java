@@ -23,6 +23,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -110,11 +111,11 @@ public final class AnalyzeHandler extends BaseRestHandler {
         final Ask ask = read(request);
 
         if (ask.refusal() != null) {
-            return channel -> channel.sendResponse(IndexAdminHandler.error(channel, ask.refusalStatus(), ask.refusalType(), ask.refusal()));
+            return channel -> channel.sendResponse(RestReplies.error(channel, ask.refusalStatus(), ask.refusalType(), ask.refusal()));
         }
         if (ask.text().isEmpty()) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_text", "give some text to analyze")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_text", "give some text to analyze")
             );
         }
 
@@ -122,13 +123,13 @@ public final class AnalyzeHandler extends BaseRestHandler {
         final var serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                IndexAdminHandler.gate(
+                RestReplies.gate(
                     serving,
                     org.opensearch.action.admin.indices.analyze.AnalyzeAction.NAME,
                     new org.opensearch.action.admin.indices.analyze.AnalyzeAction.Request(index),
@@ -140,7 +141,7 @@ public final class AnalyzeHandler extends BaseRestHandler {
             } catch (IllegalArgumentException e) {
                 try {
                     channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.BAD_REQUEST,
                             "illegal_argument_exception",
@@ -152,7 +153,7 @@ public final class AnalyzeHandler extends BaseRestHandler {
                 }
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report an analyze failure", nested);
                 }
@@ -276,7 +277,7 @@ public final class AnalyzeHandler extends BaseRestHandler {
         }
         final Optional<IndexDescriptor> descriptor = metadata.describe(index);
         if (descriptor.isEmpty()) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
             return;
         }
 

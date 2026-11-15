@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.indexadmin;
 
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.common.settings.Settings;
@@ -13,6 +13,7 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.restcore.RestReplies;
 
 import java.io.IOException;
 import java.util.Map;
@@ -62,7 +63,7 @@ final class IndexCreation {
     ) throws Exception {
         try {
             return createIndex(serving, metadata, request.index(), fromNative(request));
-        } catch (IndexAdminHandler.RefusedException e) {
+        } catch (RestReplies.RefusedException e) {
             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), e.status);
         } catch (org.opensearch.serverless.metadata.TemplateResolver.MissingComponentException e) {
             throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
@@ -71,7 +72,7 @@ final class IndexCreation {
 
     /** Shared native creation payload validation for create-index and rollover. */
     static IndexCreateRequest fromNative(org.opensearch.action.admin.indices.create.CreateIndexRequest request)
-        throws IndexAdminHandler.RefusedException {
+        throws RestReplies.RefusedException {
         final var invalid = request.validate();
         if (invalid != null) {
             throw invalid;
@@ -145,7 +146,7 @@ final class IndexCreation {
         MetadataPlane metadata,
         String index,
         IndexCreateRequest create
-    ) throws IOException, IndexAdminHandler.RefusedException {
+    ) throws IOException, RestReplies.RefusedException {
         return createIndex(
             serving,
             metadata,
@@ -174,7 +175,7 @@ final class IndexCreation {
      * @param inherited what the templates contributed
      * @return the descriptor as created
      * @throws IOException if a register cannot be read or written
-     * @throws IndexAdminHandler.RefusedException if the merged settings are ones core would refuse, or this design cannot honour
+     * @throws RestReplies.RefusedException if the merged settings are ones core would refuse, or this design cannot honour
      */
     static IndexDescriptor createIndex(
         org.opensearch.serverless.node.NodeContext serving,
@@ -182,7 +183,7 @@ final class IndexCreation {
         String index,
         IndexCreateRequest create,
         org.opensearch.serverless.metadata.TemplateResolver.Inherited inherited
-    ) throws IOException, IndexAdminHandler.RefusedException {
+    ) throws IOException, RestReplies.RefusedException {
         final Settings requested = IndexCreateRequest.settingsWith(create.settings, inherited);
         // The shard mode is the descriptor's own field, not a setting core knows, so it is taken out
         // before core validates the rest. Absent, the index has no unit layout and routes as it always has.
@@ -190,7 +191,7 @@ final class IndexCreation {
         try {
             mode = org.opensearch.serverless.routing.ShardMode.requested(requested);
         } catch (IllegalArgumentException e) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+            throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
         }
         final Settings settings = org.opensearch.serverless.routing.ShardMode.without(requested);
         // Parsed and validated before the descriptor exists, not by the first shard to open it. A value
@@ -209,11 +210,7 @@ final class IndexCreation {
             descriptor = descriptor.withLayout(org.opensearch.serverless.routing.UnitLayout.initial(mode, declaredShards));
         }
         if (serving == null) {
-            throw new IndexAdminHandler.RefusedException(
-                RestStatus.SERVICE_UNAVAILABLE,
-                "node_unavailable",
-                "the serving node is unavailable"
-            );
+            throw new RestReplies.RefusedException(RestStatus.SERVICE_UNAVAILABLE, "node_unavailable", "the serving node is unavailable");
         }
         // Validate the final mapping and analysis configuration with this node's actual plugin registry.
         // The administrative factory creates no registered IndexService, shard, or on-disk index.
@@ -321,9 +318,9 @@ final class IndexCreation {
      * @param given normalised ({@code index.}-prefixed) settings
      * @param atCreation whether this is a create, where dependencies between settings are checked as
      *     core checks them; an update validates each value on its own, as core's update does
-     * @throws IndexAdminHandler.RefusedException with the status and words the caller should see
+     * @throws RestReplies.RefusedException with the status and words the caller should see
      */
-    static void validateIndexSettings(Settings given, boolean atCreation) throws IndexAdminHandler.RefusedException {
+    static void validateIndexSettings(Settings given, boolean atCreation) throws RestReplies.RefusedException {
         validateIndexSettings(given, atCreation, org.opensearch.common.settings.IndexScopedSettings.DEFAULT_SCOPED_SETTINGS);
     }
 
@@ -334,15 +331,15 @@ final class IndexCreation {
      * @param given normalised ({@code index.}-prefixed) settings
      * @param atCreation whether this is a create
      * @param scoped the index settings to validate against
-     * @throws IndexAdminHandler.RefusedException with the status and words the caller should see
+     * @throws RestReplies.RefusedException with the status and words the caller should see
      */
     static void validateIndexSettings(Settings given, boolean atCreation, org.opensearch.common.settings.IndexScopedSettings scoped)
-        throws IndexAdminHandler.RefusedException {
+        throws RestReplies.RefusedException {
         // The shard mode is the shell's, not core's: checked here, and left out of what core validates.
         try {
             org.opensearch.serverless.routing.ShardMode.requested(given);
         } catch (IllegalArgumentException e) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+            throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
         }
         // So is the bucket policy.
         final String bucketPolicy = given.get(org.opensearch.serverless.bucket.BucketSettings.INDEX_POLICY.getKey());
@@ -350,7 +347,7 @@ final class IndexCreation {
             try {
                 org.opensearch.serverless.bucket.BucketPolicy.check(bucketPolicy);
             } catch (IllegalArgumentException e) {
-                throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+                throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
             }
         }
         // So is the segment placement.
@@ -359,7 +356,7 @@ final class IndexCreation {
             try {
                 org.opensearch.serverless.node.SegmentPlacement.check(placement);
             } catch (IllegalArgumentException e) {
-                throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+                throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
             }
         }
         final String overlay = given.get(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_INDEX.getKey());
@@ -367,7 +364,7 @@ final class IndexCreation {
             try {
                 org.opensearch.serverless.transport.TailOverlays.check(overlay);
             } catch (IllegalArgumentException e) {
-                throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+                throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
             }
         }
         final Settings settings = org.opensearch.serverless.routing.ShardMode.without(given)
@@ -377,12 +374,12 @@ final class IndexCreation {
             .filter(key -> org.opensearch.serverless.bucket.BucketSettings.GROUP.getKey().equals(key) == false);
         final String unsupported = unsupportedIndexSetting(settings);
         if (unsupported != null) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_setting", unsupported);
+            throw new RestReplies.RefusedException(RestStatus.NOT_IMPLEMENTED, "unsupported_setting", unsupported);
         }
         for (String key : settings.keySet()) {
             final var setting = scoped.get(key);
             if (scoped.isPrivateSetting(key) || (setting != null && setting.isPrivateIndex())) {
-                throw new IndexAdminHandler.RefusedException(
+                throw new RestReplies.RefusedException(
                     RestStatus.BAD_REQUEST,
                     "illegal_argument_exception",
                     "private index setting [" + key + "] can not be set explicitly"
@@ -393,7 +390,7 @@ final class IndexCreation {
             // Only user settings reach the descriptor: private values belong to its authoritative fields.
             scoped.validate(settings, atCreation, false, false);
         } catch (IllegalArgumentException e) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
+            throw new RestReplies.RefusedException(RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage());
         }
     }
 

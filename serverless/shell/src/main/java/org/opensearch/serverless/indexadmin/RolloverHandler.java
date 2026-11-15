@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.indexadmin;
 
 import org.opensearch.action.admin.indices.rollover.RolloverAction;
 import org.opensearch.action.admin.indices.rollover.RolloverRequest;
@@ -19,12 +19,14 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.serverless.alias.AliasHandler;
 import org.opensearch.serverless.cluster.AliasRecord;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.DescriptorResolution;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.SearchFanout;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -99,7 +101,7 @@ public final class RolloverHandler extends BaseRestHandler {
         final NodeContext serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         final var content = request.hasContent() ? request.content() : null;
@@ -139,10 +141,10 @@ public final class RolloverHandler extends BaseRestHandler {
                 }
             } catch (Exception e) {
                 try {
-                    if (e instanceof IndexAdminHandler.RefusedException refused) {
-                        channel.sendResponse(IndexAdminHandler.error(channel, refused.status, refused.type, refused.getMessage()));
+                    if (e instanceof RestReplies.RefusedException refused) {
+                        channel.sendResponse(RestReplies.error(channel, refused.status, refused.type, refused.getMessage()));
                     } else {
-                        channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                        channel.sendResponse(RestReplies.failure(channel, e));
                     }
                 } catch (IOException nested) {
                     logger.error("failed to report a rollover failure", nested);
@@ -151,10 +153,10 @@ public final class RolloverHandler extends BaseRestHandler {
         });
     }
 
-    private static void validateBody(Map<String, Object> body) throws IndexAdminHandler.RefusedException {
+    private static void validateBody(Map<String, Object> body) throws RestReplies.RefusedException {
         for (Map.Entry<String, Object> field : body.entrySet()) {
             if (BODY_FIELDS.contains(field.getKey()) == false || field.getValue() instanceof Map<?, ?> == false) {
-                throw new IndexAdminHandler.RefusedException(
+                throw new RestReplies.RefusedException(
                     RestStatus.BAD_REQUEST,
                     "malformed_body",
                     "rollover field [" + field.getKey() + "] must be a supported object-valued field"
@@ -168,12 +170,12 @@ public final class RolloverHandler extends BaseRestHandler {
         }
     }
 
-    private static void validateCondition(String name) throws IndexAdminHandler.RefusedException {
+    private static void validateCondition(String name) throws RestReplies.RefusedException {
         if ("max_age".equals(name) || "max_docs".equals(name)) {
             return;
         }
         final boolean size = name.startsWith("max_size") || name.startsWith("max_primary_shard_size");
-        throw new IndexAdminHandler.RefusedException(
+        throw new RestReplies.RefusedException(
             size ? RestStatus.NOT_IMPLEMENTED : RestStatus.BAD_REQUEST,
             "unsupported_condition",
             size ? "store sizes are not reported here, so a size condition cannot be evaluated" : "unknown condition [" + name + "]"
@@ -208,7 +210,7 @@ public final class RolloverHandler extends BaseRestHandler {
     private RolloverResponse rollover(NodeContext serving, MetadataPlane metadata, Ask ask) throws Exception {
         final DescriptorResolution resolved = metadata.resolveForAliasMutation(ask.target());
         if (resolved.alias() == null) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 resolved.index() != null ? RestStatus.BAD_REQUEST : RestStatus.NOT_FOUND,
                 resolved.index() != null ? "illegal_argument_exception" : "index_not_found_exception",
                 resolved.index() != null
@@ -218,7 +220,7 @@ public final class RolloverHandler extends BaseRestHandler {
         }
         final AliasRecord record = resolved.alias();
         if (record.mutationPending()) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.CONFLICT,
                 "version_conflict_engine_exception",
                 "alias is being changed: " + ask.target()
@@ -229,7 +231,7 @@ public final class RolloverHandler extends BaseRestHandler {
         if (record.dataStream() && (ask.newIndex() != null || bodyShapesIndex)) {
             // Core's rules, in core's words: a stream's backing index is named by its generation and shaped
             // by its template, and a rollover may not override either.
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "illegal_argument_exception",
                 ask.newIndex() != null
@@ -239,7 +241,7 @@ public final class RolloverHandler extends BaseRestHandler {
         }
         if (record.writesTo() == null) {
             // Core's refusal: several indices and none marked as the write index.
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "illegal_argument_exception",
                 "rollover target [" + ask.target() + "] does not point to a write index"
@@ -248,7 +250,7 @@ public final class RolloverHandler extends BaseRestHandler {
         final String oldName = record.writesTo();
         final Optional<IndexDescriptor> old = metadata.describe(oldName);
         if (old.isEmpty()) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.NOT_FOUND,
                 "index_not_found",
                 "the current index [" + oldName + "] does not exist"
@@ -262,7 +264,7 @@ public final class RolloverHandler extends BaseRestHandler {
         } else {
             newName = nextName(oldName);
             if (newName == null) {
-                throw new IndexAdminHandler.RefusedException(
+                throw new RestReplies.RefusedException(
                     RestStatus.BAD_REQUEST,
                     "illegal_argument_exception",
                     "index name [" + oldName + "] does not match pattern '^.*-\\\\d+$'; name the new index in the path"
@@ -275,7 +277,7 @@ public final class RolloverHandler extends BaseRestHandler {
         for (Map.Entry<String, Object> condition : ask.conditions().entrySet()) {
             if ("max_age".equals(condition.getKey())) {
                 if (old.get().createdAtMillis() == 0L) {
-                    throw new IndexAdminHandler.RefusedException(
+                    throw new RestReplies.RefusedException(
                         RestStatus.NOT_IMPLEMENTED,
                         "unsupported_condition",
                         "max_age cannot be evaluated: [" + oldName + "] predates creation times being recorded"
@@ -292,7 +294,7 @@ public final class RolloverHandler extends BaseRestHandler {
                     new SearchSourceBuilder().query(QueryBuilders.matchAllQuery()).size(0).trackTotalHits(true)
                 );
                 if (outcome.complete() == false) {
-                    throw new IndexAdminHandler.RefusedException(
+                    throw new RestReplies.RefusedException(
                         RestStatus.SERVICE_UNAVAILABLE,
                         "count_incomplete",
                         "max_docs cannot be evaluated: only "
@@ -314,7 +316,7 @@ public final class RolloverHandler extends BaseRestHandler {
 
         if (serving.isSystemIndex(newName)) {
             // Reserved on every path that mints a name, not only on PUT /{index}.
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.FORBIDDEN,
                 "system_index",
                 "[" + newName + "] belongs to a plugin and cannot be created here"
@@ -328,7 +330,7 @@ public final class RolloverHandler extends BaseRestHandler {
         final IndexCreateRequest create = ask.create();
         if (create.aliases.isEmpty() == false) {
             // Refused rather than dropped: the new index would be created without the aliases the caller asked for.
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.NOT_IMPLEMENTED,
                 "unsupported_setting",
                 "'aliases' in a rollover body is not supported here; add them to the new index with POST /_aliases"
@@ -362,13 +364,13 @@ public final class RolloverHandler extends BaseRestHandler {
                 createdUuid = IndexAdminHandler.createIndex(serving, metadata, newName, create).uuid();
             }
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "resource_already_exists_exception",
                 "index [" + newName + "] already exists"
             );
-        } catch (IndexAdminHandler.RefusedException e) {
-            throw new IndexAdminHandler.RefusedException(e.status, e.type, e.getMessage());
+        } catch (RestReplies.RefusedException e) {
+            throw new RestReplies.RefusedException(e.status, e.type, e.getMessage());
         }
         final AliasRecord moved;
         if (record.dataStream()) {
@@ -397,7 +399,7 @@ public final class RolloverHandler extends BaseRestHandler {
                 logger.warn("could not remove the index [" + newName + "] created by a rollover that lost its swap", e);
                 left = "the index [" + newName + "] was created and not adopted, and could not be removed: " + e.getMessage();
             }
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.CONFLICT,
                 "version_conflict_engine_exception",
                 "[" + ask.target() + "] was changed concurrently; nothing was rolled over and " + left + "; retry"

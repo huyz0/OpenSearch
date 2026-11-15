@@ -17,6 +17,8 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.TemplateStore;
 import org.opensearch.serverless.metadata.TooManyTemplatesException;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.restcore.PendingRestChannel;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -89,7 +91,7 @@ public final class PipelineHandler extends BaseRestHandler {
         final var serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         // Keep the accounted HTTP bytes until the operation completes. Decode only the admitted body,
@@ -171,13 +173,13 @@ public final class PipelineHandler extends BaseRestHandler {
                         }
                     });
                 }
-            } catch (IndexAdminHandler.RefusedException e) {
+            } catch (RestReplies.RefusedException e) {
                 sendQuietly(channel, e.status, e.type, e.getMessage());
             } catch (TooManyTemplatesException e) {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_pipelines", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a pipeline failure", nested);
                 }
@@ -190,11 +192,11 @@ public final class PipelineHandler extends BaseRestHandler {
         TemplateStore store,
         String id,
         String body
-    ) throws IOException, IndexAdminHandler.RefusedException {
+    ) throws IOException, RestReplies.RefusedException {
         try {
             serving.services().ingestPipelines().compile(id, body);
         } catch (Exception e) {
-            throw new IndexAdminHandler.RefusedException(
+            throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
                 "invalid_pipeline",
                 (e.getMessage() == null ? e.toString() : e.getMessage())
@@ -361,9 +363,9 @@ public final class PipelineHandler extends BaseRestHandler {
     }
 
     private org.opensearch.action.support.clustermanager.AcknowledgedResponse delete(TemplateStore store, String id) throws IOException,
-        IndexAdminHandler.RefusedException {
+        RestReplies.RefusedException {
         if (store.delete(id) == false) {
-            throw new IndexAdminHandler.RefusedException(RestStatus.NOT_FOUND, "pipeline_missing", "no such pipeline: " + id);
+            throw new RestReplies.RefusedException(RestStatus.NOT_FOUND, "pipeline_missing", "no such pipeline: " + id);
         }
         return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
@@ -433,7 +435,7 @@ public final class PipelineHandler extends BaseRestHandler {
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
         try {
-            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+            channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
             logger.error("failed to report a pipeline refusal", e);
         }

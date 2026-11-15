@@ -14,6 +14,9 @@ import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.ops.Fanout;
+import org.opensearch.serverless.restcore.CatTable;
+import org.opensearch.serverless.restcore.IndexPatterns;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -119,13 +122,13 @@ public final class ListIndicesHandler extends BaseRestHandler {
 
         if (unsupportedCat != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_cat_parameter", unsupportedCat)
+                RestReplies.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_cat_parameter", unsupportedCat)
             );
         }
         final boolean listing = request.path().startsWith("/_list/");
         if (listing == false && (size != null || nextToken != null)) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "illegal_argument_exception",
@@ -138,7 +141,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
             paging = listing ? Paging.of(index, size, nextToken) : null;
         } catch (IllegalArgumentException e) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage())
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage())
             );
         }
 
@@ -146,13 +149,13 @@ public final class ListIndicesHandler extends BaseRestHandler {
         final var serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC).execute(() -> {
             try {
-                IndexAdminHandler.gate(
+                RestReplies.gate(
                     serving,
                     org.opensearch.action.admin.indices.get.GetIndexAction.NAME,
                     new org.opensearch.action.admin.indices.get.GetIndexRequest().indices(index),
@@ -171,7 +174,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
                 sendQuietly(channel, RestStatus.BAD_REQUEST, "too_many_indices", e.getMessage());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a list failure", nested);
                 }
@@ -309,7 +312,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
 
     private void sendQuietly(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
         try {
-            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+            channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
             logger.error("failed to report a list refusal", e);
         }

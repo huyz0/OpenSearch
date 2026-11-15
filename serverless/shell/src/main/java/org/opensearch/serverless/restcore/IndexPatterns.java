@@ -6,7 +6,7 @@
  * compatible open source license.
  */
 
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.restcore;
 
 import org.opensearch.serverless.metadata.MetadataPlane;
 
@@ -34,7 +34,7 @@ import java.util.Set;
  * smaller operation rather than a second copy of the larger one; unifying them is deliberately not done in
  * passing.
  */
-final class IndexPatterns {
+public final class IndexPatterns {
 
     private IndexPatterns() {}
 
@@ -49,7 +49,7 @@ final class IndexPatterns {
      *     more than the cap
      * @throws IOException if listing fails
      */
-    static List<String> expand(MetadataPlane metadata, String requested, int cap) throws IOException {
+    public static List<String> expand(MetadataPlane metadata, String requested, int cap) throws IOException {
         final Set<String> names = new LinkedHashSet<>();
         for (String each : requested.split(",")) {
             final String name = each.trim();
@@ -71,7 +71,7 @@ final class IndexPatterns {
      * @param name the name as typed
      * @return whether it is a trailing-star prefix pattern
      */
-    static boolean isPrefixPattern(String name) {
+    public static boolean isPrefixPattern(String name) {
         return name.endsWith("*") && name.indexOf('*') == name.length() - 1;
     }
 }

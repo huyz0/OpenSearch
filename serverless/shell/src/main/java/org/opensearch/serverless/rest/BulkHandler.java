@@ -28,6 +28,7 @@ import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.BulkSettings;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.DocumentRouting;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -198,13 +199,13 @@ public final class BulkHandler extends BaseRestHandler {
             }
             if (metadata == null) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                    RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
                 );
                 return;
             }
             if (requireAlias) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.NOT_IMPLEMENTED,
                         "unsupported_write",
@@ -258,7 +259,7 @@ public final class BulkHandler extends BaseRestHandler {
             for (String param : request.params().keySet().toArray(new String[0])) {
                 request.param(param);
             }
-            return channel -> channel.sendResponse(IndexAdminHandler.failure(channel, e));
+            return channel -> channel.sendResponse(RestReplies.failure(channel, e));
         }
         final RestChannelConsumer consumer;
         try {
@@ -308,12 +309,12 @@ public final class BulkHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         if (body == null || body.length == 0) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a bulk request requires a newline-delimited body")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_body", "a bulk request requires a newline-delimited body")
             );
         }
 
@@ -323,19 +324,17 @@ public final class BulkHandler extends BaseRestHandler {
         } catch (BulkBodyParser.BadRequest e) {
             // A body that does not parse is not a batch with some bad items in it -- there is no way to
             // know where the good ones end. The whole request is refused, and the line is named.
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_bulk_body", e.getMessage())
-            );
+            return channel -> channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_bulk_body", e.getMessage()));
         }
         if (items.isEmpty()) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "empty_bulk", "the body contained no operations")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "empty_bulk", "the body contained no operations")
             );
         }
 
         if (requireAlias) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_write",
@@ -450,7 +449,7 @@ public final class BulkHandler extends BaseRestHandler {
                 }
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a bulk failure", nested);
                 }

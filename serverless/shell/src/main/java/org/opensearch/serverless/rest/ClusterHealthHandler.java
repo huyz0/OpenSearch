@@ -16,6 +16,8 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.restcore.CatTable;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -199,7 +201,7 @@ public final class ClusterHealthHandler extends BaseRestHandler {
         final String refusal = refuse(cat, catUnsupported, waitForStatus, waitForActiveShards, waitForEvents, level);
         if (refusal != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_health_parameter", refusal)
+                RestReplies.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_health_parameter", refusal)
             );
         }
 
@@ -208,7 +210,7 @@ public final class ClusterHealthHandler extends BaseRestHandler {
             nodesWanted = NodeCondition.parse(waitForNodes);
             if (nodesWanted == null) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.BAD_REQUEST,
                         "invalid_parameter",
@@ -223,7 +225,7 @@ public final class ClusterHealthHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
@@ -242,7 +244,7 @@ public final class ClusterHealthHandler extends BaseRestHandler {
             // and there is no reason health gets to give it. A caller who wants green over shards names
             // the index whose shards they mean.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "unscoped_wait_for_status",
@@ -257,7 +259,7 @@ public final class ClusterHealthHandler extends BaseRestHandler {
             final Health health = await(metadata, ask);
             if (health.missing != null) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + health.missing)
+                    RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + health.missing)
                 );
                 return;
             }
@@ -569,7 +571,7 @@ public final class ClusterHealthHandler extends BaseRestHandler {
 
     private void run(org.opensearch.rest.RestChannel channel, org.opensearch.common.CheckedRunnable<Exception> work) {
         try {
-            IndexAdminHandler.gate(
+            RestReplies.gate(
                 node.get(),
                 org.opensearch.action.admin.cluster.health.ClusterHealthAction.NAME,
                 new org.opensearch.action.admin.cluster.health.ClusterHealthRequest(),
@@ -580,7 +582,7 @@ public final class ClusterHealthHandler extends BaseRestHandler {
             );
         } catch (Exception e) {
             try {
-                channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                channel.sendResponse(RestReplies.failure(channel, e));
             } catch (IOException nested) {
                 logger.error("failed to report a health failure", nested);
             }

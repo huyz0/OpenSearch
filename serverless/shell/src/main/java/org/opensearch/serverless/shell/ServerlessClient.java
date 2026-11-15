@@ -444,7 +444,7 @@ public final class ServerlessClient extends AbstractClient {
         final java.util.List<org.opensearch.action.admin.indices.alias.Alias> aliases = new java.util.ArrayList<>(request.aliases());
         request.aliases().removeAll(aliases);
         try {
-            org.opensearch.serverless.rest.IndexAdminHandler.createIndex(node.get(), metadata, request);
+            org.opensearch.serverless.indexadmin.IndexAdminHandler.createIndex(node.get(), metadata, request);
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
             throw new org.opensearch.ResourceAlreadyExistsException(request.index());
         }

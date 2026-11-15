@@ -43,9 +43,11 @@ def structureLayers = [
   transport: 10,
   reconcile: 11,
   ops: 12, warm: 12,
-  documents: 13,
-  rest: 14,
-  shell: 15
+  documents: 13, restcore: 13,
+  alias: 14, snapshot: 14,
+  indexadmin: 15,
+  rest: 16,
+  shell: 17
 ]
 def maxClassLines = 1000
 def maxPackageFiles = 40

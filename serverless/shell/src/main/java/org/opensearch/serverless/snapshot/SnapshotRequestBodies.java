@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.snapshot;
 
 import org.opensearch.core.xcontent.XContentParser;
 import org.opensearch.rest.RestRequest;

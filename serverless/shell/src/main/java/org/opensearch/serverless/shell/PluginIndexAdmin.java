@@ -80,11 +80,11 @@ final class PluginIndexAdmin {
 
     PluginIndexAdmin(ServerlessNode node) {
         this.node = node;
-        this.mappings = new org.opensearch.serverless.rest.MappingUpdateHandler(() -> node.metadataPlane(), () -> node);
-        this.settings = new org.opensearch.serverless.rest.SettingsUpdateHandler(() -> node.metadataPlane(), () -> node);
-        this.indices = new org.opensearch.serverless.rest.IndexAdminHandler(() -> node.metadataPlane(), () -> node);
-        this.aliases = org.opensearch.serverless.rest.AliasHandler.forPlugins(() -> node.metadataPlane(), () -> node);
-        this.rollover = new org.opensearch.serverless.rest.RolloverHandler(() -> node, () -> node.metadataPlane());
+        this.mappings = new org.opensearch.serverless.indexadmin.MappingUpdateHandler(() -> node.metadataPlane(), () -> node);
+        this.settings = new org.opensearch.serverless.indexadmin.SettingsUpdateHandler(() -> node.metadataPlane(), () -> node);
+        this.indices = new org.opensearch.serverless.indexadmin.IndexAdminHandler(() -> node.metadataPlane(), () -> node);
+        this.aliases = org.opensearch.serverless.alias.AliasHandler.forPlugins(() -> node.metadataPlane(), () -> node);
+        this.rollover = new org.opensearch.serverless.indexadmin.RolloverHandler(() -> node, () -> node.metadataPlane());
     }
 
     // ---- reads

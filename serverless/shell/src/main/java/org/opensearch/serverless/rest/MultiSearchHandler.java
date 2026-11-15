@@ -21,6 +21,8 @@ import org.opensearch.serverless.ops.DocumentRouting;
 import org.opensearch.serverless.ops.ResponseMemory;
 import org.opensearch.serverless.ops.SearchFanout;
 import org.opensearch.serverless.ops.SearchRendering;
+import org.opensearch.serverless.restcore.ResponseBudget;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.ByteArrayInputStream;
@@ -196,7 +198,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
             // Consumed and refused, rather than left for BaseRestHandler to call unrecognized: it is a
             // real parameter of core's _msearch, and the refusal says what to do instead.
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_search",
@@ -206,7 +208,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
         }
         if (request.hasContent() == false) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "missing_body",
@@ -218,7 +220,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
         final var serving0 = node.get();
         if (serving0 == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         final List<Sub> batch;
@@ -231,13 +233,11 @@ public final class MultiSearchHandler extends BaseRestHandler {
                 serving0.services().searchXContentRegistry()
             );
         } catch (BadBatch e) {
-            return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "malformed_request", e.getMessage())
-            );
+            return channel -> channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "malformed_request", e.getMessage()));
         }
         if (batch.isEmpty()) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "empty_request", "the body contained no searches")
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "empty_request", "the body contained no searches")
             );
         }
 
@@ -245,7 +245,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
         final var serving = node.get();
         if (metadata == null || serving == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
@@ -254,7 +254,7 @@ public final class MultiSearchHandler extends BaseRestHandler {
                 answer(channel, metadata, serving, batch, request);
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a multi-search failure", nested);
                 }

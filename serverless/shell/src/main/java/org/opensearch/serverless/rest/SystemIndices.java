@@ -12,6 +12,7 @@ import org.opensearch.common.regex.Regex;
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.rest.RestHandler;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.serverless.restcore.RestReplies;
 
 import java.util.List;
 
@@ -134,7 +135,7 @@ public final class SystemIndices {
         throws java.io.IOException {
         // 403 rather than 404: pretending the index does not exist would send an operator looking for a
         // missing index, and it hides nothing an attacker could not learn by installing the same plugin.
-        return IndexAdminHandler.error(
+        return RestReplies.error(
             channel,
             RestStatus.FORBIDDEN,
             "system_index",

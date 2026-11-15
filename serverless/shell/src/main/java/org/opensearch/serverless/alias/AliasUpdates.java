@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.alias;
 
 import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
@@ -13,6 +13,7 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.cluster.AliasRecord;
 import org.opensearch.serverless.metadata.MetadataPlane;
+import org.opensearch.serverless.restcore.RestReplies;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -50,7 +51,7 @@ final class AliasUpdates {
                         case DELETE -> attach(channel, metadata, aliasName, indices, false, null);
                         case GET, HEAD -> AliasReads.membership(channel, metadata, aliasName, indices, method == RestRequest.Method.HEAD);
                         default -> channel.sendResponse(
-                            IndexAdminHandler.error(
+                            RestReplies.error(
                                 channel,
                                 RestStatus.METHOD_NOT_ALLOWED,
                                 "method_not_allowed",
@@ -72,17 +73,12 @@ final class AliasUpdates {
                     }
                     case DELETE -> delete(channel, metadata, aliasName);
                     default -> channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.METHOD_NOT_ALLOWED,
-                            "method_not_allowed",
-                            method + " is not supported here"
-                        )
+                        RestReplies.error(channel, RestStatus.METHOD_NOT_ALLOWED, "method_not_allowed", method + " is not supported here")
                     );
                 }
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report an alias failure", nested);
                 }
@@ -119,7 +115,7 @@ final class AliasUpdates {
             for (String index : indices) {
                 if (handler.isSystemIndex(index)) {
                     channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.FORBIDDEN,
                             "system_index",
@@ -130,12 +126,7 @@ final class AliasUpdates {
                 }
                 if (metadata.describe(index).isEmpty()) {
                     channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.NOT_FOUND,
-                            "index_not_found",
-                            "cannot alias [" + index + "]: no such index"
-                        )
+                        RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", "cannot alias [" + index + "]: no such index")
                     );
                     return;
                 }
@@ -143,7 +134,7 @@ final class AliasUpdates {
         }
         final AliasSwap.Refusal failure = AliasSwap.swap(metadata, name, indices, adding, isWriteIndex);
         if (failure != null) {
-            channel.sendResponse(IndexAdminHandler.error(channel, failure.status(), failure.type(), failure.reason()));
+            channel.sendResponse(RestReplies.error(channel, failure.status(), failure.type(), failure.reason()));
             return;
         }
         try (XContentBuilder builder = channel.newBuilder()) {
@@ -172,7 +163,7 @@ final class AliasUpdates {
      */
     void actions(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String body) throws IOException {
         if (body == null || body.isBlank()) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "missing_body", "an actions body is required"));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "missing_body", "an actions body is required"));
             return;
         }
         final java.util.Map<String, Object> parsed;
@@ -183,7 +174,7 @@ final class AliasUpdates {
                 org.opensearch.common.xcontent.XContentType.JSON
             ).v2();
         } catch (Exception e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not parse the actions"));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "malformed_body", "could not parse the actions"));
             return;
         }
 
@@ -195,19 +186,14 @@ final class AliasUpdates {
                     // Refused rather than skipped: an action that is not one verb with one body is a
                     // malformed request, and skipping it answered the rest with "acknowledged".
                     channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.BAD_REQUEST,
-                            "malformed_body",
-                            "each action must be one object with one verb"
-                        )
+                        RestReplies.error(channel, RestStatus.BAD_REQUEST, "malformed_body", "each action must be one object with one verb")
                     );
                     return;
                 }
                 final var entry = action.entrySet().iterator().next();
                 if (!(entry.getValue() instanceof java.util.Map<?, ?> detail)) {
                     channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.BAD_REQUEST,
                             "malformed_body",
@@ -218,13 +204,13 @@ final class AliasUpdates {
                 }
                 final String option = AliasHandler.unsupportedAliasOption(detail);
                 if (option != null) {
-                    channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_alias_option", option));
+                    channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_alias_option", option));
                     return;
                 }
                 if ("remove_index".equals(entry.getKey())) {
                     // Names no alias, so it is answered here rather than by the shape check below.
                     channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.NOT_IMPLEMENTED,
                             "unsupported_action",
@@ -241,7 +227,7 @@ final class AliasUpdates {
                 final List<String> aliasNames = AliasHandler.namesOf(detail.get("alias"), detail.get("aliases"));
                 if (names.isEmpty() || aliasNames.isEmpty()) {
                     channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.BAD_REQUEST,
                             "malformed_body",
@@ -270,12 +256,12 @@ final class AliasUpdates {
             }
         }
         if (steps.isEmpty()) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "no_actions", "the body named no actions"));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "no_actions", "the body named no actions"));
             return;
         }
         if (aliases.size() > 1) {
             channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_action",
@@ -294,7 +280,7 @@ final class AliasUpdates {
             final var resolved = metadata.resolveForAliasMutation(alias);
             if (resolved.index() != null) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "name_taken", "[" + alias + "] is an index, not an alias")
+                    RestReplies.error(channel, RestStatus.BAD_REQUEST, "name_taken", "[" + alias + "] is an index, not an alias")
                 );
                 return;
             }
@@ -303,12 +289,7 @@ final class AliasUpdates {
                 // Core's refusal, in core's words. Rebuilding the record here would have turned the stream
                 // into a plain alias: no generation, no timestamp field, no write index, and a 200.
                 channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.BAD_REQUEST,
-                        "illegal_argument_exception",
-                        AliasSwap.dataStreamNotAlias(alias)
-                    )
+                    RestReplies.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", AliasSwap.dataStreamNotAlias(alias))
                 );
                 return;
             }
@@ -323,7 +304,7 @@ final class AliasUpdates {
                 if ("add".equals(step.get("op"))) {
                     if (handler.isSystemIndex(index)) {
                         channel.sendResponse(
-                            IndexAdminHandler.error(
+                            RestReplies.error(
                                 channel,
                                 RestStatus.FORBIDDEN,
                                 "system_index",
@@ -334,7 +315,7 @@ final class AliasUpdates {
                     }
                     if (metadata.describe(index).isEmpty()) {
                         channel.sendResponse(
-                            IndexAdminHandler.error(
+                            RestReplies.error(
                                 channel,
                                 RestStatus.NOT_FOUND,
                                 "index_not_found",
@@ -360,7 +341,7 @@ final class AliasUpdates {
                         // must_exist is the caller saying a silent no-op would be a mistake, which is the
                         // default position of everything else on this surface.
                         channel.sendResponse(
-                            IndexAdminHandler.error(
+                            RestReplies.error(
                                 channel,
                                 RestStatus.NOT_FOUND,
                                 "aliases_not_found_exception",
@@ -371,7 +352,7 @@ final class AliasUpdates {
                     }
                 } else if ("remove_index".equals(step.get("op"))) {
                     channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.NOT_IMPLEMENTED,
                             "unsupported_action",
@@ -383,7 +364,7 @@ final class AliasUpdates {
                     return;
                 } else {
                     channel.sendResponse(
-                        IndexAdminHandler.error(
+                        RestReplies.error(
                             channel,
                             RestStatus.BAD_REQUEST,
                             "unsupported_action",
@@ -395,7 +376,7 @@ final class AliasUpdates {
             }
             if (marked > 1) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.BAD_REQUEST,
                         "illegal_state_exception",
@@ -418,12 +399,7 @@ final class AliasUpdates {
                 }
                 if (silenced == false) {
                     channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.NOT_FOUND,
-                            "aliases_not_found_exception",
-                            "aliases [" + alias + "] missing"
-                        )
+                        RestReplies.error(channel, RestStatus.NOT_FOUND, "aliases_not_found_exception", "aliases [" + alias + "] missing")
                     );
                     return;
                 }
@@ -458,7 +434,7 @@ final class AliasUpdates {
             }
         }
         channel.sendResponse(
-            IndexAdminHandler.error(
+            RestReplies.error(
                 channel,
                 RestStatus.CONFLICT,
                 "version_conflict_engine_exception",
@@ -471,7 +447,7 @@ final class AliasUpdates {
         throws IOException {
         if (Boolean.TRUE.equals(isWriteIndex) && indices.size() != 1) {
             channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "illegal_argument_exception",
@@ -486,7 +462,7 @@ final class AliasUpdates {
         for (String index : indices) {
             if (handler.isSystemIndex(index)) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.FORBIDDEN,
                         "system_index",
@@ -497,7 +473,7 @@ final class AliasUpdates {
             }
             if (metadata.describe(index).isEmpty()) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "cannot alias [" + index + "]: no such index")
+                    RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", "cannot alias [" + index + "]: no such index")
                 );
                 return;
             }
@@ -506,7 +482,7 @@ final class AliasUpdates {
             metadata.createAlias(new AliasRecord(name, indices).withWriteMember(Boolean.TRUE.equals(isWriteIndex) ? indices.get(0) : null));
         } catch (org.opensearch.serverless.metadata.IndexAlreadyExistsException e) {
             channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "name_taken",
@@ -536,14 +512,14 @@ final class AliasUpdates {
     void delete(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String name) throws IOException {
         final var found = metadata.aliasWithGeneration(name);
         if (found.isEmpty()) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "alias_not_found", "no such alias: " + name));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "alias_not_found", "no such alias: " + name));
             return;
         }
         if (found.get().alias().dataStream()) {
             // Deleting the record and leaving the backing indices would strand them under names nothing
             // resolves; the data-stream API deletes both, and is the one that knows to.
             channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "illegal_argument_exception",
@@ -554,7 +530,7 @@ final class AliasUpdates {
         }
         if (metadata.deleteAlias(found.get().alias(), found.get().generation()) == false) {
             channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.CONFLICT,
                     "version_conflict_engine_exception",

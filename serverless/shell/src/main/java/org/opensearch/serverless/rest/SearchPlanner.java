@@ -18,6 +18,7 @@ import org.opensearch.serverless.ops.SearchFanout;
 import org.opensearch.serverless.ops.SearchGate;
 import org.opensearch.serverless.ops.SearchRendering;
 import org.opensearch.serverless.ops.SearchRules;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.IOException;
@@ -72,7 +73,7 @@ final class SearchPlanner {
         // search that carried it.
         if (searchRequest.searchType() != org.opensearch.action.search.SearchType.QUERY_THEN_FETCH) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_search",
@@ -82,7 +83,7 @@ final class SearchPlanner {
         }
         if (SearchGate.selectsShards(searchRequest.preference())) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_search",
@@ -92,7 +93,7 @@ final class SearchPlanner {
         }
         if (searchRequest.scroll() != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_search",
@@ -127,7 +128,7 @@ final class SearchPlanner {
                     final Optional<String> stored = metadata.searchPipelines().get(searchRequest.pipeline());
                     if (stored.isEmpty()) {
                         return channel -> channel.sendResponse(
-                            IndexAdminHandler.error(
+                            RestReplies.error(
                                 channel,
                                 RestStatus.BAD_REQUEST,
                                 "pipeline_missing",
@@ -140,7 +141,7 @@ final class SearchPlanner {
                         .transformRequest(searchRequest.pipeline(), stored.get(), searchRequest);
                 }
             } catch (Exception e) {
-                return channel -> channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                return channel -> channel.sendResponse(RestReplies.failure(channel, e));
             }
         } else {
             pipelined = null;
@@ -157,7 +158,7 @@ final class SearchPlanner {
         final String unsupported = SearchRules.whatCannotBeMerged(source);
         if (unsupported != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_search", unsupported)
+                RestReplies.error(channel, RestStatus.NOT_IMPLEMENTED, "unsupported_search", unsupported)
             );
         }
 
@@ -171,7 +172,7 @@ final class SearchPlanner {
         if (bodyPit != null) {
             if (pitParam != null && pitParam.equals(bodyPit.getId()) == false) {
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_query", "the pit named in the body and in ?pit= differ")
+                    RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_query", "the pit named in the body and in ?pit= differ")
                 );
             }
             pitId = bodyPit.getId();
@@ -185,12 +186,7 @@ final class SearchPlanner {
                 // which would be more useful and would also be a way to find out whether an id was ever
                 // valid, and there is no reason to offer that.
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.NOT_FOUND,
-                        "pit_not_found",
-                        "no such point in time, or it has expired: " + pitId
-                    )
+                    RestReplies.error(channel, RestStatus.NOT_FOUND, "pit_not_found", "no such point in time, or it has expired: " + pitId)
                 );
             }
             org.opensearch.serverless.metadata.PointInTime frozen = pit.get();
@@ -200,7 +196,7 @@ final class SearchPlanner {
                 // The name is gone, or names a different index now. A record written before the uuid was
                 // recorded (indexUuid null) cannot be checked and is left to the manifest's own lengths.
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.NOT_FOUND,
                         "pit_not_found",
@@ -216,7 +212,7 @@ final class SearchPlanner {
                 // answer hits from logs under the orders path -- a lie in the URL.
                 final String named = java.util.Arrays.toString(searchRequest.indices());
                 return channel -> channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.BAD_REQUEST,
                         "bad_query",
@@ -234,12 +230,7 @@ final class SearchPlanner {
                     // The same refusal creating the view gives, for the same reason: a caller asking for a
                     // day and being quietly handed an hour finds out at minute sixty-one.
                     return channel -> channel.sendResponse(
-                        IndexAdminHandler.error(
-                            channel,
-                            RestStatus.BAD_REQUEST,
-                            "keep_alive_too_long",
-                            PointInTimeHandler.keepAliveTooLong()
-                        )
+                        RestReplies.error(channel, RestStatus.BAD_REQUEST, "keep_alive_too_long", PointInTimeHandler.keepAliveTooLong())
                     );
                 }
                 // OpenSearch's keep_alive on a search extends the view from now. This shell's expiry is
@@ -260,7 +251,7 @@ final class SearchPlanner {
                     frozen = frozen.withExpiry(until);
                     if (metadata.extendPointInTime(frozen, expected) == false) {
                         return channel -> channel.sendResponse(
-                            IndexAdminHandler.error(
+                            RestReplies.error(
                                 channel,
                                 RestStatus.NOT_FOUND,
                                 "pit_not_found",
@@ -276,7 +267,7 @@ final class SearchPlanner {
                     respondFrozen(channel, serving, metadata, view, source, counting, request, partialResults, postProcess);
                 } catch (Exception e) {
                     try {
-                        channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                        channel.sendResponse(RestReplies.failure(channel, e));
                     } catch (IOException nested) {
                         logger.error("failed to report a frozen search failure", nested);
                     }
@@ -316,7 +307,7 @@ final class SearchPlanner {
             java.util.Set.of()
         );
         if (resolved.refused()) {
-            return channel -> channel.sendResponse(IndexAdminHandler.error(channel, resolved.status(), resolved.type(), resolved.reason()));
+            return channel -> channel.sendResponse(RestReplies.error(channel, resolved.status(), resolved.type(), resolved.reason()));
         }
 
         // Off the HTTP thread. executeQueryPhase hands work to the search pool and this waits for it;
@@ -340,7 +331,7 @@ final class SearchPlanner {
                 );
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a search failure", nested);
                 }
@@ -409,7 +400,7 @@ final class SearchPlanner {
                 // Released or expired between this request resolving the record and a shard opening it.
                 // To the caller that is the view being gone, not the node failing.
                 channel.sendResponse(
-                    IndexAdminHandler.error(
+                    RestReplies.error(
                         channel,
                         RestStatus.NOT_FOUND,
                         "pit_not_found",

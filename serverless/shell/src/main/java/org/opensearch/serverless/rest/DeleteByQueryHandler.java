@@ -18,6 +18,7 @@ import org.opensearch.rest.RestRequest;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.ops.ShardOperations;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.shard.DeleteByQueryOutcome;
 import org.opensearch.serverless.shard.NoSuchIndexException;
 import org.opensearch.threadpool.ThreadPool;
@@ -71,7 +72,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         // deliberate refusal into a 400 about an unconsumed parameter.
         final String index = request.param("index");
         final long maxDocs = request.paramAsLong("max_docs", Long.MAX_VALUE);
-        final boolean refresh = IndexAdminHandler.refresh(request);
+        final boolean refresh = RestReplies.refresh(request);
         final boolean waitForCompletion = request.paramAsBoolean("wait_for_completion", true);
         final String routing = request.param("routing");
         final QueryBuilder urlQuery = org.opensearch.rest.action.RestActions.urlParamsToQueryBuilder(request);
@@ -111,7 +112,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
 
         if (unsupportedSelection != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_delete_by_query",
@@ -123,12 +124,12 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
         if (waitForCompletion == false) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_delete_by_query",
@@ -139,7 +140,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         }
         if (routing != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_delete_by_query",
@@ -149,7 +150,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         }
         if ("abort".equals(conflicts) == false && "proceed".equals(conflicts) == false) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "illegal_argument_exception",
@@ -161,7 +162,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         final NodeContext serving = node.get();
         if (request.hasContent() == false && urlQuery == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "missing_query",
@@ -185,12 +186,12 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
             body = readQueryBody(parser);
         } catch (Exception e) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "bad_query", "could not parse the query: " + e.getMessage())
+                RestReplies.error(channel, RestStatus.BAD_REQUEST, "bad_query", "could not parse the query: " + e.getMessage())
             );
         }
         if (body.query() == null && urlQuery == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.BAD_REQUEST,
                     "missing_query",
@@ -201,7 +202,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         final String unsupported = body.unsupported();
         if (unsupported != null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(
+                RestReplies.error(
                     channel,
                     RestStatus.NOT_IMPLEMENTED,
                     "unsupported_delete_by_query",
@@ -233,7 +234,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
                 sendError(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + e.index());
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a delete_by_query failure", nested);
                 }
@@ -292,7 +293,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
 
     private void sendError(org.opensearch.rest.RestChannel channel, RestStatus status, String type, String reason) {
         try {
-            channel.sendResponse(IndexAdminHandler.error(channel, status, type, reason));
+            channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException nested) {
             logger.error("failed to report a delete_by_query failure", nested);
         }

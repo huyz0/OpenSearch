@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.snapshot;
 
 import org.opensearch.Version;
 import org.opensearch.common.UUIDs;
@@ -25,6 +25,7 @@ import org.opensearch.serverless.metadata.RepositoryMissingException;
 import org.opensearch.serverless.metadata.SnapshotAlreadyExistsException;
 import org.opensearch.serverless.metadata.SnapshotRecord;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.serverless.store.CommitManifest;
 import org.opensearch.serverless.store.SegmentPublisher;
 
@@ -76,19 +77,19 @@ final class SnapshotOperations {
                 () -> capture(metadata, repo, snapshot, indexNames, ignoreUnavailable, partial)
             );
         } catch (RepositoryMissingException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "repository_missing_exception", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "repository_missing_exception", e.getMessage()));
             return;
         } catch (SnapshotHandler.IndexNotFoundForOperationException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", e.getMessage()));
             return;
         } catch (SnapshotHandler.SystemIndexException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
             return;
         } catch (SnapshotHandler.NothingPublishedException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.CONFLICT, "nothing_published", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.CONFLICT, "nothing_published", e.getMessage()));
             return;
         } catch (SnapshotAlreadyExistsException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "snapshot_already_exists", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "snapshot_already_exists", e.getMessage()));
             return;
         }
 
@@ -266,12 +267,7 @@ final class SnapshotOperations {
         );
         if (record.isEmpty()) {
             channel.sendResponse(
-                IndexAdminHandler.error(
-                    channel,
-                    RestStatus.NOT_FOUND,
-                    "snapshot_missing_exception",
-                    "no such snapshot: " + repo + "/" + snapshot
-                )
+                RestReplies.error(channel, RestStatus.NOT_FOUND, "snapshot_missing_exception", "no such snapshot: " + repo + "/" + snapshot)
             );
             return;
         }
@@ -300,7 +296,7 @@ final class SnapshotOperations {
             // Core's answer for a repository that is not registered, rather than an empty list that reads
             // as "registered and holding nothing".
             channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "repository_missing_exception", "[" + repo + "] missing")
+                RestReplies.error(channel, RestStatus.NOT_FOUND, "repository_missing_exception", "[" + repo + "] missing")
             );
             return;
         }
@@ -330,12 +326,7 @@ final class SnapshotOperations {
             );
             if (existed == false) {
                 channel.sendResponse(
-                    IndexAdminHandler.error(
-                        channel,
-                        RestStatus.NOT_FOUND,
-                        "snapshot_missing_exception",
-                        "no such snapshot: " + repo + "/" + name
-                    )
+                    RestReplies.error(channel, RestStatus.NOT_FOUND, "snapshot_missing_exception", "no such snapshot: " + repo + "/" + name)
                 );
                 return;
             }
@@ -371,25 +362,25 @@ final class SnapshotOperations {
                 () -> restore(metadata, repo, snapshot, body)
             );
         } catch (SnapshotHandler.SnapshotMissingException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "snapshot_missing_exception", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "snapshot_missing_exception", e.getMessage()));
             return;
         } catch (SnapshotHandler.IndexNotCapturedException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", e.getMessage()));
             return;
         } catch (SnapshotHandler.IndexNameCollisionException | IndexAlreadyExistsException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.BAD_REQUEST, "index_already_exists", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "index_already_exists", e.getMessage()));
             return;
         } catch (SnapshotHandler.SystemIndexException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.FORBIDDEN, "system_index", e.getMessage()));
             return;
         } catch (SnapshotHandler.SnapshotInProgressException e) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.CONFLICT, "snapshot_in_progress", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.CONFLICT, "snapshot_in_progress", e.getMessage()));
             return;
         } catch (SnapshotHandler.RestoreConflictException e) {
             // Reported, not counted as a success. The manifest compare-and-swap result used to be
             // discarded, so a shard that a writer had already published on the fresh index stayed empty
             // behind {"failed": 0}, with the copied blobs unreferenced in the live term.
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.CONFLICT, "restore_conflict", e.getMessage()));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.CONFLICT, "restore_conflict", e.getMessage()));
             return;
         }
 

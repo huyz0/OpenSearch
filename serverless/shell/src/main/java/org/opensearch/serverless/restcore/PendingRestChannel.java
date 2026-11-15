@@ -5,7 +5,7 @@
  * this file be licensed under the Apache-2.0 license or a
  * compatible open source license.
  */
-package org.opensearch.serverless.rest;
+package org.opensearch.serverless.restcore;
 
 import org.opensearch.common.io.stream.BytesStreamOutput;
 import org.opensearch.core.xcontent.MediaType;
@@ -18,15 +18,15 @@ import java.io.IOException;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Holds a response until action filters finish, using the HTTP channel's accounted output buffers. */
-final class PendingRestChannel implements RestChannel {
+public final class PendingRestChannel implements RestChannel {
     private final RestChannel delegate;
     private final AtomicReference<RestResponse> pending = new AtomicReference<>();
 
-    PendingRestChannel(RestChannel delegate) {
+    public PendingRestChannel(RestChannel delegate) {
         this.delegate = delegate;
     }
 
-    RestResponse response() {
+    public RestResponse response() {
         final RestResponse response = pending.get();
         if (response == null) {
             throw new IllegalStateException("the operation did not produce a response");

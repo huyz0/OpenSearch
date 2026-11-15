@@ -17,6 +17,8 @@ import org.opensearch.serverless.cluster.IndexDescriptor;
 import org.opensearch.serverless.membership.NodeLease;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.metadata.ShardHead;
+import org.opensearch.serverless.restcore.NotImplementedHandler;
+import org.opensearch.serverless.restcore.RestReplies;
 import org.opensearch.transport.client.node.NodeClient;
 
 import java.io.IOException;
@@ -96,7 +98,7 @@ public final class CatalogHandler extends BaseRestHandler {
         final MetadataPlane metadata = plane.get();
         if (metadata == null) {
             return channel -> channel.sendResponse(
-                IndexAdminHandler.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
+                RestReplies.error(channel, RestStatus.SERVICE_UNAVAILABLE, "no_metadata_plane", "no metadata plane configured")
             );
         }
 
@@ -122,7 +124,7 @@ public final class CatalogHandler extends BaseRestHandler {
     private static void shards(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String index) throws IOException {
         final Optional<IndexDescriptor> descriptor = metadata.describe(index);
         if (descriptor.isEmpty()) {
-            channel.sendResponse(IndexAdminHandler.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
+            channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "index_not_found", "no such index: " + index));
             return;
         }
         try (XContentBuilder builder = channel.newBuilder()) {
@@ -198,13 +200,13 @@ public final class CatalogHandler extends BaseRestHandler {
         final var serving = node.get();
         final Runnable run = () -> {
             try {
-                IndexAdminHandler.gate(serving, action, actionRequest, () -> {
+                RestReplies.gate(serving, action, actionRequest, () -> {
                     work.run();
                     return null;
                 });
             } catch (Exception e) {
                 try {
-                    channel.sendResponse(IndexAdminHandler.failure(channel, e));
+                    channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
                     logger.error("failed to report a catalog failure", nested);
                 }
