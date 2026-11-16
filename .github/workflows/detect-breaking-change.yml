@@ -1,6 +1,8 @@
 name: "Detect Breaking Changes"
 on:
-  pull_request
+  # Fork: only build main; feature branches skip CI to stay within Actions limits.
+  pull_request:
+    branches: [ main ]
 
 jobs:
   detect-breaking-change:

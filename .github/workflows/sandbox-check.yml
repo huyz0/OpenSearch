@@ -1,9 +1,12 @@
 name: Sandbox Check
 on:
+  # Fork: only build main; feature branches skip CI to stay within Actions limits.
   push:
+    branches: [ main ]
     paths:
       - 'sandbox/**'
   pull_request:
+    branches: [ main ]
     paths:
       - 'sandbox/**'
 
