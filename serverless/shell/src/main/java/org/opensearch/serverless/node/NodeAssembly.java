@@ -147,7 +147,6 @@ final class NodeAssembly {
                 node.storage.engineFactoryProviders(),
                 node.storage.directoryFactories()
             );
-            org.opensearch.serverless.schema.SharedAnalysis.install(node.indicesService);
             node.searchService = node.services.buildSearchService(node.clusterSettings, node.clusterService, node.indicesService);
             node.nodeClient = NodeComponents.nodeClient(settings, node.threadPool, node.services);
             success = true;

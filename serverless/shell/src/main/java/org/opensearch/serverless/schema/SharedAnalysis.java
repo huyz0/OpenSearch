@@ -16,7 +16,6 @@ import org.opensearch.index.analysis.IndexAnalyzers;
 import org.opensearch.index.analysis.IndexAnalyzersProvider;
 import org.opensearch.index.mapper.Mapping;
 import org.opensearch.index.mapper.SharedMappings;
-import org.opensearch.indices.IndicesService;
 import org.opensearch.serverless.settings.ServerlessSettings;
 
 import java.io.Closeable;
@@ -88,15 +87,13 @@ public final class SharedAnalysis implements IndexAnalyzersProvider {
     private final Map<String, Group> groups = new HashMap<>();
 
     /**
-     * Has every index this node opens from now on share analyzers and parsed mappings.
+     * Has an index share analyzers and parsed mappings with the other indices this node opens with the same schema.
+     * Called for every index module, as plugins are.
      *
-     * @param indicesService the node's indices service
-     * @return the sharing installed
+     * @param indexModule the module of the index being opened
      */
-    public static SharedAnalysis install(IndicesService indicesService) {
-        final SharedAnalysis shared = new SharedAnalysis();
-        indicesService.setIndexAnalyzersProvider(shared);
-        return shared;
+    public void onIndexModule(org.opensearch.index.IndexModule indexModule) {
+        indexModule.setIndexAnalyzersProvider(this);
     }
 
     @Override

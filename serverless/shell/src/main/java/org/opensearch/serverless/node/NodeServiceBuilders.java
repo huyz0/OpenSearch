@@ -106,7 +106,9 @@ final class NodeServiceBuilders {
      * chosen directly, and the rest assumes a cluster with a manager. An operator installs a plugin; nobody
      * installs a module.
      *
-     * <p>It also gives every index the shell's own search listeners: {@link org.opensearch.serverless.shard.StoredFieldsPrefetch}.
+     * <p>It also gives every index the shell's own search listeners
+     * ({@link org.opensearch.serverless.shard.StoredFieldsPrefetch}), and has indices with the same schema share
+     * analyzers and parsed mappings ({@link org.opensearch.serverless.schema.SharedAnalysis}).
      *
      * @param settings the node settings
      * @param environment the node environment, which knows where {@code plugins/} is
@@ -114,6 +116,7 @@ final class NodeServiceBuilders {
      */
     static PluginsService buildPluginsService(Settings settings, Environment environment) {
         final java.nio.file.Path pluginsDir = environment.pluginsDir();
+        final org.opensearch.serverless.schema.SharedAnalysis sharedAnalysis = new org.opensearch.serverless.schema.SharedAnalysis();
         return new PluginsService(
             settings,
             environment.configDir(),
@@ -126,6 +129,8 @@ final class NodeServiceBuilders {
                 super.onIndexModule(indexModule);
                 // Every shard's fetch announces its hits' stored fields first, so cold blocks are fetched together.
                 indexModule.addSearchOperationListener(org.opensearch.serverless.shard.StoredFieldsPrefetch.INSTANCE);
+                // Indices with the same schema share one set of analyzers and one parsed copy of each mapping.
+                sharedAnalysis.onIndexModule(indexModule);
             }
         };
     }
