@@ -85,6 +85,7 @@ import static org.opensearch.repositories.s3.S3Repository.SERVER_SIDE_ENCRYPTION
 import static org.opensearch.repositories.s3.S3Repository.SERVER_SIDE_ENCRYPTION_ENCRYPTION_CONTEXT_SETTING;
 import static org.opensearch.repositories.s3.S3Repository.SERVER_SIDE_ENCRYPTION_KMS_KEY_SETTING;
 import static org.opensearch.repositories.s3.S3Repository.SERVER_SIDE_ENCRYPTION_TYPE_SETTING;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -759,7 +760,8 @@ public class S3BlobContainerMockClientTests extends OpenSearchTestCase implement
             any(InputStream.class),
             anyLong(),
             anyMap(),
-            isNull()
+            isNull(),
+            anyBoolean()
         );
 
         if (expectException) {
