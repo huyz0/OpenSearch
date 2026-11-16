@@ -114,6 +114,7 @@ class GoogleCloudStorageBlobStore implements BlobStore {
     private final GoogleCloudStorageService storageService;
     private final GoogleCloudStorageOperationsStats stats;
     private final int bufferSize;
+    final GoogleCloudStorageBlobRegisters registers;
 
     GoogleCloudStorageBlobStore(
         String bucketName,
@@ -128,6 +129,7 @@ class GoogleCloudStorageBlobStore implements BlobStore {
         this.storageService = storageService;
         this.stats = new GoogleCloudStorageOperationsStats(bucketName);
         this.bufferSize = bufferSize;
+        this.registers = new GoogleCloudStorageBlobRegisters(this::client, bucketName);
     }
 
     private Storage client() throws IOException {

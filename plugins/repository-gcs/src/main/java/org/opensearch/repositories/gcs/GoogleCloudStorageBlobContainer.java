@@ -36,17 +36,22 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStoreException;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.support.AbstractBlobContainer;
+import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
-class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
+class GoogleCloudStorageBlobContainer extends AbstractBlobContainer implements ConditionalBlobContainer {
 
     private final GoogleCloudStorageBlobStore blobStore;
     private final String path;
@@ -121,6 +126,22 @@ class GoogleCloudStorageBlobContainer extends AbstractBlobContainer {
     @Override
     public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws IOException {
         blobStore.deleteBlobsIgnoringIfNotExists(blobNames.stream().map(this::buildKey).collect(Collectors.toList()));
+    }
+
+    @Override
+    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        return blobStore.registers.read(buildKey(blobName));
+    }
+
+    @Override
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        return blobStore.registers.deleteIfUnchanged(buildKey(blobName), expectedGeneration);
+    }
+
+    @Override
+    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        return blobStore.registers.compareAndSwap(buildKey(blobName), expectedGeneration, newValue);
     }
 
     private String buildKey(String blobName) {

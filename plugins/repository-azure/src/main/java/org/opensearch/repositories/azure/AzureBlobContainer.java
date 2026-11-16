@@ -45,9 +45,13 @@ import org.opensearch.common.Nullable;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.support.AbstractBlobContainer;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.threadpool.ThreadPool;
 
 import java.io.FileInputStream;
@@ -58,9 +62,10 @@ import java.net.URISyntaxException;
 import java.nio.file.NoSuchFileException;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
 
-public class AzureBlobContainer extends AbstractBlobContainer {
+public class AzureBlobContainer extends AbstractBlobContainer implements ConditionalBlobContainer {
     /**
      * The default minimum read size, in bytes, for a {@link BlobInputStream} or {@link FileInputStream}.
      */
@@ -230,6 +235,34 @@ public class AzureBlobContainer extends AbstractBlobContainer {
             return blobStore.children(path);
         } catch (URISyntaxException | BlobStorageException e) {
             throw new IOException("Failed to list children in path [" + path.buildAsString() + "].", e);
+        }
+    }
+
+    @Override
+    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        try {
+            return blobStore.registers.read(buildKey(blobName));
+        } catch (URISyntaxException e) {
+            throw new IOException("Can not read register " + blobName, e);
+        }
+    }
+
+    @Override
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        try {
+            return blobStore.registers.deleteIfUnchanged(buildKey(blobName), expectedGeneration);
+        } catch (URISyntaxException | BlobStorageException e) {
+            throw new IOException("Can not conditionally delete register " + blobName, e);
+        }
+    }
+
+    @Override
+    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        try {
+            return blobStore.registers.compareAndSwap(buildKey(blobName), expectedGeneration, newValue);
+        } catch (URISyntaxException e) {
+            throw new IOException("Can not CAS register " + blobName, e);
         }
     }
 

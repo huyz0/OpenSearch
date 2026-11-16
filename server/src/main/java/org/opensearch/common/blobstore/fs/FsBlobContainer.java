@@ -38,13 +38,17 @@ import org.opensearch.common.UUIDs;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobVersionConflictException;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.VersionedBlob;
 import org.opensearch.common.blobstore.support.AbstractBlobContainer;
 import org.opensearch.common.blobstore.support.PlainBlobMetadata;
 import org.opensearch.common.io.Streams;
 import org.opensearch.common.util.io.IOUtils;
+import org.opensearch.core.common.bytes.BytesReference;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
@@ -67,6 +71,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -82,7 +87,7 @@ import static java.util.Collections.unmodifiableMap;
  *
  * @opensearch.internal
  */
-public class FsBlobContainer extends AbstractBlobContainer {
+public class FsBlobContainer extends AbstractBlobContainer implements ConditionalBlobContainer {
 
     private static final String TEMP_FILE_PREFIX = "pending-";
 
@@ -105,7 +110,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
         Map<String, BlobContainer> builder = new HashMap<>();
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(path)) {
             for (Path file : stream) {
-                if (Files.isDirectory(file)) {
+                if (file.getFileName().toString().equals(FsBlobRegisters.LOCK_DIRECTORY) == false && Files.isDirectory(file)) {
                     final String name = file.getFileName().toString();
                     builder.put(name, new FsBlobContainer(blobStore, path().add(name), file));
                 }
@@ -129,7 +134,9 @@ public class FsBlobContainer extends AbstractBlobContainer {
                     continue;
                 }
                 if (attrs.isRegularFile()) {
-                    builder.put(file.getFileName().toString(), new PlainBlobMetadata(file.getFileName().toString(), attrs.size()));
+                    if (file.getFileName().toString().equals(FsBlobRegisters.LOCK_DIRECTORY) == false) {
+                        builder.put(file.getFileName().toString(), new PlainBlobMetadata(file.getFileName().toString(), attrs.size()));
+                    }
                 }
             }
         }
@@ -151,8 +158,10 @@ public class FsBlobContainer extends AbstractBlobContainer {
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
                 Files.delete(file);
-                filesDeleted.incrementAndGet();
-                bytesDeleted.addAndGet(attrs.size());
+                if (file.getParent().getFileName().toString().equals(FsBlobRegisters.LOCK_DIRECTORY) == false) {
+                    filesDeleted.incrementAndGet();
+                    bytesDeleted.addAndGet(attrs.size());
+                }
                 return FileVisitResult.CONTINUE;
             }
         });
@@ -168,19 +177,19 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     @Override
     public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws IOException {
-        IOUtils.rm(blobNames.stream().map(path::resolve).toArray(Path[]::new));
+        IOUtils.rm(blobNames.stream().map(this::resolveBlobPath).toArray(Path[]::new));
         // See delete(): deletion invalidates any previously issued version token for these paths.
         blobNames.forEach(blobName -> CONDITIONAL_WRITE_VERSIONS.remove(conditionalWriteKey(blobName)));
     }
 
     @Override
     public boolean blobExists(String blobName) {
-        return Files.exists(path.resolve(blobName));
+        return FsBlobRegisters.isLockPath(path.resolve(blobName)) == false && Files.exists(path.resolve(blobName));
     }
 
     @Override
     public InputStream readBlob(String name) throws IOException {
-        final Path resolvedPath = path.resolve(name);
+        final Path resolvedPath = resolveBlobPath(name);
         try {
             return Files.newInputStream(resolvedPath);
         } catch (FileNotFoundException fnfe) {
@@ -190,7 +199,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     @Override
     public InputStream readBlob(String blobName, long position, long length) throws IOException {
-        final SeekableByteChannel channel = Files.newByteChannel(path.resolve(blobName));
+        final SeekableByteChannel channel = Files.newByteChannel(resolveBlobPath(blobName));
         if (position > 0L) {
             channel.position(position);
         }
@@ -235,6 +244,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
     @Override
     public void writeBlobAtomic(final String blobName, final InputStream inputStream, final long blobSize, boolean failIfAlreadyExists)
         throws IOException {
+        resolveBlobPath(blobName);
         final String tempBlob = tempBlobName(blobName);
         final Path tempBlobPath = path.resolve(tempBlob);
         try {
@@ -267,8 +277,8 @@ public class FsBlobContainer extends AbstractBlobContainer {
 
     public void moveBlobAtomic(final String sourceBlobName, final String targetBlobName, final boolean failIfAlreadyExists)
         throws IOException {
-        final Path sourceBlobPath = path.resolve(sourceBlobName);
-        final Path targetBlobPath = path.resolve(targetBlobName);
+        final Path sourceBlobPath = resolveBlobPath(sourceBlobName);
+        final Path targetBlobPath = resolveBlobPath(targetBlobName);
         // If the target file exists then Files.move() behaviour is implementation specific
         // the existing file might be replaced or this method fails by throwing an IOException.
         if (Files.exists(targetBlobPath)) {
@@ -359,7 +369,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
     @Override
     public VersionedBlob readBlobWithVersion(String blobName) throws IOException {
         synchronized (conditionalWriteLock(blobName)) {
-            final Path file = path.resolve(blobName);
+            final Path file = resolveBlobPath(blobName);
             final String versionToken = currentVersionToken(blobName);
             try {
                 // Versioned reads materialize the blob in memory and are meant for small control blobs only; refuse
@@ -378,6 +388,7 @@ public class FsBlobContainer extends AbstractBlobContainer {
     @Override
     public String writeBlobConditionally(String blobName, InputStream inputStream, long blobSize, @Nullable String expectedVersionToken)
         throws IOException {
+        resolveBlobPath(blobName);
         synchronized (conditionalWriteLock(blobName)) {
             final String currentVersionToken = currentVersionToken(blobName);
             if (Objects.equals(expectedVersionToken, currentVersionToken) == false) {
@@ -420,5 +431,30 @@ public class FsBlobContainer extends AbstractBlobContainer {
      */
     public static boolean isTempBlobName(final String blobName) {
         return blobName.startsWith(TEMP_FILE_PREFIX);
+    }
+
+    @Override
+    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        return FsBlobRegisters.read(resolveBlobPath(blobName));
+    }
+
+    @Override
+    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        return FsBlobRegisters.compareAndSwap(resolveBlobPath(blobName), expectedGeneration, newValue);
+    }
+
+    @Override
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        return FsBlobRegisters.deleteIfUnchanged(resolveBlobPath(blobName), expectedGeneration);
+    }
+
+    /** Resolves a blob name, refusing names inside the reserved register lock directory. */
+    private Path resolveBlobPath(String blobName) {
+        final Path resolved = path.resolve(blobName);
+        if (FsBlobRegisters.isLockPath(resolved)) {
+            throw new IllegalArgumentException("reserved register coordination file: " + blobName);
+        }
+        return resolved;
     }
 }

@@ -75,8 +75,11 @@ import org.opensearch.common.blobstore.AsyncMultiStreamBlobContainer;
 import org.opensearch.common.blobstore.BlobContainer;
 import org.opensearch.common.blobstore.BlobMetadata;
 import org.opensearch.common.blobstore.BlobPath;
+import org.opensearch.common.blobstore.BlobRegister;
+import org.opensearch.common.blobstore.BlobRegisterCasResult;
 import org.opensearch.common.blobstore.BlobStoreException;
 import org.opensearch.common.blobstore.BlobVersionConflictException;
+import org.opensearch.common.blobstore.ConditionalBlobContainer;
 import org.opensearch.common.blobstore.DeleteResult;
 import org.opensearch.common.blobstore.InputStreamWithMetadata;
 import org.opensearch.common.blobstore.VersionedBlob;
@@ -90,6 +93,7 @@ import org.opensearch.common.io.InputStreamContainer;
 import org.opensearch.common.util.concurrent.FutureUtils;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.common.Strings;
+import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.common.unit.ByteSizeUnit;
 import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.repositories.s3.async.S3AsyncDeleteHelper;
@@ -108,6 +112,7 @@ import java.nio.file.NoSuchFileException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -125,18 +130,20 @@ import static org.opensearch.repositories.s3.S3Repository.MAX_FILE_SIZE_USING_MU
 import static org.opensearch.repositories.s3.S3Repository.MIN_PART_SIZE_USING_MULTIPART;
 import static org.opensearch.repositories.s3.utils.SseKmsUtil.configureEncryptionSettings;
 
-class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamBlobContainer {
+class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamBlobContainer, ConditionalBlobContainer {
 
     private static final Logger logger = LogManager.getLogger(S3BlobContainer.class);
     private static final long DEFAULT_OPERATION_TIMEOUT = TimeUnit.SECONDS.toSeconds(30);
 
     private final S3BlobStore blobStore;
     private final String keyPath;
+    private final S3BlobRegisters registers;
 
     S3BlobContainer(BlobPath path, S3BlobStore blobStore) {
         super(path);
         this.blobStore = blobStore;
         this.keyPath = path.buildAsString();
+        this.registers = new S3BlobRegisters(blobStore, keyPath);
     }
 
     @Override
@@ -349,7 +356,7 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
      * ordinary {@link IOException} and be retried: the retry resolves it definitively (a 412 if the CAS was genuinely
      * lost, success if it was not), whereas classifying it as lost would fence a healthy writer whose rival lost.
      */
-    private static boolean isConditionFailure(S3Exception e, boolean isCompareAndSwap) {
+    static boolean isConditionFailure(S3Exception e, boolean isCompareAndSwap) {
         // 412 Precondition Failed is unambiguous: the If-Match/If-None-Match condition was not met.
         if (e.statusCode() == 412) {
             return true;
@@ -1153,5 +1160,26 @@ class S3BlobContainer extends AbstractBlobContainer implements AsyncMultiStreamB
         } catch (Exception e) {
             completionListener.onFailure(new IOException("Failed to initiate async blob deletion", e));
         }
+    }
+
+    @Override
+    public Optional<BlobRegister> readRegister(String blobName) throws IOException {
+        return registers.read(blobName);
+    }
+
+    @Override
+    public BlobRegisterCasResult compareAndSwapRegister(String blobName, long expectedGeneration, BytesReference newValue)
+        throws IOException {
+        return registers.compareAndSwap(blobName, expectedGeneration, newValue);
+    }
+
+    @Override
+    public BlobRegisterCasResult createRegisterIfAbsent(String blobName, BytesReference value) throws IOException {
+        return registers.createIfAbsent(blobName, value);
+    }
+
+    @Override
+    public boolean deleteRegisterIfUnchanged(String blobName, long expectedGeneration) throws IOException {
+        return registers.deleteIfUnchanged(blobName, expectedGeneration);
     }
 }

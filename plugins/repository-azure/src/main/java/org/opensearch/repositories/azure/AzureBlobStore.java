@@ -101,6 +101,7 @@ public class AzureBlobStore implements BlobStore {
 
     private final String clientName;
     private final String container;
+    final AzureBlobRegisters registers;
     private final LocationMode locationMode;
 
     private final Stats stats = new Stats();
@@ -108,6 +109,7 @@ public class AzureBlobStore implements BlobStore {
 
     public AzureBlobStore(RepositoryMetadata metadata, AzureStorageService service, ThreadPool threadPool) {
         this.container = Repository.CONTAINER_SETTING.get(metadata.settings());
+        this.registers = new AzureBlobRegisters(this::client, container, this::timeout);
         this.clientName = Repository.CLIENT_NAME.get(metadata.settings());
         this.service = service;
         this.threadPool = threadPool;
