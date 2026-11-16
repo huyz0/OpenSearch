@@ -528,6 +528,15 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
     }
 
     private synchronized Map<String, DocumentMapper> internalMerge(Map<String, CompressedXContent> mappings, MergeReason reason) {
+        // Mappings that come from index metadata may be shared with other indices that share these analyzers: on
+        // the first load the parsed mapping is reused outright, and after an update the merged result is swapped
+        // for an equal mapping another index already holds.
+        final SharedMappings shared = reason == MergeReason.MAPPING_RECOVERY && indexSettings.isPluggableDataFormatEnabled() == false
+            ? indexAnalyzers.sharedMappings()
+            : null;
+        final boolean firstLoad = mapper == null;
+        CompressedXContent source = null;
+        boolean reused = false;
         DocumentMapper documentMapper = null;
         for (Map.Entry<String, CompressedXContent> entry : mappings.entrySet()) {
             String type = entry.getKey();
@@ -536,13 +545,60 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
             }
 
             try {
-                documentMapper = documentParser.parse(type, entry.getValue());
+                source = entry.getValue();
+                final Mapping held = shared == null || firstLoad == false ? null : shared.get(source);
+                if (held != null) {
+                    documentMapper = new DocumentMapper(this, held);
+                    reused = true;
+                } else {
+                    documentMapper = documentParser.parse(type, source);
+                }
             } catch (Exception e) {
                 throw new MapperParsingException("Failed to parse mapping [{}]: {}", e, entry.getKey(), e.getMessage());
             }
         }
 
-        return internalMerge(documentMapper, reason);
+        final Map<String, DocumentMapper> results = internalMerge(documentMapper, reason);
+        if (shared != null && source != null && reused == false) {
+            if (firstLoad) {
+                // Offered only once it has been merged and validated here, so another index never reuses a mapping
+                // this one refused.
+                shared.put(source, documentMapper.mapping());
+            } else {
+                adoptShared(shared, source);
+            }
+        }
+        return results;
+    }
+
+    /**
+     * After an update from index metadata has been merged and validated here: if the result renders exactly as its
+     * source, adopt the mapping another index already holds for that source, or offer this one. A merge that came out
+     * different from its source keeps its own mapping, as it would without sharing.
+     */
+    private void adoptShared(SharedMappings shared, CompressedXContent source) {
+        final DocumentMapper merged = this.mapper;
+        if (merged == null || withoutType(merged.mappingSource(), merged.type()).equals(withoutType(source, merged.type())) == false) {
+            return;
+        }
+        final Mapping held = shared.get(source);
+        if (held == null) {
+            shared.put(source, merged.mapping());
+        } else if (held != merged.mapping()) {
+            this.mapper = new DocumentMapper(this, held, merged.getVersion());
+            this.compositeMappedFieldTypes = getCompositeFieldTypesFromMapper();
+            buildCompositeFieldLookup();
+        }
+    }
+
+    /** A mapping source as a map, without the type name a document mapper wraps it in and index metadata may not. */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> withoutType(CompressedXContent source, String type) {
+        final Map<String, Object> map = XContentHelper.convertToMap(source.compressedReference(), true, MediaTypeRegistry.JSON).v2();
+        if (map.size() == 1 && map.get(type) instanceof Map) {
+            return (Map<String, Object>) map.get(type);
+        }
+        return map;
     }
 
     static void validateTypeName(String type) {
