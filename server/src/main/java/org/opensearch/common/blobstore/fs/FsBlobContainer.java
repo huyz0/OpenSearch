@@ -132,6 +132,13 @@ public class FsBlobContainer extends AbstractBlobContainer implements Conditiona
                 } catch (FileNotFoundException | NoSuchFileException e) {
                     // The file was concurrently deleted between listing files and trying to get its attributes so we skip it here
                     continue;
+                } catch (java.nio.file.AccessDeniedException e) {
+                    // Windows reports a file that is being deleted as access denied rather than missing; a temporary
+                    // blob is deleted as soon as it is published, so it is skipped the way a deleted one is.
+                    if (isTempBlobName(file.getFileName().toString())) {
+                        continue;
+                    }
+                    throw e;
                 }
                 if (attrs.isRegularFile()) {
                     if (file.getFileName().toString().equals(FsBlobRegisters.LOCK_DIRECTORY) == false) {
@@ -215,17 +222,43 @@ public class FsBlobContainer extends AbstractBlobContainer implements Conditiona
 
     @Override
     public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
-        final Path file = path.resolve(blobName);
-        try {
-            writeToPath(inputStream, file, blobSize);
-        } catch (FileAlreadyExistsException faee) {
-            if (failIfAlreadyExists) {
-                throw faee;
+        final Path file = resolveBlobPath(blobName);
+        if (failIfAlreadyExists) {
+            createWhole(blobName, inputStream, blobSize);
+        } else {
+            try {
+                writeToPath(inputStream, file, blobSize);
+            } catch (FileAlreadyExistsException faee) {
+                deleteBlobsIgnoringIfNotExists(Collections.singletonList(blobName));
+                writeToPath(inputStream, file, blobSize);
             }
-            deleteBlobsIgnoringIfNotExists(Collections.singletonList(blobName));
-            writeToPath(inputStream, file, blobSize);
         }
         IOUtils.fsync(path, true);
+    }
+
+    /**
+     * Creates a blob only if its name is free, and never lets the name be seen before the content is whole.
+     *
+     * <p>Writing in place created the name first and filled it afterwards, so a concurrent listing could see the
+     * blob at any length from zero up. An object store never shows a partly written object, and callers written
+     * against one rely on that: a log that marks a fence with a blob of no bytes read a record still being written
+     * as a fence, skipped fencing the term, and let the fenced writer append after a takeover. So the content goes to
+     * a temporary blob first and is published under its name by a hard link, which either creates the name with the
+     * whole content behind it or fails because the name is taken -- the same answer put-if-absent gives.
+     */
+    private void createWhole(String blobName, InputStream inputStream, long blobSize) throws IOException {
+        final Path target = resolveBlobPath(blobName);
+        final Path temp = path.resolve(tempBlobName(blobName));
+        try {
+            writeToPath(inputStream, temp, blobSize);
+            try {
+                Files.createLink(target, temp);
+            } catch (UnsupportedOperationException e) {
+                throw new IOException("atomic blob creation requires filesystem hard link support", e);
+            }
+        } finally {
+            Files.deleteIfExists(temp);
+        }
     }
 
     @Override
