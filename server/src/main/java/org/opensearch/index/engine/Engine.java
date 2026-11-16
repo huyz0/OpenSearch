@@ -986,6 +986,37 @@ public abstract class Engine implements LifecycleAware, Closeable {
         return null;
     }
 
+    /**
+     * Operations beyond the local translog that this engine needs replayed to rebuild its state. {@code IndexShard}
+     * replays them right after local translog recovery, through the same {@code applyTranslogOperation} path, so
+     * mapping updates and version and sequence-number bookkeeping are handled exactly as for the translog.
+     *
+     * <p>Empty by default: an engine whose durability is the local translog alone has nothing to add. An engine with
+     * another durability mechanism, such as a write-ahead log in remote storage, returns the operations that were
+     * made durable there but are not yet in the shard's local state. Such an engine must fence the replayed
+     * operations against any writer that has taken over the shard since they were written.
+     *
+     * @return an ordered snapshot of the operations to replay; the caller closes it
+     */
+    public Translog.Snapshot engineRecoverySnapshot() throws IOException {
+        return EMPTY_RECOVERY_SNAPSHOT;
+    }
+
+    private static final Translog.Snapshot EMPTY_RECOVERY_SNAPSHOT = new Translog.Snapshot() {
+        @Override
+        public int totalOperations() {
+            return 0;
+        }
+
+        @Override
+        public Translog.Operation next() {
+            return null;
+        }
+
+        @Override
+        public void close() {}
+    };
+
     protected TranslogDeletionPolicy getTranslogDeletionPolicy(EngineConfig engineConfig) {
         TranslogDeletionPolicy customTranslogDeletionPolicy = null;
         if (engineConfig.getCustomTranslogDeletionPolicyFactory() != null) {

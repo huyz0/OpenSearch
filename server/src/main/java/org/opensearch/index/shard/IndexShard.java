@@ -3322,6 +3322,32 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
 
         getIndexer().translogManager()
             .recoverFromTranslog(translogRecoveryRunner, getIndexer().getProcessedLocalCheckpoint(), Long.MAX_VALUE);
+
+        recoverAdditionalEngineOperations(translogRecoveryStats);
+    }
+
+    /**
+     * Replays {@link Engine#engineRecoverySnapshot()} through the same path as local translog recovery, so mapping
+     * updates and version bookkeeping match. It runs here rather than in the engine because only the shard has the
+     * {@link org.opensearch.index.mapper.MapperService}.
+     */
+    private void recoverAdditionalEngineOperations(RecoveryState.Translog translogRecoveryStats) throws IOException {
+        Indexer indexer = getIndexer();
+        if (!(indexer instanceof EngineBackedIndexer)) {
+            return;
+        }
+        try (Translog.Snapshot snapshot = ((EngineBackedIndexer) indexer).getEngine().engineRecoverySnapshot()) {
+            if (snapshot.totalOperations() == 0) {
+                return;
+            }
+            translogRecoveryStats.totalOperations(translogRecoveryStats.totalOperations() + snapshot.totalOperations());
+            runTranslogRecovery(
+                indexer,
+                snapshot,
+                Engine.Operation.Origin.LOCAL_TRANSLOG_RECOVERY,
+                translogRecoveryStats::incrementRecoveredOperations
+            );
+        }
     }
 
     /**
