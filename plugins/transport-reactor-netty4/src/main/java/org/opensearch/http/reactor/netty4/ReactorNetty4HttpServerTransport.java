@@ -160,6 +160,18 @@ public class ReactorNetty4HttpServerTransport extends AbstractHttpServerTranspor
     public static final Setting<Long> SETTING_H3_MAX_STREAMS = Setting.longSetting("h3.max_streams", 100L, Property.NodeScope);
 
     /**
+     * Whether a streaming handler's request content is read from the connection only as the handler asks for it. On, a
+     * handler that is busy with what it has stops the socket being read and TCP slows the client, so a request holds
+     * memory for the chunks the handler asked for rather than for however fast the client sends. Off, every chunk is read
+     * as it arrives and handed on, queuing in memory until the handler takes it.
+     */
+    public static final Setting<Boolean> SETTING_STREAMING_DEMAND_DRIVEN = Setting.boolSetting(
+        "http.reactor.netty4.streaming.demand_driven",
+        false,
+        Property.NodeScope
+    );
+
+    /**
      * The number of Reactor Netty HTTP workers
      */
     public static final Setting<Integer> SETTING_HTTP_WORKER_COUNT = Setting.intSetting("http.netty.worker_count", 0, Property.NodeScope);
@@ -211,6 +223,7 @@ public class ReactorNetty4HttpServerTransport extends AbstractHttpServerTranspor
     private final int readTimeoutMillis;
     private final int connectTimeoutMillis;
     private final int maxCompositeBufferComponents;
+    private final boolean streamingDemandDriven;
     private final ByteSizeValue maxInitialLineLength;
     private final ByteSizeValue maxHeaderSize;
     private final ByteSizeValue maxChunkSize;
@@ -292,6 +305,7 @@ public class ReactorNetty4HttpServerTransport extends AbstractHttpServerTranspor
         this.connectTimeoutMillis = Math.toIntExact(SETTING_HTTP_CONNECT_TIMEOUT.get(settings).getMillis());
         this.sharedGroupFactory = sharedGroupFactory;
         this.maxCompositeBufferComponents = SETTING_HTTP_NETTY_MAX_COMPOSITE_BUFFER_COMPONENTS.get(settings);
+        this.streamingDemandDriven = SETTING_STREAMING_DEMAND_DRIVEN.get(settings);
         this.maxChunkSize = SETTING_HTTP_MAX_CHUNK_SIZE.get(settings);
         this.maxHeaderSize = SETTING_HTTP_MAX_HEADER_SIZE.get(settings);
         this.h2cMaxContentLength = SETTING_H2C_MAX_CONTENT_LENGTH.get(settings);
@@ -542,14 +556,23 @@ public class ReactorNetty4HttpServerTransport extends AbstractHttpServerTranspor
             final ReactorNetty4StreamingRequestConsumer<HttpContent> consumer = new ReactorNetty4StreamingRequestConsumer<>(
                 this,
                 request,
-                response
+                response,
+                streamingDemandDriven ? request.receiveContent() : null
             );
 
-            request.receiveContent()
-                .switchIfEmpty(Mono.just(DefaultLastHttpContent.EMPTY_LAST_CONTENT))
-                .subscribe(consumer, error -> {}, () -> consumer.accept(DefaultLastHttpContent.EMPTY_LAST_CONTENT));
+            if (streamingDemandDriven == false) {
+                request.receiveContent()
+                    .switchIfEmpty(Mono.just(DefaultLastHttpContent.EMPTY_LAST_CONTENT))
+                    .subscribe(consumer, error -> {}, () -> consumer.accept(DefaultLastHttpContent.EMPTY_LAST_CONTENT));
+            }
 
             incomingStream(new ReactorNetty4HttpRequest(request, responseHeadersFactory), consumer.httpChannel());
+            if (streamingDemandDriven) {
+                // Sending starts when the handler sends its first content, not now: Reactor Netty commits the status and
+                // headers as soon as sending starts, so a handler that reads the body before it answers (a refusal part way
+                // through, say) could otherwise only ever answer 200.
+                return reactor.core.publisher.Flux.from(consumer).switchOnFirst((first, all) -> response.sendObject(all).then()).then();
+            }
             return response.sendObject(consumer);
         } else {
             final ReactorNetty4NonStreamingRequestConsumer<HttpContent> consumer = new ReactorNetty4NonStreamingRequestConsumer<>(

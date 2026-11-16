@@ -23,12 +23,15 @@ import java.util.Optional;
 
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.http.DefaultHttpContent;
+import io.netty.handler.codec.http.DefaultLastHttpContent;
 import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpContent;
+import io.netty.handler.codec.http.LastHttpContent;
 import org.reactivestreams.Publisher;
 import org.reactivestreams.Subscriber;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxSink;
+import reactor.core.publisher.Mono;
 import reactor.netty.http.server.HttpServerRequest;
 import reactor.netty.http.server.HttpServerResponse;
 
@@ -42,12 +45,40 @@ class ReactorNetty4StreamingHttpChannel implements StreamingHttpChannel {
     private volatile boolean lastChunkReceived = false;
 
     ReactorNetty4StreamingHttpChannel(HttpServerRequest request, HttpServerResponse response, StreamingHttpContentSender sender) {
+        this(request, response, sender, null);
+    }
+
+    /**
+     * Creates a channel whose request chunks are read from the connection only as the handler asks for them.
+     *
+     * @param content the request's content, or null to have chunks pushed through {@link #receiveChunk} as they arrive.
+     *     Read on demand, a handler that has not asked for more stops the socket being read, and TCP slows the client,
+     *     rather than chunks queuing in memory without bound.
+     */
+    ReactorNetty4StreamingHttpChannel(
+        HttpServerRequest request,
+        HttpServerResponse response,
+        StreamingHttpContentSender sender,
+        Flux<HttpContent> content
+    ) {
         this.request = request;
         this.response = response;
         this.sender = sender;
-        this.receiver = Flux.create(producer -> this.producer = producer);
+        if (content == null) {
+            this.receiver = Flux.create(producer -> this.producer = producer);
+            this.demandDriven = false;
+        } else {
+            // The chunk copies its bytes as it is made, inside onNext, so the buffer Reactor Netty releases after it is
+            // no longer referenced. The last chunk ends the stream, whether it is the request's own or the one appended.
+            this.receiver = content.concatWith(Mono.just(DefaultLastHttpContent.EMPTY_LAST_CONTENT))
+                .map(chunk -> (HttpChunk) new ReactorNetty4HttpChunk(chunk.content(), chunk instanceof LastHttpContent))
+                .takeUntil(HttpChunk::isLast);
+            this.demandDriven = true;
+        }
         this.request.withConnection(connection -> Netty4Utils.addListener(connection.channel().closeFuture(), closeContext));
     }
+
+    private final boolean demandDriven;
 
     @Override
     public boolean isOpen() {
@@ -119,7 +150,7 @@ class ReactorNetty4StreamingHttpChannel implements StreamingHttpChannel {
 
     @Override
     public boolean isReadable() {
-        return producer != null;
+        return demandDriven || producer != null;
     }
 
     @Override

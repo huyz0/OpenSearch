@@ -29,8 +29,23 @@ class ReactorNetty4StreamingRequestConsumer<T extends HttpContent> implements Co
         HttpServerRequest request,
         HttpServerResponse response
     ) {
+        this(transport, request, response, null);
+    }
+
+    /**
+     * Creates the consumer.
+     *
+     * @param content the request's content to be read as the handler asks for it, or null to push every chunk through
+     *     {@link #accept} as it arrives
+     */
+    ReactorNetty4StreamingRequestConsumer(
+        ReactorNetty4HttpServerTransport transport,
+        HttpServerRequest request,
+        HttpServerResponse response,
+        reactor.core.publisher.Flux<HttpContent> content
+    ) {
         this.sender = new ReactorNetty4StreamingResponseProducer();
-        this.httpChannel = new ReactorNetty4StreamingHttpChannel(request, response, sender);
+        this.httpChannel = new ReactorNetty4StreamingHttpChannel(request, response, sender, content);
         transport.serverAcceptedChannel(httpChannel);
     }
 
