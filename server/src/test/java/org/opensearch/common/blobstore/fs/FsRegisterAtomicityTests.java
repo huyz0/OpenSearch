@@ -176,6 +176,25 @@ public class FsRegisterAtomicityTests extends OpenSearchTestCase {
         }
     }
 
+    public void testRegisterCoordinationIsHiddenAndLongNamesRemainUsable() throws Exception {
+        try (var store = new FsBlobStore(1024, createTempDir(), false)) {
+            final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath()));
+            final String name = "r".repeat(255);
+            final long generation = container.createRegisterIfAbsent(name, new BytesArray("value")).currentGeneration();
+            assertEquals(Set.of(name), container.listBlobs().keySet());
+            assertTrue(container.children().isEmpty());
+            assertTrue(container.children(null, 10).isEmpty());
+            assertEquals(
+                java.util.List.of(name),
+                container.listBlobsByPrefix("", null, 10).stream().map(org.opensearch.common.blobstore.BlobMetadata::name).toList()
+            );
+            assertTrue(container.deleteRegisterIfUnchanged(name, generation));
+            assertTrue(container.listBlobs().isEmpty());
+            assertTrue(container.createRegisterIfAbsent(name, new BytesArray("new-incarnation")).applied());
+            assertEquals(1L, container.delete().blobsDeleted());
+        }
+    }
+
     public void testConcurrentRegistersKeepTheirLocksIndependent() throws Exception {
         try (var store = new FsBlobStore(1024, createTempDir(), false)) {
             final ConditionalBlobContainer container = ConditionalBlobContainer.of(store.blobContainer(BlobPath.cleanPath()));
