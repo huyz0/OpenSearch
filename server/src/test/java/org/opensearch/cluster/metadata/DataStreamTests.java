@@ -48,6 +48,24 @@ import static org.hamcrest.Matchers.equalTo;
 
 public class DataStreamTests extends AbstractSerializingTestCase<DataStream> {
 
+    public void testExplicitGenerationSnapshotPreservesLegacyBackingNames() throws Exception {
+        final var backing = new Index("restored-backing", "uuid-restored");
+        final var snapshot = new DataStream("events", createTimestampField("@timestamp"), List.of(backing), 7L);
+        assertEquals(List.of(backing), snapshot.getIndices());
+        assertEquals(7L, snapshot.getGeneration());
+        assertEquals(snapshot, copyInstance(snapshot, org.opensearch.Version.CURRENT));
+    }
+
+    public void testCreationAndRolloverKeepTheirNamingChecks() {
+        final var backing = new Index("restored-backing", "uuid-restored");
+        expectThrows(AssertionError.class, () -> new DataStream("events", createTimestampField("@timestamp"), List.of(backing)));
+        final var snapshot = new DataStream("events", createTimestampField("@timestamp"), List.of(backing), 7L);
+        expectThrows(AssertionError.class, () -> snapshot.rollover(new Index("wrong-next-name", "uuid-next")));
+        final var rolled = snapshot.rollover(new Index(getDefaultBackingIndexName("events", 8L), "uuid-next"));
+        assertEquals(8L, rolled.getGeneration());
+        assertEquals(backing, rolled.getIndices().get(0));
+    }
+
     public static List<Index> randomIndexInstances() {
         int numIndices = randomIntBetween(0, 128);
         List<Index> indices = new ArrayList<>(numIndices);
