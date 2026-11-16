@@ -77,6 +77,28 @@ public class FsBlobStore implements BlobStore {
     }
 
     @Override
+    public void validateKey(BlobPath path, String blobName) {
+        for (String component : path) {
+            validateComponent(component);
+        }
+        validateComponent(blobName);
+    }
+
+    private static void validateComponent(String component) {
+        final boolean windows = org.apache.lucene.util.Constants.WINDOWS;
+        final int length = windows ? component.length() : component.getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+        if (length > 255) {
+            throw new IllegalArgumentException(
+                "filesystem key component exceeds the 255 "
+                    + (windows ? "UTF-16 code-unit" : "UTF-8 byte")
+                    + " limit (requires "
+                    + length
+                    + ")"
+            );
+        }
+    }
+
+    @Override
     public BlobContainer blobContainer(BlobPath path) {
         try {
             return new FsBlobContainer(this, path, buildAndCreate(path));

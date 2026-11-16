@@ -50,6 +50,16 @@ public interface BlobStore extends Closeable {
     BlobContainer blobContainer(BlobPath path);
 
     /**
+     * Checks backend-specific key constraints before publishing metadata that refers to the key.
+     * Implementations must not create the container or write data. Decorators must delegate this check.
+     *
+     * @param path the container path
+     * @param blobName a blob that will be addressed in the container
+     * @throws IllegalArgumentException if the backend cannot represent the key
+     */
+    default void validateKey(BlobPath path, String blobName) {}
+
+    /**
      * Returns statistics on the count of operations that have been performed on this blob store
      */
     /**
