@@ -129,9 +129,10 @@ final class FleetLoad implements Closeable {
         }
         threads.clear();
         // And every write already sent, so a check that follows sees each of them with its answer.
-        if (inFlight.tryAcquire(MAX_IN_FLIGHT, 3, TimeUnit.MINUTES)) {
-            inFlight.release(MAX_IN_FLIGHT);
+        if (inFlight.tryAcquire(MAX_IN_FLIGHT, 3, TimeUnit.MINUTES) == false) {
+            throw new IllegalStateException("fleet write ledger did not drain");
         }
+        inFlight.release(MAX_IN_FLIGHT);
     }
 
     /** Writes the client could not send because {@link #MAX_IN_FLIGHT} were already outstanding. */
@@ -448,14 +449,14 @@ final class FleetLoad implements Closeable {
         return new Window(kind, acked + refused + unknown, acked, refused, unknown, percentile(latencies, 50), percentile(latencies, 99));
     }
 
-    /** The ledger's writes ending between two instants to indices the filter accepts, as a window. */
+    /** The drained ledger's writes started in the half-open interval, grouped by index. */
     Window ledgerWindow(long fromNanos, long toNanos, java.util.function.Predicate<String> index) {
         final List<Long> latencies = new ArrayList<>();
         long acked = 0;
         long refused = 0;
         long unknown = 0;
         for (FleetLedger.Write write : ledger.writes()) {
-            if (write.endedNanos() < fromNanos || write.endedNanos() > toNanos || index.test(write.index()) == false) {
+            if (write.startedNanos() < fromNanos || write.startedNanos() >= toNanos || index.test(write.index()) == false) {
                 continue;
             }
             switch (write.outcome()) {

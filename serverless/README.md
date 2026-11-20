@@ -103,6 +103,8 @@ If something here looks like a hang, measure before concluding.
 
 ## Testing
 
+See [pilot readiness](pilot-readiness.md) for the required RustFS smoke, fleet checks and matched workload procedure.
+
 `:serverless:testkit:test` is 549 tests. `processTest` forks real JVMs, `pluginTest` installs a
 real assembled plugin, `tlsTest` does a real handshake. `s3Test` needs a live S3-compatible endpoint
 (RustFS, MinIO or SeaweedFS) and assume-skips without one.
@@ -243,11 +245,10 @@ unpublished record of every shard is, so a successor reads it without a listing.
 - **Deleting.** A node deletes its own blobs behind the trim point its lease records: the oldest record any of its
   shards has not published. A survivor deletes a dead node's log once every shard it names has published past it.
   Neither lists.
-- **Lifecycle rule.** A delete that fails, or a fence above another, leaves a blob nothing names. Give the bucket a
-  lifecycle rule that expires objects under the `nodelog/` prefix after some days; seven is a reasonable choice.
-  It must exceed the longest any record can stay unpublished, which for a running fleet is the publish age plus a
-  takeover. A whole fleet down for longer than the rule loses what its logs held unpublished, so set it beyond any
-  outage the deployment means to recover from.
+- **WAL retention.** Keep age-based object expiration off the live `nodelog/` prefix. An acknowledged record can be
+  the only durable copy until a commit covers it, including while the whole fleet is offline. Let the shell reclaim
+  covered records using its persisted trim and replay state. A failed cleanup can leave unreferenced objects behind;
+  keep them until their safety to delete can be established.
 - **Node packs and log commits (both on by default).** A publish's segment blobs of up to
   `serverless.segments.node_pack.max_blob_bytes` go into the node's next pack, one PUT shared by every shard of any
   index that publishes within `serverless.segments.node_pack.linger_millis`. A publish's commit is staged on the writer

@@ -99,6 +99,10 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
 
     /** Forks a node whose credentials come from a keystore, as a deployed node's would. */
     private NodeProcess bucketNode(String name, String bucket) throws Exception {
+        return bucketNode(name, bucket, Map.of());
+    }
+
+    private NodeProcess bucketNode(String name, String bucket, Map<String, String> overrides) throws Exception {
         final Path home = createTempDir();
         NodeProcess.writeKeystore(
             home,
@@ -109,7 +113,9 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
                 org.opensearch.repositories.s3.MinioBlobStores.secretKey()
             )
         );
-        return NodeProcess.start(name, null, home, bucketSettings(bucket));
+        final Map<String, String> settings = new java.util.HashMap<>(bucketSettings(bucket));
+        settings.putAll(overrides);
+        return NodeProcess.start(name, null, home, settings);
     }
 
     private String freshBucket() throws Exception {
@@ -208,6 +214,46 @@ public class ServerlessBucketContentionTests extends OpenSearchTestCase {
             final Response found = search(b, "msg:rebuilt");
             assertEquals(200, found.status());
             assertEquals("every acknowledged write must be recoverable from the bucket alone: " + found.body(), 11, hitCount(found.body()));
+        }
+    }
+
+    public void testFullFleetHardStopRecoversUnpublishedWritesFromTheSameBucket() throws Exception {
+        assumeEndpoint();
+        final String bucket = freshBucket();
+        final MetadataPlane plane = plane(bucket);
+        final Map<String, String> lazyPublish = Map.of(
+            "serverless.wal.node_log.publish_max_age_millis",
+            "60000",
+            "serverless.wal.node_log.commits.checkpoint_millis",
+            "150000",
+            "serverless.search.tail_overlay.publish_max_age_millis",
+            "60000",
+            "serverless.segments.node_pack.enabled",
+            "false"
+        );
+        try (
+            NodeProcess first = bucketNode("before-stop-a", bucket, lazyPublish);
+            NodeProcess second = bucketNode("before-stop-b", bucket, lazyPublish)
+        ) {
+            assertEquals(200, send(first, "PUT", "/alpha?shards=1", MAPPING).status());
+            assertEquals(201, putDoc(first, "published", "{\"msg\":\"retained\",\"n\":1}").status());
+            final var publisher = plane.segmentPublisher("alpha", 0);
+            assertBusy(() -> assertTrue(publisher.readManifest().isPresent()), 30, TimeUnit.SECONDS);
+            final var before = publisher.readManifest().orElseThrow();
+            assertEquals(201, putDoc(first, "unpublished", "{\"msg\":\"retained\",\"n\":2}").status());
+            assertTrue(plane.membership().read(first.nodeId()).orElseThrow().nodeLog().isEmpty() == false);
+            first.killHard();
+            second.killHard();
+            assertFalse(first.alive());
+            assertFalse(second.alive());
+            assertEquals("there was no final publish", before.walOrdinal(), publisher.readManifest().orElseThrow().walOrdinal());
+        }
+        try (NodeProcess replacement = bucketNode("after-stop", bucket)) {
+            assertBusy(() -> {
+                final Response found = send(replacement, "GET", "/alpha/_doc/unpublished", null);
+                assertEquals(found.body(), 200, found.status());
+                assertTrue(found.body(), found.body().contains("retained"));
+            }, 90, TimeUnit.SECONDS);
         }
     }
 

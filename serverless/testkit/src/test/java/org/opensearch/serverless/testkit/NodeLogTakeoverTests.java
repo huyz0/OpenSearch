@@ -164,4 +164,38 @@ public class NodeLogTakeoverTests extends OpenSearchTestCase {
             assertEquals("the fence, and nothing read below the trim point", 1L, store.blobWrites());
         }
     }
+
+    public void testTakeoverRefusesMissingAcknowledgedHistory() throws Exception {
+        for (long missing : new long[] { 0L, 1L }) {
+            try (var store = MeterStores.create(createTempDir(), createTempDir())) {
+                final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
+                final NodeLogCommitter writer = committer(log);
+                writer.commit(A, 1L, one("a0", 0));
+                writer.commit(A, 1L, one("a1", 1));
+                final List<NodeLogEpoch> lease = writer.positions();
+                log.deleteRange(0L, missing, missing + 1L);
+
+                final NodeLogTakeover takeover = new NodeLogTakeover(log, lease, "node-2", 2L);
+                final IOException failure = expectThrows(IOException.class, () -> takeover.records(A));
+                assertTrue(failure.getMessage(), failure.getMessage().contains("missing required node-log"));
+            }
+        }
+    }
+
+    public void testTakeoverDistinguishesTheTwoOutcomesOfAnAmbiguousAppend() throws Exception {
+        for (var fault : List.of(CrashPointBlobStore.Fault.FAIL_BEFORE, CrashPointBlobStore.Fault.AMBIGUOUS)) {
+            try (var store = MeterStores.create(createTempDir(), createTempDir())) {
+                final var faulty = new CrashPointBlobStore(store);
+                final NodeLogCommitter writer = committer(new NodeLogStore(faulty, BlobPath.cleanPath(), "node-1"));
+                writer.commit(A, 1L, one("acknowledged", 0));
+                faulty.on(step -> step.kind() == CrashPointBlobStore.Kind.CREATE, fault, 1);
+                expectThrows(IOException.class, () -> writer.commit(A, 1L, one("unknown", 1)));
+                final NodeLogStore log = new NodeLogStore(store, BlobPath.cleanPath(), "node-1");
+                final NodeLogTakeover takeover = new NodeLogTakeover(log, writer.positions(), "node-2", 2L);
+
+                assertEquals(fault.landed() ? List.of("acknowledged", "unknown") : List.of("acknowledged"), ids(takeover.records(A)));
+                assertEquals(Long.valueOf(fault.landed() ? 2L : 1L), takeover.ends().get(0L));
+            }
+        }
+    }
 }

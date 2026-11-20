@@ -13,9 +13,9 @@ last poll, and gives it a level with the same rule a node uses: a minute over it
 minutes over to 2, then 3; five minutes under lowers it one. When the levels change it writes them to the cluster
 settings, serverless.cost.tenant_levels, which every node reads; nothing is written while they stay the same.
 
-It keeps nothing on disk: on start it takes the levels already in the cluster settings as its own. Nodes answer with
-totals since they started, and started_millis tells it a node restarted, so a missed poll or a second collector loses
-nothing and costs nothing.
+It keeps nothing on disk: on start it takes the levels already in the cluster settings as its own. Levels hold
+through incomplete observations. After a missed sample, restart, or membership change, the collector waits for
+two comparable snapshots before resuming its timers.
 
     usage_collector.py --nodes 10.0.0.1:9200,10.0.0.2:9200 [--interval 60] [--once] [--dry-run]
     usage_collector.py --self-test
@@ -94,17 +94,20 @@ class Collector:
     def poll(self, nodes, now):
         cost_by_tenant = {}
         budget_by_tenant = {}
-        answered = 0
-        for node in nodes:
+        samples = {}
+        expected = dict.fromkeys(nodes)
+        comparable = self.last.keys() == expected.keys()
+        for node in expected:
             try:
                 answer = self.fetch(node)
-            except Exception as e:  # a node down for one poll is counted again at the next
+                started = answer["started_millis"]
+            except Exception as e:
                 print("could not read %s: %s" % (node, e), file=sys.stderr)
                 continue
-            answered += 1
-            started = answer.get("started_millis")
             previous = self.last.get(node)
-            before = previous[1] if previous and previous[0] == started else {}
+            same_process = previous is not None and previous[0] == started
+            comparable = comparable and same_process
+            before = previous[1] if same_process else {}
             totals = {}
             for index, line in (answer.get("indices") or {}).items():
                 if index.startswith("_"):
@@ -115,18 +118,18 @@ class Collector:
                 delta = cost - before.get(index, 0.0)
                 if delta < 0:
                     delta = cost
-                if previous is not None:
-                    cost_by_tenant[tenant] = cost_by_tenant.get(tenant, 0.0) + delta
+                cost_by_tenant[tenant] = cost_by_tenant.get(tenant, 0.0) + delta
                 budget = line.get("budget_per_minute")
                 if budget is not None:
                     budget_by_tenant[tenant] = max(budget_by_tenant.get(tenant, 0), budget)
-            self.last[node] = (started, totals)
-        if answered == 0:
-            # Nothing heard is not the same as nothing spent: levels stay as they are.
-            return None
-        elapsed = None if self.last_poll is None else max(1.0, now - self.last_poll)
+            samples[node] = (started, totals)
+        elapsed = None if self.last_poll is None else now - self.last_poll
+        self.last = samples
         self.last_poll = now
-        if elapsed is None:
+        if not comparable or not expected or samples.keys() != expected.keys() or elapsed is None or elapsed <= 0:
+            for state in self.tenants.values():
+                state.over_since = None
+                state.under_since = None
             return None
         for tenant, cost in cost_by_tenant.items():
             budget = budget_by_tenant.get(tenant)
@@ -189,12 +192,8 @@ def self_test():
         # Tenant a: 15 a minute on each of two nodes, 30 in total, over its 20. Tenant b: 5 on each, under.
         totals["a"] += 15.0
         totals["b"] += 5.0
-        # n2 restarts at minute 6: its totals begin again from what it did since.
-        started2 = 1 if minute < 6 else 2
-        b2 = totals["b"] if minute < 6 else 5.0 * (minute - 5)
-        a2 = totals["a"] if minute < 6 else 15.0 * (minute - 5)
         answers["n1"] = answer(1, totals["a"], totals["b"])
-        answers["n2"] = answer(started2, a2, b2)
+        answers["n2"] = answer(1, totals["a"], totals["b"])
         levels.append(collector.poll(nodes, now))
         now += 60.0
     assert levels[0] is None, levels[0]
@@ -207,7 +206,7 @@ def self_test():
     # Then a goes quiet: down one level every five minutes.
     for minute in range(16):
         answers["n1"] = answer(1, totals["a"], totals["b"])
-        answers["n2"] = answer(2, 15.0 * 6, 5.0 * 6)
+        answers["n2"] = answer(1, totals["a"], totals["b"])
         collector.poll(nodes, now)
         now += 60.0
     assert writes == ["a=1", "a=2", "a=3", "a=2", "a=1", ""], writes
@@ -219,6 +218,35 @@ def self_test():
     for minute in range(10):
         assert quiet.poll(nodes, now + 60.0 * minute) is None
     assert quiet.tenants["a"].level == 2
+    # One quiet peer cannot stand in for a missing spending node.
+    def partial(node):
+        if node == "n2":
+            raise OSError("refused")
+        return {"started_millis": 1}
+
+    incomplete = Collector(partial, writes.append, {"a": 2}, now)
+    for minute in range(7):
+        incomplete.poll(nodes, now + 60.0 * minute)
+    assert incomplete.tenants["a"].level == 2
+
+    # A late counter covers three minutes. Its delta is not one minute of spending.
+    samples = {"n1": answer(1, 0.0, 0.0), "n2": answer(1, 0.0, 0.0)}
+    delayed = Collector(samples.__getitem__, writes.append, {}, 0.0)
+    delayed.poll(nodes, 0.0)
+    del samples["n2"]
+    delayed.poll(nodes, 60.0)
+    delayed.poll(nodes, 120.0)
+    samples["n2"] = answer(1, 30.0, 0.0)
+    delayed.poll(nodes, 180.0)
+    assert "a" not in delayed.tenants
+    samples["n2"] = answer(1, 40.0, 0.0)
+    assert delayed.poll(nodes, 240.0) == {}
+    samples["n2"] = answer(2, 10.0, 0.0)
+    assert delayed.poll(nodes, 300.0) is None
+    samples["n2"] = answer(2, 20.0, 0.0)
+    assert delayed.poll(nodes, 360.0) == {}
+    assert delayed.poll(["n2"], 420.0) is None
+
     # Started from what the cluster already has.
     again = Collector(lambda node: answers[node], writes.append, parse_levels("a=2, bad, c=x"), now)
     assert again.written == "a=2" and again.tenants["a"].level == 2

@@ -96,7 +96,8 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
 
     public void testACrashedWritersUnpublishedWritesSurviveTwoTakeovers() throws Exception {
         final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
-        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(8192, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+        final var store = MeterStores.create(createTempDir(), createTempDir());
+        final MetadataPlane plane = new MetadataPlane(store, BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", SHARDS, MAPPING, null));
 
         final ServerlessNode first = new ServerlessNode(nodeSettings("node-log-first"));
@@ -111,8 +112,9 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
                 plane.membership().read(first.localNode().getId()).orElseThrow().nodeLog().isEmpty()
             );
 
-            // The first writer never lets go; its lease runs out on the shared clock.
-            clock.addAndGet(2 * TTL);
+            // The first writer never lets go. Advance beyond a week so an old record
+            // is still indispensable when a successor takes the shard.
+            clock.addAndGet(java.util.concurrent.TimeUnit.DAYS.toMillis(8));
             second.startup().start();
             second.setMetadataPlane(plane);
             assertEquals(
@@ -140,6 +142,7 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
         } finally {
             closeQuietly(second);
             closeQuietly(first);
+            store.close();
         }
     }
 

@@ -8,6 +8,25 @@
 
 apply plugin: 'opensearch.build'
 
+// Only the emulator fixtures compile against the GCS SDK. Keep its dependency types
+// off the ordinary test compile classpath.
+sourceSets {
+  test {
+    java.exclude '**/GcsEmulator*.java'
+  }
+  gcsEmulatorTest {
+    java.srcDir 'src/test/java'
+    java.include '**/GcsEmulator*.java'
+    compileClasspath += sourceSets.test.output
+    runtimeClasspath += sourceSets.test.output
+  }
+}
+
+configurations {
+  gcsEmulatorTestImplementation.extendsFrom testImplementation
+  gcsEmulatorTestRuntimeOnly.extendsFrom testRuntimeOnly
+}
+
 dependencies {
   implementation project(':server')
   implementation project(':serverless:shell')
@@ -25,15 +44,17 @@ dependencies {
   ['com.google.cloud:google-cloud-storage:2.60.0', 'com.google.cloud:google-cloud-core:2.60.0',
    'com.google.cloud:google-cloud-core-http:2.60.0', 'com.google.api:gax:2.72.1', 'com.google.api:api-common:2.55.1',
    'com.google.auth:google-auth-library-credentials:1.41.0', 'com.google.auth:google-auth-library-oauth2-http:1.41.0',
-   'org.checkerframework:checker-qual:4.2.3'].each {
-    testCompileOnly(it) { transitive = false }
+   'org.checkerframework:checker-qual:4.2.3', 'com.google.guava:guava:33.4.0-jre'].each {
+    gcsEmulatorTestCompileOnly(it) { transitive = false }
   }
 }
 
 // The GCS plugin pins a newer guava than the one the Azure plugin takes from the version catalog, and the build
 // fails on any version conflict. Both only need it at runtime; the newer one serves both.
-configurations.named('testRuntimeClasspath').configure {
-  resolutionStrategy.force 'com.google.guava:guava:33.4.0-jre'
+['testRuntimeClasspath', 'gcsEmulatorTestRuntimeClasspath'].each { name ->
+  configurations.named(name).configure {
+    resolutionStrategy.force 'com.google.guava:guava:33.4.0-jre'
+  }
 }
 
 // Spikes (package org.opensearch.serverless.spike) live here. They are disposable probes, not a
@@ -54,6 +75,7 @@ tasks.named('test').configure {
   exclude '**/MinioBlobContainerConformanceTests.class'
   exclude '**/SeaweedBlobContainerConformanceTests.class'
   exclude '**/Rustfs*BlobContainerConformanceTests.class'
+  exclude '**/RustfsNodeLogTakeover*Tests.class'
   exclude '**/ServerlessOnObjectStoreTests.class'
   exclude '**/ServerlessBucketContentionTests.class'
   exclude '**/ServerlessCostTests.class'
@@ -117,6 +139,12 @@ tasks.register('s3Test', Test) {
   include '**/Serverless*MeasurementTests.class'
   include '**/BlobContainerWrapperGuardTests.class'
   include '**/ServerlessLogRepairTests.class'
+  include '**/RustfsNodeLogTakeover*Tests.class'
+  if (Boolean.getBoolean('tests.serverless.rustfs.gate')) {
+    systemProperty 'tests.serverless.meter.store', 's3'
+    outputs.upToDateWhen { false }
+    outputs.doNotCacheIf('requires a live RustFS store') { true }
+  }
   // Meters that run on the filesystem by default and on a live endpoint with -Dtests.serverless.meter.store=s3 (MeterStores).
   // Each assume-skips unless its own switch is set, so including them here costs nothing.
   include '**/NodeLogSoakMeterTests.class'
@@ -157,6 +185,10 @@ tasks.register('processTest', Test) {
   // Forks real JVMs *and* talks to S3, so it needs both this task's seccomp exemption and the config
   // path the AWS SDK insists on.
   include '**/ServerlessBucketContentionTests.class'
+  if (Boolean.getBoolean('tests.serverless.rustfs.gate')) {
+    outputs.upToDateWhen { false }
+    outputs.doNotCacheIf('requires a live RustFS store') { true }
+  }
   systemProperty 'opensearch.path.conf', 'config'
   systemProperty 'tests.system_call_filter', 'false'
   // The forked node must run a PRODUCTION classpath. OpenSearch's Randomness decides it is "running
@@ -198,6 +230,11 @@ tasks.register('fleetTest', Test) {
   outputs.upToDateWhen { false }
 }
 
+tasks.register('rustfsWireMeter', JavaExec) {
+  classpath = sourceSets.test.runtimeClasspath
+  mainClass = 'org.opensearch.serverless.testkit.FaultProxy'
+}
+
 /*
  * The conformance and WAL fencing suites against GCS and Azure emulators (fake-gcs-server and Azurite), through
  * the production GCS and Azure blob stores. Not part of check: it needs both emulators running, and each test
@@ -209,8 +246,8 @@ tasks.register('fleetTest', Test) {
  *   ./gradlew :serverless:testkit:emulatorTest [-Dtests.serverless.gcs.endpoint=...] [-Dtests.serverless.azure.endpoint=...]
  */
 tasks.register('emulatorTest', Test) {
-  testClassesDirs = sourceSets.test.output.classesDirs
-  classpath = sourceSets.test.runtimeClasspath
+  testClassesDirs = sourceSets.test.output.classesDirs + sourceSets.gcsEmulatorTest.output.classesDirs
+  classpath = sourceSets.test.runtimeClasspath + sourceSets.gcsEmulatorTest.runtimeClasspath
   include '**/GcsEmulator*Tests.class'
   include '**/Azurite*Tests.class'
   systemProperty 'tests.security.manager', 'false'

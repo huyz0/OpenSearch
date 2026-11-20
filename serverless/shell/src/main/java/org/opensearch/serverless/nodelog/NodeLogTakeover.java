@@ -142,6 +142,7 @@ public final class NodeLogTakeover {
     }
 
     private final boolean fence;
+    private Map<Long, Long> trimFloors;
 
     private NodeLogTakeover(NodeLogStore log, List<NodeLogEpoch> epochs, String fencedBy, long term, LeaseReader reread, boolean fence) {
         this.fence = fence;
@@ -181,8 +182,10 @@ public final class NodeLogTakeover {
         }
         final Map<Long, Long> fences = new HashMap<>();
         final Map<Long, Long> floors = new HashMap<>();
+        final Map<Long, Long> landed = new HashMap<>();
         for (NodeLogEpoch epoch : epochs) {
             floors.put(epoch.epoch(), epoch.trimPoint());
+            landed.put(epoch.epoch(), epoch.landed());
             fences.put(
                 epoch.epoch(),
                 this.fence ? log.fence(epoch.epoch(), epoch.landed(), fencedBy, term) : log.firstFree(epoch.epoch(), epoch.landed())
@@ -196,6 +199,7 @@ public final class NodeLogTakeover {
                     if (fence != null) {
                         // Nothing below a trim point the lease has recorded is needed, so the header search stops there.
                         floors.merge(now.epoch(), now.trimPoint(), Math::max);
+                        landed.merge(now.epoch(), now.landed(), Math::max);
                     }
                     if (fence != null && now.trimPoint() > fence) {
                         // Deleted past the fence after the lease this started from: the fence may be in a hole.
@@ -213,9 +217,17 @@ public final class NodeLogTakeover {
         }
         final Map<Long, Optional<Header>> found = new ConcurrentHashMap<>();
         for (NodeLogEpoch epoch : epochs) {
-            found.put(epoch.epoch(), log.lastHeaderBelow(epoch.epoch(), fences.get(epoch.epoch()), floors.get(epoch.epoch())));
+            final long id = epoch.epoch();
+            final long floor = floors.get(id);
+            final long required = landed.get(id) - 1L;
+            final Optional<Header> last = log.lastHeaderBelow(id, fences.get(id), Math.max(floor, required));
+            if (required >= floor && last.isEmpty()) {
+                throw missingRequired(id, required);
+            }
+            found.put(id, last);
         }
         ends = Map.copyOf(fences);
+        trimFloors = Map.copyOf(floors);
         lastHeaders = found;
     }
 
@@ -458,7 +470,11 @@ public final class NodeLogTakeover {
         }
         final Optional<NodeLogBlob.Entry> entry = log.readEntry(epoch, ordinal);
         if (entry.isEmpty()) {
-            // The index named a blob whose append's outcome was unknown, and it did not land.
+            // A later header proves earlier slots landed. The trim floor accounts for slots the lease allowed to delete.
+            if (last != null && ordinal >= trimFloors.get(epoch)) {
+                throw missingRequired(epoch, ordinal);
+            }
+            // A local replay can name its own ambiguous append. A published slot below the trim floor is also dispensable.
             return null;
         }
         if (entry.get() instanceof Header header) {
@@ -468,5 +484,9 @@ public final class NodeLogTakeover {
         throw new IOException(
             "node-log blob " + ordinal + " of epoch " + epoch + " of " + log.nodeId() + " is a fence below the last header"
         );
+    }
+
+    private IOException missingRequired(long epoch, long ordinal) {
+        return new IOException("missing required node-log blob " + ordinal + " of epoch " + epoch + " of " + log.nodeId());
     }
 }

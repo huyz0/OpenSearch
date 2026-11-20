@@ -342,26 +342,22 @@ public final class ShardReconciler {
                 );
             }
             final ShardId shardId = new ShardId(indexMetadata.getIndex(), assignment.shardId());
-            final IndexShard already = open.get(shardId);
-            if (already != null) {
-                if (already.getOperationPrimaryTerm() >= assignment.term()) {
-                    continue;
+            synchronized (lifecycle(shardId)) {
+                final IndexShard already = open.get(shardId);
+                if (already != null) {
+                    final boolean reader = readers.contains(shardId);
+                    if (reader == false && already.getOperationPrimaryTerm() >= assignment.term()) {
+                        continue;
+                    }
+                    // A reader at the same term holds no ownership. An older writer needs replay at the new term.
+                    if (releaseShardLocked(shardId, "reopening as writer at term " + assignment.term(), false) == false) {
+                        throw new IOException("cannot open writer for " + shardId + " while a reader is still serving a query");
+                    }
                 }
-                // Held here at an older term than the one this node has just won. The takeover fenced that
-                // term's log, so a write through the old shard would land at the fence and be refused -- and
-                // before the fence existed it landed behind the seal and was never replayed. Reopen at the
-                // term that was won, which fences this node's own earlier writer and replays what it wrote.
-                releaseShard(
-                    shardId,
-                    "reopening at term " + assignment.term() + ", won while held at " + already.getOperationPrimaryTerm()
-                );
+                // Open published files through the block cache. Recovery downloads only the ranges it reads.
+                opener.openAndStart(onBlockCache(indexMetadata), shardId, assignment.term(), view.nodes(), true, null);
+                opened.add(shardId);
             }
-            // A writer opens lazily too. It used to download every published file first, which made a
-            // cold start proportional to the shard rather than to what the first write touches; a merge
-            // reads its inputs through the block cache and writes its output locally, and the publisher
-            // inherits unchanged files by name, so nothing about publishing needed the download.
-            opener.openAndStart(onBlockCache(indexMetadata), shardId, assignment.term(), view.nodes(), true, null);
-            opened.add(shardId);
         }
         return opened;
     }

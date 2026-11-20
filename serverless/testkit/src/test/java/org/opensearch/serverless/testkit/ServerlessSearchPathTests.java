@@ -117,6 +117,32 @@ public class ServerlessSearchPathTests extends OpenSearchTestCase {
         }
     }
 
+    public void testWriterActivationLeavesAPinnedReaderIntact() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = planeOver(createTempDir(), clock);
+        plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+        writeAndPublish(plane, null, 2);
+
+        try (ServerlessNode candidate = new ServerlessNode(nodeSettings("reader-promotion", "ingest,search"))) {
+            candidate.startup().start();
+            final ShardId id = candidate.readers().serveAsReader(plane, "alpha", 0);
+            final IndexShard reader = candidate.reconciler().shard(id);
+            clock.addAndGet(2 * TTL);
+            candidate.reconciler().enter(id);
+            try {
+                expectThrows(java.io.IOException.class, () -> candidate.activation().activateWriter(plane, "alpha", 0));
+                assertSame(reader, candidate.reconciler().shard(id));
+                assertTrue(candidate.reconciler().isReader(id));
+                assertEquals(2L, ShardOps.hits(candidate.searchService(), id, "msg", "searchable"));
+            } finally {
+                candidate.reconciler().exit(id);
+            }
+            assertEquals(id, candidate.activation().activateWriter(plane, "alpha", 0).orElseThrow());
+            assertFalse(candidate.reconciler().isReader(id));
+            assertNotSame(reader, candidate.reconciler().writerShard(id));
+        }
+    }
+
     /** Scale to zero: every search node dies, and a brand-new one serves the same data. */
     public void testScaleToZeroAndBack() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
