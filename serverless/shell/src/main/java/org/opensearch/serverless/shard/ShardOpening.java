@@ -105,6 +105,7 @@ final class ShardOpening {
             step[0]++;
             at[0] = now;
         };
+        IndexShard created = null;
         try {
             final IndexService indexService = indexServiceFor(indexMetadata);
             lap.run();
@@ -161,6 +162,7 @@ final class ShardOpening {
             } finally {
                 reconciler.pendingManifests.remove(shardId);
             }
+            created = shard;
             lap.run();
             // A failed engine is reported, not just left in place: a shard whose engine has failed still counts as
             // open, and a writer's head kept naming a node that answered "engine is closed" to everything.
@@ -299,17 +301,11 @@ final class ShardOpening {
                     // free slot still names records a writer published before it let go, and replaying those changes
                     // nothing. Published before it serves, so what it replayed is in a commit and no later takeover depends on the
                     // log that held it: a predecessor's log names this shard's records only until the shard is taken.
-                    try {
-                        // What the commit is certain to hold, read before its flush, as a publish from the loop reads it.
-                        final long covered = shard.seqNoStats().getLocalCheckpoint();
-                        reconciler.publishing.publishAtOpen(shardId, shardHeadTerm);
-                        // This is the node's first publish of the shard: recorded, so the loop does not publish the same
-                        // operations again under the same term as soon as the take returns.
-                        reconciler.publishedThroughAtOpen.put(shardId, covered);
-                    } catch (IOException | RuntimeException e) {
-                        reconciler.open.remove(shardId);
-                        throw e;
-                    }
+                    // What the commit is certain to hold, read before its flush, as a publish from the loop reads it.
+                    final long covered = shard.seqNoStats().getLocalCheckpoint();
+                    reconciler.publishing.publishAtOpen(shardId, shardHeadTerm);
+                    // The next pass can skip this publish.
+                    reconciler.publishedThroughAtOpen.put(shardId, covered);
                 }
                 final ShardReconciler.NodeLogHooks hooks = reconciler.nodeLog;
                 if (armedWriters != null && hooks != null) {
@@ -337,7 +333,7 @@ final class ShardOpening {
         } catch (Exception e) {
             // Service creation can succeed before mapping, manifest lookup or shard creation fails.
             // Look it up here because indexServiceFor itself can throw after installing the service.
-            abandon(reconciler.indicesService.indexService(shardId.getIndex()), shardId, e);
+            abandon(reconciler.indicesService.indexService(shardId.getIndex()), shardId, created, e);
             throw e;
         } finally {
             // Handed in for this open only, used or not.
@@ -410,10 +406,15 @@ final class ShardOpening {
     }
 
     /** Takes a shard that never became ours back out of its IndexService, keeping the cause's own report. */
-    void abandon(IndexService indexService, ShardId shardId, Exception cause) {
+    private void abandon(IndexService indexService, ShardId shardId, IndexShard created, Exception cause) {
         try {
-            if (indexService != null && indexService.hasShard(shardId.id())) {
-                indexService.removeShard(shardId.id(), "activation failed: " + cause.getMessage());
+            if (created != null && indexService != null && indexService.getShardOrNull(shardId.id()) == created) {
+                final String reason = "activation failed: " + cause.getMessage();
+                if (reconciler.open.get(shardId) == created) {
+                    reconciler.releaseShardLocked(shardId, reason, false, true);
+                } else {
+                    indexService.removeShard(shardId.id(), reason);
+                }
             }
         } catch (Exception e) {
             cause.addSuppressed(e);

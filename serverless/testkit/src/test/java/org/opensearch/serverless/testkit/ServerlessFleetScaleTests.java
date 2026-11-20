@@ -179,14 +179,15 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         }
 
         ledger = new FleetLedger(results.resolve("ledger.csv"));
+        final double churnRate = Double.parseDouble(prop("churn_per_second", "5"));
         final FleetLoad.Shape steady = new FleetLoad.Shape(
             Math.min(population, activePerNode * nodes),
             population,
             0.05,
-            0.05,
+            churnRate > 0 ? 0.05 : 0.0,
             50,
             Double.parseDouble(prop("writes_per_second", "100")),
-            Double.parseDouble(prop("churn_per_second", "5"))
+            churnRate
         );
         load = new FleetLoad(() -> List.copyOf(fleet), ledger, steady, runId);
         final Thread sampler = startActivationSampler();
@@ -649,13 +650,17 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
 
     /** kill -9 of the node holding the most shards, writes continuing; how long until each of its shards takes writes again. */
     private void kill(int seconds) throws Exception {
+        final boolean isolationGate = Boolean.parseBoolean(prop("kill_isolation", "false"));
+        final int recoveryBudget = Math.max(seconds, (int) (6 * ttlMillis / 1000));
+        final long baselineStart = System.nanoTime();
+        if (isolationGate) {
+            sleepSeconds(recoveryBudget);
+        }
         final int victim = victimNode();
         final NodeProcess node = fleet.get(victim);
         final List<String> owned = shardsOwnedBy(node.nodeId());
         line("- killing " + node.name() + ", which owned " + owned.size() + " shards; lease TTL " + ttlMillis + " ms");
         final long leaseExpiresAt = plane.membership().read(node.nodeId()).map(l -> l.expiresAtMillis()).orElse(-1L);
-        final long killedAtMillis = System.currentTimeMillis();
-        final long killedAt = System.nanoTime();
         fleet.remove(node);
         final Map<String, Long> sourcesBefore = new TreeMap<>();
         for (String source : org.opensearch.serverless.reconcile.BackgroundReconciler.ACTIVATION_SOURCES) {
@@ -663,6 +668,10 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         }
         final long routedBefore = fleetSum("capacity", "takeover_writes_routed");
         final long leftBefore = fleetSum("capacity", "takeover_doubts_left");
+        final long killedAtMillis = System.currentTimeMillis();
+        final long killedAt = System.nanoTime();
+        final long deadline = killedAt + TimeUnit.SECONDS.toNanos(recoveryBudget);
+        final long shedAtKill = load.shed();
         node.killHard();
         acquiredAfter.clear();
         // Each survivor's activation queue while it takes the dead node's shards: how deep, and how long the longest wait.
@@ -694,7 +703,7 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
         watcher.start();
         final Map<String, Long> takeover;
         try {
-            takeover = probeUntilWritable(owned, killedAt, Math.max(seconds, (int) (6 * ttlMillis / 1000)), node.nodeId());
+            takeover = probeUntilWritable(owned, killedAt, recoveryBudget, node.nodeId());
         } finally {
             watching.set(false);
             watcher.join(30_000);
@@ -743,12 +752,39 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 )
             );
         }
-        line("- writes from the kill until every shard was back: " + load.window("write", killedAt, killedAt + maxOr(takeover, 0L)));
-        // Split: the dead node's own shards cannot be written until they are taken; everything else should not notice.
+        // A fixed observation window includes recovery failures and is comparable to the no-fault control.
+        if (isolationGate) {
+            sleepSeconds(Math.max(0L, TimeUnit.NANOSECONDS.toSeconds(deadline - System.nanoTime()) + 1));
+        }
+        final long measuredUntil = isolationGate || takeover.size() != owned.size() ? deadline : killedAt + maxOr(takeover, 0L);
+        load.stop();
         final Set<String> deadIndices = new java.util.HashSet<>(owned);
-        final long backAt = killedAt + maxOr(takeover, 0L);
-        line("  - to the dead node's shards: " + load.ledgerWindow(killedAt, backAt, deadIndices::contains));
-        line("  - to every other shard: " + load.ledgerWindow(killedAt, backAt, index -> deadIndices.contains(index) == false));
+        final java.util.function.Predicate<String> healthy = index -> deadIndices.contains(index) == false;
+        final FleetLoad.Window unaffected = load.ledgerWindow(killedAt, measuredUntil, healthy);
+        line("- writes started in the kill observation window:");
+        line("  - to the dead node's shards: " + load.ledgerWindow(killedAt, measuredUntil, deadIndices::contains));
+        line("  - to every other shard: " + unaffected);
+        if (isolationGate) {
+            final FleetLoad.Window baseline = load.ledgerWindow(
+                baselineStart,
+                baselineStart + TimeUnit.SECONDS.toNanos(recoveryBudget),
+                healthy
+            );
+            line("  - same healthy cohort without a failure: " + baseline);
+            writeReport();
+            assertFalse("no affected shards in kill isolation run", owned.isEmpty());
+            assertEquals("all affected shards must acknowledge by the deadline", owned.size(), takeover.size());
+            assertTrue("load generator shed writes during takeover", load.shed() == shedAtKill);
+            assertTrue("both healthy cohorts must include successful writes", baseline.acked() > 0 && unaffected.acked() > 0);
+            assertTrue(
+                "healthy write errors exceed control by more than five percentage points",
+                unaffected.errorRate() <= baseline.errorRate() + 0.05
+            );
+            assertTrue("healthy write p99 exceeds twice the control", unaffected.p99Millis() <= 2L * Math.max(1L, baseline.p99Millis()));
+            final Map<String, Long> stable = probeUntilWritable(owned, System.nanoTime(), 10, node.nodeId());
+            assertEquals("all affected shards must remain writable before the dead process returns", owned.size(), stable.size());
+        }
+        load.start();
         sleepSeconds(Math.max(0, seconds - (int) TimeUnit.NANOSECONDS.toSeconds(System.nanoTime() - killedAt)));
         fleet.add(victim, startNode(victim));
     }
@@ -1970,6 +2006,8 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
     }
 
     private void header(int nodes, int population, int activePerNode, int seconds, String endpoint, String bucket) {
+        final String churnRate = prop("churn_per_second", "5");
+        final String churnShare = Double.parseDouble(churnRate) > 0 ? "5%" : "0%";
         line("# Fleet run " + Instant.now());
         line("");
         line("- nodes " + nodes + ", heap " + prop("heap", "2g") + " each, shard cap " + prop("max_shards", "100") + " per node");
@@ -1979,8 +2017,10 @@ public class ServerlessFleetScaleTests extends OpenSearchTestCase {
                 + prop("writes_per_second", "100")
                 + " writes/s, open-loop with up to "
                 + FleetLoad.MAX_IN_FLIGHT
-                + " in flight, 5% to dormant indices, 5% to churned names; churn "
-                + prop("churn_per_second", "5")
+                + " in flight, 5% to dormant indices, "
+                + churnShare
+                + " to churned names; churn "
+                + churnRate
                 + " ops/s; a wide search every 2 s; gets every 100 ms"
         );
         line("- store " + endpoint + ", bucket " + bucket + "; lease TTL " + ttlMillis + " ms; each scenario " + seconds + " s");

@@ -550,12 +550,7 @@ final class ShardActivations {
                 }
             }
             try {
-                if (open != null) {
-                    // Held as a reader. That used to count as held, so a node that had searched a shard could
-                    // never become its writer until idle release let the reader go. A reader holds no head
-                    // and no unpublished write, so closing it costs nothing.
-                    reconciler.node.reconciler().releaseShard(open, "reopening as a writer");
-                }
+                // The writer open promotes a local reader under the shard's lifecycle lock, after it has won the head.
                 final Optional<ShardId> taken = reconciler.node.activation().activateWriter(reconciler.plane, indexName, shard);
                 // Its idle clock starts here, so a shard just taken is not immediately a candidate for being
                 // given straight back -- whether it was wanted or taken on demand.

@@ -48,6 +48,7 @@ import java.util.concurrent.locks.LockSupport;
  */
 final class FaultProxy implements Closeable {
 
+    private static final java.util.regex.Pattern RETRY_ATTEMPT = java.util.regex.Pattern.compile("\\battempt=(?:[2-9]|[1-9][0-9]+)\\b");
     /** A generator per connection thread; these are not test threads, so the framework's randomness is out of reach. */
     private final ThreadLocal<java.util.Random> random = ThreadLocal.withInitial(() -> new java.util.Random(System.nanoTime()));
 
@@ -55,6 +56,7 @@ final class FaultProxy implements Closeable {
     private final InetSocketAddress upstream;
     private final ServerSocket server;
     private final Thread acceptor;
+    private final boolean reportCounts;
     private final Set<Socket> open = ConcurrentHashMap.newKeySet();
     private volatile boolean closed;
 
@@ -67,14 +69,32 @@ final class FaultProxy implements Closeable {
     private final Map<String, AtomicLong> byArea = new ConcurrentHashMap<>();
     private final AtomicLong injected = new AtomicLong();
     private final AtomicLong refused = new AtomicLong();
+    private final AtomicLong sdkRetries = new AtomicLong();
 
     FaultProxy(String name, String upstreamHost, int upstreamPort) throws IOException {
+        this(name, upstreamHost, upstreamPort, false);
+    }
+
+    private FaultProxy(String name, String upstreamHost, int upstreamPort, boolean reportCounts) throws IOException {
         this.name = name;
+        this.reportCounts = reportCounts;
         this.upstream = new InetSocketAddress(InetAddress.getByName(upstreamHost), upstreamPort);
         this.server = new ServerSocket(0, 256, InetAddress.getLoopbackAddress());
         this.acceptor = new Thread(this::accept, "fault-proxy-" + name);
         this.acceptor.setDaemon(true);
         this.acceptor.start();
+    }
+
+    /** Runs a loopback-only meter in front of a local RustFS process. */
+    @SuppressForbidden(reason = "the command line meter writes its bound address to stdout")
+    public static void main(String[] args) throws Exception {
+        if (args.length != 1) {
+            throw new IllegalArgumentException("usage: FaultProxy <local RustFS port>");
+        }
+        try (FaultProxy proxy = new FaultProxy("rustfs-meter", "127.0.0.1", Integer.parseInt(args[0]), true)) {
+            System.out.println("RustFS wire meter: " + proxy.endpoint());
+            proxy.acceptor.join();
+        }
     }
 
     /** The endpoint a node should be pointed at instead of the store. */
@@ -129,6 +149,7 @@ final class FaultProxy implements Closeable {
         byArea.clear();
         injected.set(0);
         refused.set(0);
+        sdkRetries.set(0);
     }
 
     private void accept() {
@@ -169,6 +190,10 @@ final class FaultProxy implements Closeable {
                 if (request == null) {
                     return;
                 }
+                if (reportCounts && "GET".equals(request.method()) && "/__serverless_wire_counts".equals(request.target())) {
+                    replyWithCounts(toClient);
+                    return;
+                }
                 final String op = classify(request);
                 byArea.computeIfAbsent(op + " " + area(request.target()), k -> new AtomicLong()).incrementAndGet();
                 final long delay = latencyMillis;
@@ -184,6 +209,10 @@ final class FaultProxy implements Closeable {
                     return;
                 }
                 requests.computeIfAbsent(op, k -> new AtomicLong()).incrementAndGet();
+                final String attempt = request.header("amz-sdk-request");
+                if (reportCounts && attempt != null && RETRY_ATTEMPT.matcher(attempt).find()) {
+                    sdkRetries.incrementAndGet();
+                }
                 if (store == null) {
                     store = new Socket();
                     store.connect(upstream, 10_000);
@@ -239,6 +268,20 @@ final class FaultProxy implements Closeable {
                 open.remove(store);
             }
         }
+    }
+
+    private void replyWithCounts(OutputStream output) throws IOException {
+        final StringBuilder counts = new StringBuilder();
+        counts().forEach((operation, count) -> counts.append(operation).append(' ').append(count).append('\n'));
+        counts.append("SDK_RETRIES ").append(sdkRetries.get()).append('\n');
+        final byte[] body = counts.toString().getBytes(StandardCharsets.UTF_8);
+        output.write(
+            ("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: " + body.length + "\r\n\r\n").getBytes(
+                StandardCharsets.US_ASCII
+            )
+        );
+        output.write(body);
+        output.flush();
     }
 
     /** Relays a response; false when the connection cannot carry another request. */

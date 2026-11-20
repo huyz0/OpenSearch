@@ -11,7 +11,6 @@ import org.opensearch.cluster.ClusterState;
 import org.opensearch.cluster.metadata.IndexMetadata;
 import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.core.index.shard.ShardId;
-import org.opensearch.index.shard.IndexShard;
 import org.opensearch.serverless.metadata.PointInTime;
 import org.opensearch.serverless.store.CommitManifest;
 
@@ -90,27 +89,20 @@ final class ShardReaders {
                             + "An empty result here would be indistinguishable from an empty index."
                     )
                 );
-        // Readers read blocks; they do not download segments. The store type is set here rather than in
-        // the descriptor because it is a property of how this node is serving the shard, not of the index.
-        final IndexShard opened = reconciler.opener.openAndStart(
-            ShardReconciler.onBlockCache(indexMetadata),
-            shardId,
-            manifest.term(),
-            view.nodes(),
-            false,
-            manifest
-        );
         synchronized (reconciler.lifecycle(shardId)) {
-            // Recorded as a reader only if it is still the shard open under this id. A write can take the shard
-            // for this node's writer between the open and here, and a writer recorded as a reader is closed as
-            // one -- by a pass that believes it holds no head -- while its head stays behind.
-            if (reconciler.open.get(shardId) == opened) {
-                reconciler.readers.add(shardId);
-                // What it is a cache of. A reader never changes commit while it is open -- a ReadOnlyEngine is
-                // opened on one and core offers no way to move it -- so the only way to notice the commit has
-                // moved on is to remember which one this is and compare.
-                reconciler.readerCommits.put(shardId, manifest);
+            // A writer or another reader can have opened while we fetched the manifest.
+            if (reconciler.open.containsKey(shardId)) {
+                return shardId;
             }
+            reconciler.opener.openAndStart(
+                ShardReconciler.onBlockCache(indexMetadata),
+                shardId,
+                manifest.term(),
+                view.nodes(),
+                false,
+                manifest
+            );
+            reconciler.readerCommits.put(shardId, manifest);
         }
         return shardId;
     }
@@ -235,14 +227,14 @@ final class ShardReaders {
                     .build()
             )
             .build();
-        reconciler.opener.openAndStart(frozen, shardId, manifest.term(), nodes, false, manifest);
-        reconciler.readers.add(shardId);
-        // A view serves a commit like any other reader, so it records which one. It is exempt from the
-        // staleness pass because it is a view, not because it forgot -- and the difference matters: the
-        // exemption was at first protected only by this line's absence, which is an accident rather than a
-        // guarantee and the canary for it could not fail.
-        reconciler.readerCommits.put(shardId, manifest);
-        reconciler.frozenViews.add(shardId);
+        synchronized (reconciler.lifecycle(shardId)) {
+            if (reconciler.open.containsKey(shardId)) {
+                return shardId;
+            }
+            reconciler.opener.openAndStart(frozen, shardId, manifest.term(), nodes, false, manifest);
+            reconciler.readerCommits.put(shardId, manifest);
+            reconciler.frozenViews.add(shardId);
+        }
         return shardId;
     }
 

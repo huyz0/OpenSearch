@@ -568,7 +568,7 @@ public final class BlockCache {
         Stripe(int max) {
             this.blocks = new LinkedHashMap<>(16, 0.75f, true) {
                 @Override
-                protected boolean removeEldestEntry(Map.Entry<String, Entry> eldest) {
+                protected boolean removeEldestEntry(Map.Entry<String, BlockCache.Entry> eldest) {
                     if (size() > max) {
                         evictedBytes += eldest.getValue().block.length;
                         return true;

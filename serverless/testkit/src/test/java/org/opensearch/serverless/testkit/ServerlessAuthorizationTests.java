@@ -90,6 +90,15 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
     public static final class ReadOnlyForEveryoneElsePlugin extends Plugin implements ActionPlugin {
 
         static final AtomicReference<ThreadContext> CONTEXT = new AtomicReference<>();
+        private final boolean restrictReads;
+
+        public ReadOnlyForEveryoneElsePlugin() {
+            this(false);
+        }
+
+        private ReadOnlyForEveryoneElsePlugin(boolean restrictReads) {
+            this.restrictReads = restrictReads;
+        }
 
         @Override
         public java.util.Collection<Object> createComponents(
@@ -137,7 +146,13 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
                     final ThreadContext context = CONTEXT.get();
                     final String caller = context == null ? null : context.getTransient(ServerlessAuthPlugin.PRINCIPAL);
                     final boolean changesSomething = action.startsWith("indices:data/write") || action.startsWith("indices:admin/create");
-                    if (changesSomething && ADMIN.equals(caller) == false) {
+                    final boolean readsOutsideScope = restrictReads
+                        && "reader".equals(caller)
+                        && action.startsWith("indices:data/read")
+                        && (request instanceof org.opensearch.action.IndicesRequest indices
+                            && indices.indices() != null
+                            && List.of(indices.indices()).equals(List.of("alpha"))) == false;
+                    if ((changesSomething || readsOutsideScope) && ADMIN.equals(caller) == false) {
                         listener.onFailure(
                             new OpenSearchSecurityException(
                                 "[" + action + "] is not permitted for [" + (caller == null ? "an unidentified caller" : caller) + "]",
@@ -181,19 +196,21 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
         plane.createIndex(new IndexDescriptor("alpha", "uuid-alpha-00000000", 1, MAPPING, null));
+        plane.createIndex(new IndexDescriptor("beta", "uuid-beta-000000000", 1, MAPPING, null));
         plane.createIndex(new IndexDescriptor(".serverless_auth", "uuid-auth-000000000", 1, AUTH_MAPPING, null));
         final Settings settings = nodeSettings("authz");
 
         try (
             ServerlessNode node = new ServerlessNode(
                 settings,
-                List.of(ServerlessAuthPlugin.withClock(settings, System::currentTimeMillis), new ReadOnlyForEveryoneElsePlugin())
+                List.of(ServerlessAuthPlugin.withClock(settings, System::currentTimeMillis), new ReadOnlyForEveryoneElsePlugin(true))
             )
         ) {
             node.startup().start();
             node.setMetadataPlane(plane);
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
             loop.want("alpha", 0);
+            loop.want("beta", 0);
             loop.want(".serverless_auth", 0);
             loop.tick(clock.get());
 
@@ -210,6 +227,17 @@ public class ServerlessAuthorizationTests extends OpenSearchTestCase {
             final Response read = send(node, "POST", "/alpha/_search", asReader, "{\"query\":{\"match_all\":{}}}");
             assertEquals("a reader must be allowed to read: " + read.body(), 200, read.status());
             assertTrue(read.body().contains("written by admin"));
+
+            final Response other = send(node, "PUT", "/beta/_doc/1?refresh=true", asAdmin, "{\"msg\":\"private to beta\"}");
+            assertEquals(other.body(), 201, other.status());
+            for (String target : List.of("beta", "alpha,beta", "b*")) {
+                final Response outside = send(node, "POST", "/" + target + "/_search", asReader, "{\"query\":{\"match_all\":{}}}");
+                assertEquals(outside.body(), 403, outside.status());
+                assertFalse(outside.body(), outside.body().contains("private to beta"));
+            }
+            final Response allowed = send(node, "POST", "/beta/_search", asAdmin, "{\"query\":{\"match_all\":{}}}");
+            assertEquals(allowed.body(), 200, allowed.status());
+            assertTrue(allowed.body(), allowed.body().contains("private to beta"));
 
             // And is refused the write, with the plugin's own status and the plugin's own words.
             final Response byReader = send(node, "PUT", "/alpha/_doc/2?refresh=true", asReader, "{\"msg\":\"written by reader\"}");
