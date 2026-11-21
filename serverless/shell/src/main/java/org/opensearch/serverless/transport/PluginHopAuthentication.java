@@ -43,13 +43,13 @@ import java.util.function.Supplier;
  * called without naming the shell. A plugin does what it does on a classic node and the hop is signed
  * underneath it.
  *
- * <p><b>Only plugin actions, and decided per message rather than per registration.</b> Signing everything
- * would put a MAC on the transport handshake, which runs while the connection that would carry it is still
- * being established. Deciding at registration is not possible either: a plugin's handler registers from
- * its own constructor, which the shell runs <em>while</em> it is still building the registry this consults.
- * So every handler is wrapped and the wrapper asks, once a message has actually arrived, whether this
- * action is one a plugin brought. Everything else is delegated untouched, which is every path that existed
- * before this class.
+ * <p>On send, sign declared plugin actions and requests marked by the shell's router after the transport has
+ * put the outgoing span in scope. This keeps every transmitted header covered by the MAC. The transport
+ * handshake is outside both sets of actions.
+ *
+ * <p>On receive, verify plugin actions here. The shell's own handlers verify in their handler bodies.
+ * Check the plugin action registry when a message arrives because the handlers are registered while the
+ * registry is still being built.
  *
  * <p><b>What the far side gets.</b> {@link ShardRouter#withMac} puts the deployment's MAC on the outgoing
  * request and marks it as plugin-originated when the caller is acting as a plugin; the thread context
@@ -92,15 +92,12 @@ public final class PluginHopAuthentication implements TransportInterceptor {
                 TransportRequestOptions options,
                 TransportResponseHandler<T> handler
             ) {
-                final ShardRouter signer = signerFor(action);
-                if (signer == null) {
+                final ShardRouter signer = router.get();
+                if (signer == null || (signer.shouldSign(request) == false && Boolean.TRUE.equals(isPluginAction.apply(action)) == false)) {
                     sender.sendRequest(connection, action, request, options, handler);
                     return;
                 }
-                // The same try-with-resources the shell's own forwards use: the headers go on the caller's
-                // context so they are written into the request, and come off again when this returns.
-                // sendRequest serialises the context synchronously, so the asynchronous completion below
-                // does not need them.
+                // Capture the headers while the outgoing transport span is in scope.
                 try (var ignored = signer.withMac(action, request, connection.getNode())) {
                     sender.sendRequest(connection, action, request, options, handler);
                 } catch (IOException e) {

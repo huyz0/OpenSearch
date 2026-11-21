@@ -26,6 +26,7 @@ import org.opensearch.serverless.plugins.PluginInjector;
 import org.opensearch.serverless.plugins.ServerlessPlugins;
 import org.opensearch.serverless.rest.SystemIndices;
 import org.opensearch.serverless.transport.ShardRouter;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.Transport;
@@ -55,6 +56,7 @@ public final class ServerlessNode extends NodeContext implements Closeable {
 
     /** Wires this node's REST and transport layers. */
     final NodeWiring wiring = new NodeWiring(this);
+    NodeTelemetry telemetry;
 
     @Override
     protected void beforeAcceptingRequests() {
@@ -181,6 +183,12 @@ public final class ServerlessNode extends NodeContext implements Closeable {
         services.clientFactory(() -> new ServerlessClient(this.settings, threadPool, () -> this, this::metadataPlane));
         boolean success = false;
         try {
+            telemetry = NodeTelemetry.create(
+                this.settings,
+                clusterSettings,
+                threadPool,
+                this.plugins.filter(org.opensearch.plugins.TelemetryPlugin.class)
+            );
             // The plugins build their components here, before the REST controller, the network module and the
             // transport exist -- the order a classic node uses, and the one plugins are written for. Each of
             // those asks the plugins for something (a request wrapper, REST handlers, transport interceptors),
@@ -200,7 +208,9 @@ public final class ServerlessNode extends NodeContext implements Closeable {
                         environment,
                         nodeEnvironment(),
                         services.namedWriteableRegistry(),
-                        services.indexNameExpressionResolver()
+                        services.indexNameExpressionResolver(),
+                        telemetry.tracer(),
+                        telemetry.metrics()
                     )
                 );
             } catch (Exception e) {
@@ -219,23 +229,27 @@ public final class ServerlessNode extends NodeContext implements Closeable {
             this.systemIndices = new SystemIndices(this.plugins.systemIndexPatterns(this.settings));
             this.systemIndex = systemIndices::contains;
             this.restController = wiring.buildRestController(clusterSettings);
-            final NetworkModule networkModule = services.buildNetworkModule(clusterSettings, restController);
+            final Tracer protocolTracer = telemetry.tracer() == NoopTracer.INSTANCE
+                ? NoopTracer.INSTANCE
+                : new ProtocolTracer(telemetry.tracer(), action -> transportService.getRequestHandler(action) != null);
+            final NetworkModule networkModule = services.buildNetworkModule(clusterSettings, restController, protocolTracer);
             final Transport transport = networkModule.getTransportSupplier().get();
             this.transportService = new TransportService(
                 this.settings,
                 transport,
                 null,
                 threadPool,
-                wiring.authenticatedPluginHops(networkModule.getTransportInterceptor()),
+                wiring.authenticatedPeerHops(networkModule.getTransportInterceptor()),
                 boundAddress -> NodeComponents.discoveryNode(nodeName, nodeEnvironment.nodeId(), boundAddress.publishAddress(), roles),
                 clusterSettings,
                 Set.of(),
-                NoopTracer.INSTANCE
+                protocolTracer
             );
             this.httpServerTransport = networkModule.getHttpServerTransportSupplier().get();
             success = true;
         } finally {
             if (success == false) {
+                IOUtils.closeWhileHandlingException(telemetry);
                 closeAfterFailedConstruction();
             }
         }
@@ -324,6 +338,7 @@ public final class ServerlessNode extends NodeContext implements Closeable {
         IOUtils.closeWhileHandlingException(services);
         IOUtils.closeWhileHandlingException(transportService, searchService, indicesService, clusterService, nodeEnvironment);
         ThreadPool.terminate(threadPool, 10, TimeUnit.SECONDS);
+        IOUtils.closeWhileHandlingException(telemetry);
         NodePackWiring.forget(this);
     }
 }

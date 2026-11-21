@@ -713,6 +713,29 @@ preparation and cleanup read only the affected indices and alias, without a
 namespace listing. An abandoned preparation can retain harmless extra reverse
 hints until recovery; reverse lookups verify them against published membership.
 
+## Metrics, stats, and tracing
+
+`GET /_serverless/stats` reports node-local capacity and activity, including shard
+ownership, circuit breakers and write pressure. Add `?nodes=_all` for a fleet
+snapshot that reports peers it could not reach. For regular collection, scrape
+each node locally so a scrape does not fan out across the fleet.
+
+For exported metrics or traces, install the OpenSearch `telemetry-otel` plugin
+(or another OpenSearch telemetry provider) on the participating nodes. Add
+`-Dopensearch.experimental.feature.telemetry.enabled=true` to the serverless JVM.
+Set `-Dtelemetry.feature.metrics.enabled=true` to export metrics. For tracing, set
+both `-Dtelemetry.feature.tracer.enabled=true` and
+`-Dtelemetry.tracer.enabled=true`. The provider handles exporter configuration and
+sampling. The OpenSearch trace sampling probability defaults to 1%.
+
+The shell records `opensearch.serverless.rest.responses` and
+`opensearch.serverless.rest.response_time` by HTTP method and status for requests
+dispatched to registered handlers. The histogram measures milliseconds to response
+headers or a handler exception. HTTP and peer transport spans share the provider's
+trace context. Shell protocol instrumentation omits raw paths, query strings,
+request bodies, user identifiers, peer addresses and exception messages. Plugins
+may add their own telemetry through the OpenSearch API.
+
 ## Write threads
 
 A write is acknowledged once its node-log window lands, so its thread mostly waits. On core's `write` pool (one thread per

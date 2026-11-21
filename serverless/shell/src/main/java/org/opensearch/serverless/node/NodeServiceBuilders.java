@@ -34,7 +34,7 @@ import org.opensearch.rest.RestController;
 import org.opensearch.search.SearchService;
 import org.opensearch.search.query.QueryPhase;
 import org.opensearch.serverless.shard.LocalOnlyPublisher;
-import org.opensearch.telemetry.tracing.noop.NoopTracer;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.transport.Netty4ModulePlugin;
 
 import java.util.ArrayList;
@@ -326,7 +326,7 @@ final class NodeServiceBuilders {
      * There is exactly one supported transport, and pretending otherwise would add a lookup with one
      * possible answer.
      */
-    NetworkModule buildNetworkModule(ClusterSettings clusterSettings, RestController restController) {
+    NetworkModule buildNetworkModule(ClusterSettings clusterSettings, RestController restController, Tracer tracer) {
         // Netty first, then whatever plugins were installed.
         //
         // Core's NetworkModule resolves transport.type and http.type by name across every NetworkPlugin it
@@ -360,7 +360,7 @@ final class NodeServiceBuilders {
             new NetworkService(Collections.emptyList()),
             restController,
             clusterSettings,
-            NoopTracer.INSTANCE,
+            tracer,
             Collections.emptyList(),
             services.secureSettingsFactories()
         );

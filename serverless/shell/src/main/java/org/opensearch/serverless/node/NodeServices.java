@@ -29,6 +29,7 @@ import org.opensearch.serverless.action.ActionGate;
 import org.opensearch.serverless.action.RefusingIndexNameExpressionResolver;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.plugins.ServerlessPlugins;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.Netty4ModulePlugin;
 
@@ -165,8 +166,8 @@ public final class NodeServices implements Closeable {
         return builders.buildSearchService(clusterSettings, clusterService, indicesService);
     }
 
-    public NetworkModule buildNetworkModule(ClusterSettings clusterSettings, RestController restController) {
-        return builders.buildNetworkModule(clusterSettings, restController);
+    public NetworkModule buildNetworkModule(ClusterSettings clusterSettings, RestController restController, Tracer tracer) {
+        return builders.buildNetworkModule(clusterSettings, restController, tracer);
     }
 
     /**

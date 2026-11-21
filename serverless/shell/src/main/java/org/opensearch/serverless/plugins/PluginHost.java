@@ -15,6 +15,8 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.env.Environment;
 import org.opensearch.env.NodeEnvironment;
 import org.opensearch.script.ScriptService;
+import org.opensearch.telemetry.metrics.MetricsRegistry;
+import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.Client;
 import org.opensearch.watcher.ResourceWatcherService;
@@ -32,8 +34,11 @@ import org.opensearch.watcher.ResourceWatcherService;
  * @param nodeEnvironment the node's data paths
  * @param namedWriteableRegistry the node's wire registry
  * @param indexNameExpressionResolver the node's index name resolver
+ * @param tracer the node's tracer
+ * @param metricsRegistry the node's metrics registry
  */
 public record PluginHost(Client client, ClusterService clusterService, ThreadPool threadPool, ResourceWatcherService resourceWatcherService,
     ScriptService scriptService, NamedXContentRegistry xContentRegistry, Environment environment, NodeEnvironment nodeEnvironment,
-    NamedWriteableRegistry namedWriteableRegistry, IndexNameExpressionResolver indexNameExpressionResolver) {
+    NamedWriteableRegistry namedWriteableRegistry, IndexNameExpressionResolver indexNameExpressionResolver, Tracer tracer,
+    MetricsRegistry metricsRegistry) {
 }

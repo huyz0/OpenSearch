@@ -54,6 +54,7 @@ import org.opensearch.core.common.unit.ByteSizeValue;
 import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.rest.StreamingRestChannel;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanBuilder;
 import org.opensearch.telemetry.tracing.SpanScope;
@@ -363,7 +364,10 @@ public abstract class AbstractHttpServerTransport extends AbstractLifecycleCompo
         RestChannel traceableRestChannel = channel;
         final ThreadContext threadContext = threadPool.getThreadContext();
         try (ThreadContext.StoredContext ignore = threadContext.stashContext()) {
-            final Span span = tracer.startSpan(SpanBuilder.from(restRequest));
+            // Streaming requests enter here without the HTTP span created by incomingRequest.
+            final Span span = channel instanceof StreamingRestChannel && tracer.isRecording()
+                ? tracer.startSpan(SpanBuilder.from(restRequest), extractHeaders(restRequest.getHeaders()))
+                : tracer.startSpan(SpanBuilder.from(restRequest));
             try (final SpanScope spanScope = tracer.withSpanInScope(span)) {
                 if (channel != null) {
                     traceableRestChannel = TraceableRestChannel.create(channel, span, tracer);

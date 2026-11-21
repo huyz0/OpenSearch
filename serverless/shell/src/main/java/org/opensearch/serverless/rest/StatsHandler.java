@@ -326,8 +326,8 @@ public final class StatsHandler extends BaseRestHandler {
     }
 
     private static String describeFailure(Exception e) {
-        final String message = e.getMessage();
-        return message == null || message.isBlank() ? e.getClass().getSimpleName() : message;
+        // Transport exceptions may contain remote addresses, request material or backend error details.
+        return org.opensearch.ExceptionsHelper.unwrapCause(e).getClass().getSimpleName();
     }
 
     /**
