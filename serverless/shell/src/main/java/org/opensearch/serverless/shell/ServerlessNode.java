@@ -315,7 +315,7 @@ public final class ServerlessNode extends NodeContext implements Closeable {
             try {
                 service.stop();
             } catch (RuntimeException e) {
-                logger.warn("a plugin service failed to stop: " + service.getClass().getName(), e);
+                logger.warn("Could not stop a plugin service (error_type={})", e.getClass().getSimpleName());
             }
             IOUtils.closeWhileHandlingException(service);
         }

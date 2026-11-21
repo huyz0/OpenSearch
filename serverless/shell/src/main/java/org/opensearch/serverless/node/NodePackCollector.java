@@ -169,7 +169,7 @@ public final class NodePackCollector {
         try {
             run();
         } catch (Exception e) {
-            logger.warn("node pack collection pass for [" + ledger.nodeId() + "] failed; the next one will try again", e);
+            logger.debug("Pack collection will retry (error_type={})", e.getClass().getSimpleName());
         }
     }
 

@@ -367,7 +367,7 @@ public final class CacheWarmCopy {
                     got = answer.getValue().get();
                 } catch (java.util.concurrent.ExecutionException e) {
                     failed.incrementAndGet();
-                    LOG.warn("search peer [" + answer.getKey() + "] did not say what it holds for this node", e.getCause());
+                    LOG.debug("Search peer did not report its cached blocks (node_id={})", answer.getKey());
                     continue;
                 }
                 if (got.isEmpty()) {
@@ -474,7 +474,7 @@ public final class CacheWarmCopy {
                     } catch (IOException | RuntimeException e) {
                         // A peer that went away mid-copy costs this node only the blocks it did not hand over.
                         failed.incrementAndGet();
-                        LOG.warn("could not copy warm blocks from search peer [" + from.getKey().getId() + "]", e);
+                        LOG.debug("Could not copy cached blocks from a search peer (node_id={})", from.getKey().getId());
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                     }

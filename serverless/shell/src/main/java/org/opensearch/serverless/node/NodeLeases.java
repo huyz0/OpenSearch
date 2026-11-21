@@ -8,8 +8,10 @@
 package org.opensearch.serverless.node;
 
 import org.opensearch.serverless.cluster.IndexDescriptor;
+import org.opensearch.serverless.logging.ServerlessLogMessage;
 import org.opensearch.serverless.shard.FailedShardRelease;
 
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 
 /**
@@ -193,14 +195,7 @@ public final class NodeLeases {
             // Before the renewal, never after: from here until a verification that started after the
             // renewal completes, nothing is acknowledged. The epoch is what tells a verification that
             // began before this moment from one that began after it.
-            lapseEpoch.incrementAndGet();
-            lapsedAtMillis = now;
-            ownershipUnverified = true;
-            NodeContext.logger.info(
-                "this node's lease lapsed at {} by its own clock (now {}); acknowledgement is suspended until every held head is re-read",
-                plane.membership().ownExpiresAtMillis() - plane.membership().skewMarginMillis(),
-                now
-            );
+            suspendAcknowledgements(now, "lease_expired");
         }
         for (java.util.Map.Entry<org.opensearch.core.index.shard.ShardId, Long> lost : new java.util.ArrayList<>(
             headsToGiveBack.entrySet()
@@ -217,7 +212,12 @@ public final class NodeLeases {
                     );
                 headsToGiveBack.remove(lost.getKey(), lost.getValue());
             } catch (java.io.IOException e) {
-                NodeContext.logger.warn("could not give back the head of " + lost.getKey() + "; will retry on the next renewal", e);
+                NodeContext.logger.debug(
+                    "Shard head release will retry after renewal (index_uuid={}, shard={}, error_type={})",
+                    lost.getKey().getIndex().getUUID(),
+                    lost.getKey().id(),
+                    e.getClass().getSimpleName()
+                );
             }
         }
         boolean revoked = false;
@@ -229,11 +229,8 @@ public final class NodeLeases {
                 // taker does only once it judges the lease expired -- so a clock beyond the skew budget
                 // has had this node serving shards it may have lost. The same suspension as a lapse, and
                 // the same full scan before it lifts. The renewal after this one starts the lease afresh.
-                lapseEpoch.incrementAndGet();
-                lapsedAtMillis = plane.clock().getAsLong();
-                ownershipUnverified = true;
+                suspendAcknowledgements(plane.clock().getAsLong(), "lease_revoked");
                 revoked = true;
-                NodeContext.logger.warn("{}; acknowledgement is suspended until every held head is re-read", e.getMessage());
                 node.nodeLogs.nodeLog(plane).renew();
             }
         }
@@ -242,6 +239,21 @@ public final class NodeLeases {
             released.addAll(verifyHeads(plane));
         }
         return released;
+    }
+
+    private void suspendAcknowledgements(long now, String reason) {
+        final boolean wasSuspended = ownershipUnverified;
+        final long epoch = lapseEpoch.incrementAndGet();
+        lapsedAtMillis = now;
+        ownershipUnverified = true;
+        if (wasSuspended == false) {
+            NodeContext.logger.warn(
+                new ServerlessLogMessage(
+                    "Write acknowledgements suspended pending shard ownership verification",
+                    Map.of("event", "write_acknowledgements_suspended", "lease_epoch", epoch, "reason", reason)
+                )
+            );
+        }
     }
 
     /**
@@ -476,7 +488,16 @@ public final class NodeLeases {
             // one either still names this node or has been let go. Nothing can be taken from a node with
             // a live lease, so acknowledgement is safe again.
             ownershipUnverified = false;
-            NodeContext.logger.info("every held head re-read after the lapse; acknowledgement resumes");
+            NodeContext.logger.info(
+                new ServerlessLogMessage(
+                    "Write acknowledgements resumed after shard ownership verification",
+                    Map.of(
+                        "event", "write_acknowledgements_resumed",
+                        "lease_epoch", epoch,
+                        "released_shards", released.size()
+                    )
+                )
+            );
         }
         return released;
     }
@@ -572,7 +593,12 @@ public final class NodeLeases {
             try {
                 plane.forgetAssignment(node.localNode.getId(), shardId.getIndexName(), shardId.id());
             } catch (java.io.IOException e) {
-                NodeContext.logger.warn("could not forget the claim on " + shardId + "; it costs one head read per resync until it is", e);
+                NodeContext.logger.debug(
+                    "Could not forget an obsolete shard claim (index_uuid={}, shard={}, error_type={})",
+                    shardId.getIndex().getUUID(),
+                    shardId.id(),
+                    e.getClass().getSimpleName()
+                );
             }
         }
     }
@@ -593,7 +619,6 @@ public final class NodeLeases {
      */
     void onShardFailed(org.opensearch.index.shard.IndexShard failed, Exception cause) {
         final var shardId = failed.shardId();
-        NodeContext.logger.warn("shard " + shardId + " failed; closing it and taking it again from its published commit and log", cause);
         try {
             final var released = node.fences().underShardFence(shardId, () -> {
                 final var result = node.reconciler.releaseFailedShard(failed, "its engine failed");
@@ -605,9 +630,25 @@ public final class NodeLeases {
             });
             if (released == FailedShardRelease.WRITER && node.metadataPlane != null) {
                 node.signals.ownershipDoubted(shardId.getIndexName(), shardId.id());
+                NodeContext.logger.warn(
+                    new ServerlessLogMessage(
+                        "Failed writer closed. Recovery was requested",
+                        Map.of(
+                            "event", "writer_recovery_requested",
+                            "index_uuid", shardId.getIndex().getUUID(),
+                            "shard", shardId.id(),
+                            "error_type", cause == null ? "unknown" : cause.getClass().getSimpleName()
+                        )
+                    )
+                );
             }
         } catch (Exception e) {
-            NodeContext.logger.warn("could not close failed shard " + shardId, e);
+            NodeContext.logger.warn(
+                "Could not close a failed shard (index_uuid={}, shard={}, error_type={})",
+                shardId.getIndex().getUUID(),
+                shardId.id(),
+                e.getClass().getSimpleName()
+            );
         }
     }
 }

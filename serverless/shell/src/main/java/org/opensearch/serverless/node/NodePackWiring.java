@@ -99,7 +99,10 @@ public final class NodePackWiring {
                 writer(node, plane);
             }
         } catch (Exception e) {
-            NodeContext.logger.warn("could not read this node's pack ledger; its earlier packs are collected once it writes one", e);
+            NodeContext.logger.warn(
+                "Pack ledger read failed. Earlier packs will be collected after the next pack write (error_type={})",
+                e.getClass().getSimpleName()
+            );
         }
     }
 

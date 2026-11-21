@@ -190,7 +190,7 @@ public final class SearchHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a search failure", nested);
+                    RestReplies.logResponseFailure(logger, "search", nested);
                 }
             }
         });

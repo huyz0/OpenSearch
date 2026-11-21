@@ -225,7 +225,7 @@ final class ShardActivations {
             throw first;
         }
         if (first != null) {
-            BackgroundReconciler.logger.warn("some activations of this pass failed; the next pass retries them", first);
+            BackgroundReconciler.logger.debug("Some shard activations will retry (error_type={})", first.getClass().getSimpleName());
         }
         return taken;
     }
@@ -534,9 +534,8 @@ final class ShardActivations {
                     if (full && reconciler.leases.headNamesThisNode(indexName, shard) == false) {
                         // Refusing is a routing outcome, not an error. Saying so is the difference between a
                         // node that is full and a node that is broken, and only one of them should page anyone.
-                        BackgroundReconciler.logger.info(
-                            "not taking {}[{}] on demand: holding {} shards, the cap, and all of them are in use",
-                            indexName,
+                        BackgroundReconciler.logger.debug(
+                            "On-demand activation deferred at capacity (shard={}, capacity={})",
                             shard,
                             reconciler.maxShardsHeld
                         );

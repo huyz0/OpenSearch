@@ -95,7 +95,7 @@ public final class LogCommitCheckpoint {
                 check(node, value);
                 millis = Long.parseLong(value.trim());
             } catch (IllegalArgumentException e) {
-                NodeContext.logger.warn("ignoring the cluster's checkpoint age: " + e.getMessage());
+                NodeContext.logger.warn("Ignoring an invalid cluster checkpoint age (error_type={})", e.getClass().getSimpleName());
             }
         }
         node.logCommitCheckpointMillis = millis;

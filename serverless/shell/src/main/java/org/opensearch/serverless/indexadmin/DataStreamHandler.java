@@ -243,7 +243,7 @@ public final class DataStreamHandler extends BaseRestHandler {
                     channel.sendResponse(RestReplies.failure(channel, failure));
                 }
             } catch (IOException nested) {
-                logger.error("failed to report a data-stream failure", nested);
+                RestReplies.logResponseFailure(logger, "data_stream", nested);
             }
         });
     }
@@ -340,7 +340,7 @@ public final class DataStreamHandler extends BaseRestHandler {
             try {
                 metadata.deleteIndex(backing, created.uuid());
             } catch (Exception cleanup) {
-                logger.warn("could not remove the backing index [" + backing + "] of a data stream that was not created", cleanup);
+                logger.warn("Could not clean up a backing index after data stream creation failed (error_type={})", cleanup.getClass().getSimpleName());
             }
             throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,
@@ -459,7 +459,7 @@ public final class DataStreamHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
-            logger.error("failed to report a data-stream refusal", e);
+            RestReplies.logResponseFailure(logger, "data_stream", e);
         }
     }
 }

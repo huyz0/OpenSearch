@@ -223,7 +223,11 @@ public final class MetadataPlane {
         try {
             new org.opensearch.serverless.bucket.BucketAssigner(buckets(), 1).leave(before.get().bucket(), before.get().uuid());
         } catch (IOException e) {
-            LOGGER.warn("could not take deleted index [{}] out of bucket [{}]", before.get().name(), before.get().bucket(), e);
+            LOGGER.warn(
+                "Could not remove a deleted index from its bucket (index_uuid={}, error_type={})",
+                before.get().uuid(),
+                e.getClass().getSimpleName()
+            );
         }
     }
 

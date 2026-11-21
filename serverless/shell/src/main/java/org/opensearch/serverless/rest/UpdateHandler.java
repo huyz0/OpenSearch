@@ -199,7 +199,7 @@ public final class UpdateHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report an update failure", nested);
+                    RestReplies.logResponseFailure(logger, "update", nested);
                 }
             }
         });
@@ -209,7 +209,7 @@ public final class UpdateHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException nested) {
-            logger.error("failed to report an update failure", nested);
+            RestReplies.logResponseFailure(logger, "update", nested);
         }
     }
 

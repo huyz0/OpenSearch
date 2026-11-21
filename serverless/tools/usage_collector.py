@@ -88,6 +88,7 @@ class Collector:
         self.write = write
         self.last = {}  # node -> (started_millis, {index: cost_units})
         self.last_poll = None
+        self.samples_missing = False
         self.tenants = {t: Tenant(level, now) for t, level in initial_levels.items()}
         self.written = format_levels(initial_levels)
 
@@ -101,8 +102,7 @@ class Collector:
             try:
                 answer = self.fetch(node)
                 started = answer["started_millis"]
-            except Exception as e:
-                print("could not read %s: %s" % (node, e), file=sys.stderr)
+            except Exception:
                 continue
             previous = self.last.get(node)
             same_process = previous is not None and previous[0] == started
@@ -123,6 +123,12 @@ class Collector:
                 if budget is not None:
                     budget_by_tenant[tenant] = max(budget_by_tenant.get(tenant, 0), budget)
             samples[node] = (started, totals)
+        missing = len(expected) - len(samples)
+        if missing and not self.samples_missing:
+            print(json.dumps({"event": "usage_samples_missing", "missing_nodes": missing}), file=sys.stderr)
+        elif not missing and self.samples_missing:
+            print(json.dumps({"event": "usage_samples_restored"}), file=sys.stderr)
+        self.samples_missing = bool(missing)
         elapsed = None if self.last_poll is None else now - self.last_poll
         self.last = samples
         self.last_poll = now
@@ -279,27 +285,31 @@ def main():
         for node in nodes:
             try:
                 http_json("PUT", "http://%s/_cluster/settings" % node, {"persistent": {LEVEL_KEY: value}})
-                print("set %s=%s" % (LEVEL_KEY, value))
-                return
-            except Exception as e:
-                print("could not write through %s: %s" % (node, e), file=sys.stderr)
-        raise RuntimeError("no node took the levels")
+            except Exception:
+                continue
+            print(json.dumps({"event": "usage_levels_updated", "active_levels": len(parse_levels(value))}))
+            return
+        raise SystemExit("Could not update usage levels through any node")
 
     initial = {}
     for node in nodes:
         try:
             initial = parse_levels(flat_setting(http_json("GET", "http://%s/_cluster/settings?flat_settings=true" % node), LEVEL_KEY))
             break
-        except Exception as e:
-            print("could not read the levels through %s: %s" % (node, e), file=sys.stderr)
+        except Exception:
+            continue
+    else:
+        print(json.dumps({"event": "usage_initial_levels_unavailable"}), file=sys.stderr)
     collector = Collector(fetch, write, initial, time.monotonic())
     polls = 0
     while True:
         levels = collector.poll(nodes, time.monotonic())
         polls += 1
-        if levels is not None:
+        if args.dry_run and levels is not None:
             print("levels: %s" % (format_levels(levels) or "none"))
         if args.once and polls >= 2:
+            if not args.dry_run and levels is not None:
+                print(json.dumps({"event": "usage_poll_complete", "active_levels": len(levels)}))
             return
         time.sleep(args.interval)
 

@@ -337,7 +337,7 @@ public final class RepositoryHandler extends BaseRestHandler {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 }
             } catch (IOException nested) {
-                logger.error("failed to report a repository administration failure", nested);
+                RestReplies.logResponseFailure(logger, "repository", nested);
             }
         }
     }

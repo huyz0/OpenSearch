@@ -9,6 +9,7 @@
 package org.opensearch.serverless.nodelog;
 
 import org.opensearch.common.CheckedConsumer;
+import org.opensearch.serverless.logging.ServerlessLogMessage;
 import org.opensearch.serverless.nodelog.NodeLogBlob.Header;
 import org.opensearch.serverless.nodelog.NodeLogBlob.Range;
 import org.opensearch.serverless.nodelog.NodeLogBlob.ShardKey;
@@ -43,6 +44,8 @@ import java.util.concurrent.ConcurrentHashMap;
  * writing refuses the shard.
  */
 public final class NodeLogTakeover {
+
+    private static final org.apache.logging.log4j.Logger logger = org.apache.logging.log4j.LogManager.getLogger(NodeLogTakeover.class);
 
     /** How many times a fence is searched for again after the predecessor's lease moved past it. */
     static final int MAX_REFENCES = 8;
@@ -487,6 +490,14 @@ public final class NodeLogTakeover {
     }
 
     private IOException missingRequired(long epoch, long ordinal) {
+        if (logger.isDebugEnabled()) {
+            logger.debug(
+                new ServerlessLogMessage(
+                    "WAL replay stopped at a missing required blob",
+                    Map.of("event", "wal_replay_gap", "wal_epoch", epoch, "wal_ordinal", ordinal)
+                )
+            );
+        }
         return new IOException("missing required node-log blob " + ordinal + " of epoch " + epoch + " of " + log.nodeId());
     }
 }

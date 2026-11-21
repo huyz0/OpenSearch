@@ -107,20 +107,11 @@ final class IndexLifecycle {
         final List<PointInTime> views = plane.livePointsInTime(clock.getAsLong());
         for (int shard = 0; shard < shards; shard++) {
             if (views.isEmpty() == false && pinnedByView(views, indexName, uuid, shard)) {
-                MetadataPlane.LOGGER.info(
-                    "leaving shard " + shard + " of " + indexName + " on disk: a live point in time still names its files directly"
-                );
+                MetadataPlane.LOGGER.debug("Keeping shard data pinned by a point in time (index_uuid={}, shard={})", uuid, shard);
                 continue;
             }
             if (snapshots.isEmpty() == false && pinnedBy(snapshots, uuid, shard)) {
-                MetadataPlane.LOGGER.info(
-                    "leaving shard "
-                        + shard
-                        + " of "
-                        + indexName
-                        + " on disk: a live snapshot still names its blobs directly, "
-                        + "and deleting the index must not delete what a snapshot is holding"
-                );
+                MetadataPlane.LOGGER.debug("Keeping shard data pinned by a snapshot (index_uuid={}, shard={})", uuid, shard);
                 continue;
             }
             try {
@@ -129,7 +120,7 @@ final class IndexLifecycle {
                 // Best effort, and it has to be: this is called on paths that may not exist at all, and a
                 // store that cannot delete must not turn creating an index into a failure. What it costs
                 // when it fails is storage, which is recoverable, against a create that is not.
-                MetadataPlane.LOGGER.warn("could not clear storage for shard " + shard + " of " + indexName, e);
+                MetadataPlane.LOGGER.warn("Could not clear shard storage (index_uuid={}, shard={}, error_type={})", uuid, shard, e.getClass().getSimpleName());
             }
         }
     }

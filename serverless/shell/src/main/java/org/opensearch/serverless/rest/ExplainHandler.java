@@ -169,7 +169,7 @@ public final class ExplainHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report an explain failure", nested);
+                    RestReplies.logResponseFailure(logger, "explain", nested);
                 }
             }
         });
@@ -218,7 +218,7 @@ public final class ExplainHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
-            logger.error("failed to report an explain refusal", e);
+            RestReplies.logResponseFailure(logger, "explain", e);
         }
     }
 }

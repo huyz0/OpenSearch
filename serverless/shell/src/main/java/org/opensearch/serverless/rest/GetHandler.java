@@ -170,7 +170,7 @@ public final class GetHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a read failure", nested);
+                    RestReplies.logResponseFailure(logger, "get", nested);
                 }
             }
         });

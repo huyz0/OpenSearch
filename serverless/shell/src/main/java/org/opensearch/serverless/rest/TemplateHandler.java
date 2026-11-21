@@ -269,7 +269,7 @@ public final class TemplateHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a template failure", nested);
+                    RestReplies.logResponseFailure(logger, "template", nested);
                 }
             }
         });
@@ -467,7 +467,7 @@ public final class TemplateHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
-            logger.error("failed to report a template refusal", e);
+            RestReplies.logResponseFailure(logger, "template", e);
         }
     }
 }

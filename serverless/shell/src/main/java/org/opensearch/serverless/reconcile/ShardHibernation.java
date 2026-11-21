@@ -88,7 +88,11 @@ final class ShardHibernation {
             return reconciler.node.fences().underShardFence(shardId, () -> hibernateFenced(shardId, lastUsed, nowMillis));
         } catch (Exception e) {
             // Hibernating is an optimisation: a writer that could not hibernate stays open, and is tried again next pass.
-            BackgroundReconciler.logger.warn("could not hibernate " + shardId, e);
+            BackgroundReconciler.logger.warn(
+                "Could not hibernate the shard (shard={}, error_type={})",
+                shardId.id(),
+                e.getClass().getSimpleName()
+            );
             return false;
         }
     }
@@ -165,9 +169,13 @@ final class ShardHibernation {
                     commit.map(org.opensearch.serverless.store.CommitManifest::digest).orElse(null)
                 );
         } catch (Exception e) {
-            BackgroundReconciler.logger.debug("could not clear the writer mark of hibernated " + shardId, e);
+            BackgroundReconciler.logger.debug(
+                "Could not clear the writer mark after hibernation (shard={}, error_type={})",
+                shardId.id(),
+                e.getClass().getSimpleName()
+            );
         }
-        BackgroundReconciler.logger.debug("hibernated {} at term {}, unused for {}ms", shardId, term, nowMillis - lastUsed);
+        BackgroundReconciler.logger.debug("Shard hibernated (shard={}, primary_term={}, idle_ms={})", shardId.id(), term, nowMillis - lastUsed);
         return true;
     }
 
@@ -188,7 +196,11 @@ final class ShardHibernation {
                 directory.warmFromLocal(published, WARM_BYTES);
             }
         } catch (Exception e) {
-            BackgroundReconciler.logger.debug("could not warm the block cache with " + shard.shardId() + "'s published commit", e);
+            BackgroundReconciler.logger.debug(
+                "Could not warm the block cache for a published commit (shard={}, error_type={})",
+                shard.shardId().id(),
+                e.getClass().getSimpleName()
+            );
         }
     }
 
@@ -218,7 +230,11 @@ final class ShardHibernation {
         } catch (Exception e) {
             // The head goes on naming this node with nothing open: the next request for it takes it the ordinary way, at
             // a higher term, as a writer closed after a failed engine is.
-            BackgroundReconciler.logger.warn("could not give back the head of hibernated " + shardId, e);
+            BackgroundReconciler.logger.warn(
+                "Could not release the head of a hibernated shard (shard={}, error_type={})",
+                shardId.id(),
+                e.getClass().getSimpleName()
+            );
             return false;
         }
     }

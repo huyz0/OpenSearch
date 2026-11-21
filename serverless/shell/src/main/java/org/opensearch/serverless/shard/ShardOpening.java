@@ -73,7 +73,11 @@ final class ShardOpening {
         try {
             return hooks.loggedAfter(shardId, writers, term, register.get());
         } catch (IOException | RuntimeException e) {
-            ShardReconciler.logger.debug("could not read the commits logged for " + shardId + "; opening from the register", e);
+            ShardReconciler.logger.debug(
+                "Using the registered commit after the WAL commit lookup failed (shard={}, error_type={})",
+                shardId.id(),
+                e.getClass().getSimpleName()
+            );
             return null;
         }
     }
@@ -124,13 +128,14 @@ final class ShardOpening {
             final Optional<CommitManifest> published = logged == null ? fromRegister : Optional.of(logged.commit());
             final boolean restoring = published.isPresent() && published.get().files().isEmpty() == false;
             lap.run();
-            if (replayWal) {
+            if (replayWal && ShardReconciler.logger.isDebugEnabled()) {
                 ShardReconciler.logger.debug(
-                    "opening writer {} at term {} from {}",
-                    shardId,
+                    "Opening writer for replay (index_uuid={}, shard={}, primary_term={}, manifest_term={}, wal_ordinal={})",
+                    shardId.getIndex().getUUID(),
+                    shardId.id(),
                     shardHeadTerm,
-                    published.map(m -> "manifest term " + m.term() + " log ordinal " + m.walOrdinal() + " by " + m.writer())
-                        .orElse("nothing published")
+                    published.map(m -> m.term()).orElse(null),
+                    published.map(m -> m.walOrdinal()).orElse(null)
                 );
             }
 
@@ -319,7 +324,11 @@ final class ShardOpening {
                     } catch (IOException | RuntimeException e) {
                         // The head goes on naming logs that hold nothing more of this shard: a successor reads them for
                         // nothing, which costs reads, never records.
-                        ShardReconciler.logger.debug("could not stop " + shardId + "'s head naming the logs it replayed", e);
+                        ShardReconciler.logger.debug(
+                            "Could not drop predecessor logs from the shard head (shard={}, error_type={})",
+                            shardId.id(),
+                            e.getClass().getSimpleName()
+                        );
                     }
                 }
                 return shard;

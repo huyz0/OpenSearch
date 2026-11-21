@@ -138,7 +138,10 @@ public final class UsersHandler extends BaseRestHandler {
                         try {
                             respond(channel, e);
                         } catch (IOException nested) {
-                            logger.error("failed to report an account management failure", nested);
+                            logger.debug(
+                                "Could not send the account management error response (error_type={})",
+                                nested.getClass().getSimpleName()
+                            );
                         }
                     } finally {
                         if (password != null) {

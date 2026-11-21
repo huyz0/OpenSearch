@@ -260,8 +260,7 @@ public final class WriterActivation {
                 // reads -- a store slowed to seconds a request stopped a whole fleet taking any shard for an hour. The
                 // activation is asked again once the scan is done.
                 NodeContext.logger.debug(
-                    "not taking {}[{}]: this node's held heads are being re-read after its lease lapsed",
-                    indexName,
+                    "Deferring writer activation until ownership verification completes (shard={})",
                     shardNumber
                 );
                 return java.util.Optional.empty();
@@ -278,7 +277,7 @@ public final class WriterActivation {
         if (described.get().writableSlot(shardNumber) == false) {
             // A unit a split retired, reached by a coordinator still routing with the layout from before it: taking it
             // back would let it take writes beside the halves that replaced it. The coordinator re-reads and retries.
-            NodeContext.logger.debug("not taking {}[{}]: it is not a live unit of the index", indexName, shardNumber);
+            NodeContext.logger.debug("Refusing activation of a retired shard (shard={})", shardNumber);
             return java.util.Optional.empty();
         }
         final long acquiringAt = System.nanoTime();

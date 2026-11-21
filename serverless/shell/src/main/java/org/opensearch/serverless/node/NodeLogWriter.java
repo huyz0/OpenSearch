@@ -296,7 +296,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
             committer.flushQueued();
         } catch (RuntimeException e) {
             // What it carried is a staged commit a successor can do without, at the cost of a longer replay.
-            logger.debug("could not write the node log's queued records", e);
+            logger.debug("Could not write queued node-log records (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -323,7 +323,7 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
             }
         } catch (IOException e) {
             // Tried again after the next renewal; what is left costs storage, never correctness.
-            logger.debug("could not delete node-log blobs behind the lease; will retry", e);
+            logger.debug("Node-log cleanup will retry (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -563,7 +563,11 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
                         plane.heads().clearWriters(shardId.getIndexName(), shardId.id(), nodeId, term);
                     }
                 } catch (IOException | RuntimeException e) {
-                    logger.debug("could not stop the head of [{}] naming the logs it replayed", shardId, e);
+                    logger.debug(
+                        "Could not drop predecessor logs from the shard head (shard={}, error_type={})",
+                        shardId.id(),
+                        e.getClass().getSimpleName()
+                    );
                 }
             });
         } catch (RuntimeException e) {
@@ -589,7 +593,11 @@ public final class NodeLogWriter implements ShardReconciler.NodeLogHooks {
                 return false;
             } catch (Exception e) {
                 if (attempt >= attempts) {
-                    logger.warn("could not write the register of [{}] after its open; its next publish writes it", shardId, e);
+                    logger.debug(
+                        "The next publish will retry the shard register (shard={}, error_type={})",
+                        shardId.id(),
+                        e.getClass().getSimpleName()
+                    );
                     return false;
                 }
             }

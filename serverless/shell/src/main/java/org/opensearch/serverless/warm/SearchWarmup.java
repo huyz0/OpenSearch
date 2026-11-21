@@ -14,6 +14,7 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FilterDirectory;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.serverless.logging.ServerlessLogMessage;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 import org.opensearch.serverless.node.SearchReadiness;
@@ -81,9 +82,20 @@ public final class SearchWarmup {
         node.threadPool().generic().execute(() -> {
             try {
                 final Outcome outcome = warm(node, plane, done);
-                LOG.info("search warm-up done: {}", outcome);
+                LOG.info(
+                    new ServerlessLogMessage(
+                        "Search warm-up finished",
+                        Map.of(
+                            "event", "search_warmup_finished",
+                            "shards_opened", outcome.opened(),
+                            "shards_failed", outcome.openFailed(),
+                            "blocks_copied", outcome.copy().blocksCopied(),
+                            "duration_ms", outcome.tookMillis()
+                        )
+                    )
+                );
             } catch (Exception e) {
-                LOG.warn("search warm-up failed; serving searches with the cache it has", e);
+                LOG.warn("Search warm-up failed. Searches will use the available cache (error_type={})", e.getClass().getSimpleName());
                 if (done.compareAndSet(false, true)) {
                     turnReady(node, plane);
                 }
@@ -162,10 +174,9 @@ public final class SearchWarmup {
                 } catch (Exception e) {
                     failed.add(shard);
                     LOG.debug(
-                        "could not open shard [{}][{}] ahead of its searches; it opens on its first",
-                        shard.indexName(),
+                        "Shard warm-up failed. The first search will open it (shard={}, error_type={})",
                         shard.shard(),
-                        e
+                        e.getClass().getSimpleName()
                     );
                 }
             }
@@ -179,7 +190,7 @@ public final class SearchWarmup {
                 try {
                     ranged += fetchFromStore(node, shard.getValue(), copy.unheld().getOrDefault(shard.getKey(), List.of()));
                 } catch (Exception e) {
-                    LOG.debug("could not read the rest of shard [{}] ahead of its searches", shard.getKey(), e);
+                    LOG.debug("Could not finish warming a shard (error_type={})", e.getClass().getSimpleName());
                 }
             }
             return ranged;
@@ -204,7 +215,7 @@ public final class SearchWarmup {
         try {
             node.leases().renewLease(plane);
         } catch (Exception e) {
-            LOG.warn("could not renew the lease after warming; the next pass advertises the search role", e);
+            LOG.debug("The next renewal will advertise the search role (error_type={})", e.getClass().getSimpleName());
         }
     }
 

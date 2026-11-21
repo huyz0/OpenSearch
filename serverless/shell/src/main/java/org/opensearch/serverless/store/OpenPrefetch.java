@@ -226,7 +226,7 @@ final class OpenPrefetch {
             }
             return subFiles;
         } catch (IOException | RuntimeException e) {
-            logger.debug("not warming the compound sub-files of {}: {}", entries.blobName(), e.toString());
+            logger.debug("Could not warm compound sub-files (error_type={})", e.getClass().getSimpleName());
             return null;
         }
     }
@@ -239,7 +239,7 @@ final class OpenPrefetch {
                 try {
                     fetch(ranges.get(i), cache);
                 } catch (IOException | RuntimeException e) {
-                    logger.debug("prefetch of {} failed; the open reads it itself: {}", ranges.get(i).target().blobName(), e.toString());
+                    logger.debug("Shard open will read a range after prefetch failed (error_type={})", e.getClass().getSimpleName());
                 } finally {
                     done.countDown();
                 }

@@ -156,7 +156,7 @@ public final class MappingUpdateHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a mapping update failure", nested);
+                    RestReplies.logResponseFailure(logger, "mapping_update", nested);
                 }
             }
         });

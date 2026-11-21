@@ -12,8 +12,10 @@ import org.opensearch.core.rest.RestStatus;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.serverless.logging.ServerlessLogMessage;
 
 import java.io.IOException;
+import java.util.Map;
 
 /**
  * What every REST handler answers with: a deliberate refusal in OpenSearch's own error shape, an uncaught failure
@@ -22,6 +24,18 @@ import java.io.IOException;
 public final class RestReplies {
 
     private RestReplies() {}
+
+    /** Records a response failure without including the request or exception text. */
+    public static void logResponseFailure(org.apache.logging.log4j.Logger logger, String operation, Exception failure) {
+        if (logger.isDebugEnabled()) {
+            logger.debug(
+                new ServerlessLogMessage(
+                    "Could not send the REST error response",
+                    Map.of("event", "rest_error_response_failed", "operation", operation, "error_type", failure.getClass().getSimpleName())
+                )
+            );
+        }
+    }
 
     /** A refusal raised while parsing, carrying the status and type the caller should see. */
     public static final class RefusedException extends Exception {

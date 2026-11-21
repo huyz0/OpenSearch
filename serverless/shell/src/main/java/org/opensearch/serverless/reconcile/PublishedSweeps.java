@@ -133,7 +133,11 @@ final class PublishedSweeps {
                     // Refreshing is an optimisation over being wrong, not a correctness step of its own: a
                     // failure here leaves the reader exactly where it was, which is where it would have been
                     // if this method did not exist.
-                    BackgroundReconciler.logger.warn("could not check whether the reader for " + shardId + " is stale; keeping it", e);
+                    BackgroundReconciler.logger.debug(
+                        "Keeping a reader after a staleness check failed (shard={}, error_type={})",
+                        shardId.id(),
+                        e.getClass().getSimpleName()
+                    );
                 }
             }
             return stale;
@@ -218,8 +222,8 @@ final class PublishedSweeps {
                 snapshots = reconciler.plane.liveSnapshots();
             } catch (Exception e) {
                 BackgroundReconciler.logger.warn(
-                    "could not read the views and snapshots a sweep must respect; sweeping nothing this pass",
-                    e
+                    "Storage sweep skipped because retention records could not be read (error_type={})",
+                    e.getClass().getSimpleName()
                 );
                 return deleted;
             }
@@ -279,7 +283,7 @@ final class PublishedSweeps {
                 } catch (Exception e) {
                     // Reclaiming space is the one job here whose failure costs only money, so it never
                     // interrupts a pass and never escalates.
-                    BackgroundReconciler.logger.warn("could not sweep " + shardId + "; the next pass will try again", e);
+                    BackgroundReconciler.logger.debug("Shard sweep will retry (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
                 }
             }
             return deleted;
@@ -313,7 +317,7 @@ final class PublishedSweeps {
             try {
                 reaped = reconciler.plane.reapPointsInTime(reconciler.plane.clock().getAsLong());
             } catch (Exception e) {
-                BackgroundReconciler.logger.warn("could not reap expired points in time; the next pass will retry", e);
+                BackgroundReconciler.logger.debug("Point-in-time cleanup will retry (error_type={})", e.getClass().getSimpleName());
             }
             closeReleasedViews();
             return reaped;
@@ -340,14 +344,17 @@ final class PublishedSweeps {
                     }
                     reconciler.collector.collectTombstones(reconciler.plane, reconciler.plane.clock().getAsLong(), selfId);
                 } catch (Exception e) {
-                    BackgroundReconciler.logger.warn("could not sweep descriptor tombstones; the next sweep will retry", e);
+                    BackgroundReconciler.logger.debug(
+                        "Descriptor tombstone sweep will retry (error_type={})",
+                        e.getClass().getSimpleName()
+                    );
                 } finally {
                     reconciler.sweepingTombstones.set(false);
                 }
             });
         } catch (RuntimeException e) {
             reconciler.sweepingTombstones.set(false);
-            BackgroundReconciler.logger.warn("could not start a tombstone sweep; the next pass that is due will try again", e);
+            BackgroundReconciler.logger.debug("Descriptor tombstone sweep could not start (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -369,9 +376,9 @@ final class PublishedSweeps {
                         BackgroundReconciler.logger.info("the orphan sweep collected {} shard containers", slice.deleted().size());
                     }
                 } catch (Exception e) {
-                    BackgroundReconciler.logger.warn(
-                        "could not sweep a slice of orphaned shards; the cursor stays and the next slice retries",
-                        e
+                    BackgroundReconciler.logger.debug(
+                        "Orphan sweep will retry from its current cursor (error_type={})",
+                        e.getClass().getSimpleName()
                     );
                 } finally {
                     reconciler.slicingOrphans.set(false);
@@ -379,7 +386,7 @@ final class PublishedSweeps {
             });
         } catch (RuntimeException e) {
             reconciler.slicingOrphans.set(false);
-            BackgroundReconciler.logger.warn("could not start an orphan slice; the next one that is due will try again", e);
+            BackgroundReconciler.logger.debug("Orphan sweep could not start (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -396,14 +403,14 @@ final class PublishedSweeps {
                     }
                     reconciler.collector.collectReclaims(reconciler.plane, reconciler.plane.clock().getAsLong(), selfId);
                 } catch (Exception e) {
-                    BackgroundReconciler.logger.warn("could not drain the reclaim queue; the next reap will retry", e);
+                    BackgroundReconciler.logger.debug("Storage reclaim will retry (error_type={})", e.getClass().getSimpleName());
                 } finally {
                     reconciler.reclaiming.set(false);
                 }
             });
         } catch (RuntimeException e) {
             reconciler.reclaiming.set(false);
-            BackgroundReconciler.logger.warn("could not start draining the reclaim queue; the next reap will try again", e);
+            BackgroundReconciler.logger.debug("Storage reclaim could not start (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -434,9 +441,9 @@ final class PublishedSweeps {
                         closed += reconciler.node.reconciler().closeFrozenReader(viewId);
                     }
                 } catch (Exception e) {
-                    BackgroundReconciler.logger.warn(
-                        "could not check whether the view " + viewId + " is still held; keeping its shards",
-                        e
+                    BackgroundReconciler.logger.debug(
+                        "Keeping frozen shards while their point in time is unreadable (error_type={})",
+                        e.getClass().getSimpleName()
                     );
                 }
             }

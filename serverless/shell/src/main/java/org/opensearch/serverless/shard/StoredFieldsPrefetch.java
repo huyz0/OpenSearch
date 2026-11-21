@@ -103,7 +103,7 @@ public final class StoredFieldsPrefetch implements SearchOperationListener {
             }
         } catch (IOException | RuntimeException e) {
             // Only a hint: each load fetches for itself.
-            logger.trace("could not announce the stored fields of the hits to fetch", e);
+            logger.trace("Could not announce a stored-field prefetch (error_type={})", e.getClass().getSimpleName());
         }
     }
 }

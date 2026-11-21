@@ -76,7 +76,7 @@ public final class DescriptorRefresh {
                 }
                 applyDescriptor(indexName, descriptor.get());
             } catch (Exception e) {
-                NodeContext.logger.warn("could not refresh the descriptor of " + indexName + " on this node's open shards", e);
+                NodeContext.logger.debug("Could not refresh the descriptor on open shards (error_type={})", e.getClass().getSimpleName());
             }
         }
         descriptorReadAtNanos.keySet().retainAll(indices);
@@ -115,7 +115,7 @@ public final class DescriptorRefresh {
             clusterSegmentPlacementReadAtNanos = now;
             clusterSegmentPlacementRead = true;
         } catch (Exception e) {
-            NodeContext.logger.warn("could not read the cluster's segment placement; keeping [" + clusterSegmentPlacement + "]", e);
+            NodeContext.logger.debug("Keeping cached segment placement after a read failed (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -160,7 +160,7 @@ public final class DescriptorRefresh {
             applyDescriptor(indexName, descriptor);
             descriptorReadAtNanos.merge(indexName, readStartedNanos, Math::max);
         } catch (Exception e) {
-            NodeContext.logger.warn("could not apply the descriptor of " + indexName + " read while routing", e);
+            NodeContext.logger.debug("Could not apply the descriptor read while routing (error_type={})", e.getClass().getSimpleName());
         }
     }
 }

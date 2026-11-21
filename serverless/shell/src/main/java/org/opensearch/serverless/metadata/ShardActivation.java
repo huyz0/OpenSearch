@@ -223,7 +223,7 @@ final class ShardActivation {
                 // A stray object in this node's assignments container -- a console upload, a scratch file --
                 // used to abort the whole read with the validator's exception, and with it every shard this
                 // node serves. Skipped, and named once in the log.
-                MetadataPlane.LOGGER.warn("ignoring [{}] in the assignments of {}: not an index name this system writes", claim, nodeId);
+                MetadataPlane.LOGGER.debug("Ignoring an assignment with an invalid index name (node_id={})", nodeId);
                 continue;
             }
             final Optional<IndexDescriptor> descriptor;
@@ -232,7 +232,7 @@ final class ShardActivation {
             } catch (IllegalArgumentException e) {
                 // Belt and braces behind the name check above: whatever the descriptor store refuses about
                 // this one claim is that claim's problem, not the resync's.
-                MetadataPlane.LOGGER.warn("ignoring the claim [{}] of {}: {}", claim, nodeId, e.getMessage());
+                MetadataPlane.LOGGER.debug("Ignoring an invalid assignment (node_id={}, error_type={})", nodeId, e.getClass().getSimpleName());
                 continue;
             }
             if (descriptor.isEmpty()) {

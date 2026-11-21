@@ -138,7 +138,12 @@ public final class NewestCommits {
             }
             return newest != null && newest.stagedAfter(register.get()) ? Optional.of(newest) : register;
         } catch (Exception e) {
-            LOG.debug("could not ask [{}] for the newest commit of [{}][{}]; serving the register", writer, indexName, shard, e);
+            LOG.debug(
+                "Using the registered commit after a writer lookup failed (writer_node_id={}, shard={}, error_type={})",
+                writer,
+                shard,
+                e.getClass().getSimpleName()
+            );
             return register;
         }
     }

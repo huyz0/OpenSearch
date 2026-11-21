@@ -62,7 +62,13 @@ final class ShardRelease {
             } catch (Exception e) {
                 // closing under us
             }
-            ShardReconciler.logger.info("releasing writer {} at term {} with max seqNo {}: {}", shardId, term, maxSeqNo, reason);
+            ShardReconciler.logger.debug(
+                "Releasing writer (index_uuid={}, shard={}, primary_term={}, max_seq_no={})",
+                shardId.getIndex().getUUID(),
+                shardId.id(),
+                term,
+                maxSeqNo
+            );
         }
         final int busy = reconciler.inFlight(shardId);
         // Readers only. A writer being released has lost its head, or is about to give it up, and a
@@ -70,11 +76,10 @@ final class ShardRelease {
         // query against it failing on a closed reader is the lesser harm, and the one this always risked.
         if (failed == false && busy > 0 && reconciler.readers.contains(shardId)) {
             ShardReconciler.logger.debug(
-                "not releasing {} ({}): {} quer{} still running against it",
-                shardId,
-                reason,
-                busy,
-                busy == 1 ? "y is" : "ies are"
+                "Keeping a reader with active queries (index_uuid={}, shard={}, active_queries={})",
+                shardId.getIndex().getUUID(),
+                shardId.id(),
+                busy
             );
             return false;
         }

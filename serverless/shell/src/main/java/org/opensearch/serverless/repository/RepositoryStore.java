@@ -107,7 +107,7 @@ public final class RepositoryStore {
             try (java.io.InputStream in = container.readBlob(name)) {
                 found.add(RepositoryDescriptor.fromStream(in));
             } catch (Exception e) {
-                logger.warn("could not read the repository [" + name + "]; leaving it out of the listing", e);
+                logger.debug("Omitting an unreadable repository from the listing (error_type={})", e.getClass().getSimpleName());
             }
         }
         return found;

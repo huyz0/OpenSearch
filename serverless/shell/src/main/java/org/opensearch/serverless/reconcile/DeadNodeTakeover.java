@@ -98,7 +98,7 @@ final class DeadNodeTakeover {
                     );
                 }
             } catch (Exception e) {
-                ReconcileScheduler.logger.warn("could not take over the shards of departed node " + deadNodeId, e);
+                ReconcileScheduler.logger.warn("Departed-node shard takeover did not finish (error_type={})", e.getClass().getSimpleName());
             }
         }
     }

@@ -392,7 +392,7 @@ final class SearchIndexResolver {
         } catch (Exception e) {
             // The rollups are an optimisation over the per-index path, which is always correct.
             org.apache.logging.log4j.LogManager.getLogger(SearchHandler.class)
-                .warn("could not read the digest rollups for [" + prefix + "*]; searching without them", e);
+                .debug("Searching without digest rollups after a read failed (error_type={})", e.getClass().getSimpleName());
             return java.util.Set.of();
         }
         final java.util.Set<String> ruledOut = new java.util.LinkedHashSet<>();

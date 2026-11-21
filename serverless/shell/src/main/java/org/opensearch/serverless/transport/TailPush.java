@@ -521,7 +521,7 @@ public final class TailPush {
             for (ShardId shardId : request.records().keySet()) {
                 unsubscribe(shardId, target, true, true, sentUnder(numbers, shardId));
             }
-            LOG.debug("could not push acknowledged records to [{}]", target, e);
+            LOG.debug("Could not push acknowledged records to a reader (target_node_id={}, error_type={})", target, e.getClass().getSimpleName());
         }
     }
 

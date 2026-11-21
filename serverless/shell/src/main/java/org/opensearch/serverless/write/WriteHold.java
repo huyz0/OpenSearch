@@ -193,7 +193,11 @@ public final class WriteHold implements AutoCloseable {
                 final long left = deadlineNanos - System.nanoTime();
                 if (left <= 0 || ended.await(left, TimeUnit.NANOSECONDS) == false) {
                     if (state.compareAndSet(HOLDING, EXPIRED)) {
-                        LOGGER.warn("the hold on {}'s writes ran out of time; its writes go on here", shardId);
+                        LOGGER.warn(
+                            "Write hold expired. Writes resume on this node (index_uuid={}, shard={})",
+                            shardId.getIndex().getUUID(),
+                            shardId.id()
+                        );
                         end();
                     }
                 }

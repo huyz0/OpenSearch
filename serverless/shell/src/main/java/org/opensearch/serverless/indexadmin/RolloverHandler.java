@@ -147,7 +147,7 @@ public final class RolloverHandler extends BaseRestHandler {
                         channel.sendResponse(RestReplies.failure(channel, e));
                     }
                 } catch (IOException nested) {
-                    logger.error("failed to report a rollover failure", nested);
+                    RestReplies.logResponseFailure(logger, "rollover", nested);
                 }
             }
         });
@@ -396,7 +396,7 @@ public final class RolloverHandler extends BaseRestHandler {
                     left = "the index [" + newName + "] changed concurrently and was not removed by this rollback";
                 }
             } catch (Exception e) {
-                logger.warn("could not remove the index [" + newName + "] created by a rollover that lost its swap", e);
+                logger.warn("Could not clean up an index after a competing rollover won (error_type={})", e.getClass().getSimpleName());
                 left = "the index [" + newName + "] was created and not adopted, and could not be removed: " + e.getMessage();
             }
             throw new RestReplies.RefusedException(

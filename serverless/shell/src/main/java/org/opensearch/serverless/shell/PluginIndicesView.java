@@ -116,7 +116,7 @@ final class PluginIndicesView {
             }
             apply();
         } catch (Exception e) {
-            logger.warn("could not load the plugins' indices into the local view; plugins will not find them there", e);
+            logger.warn("Plugin indices are unavailable in the local view (error_type={})", e.getClass().getSimpleName());
         }
         final TimeValue every = PluginSettings.INDICES_VIEW_REFRESH_INTERVAL.get(node.settings());
         if (every.millis() > 0) {
@@ -179,7 +179,7 @@ final class PluginIndicesView {
             return ClusterState.builder(state).metadata(metadata).build();
         } catch (RuntimeException e) {
             // An alias that clashes with an index name in the view: the indices without their aliases rather than no view.
-            logger.debug("not adding the plugin indices' aliases to the local view", e);
+            logger.debug("Could not add plugin index aliases to the local view (error_type={})", e.getClass().getSimpleName());
             return state;
         }
     }
@@ -267,7 +267,7 @@ final class PluginIndicesView {
                 apply();
             }
         } catch (Exception e) {
-            logger.debug("could not update the plugin indices " + names + " in the local view", e);
+            logger.debug("Could not update plugin indices in the local view (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -303,7 +303,7 @@ final class PluginIndicesView {
                 apply();
             }
         } catch (Exception e) {
-            logger.debug("could not follow changes to the plugin indices", e);
+            logger.debug("Could not follow updates to plugin indices (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -389,7 +389,7 @@ final class PluginIndicesView {
             final int wildcard = pattern.indexOf('*');
             final String prefix = wildcard < 0 ? pattern : pattern.substring(0, wildcard);
             if (prefix.isEmpty()) {
-                logger.warn("not keeping indices matching [{}] in the local view: it would list every index", pattern);
+                logger.debug("Skipping a plugin index pattern that would require listing every index");
                 continue;
             }
             sorted.add(prefix);

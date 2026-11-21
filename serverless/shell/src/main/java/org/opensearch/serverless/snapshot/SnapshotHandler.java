@@ -328,7 +328,7 @@ public final class SnapshotHandler extends BaseRestHandler {
             try {
                 channel.sendResponse(RestReplies.failure(channel, e));
             } catch (IOException nested) {
-                logger.error("failed to report a snapshot operation failure", nested);
+                RestReplies.logResponseFailure(logger, "snapshot", nested);
             }
         }
     }

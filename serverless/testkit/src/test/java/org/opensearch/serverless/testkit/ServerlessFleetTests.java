@@ -17,6 +17,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -67,6 +68,39 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
 
     private Map<String, String> settings() {
         return Map.of(org.opensearch.serverless.node.NodeSettings.LEASE_TTL_MILLIS.getKey(), TTL);
+    }
+
+    public void testRestErrorsDoNotLogQueryParameters() throws Exception {
+        final Path home = createTempDir();
+        final Path logConfiguration = Files.writeString(
+            home.resolve("logging.properties"),
+            """
+                appender.console.type = Console
+                appender.console.name = console
+                appender.console.layout.type = PatternLayout
+                appender.console.layout.pattern = %level %logger %message%n
+                rootLogger.level = info
+                rootLogger.appenderRef.console.ref = console
+                logger.suppressed.name = rest.suppressed
+                logger.suppressed.level = debug
+                """
+        );
+        final String privateValue = "private-" + randomAlphaOfLength(20);
+        try (
+            NodeProcess node = NodeProcess.start(
+                "safe-rest-logs",
+                createTempDir(),
+                home,
+                settings(),
+                List.of("-Dlog4j.configurationFile=" + logConfiguration.toUri())
+            )
+        ) {
+            final Response refused = send(node, "GET", "/_search?unknown_parameter=" + privateValue, null);
+            assertEquals(refused.body(), 400, refused.status());
+            assertTrue(refused.body(), refused.body().contains("unrecognized parameter"));
+            assertBusy(() -> assertTrue(node.output().stream().anyMatch(line -> line.contains("Serverless node started"))));
+            assertFalse("Request query parameters appeared in the node log", node.output().stream().anyMatch(line -> line.contains(privateValue)));
+        }
     }
 
     /**

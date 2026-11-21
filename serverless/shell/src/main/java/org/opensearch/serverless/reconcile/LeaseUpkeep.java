@@ -123,9 +123,10 @@ final class LeaseUpkeep {
             final var head = reconciler.plane.heads().read(indexName, shard);
             return head.isPresent() && reconciler.node.localNode().getId().equals(head.get().ownerNodeId());
         } catch (Exception e) {
-            BackgroundReconciler.logger.warn(
-                "could not read the head of " + indexName + "[" + shard + "] at the cap; treating it as not ours",
-                e
+            BackgroundReconciler.logger.debug(
+                "Cannot verify shard ownership at capacity (shard={}, error_type={})",
+                shard,
+                e.getClass().getSimpleName()
             );
             return false;
         }

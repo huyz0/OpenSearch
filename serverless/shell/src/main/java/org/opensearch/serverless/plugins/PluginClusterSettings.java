@@ -124,7 +124,7 @@ public final class PluginClusterSettings {
                 clusterSettings().applySettings(part);
                 applied = part;
             } catch (RuntimeException e) {
-                logger.warn("could not apply the plugins' cluster settings " + part.keySet() + "; keeping the previous values", e);
+                logger.warn("Keeping previous plugin cluster settings after an update failed (error_type={})", e.getClass().getSimpleName());
             }
         }
     }
@@ -153,7 +153,7 @@ public final class PluginClusterSettings {
         try {
             apply(plane.clusterConfig().read().settings());
         } catch (Exception e) {
-            logger.warn("could not read the cluster settings for the plugins; keeping the values they have", e);
+            logger.debug("Using cached plugin cluster settings after a read failed (error_type={})", e.getClass().getSimpleName());
         }
     }
 

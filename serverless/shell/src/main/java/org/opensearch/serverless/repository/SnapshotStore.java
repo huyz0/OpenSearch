@@ -301,7 +301,7 @@ public final class SnapshotStore {
                     found.add(record.get());
                 }
             } catch (Exception failure) {
-                LOGGER.warn("could not read snapshot {}; omitting it from the listing", marker, failure);
+                LOGGER.debug("Omitting an unreadable snapshot from the listing (error_type={})", failure.getClass().getSimpleName());
             }
         }
         return found;

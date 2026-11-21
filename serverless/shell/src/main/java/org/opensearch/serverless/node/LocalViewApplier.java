@@ -183,7 +183,10 @@ public final class LocalViewApplier {
                 }
                 return;
             } catch (Exception e) {
-                logger.debug("a batched view of " + batch.size() + " activations failed; projecting each alone", e);
+                logger.debug(
+                    "Applying batched activations failed. Applying them individually (error_type={})",
+                    e.getClass().getSimpleName()
+                );
             }
         }
         for (PendingView each : batch) {
@@ -258,7 +261,7 @@ public final class LocalViewApplier {
                 nodes.add(peerNode(lease));
                 changed = true;
             } catch (Exception e) {
-                logger.debug("not describing {} in the local view: {}", lease.nodeId(), e.getMessage());
+                logger.debug("Omitting a node from the local view (node_id={}, error_type={})", lease.nodeId(), e.getClass().getSimpleName());
             }
         }
         final ClusterState withPeers = changed ? ClusterState.builder(state).nodes(nodes).build() : state;

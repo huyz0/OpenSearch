@@ -177,7 +177,7 @@ public final class SettingsUpdateHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a settings update failure", nested);
+                    RestReplies.logResponseFailure(logger, "settings_update", nested);
                 }
             }
         });

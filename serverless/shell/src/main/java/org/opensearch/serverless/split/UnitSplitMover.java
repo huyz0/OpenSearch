@@ -168,15 +168,16 @@ public final class UnitSplitMover {
                 openHalf(left, toLeft);
                 openHalf(right, toRight);
                 if (hold.forwardTo(target) == false) {
-                    logger.warn("the hold on {} ran out before its halves opened; giving the split up", parent);
+                    logger.debug("Abandoning split after its write hold expired (index_uuid={}, shard={})", parent.getIndex().getUUID(), parent.id());
                     abandon(indexName, split, left, right);
                     return Optional.empty();
                 }
                 final long heldMillis = (System.nanoTime() - heldAt) / 1_000_000L;
                 final IndexDescriptor switched = apply(indexName, split);
                 logger.info(
-                    "split {} into units {} and {}: {} and {} tail records, writes held {} ms",
-                    parent,
+                    "Split shard (index_uuid={}, shard={}, left={}, right={}, left_records={}, right_records={}, duration_ms={})",
+                    parent.getIndex().getUUID(),
+                    parent.id(),
                     split.left().id(),
                     split.right().id(),
                     toLeft.size(),
@@ -304,7 +305,7 @@ public final class UnitSplitMover {
                     parent.getIndex().getUUID(),
                     node.localNode().getEphemeralId()
                 ) == false) {
-                logger.warn("could not give up the head of retired unit {}; it stays open here until it is let go", parent);
+                logger.warn("Retired shard remains open after head release failed (index_uuid={}, shard={})", parent.getIndex().getUUID(), parent.id());
                 return null;
             }
             node.reconciler().releaseShard(parent, "retired by a split");

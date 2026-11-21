@@ -30,7 +30,7 @@ def structureBaselineDir = file("${rootDir}/serverless/structure-baseline")
 
 // Lowest first. A package may reference any package in a strictly lower layer.
 def structureLayers = [
-  settings: 0,
+  settings: 0, logging: 0,
   store: 1, routing: 1, schema: 1, pipeline: 1,
   nodelog: 2, usage: 2,
   ingest: 3, membership: 3,

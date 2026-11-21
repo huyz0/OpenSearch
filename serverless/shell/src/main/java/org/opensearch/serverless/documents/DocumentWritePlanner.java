@@ -513,7 +513,7 @@ public final class DocumentWritePlanner {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (java.util.concurrent.ExecutionException e) {
-            logger.warn("activating shard " + shard + " of " + writtenIndex + " for a waiting write failed", e.getCause());
+            logger.debug("Activation for a waiting write failed (index_uuid={}, shard={})", indexUuid, shard);
         }
         if (taken.isPresent() && taken.get().getIndex().getUUID().equals(indexUuid)) {
             writeHere.accept(answer, taken.get());

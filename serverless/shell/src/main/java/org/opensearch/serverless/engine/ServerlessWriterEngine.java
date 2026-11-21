@@ -109,15 +109,14 @@ public final class ServerlessWriterEngine extends InternalEngine {
     );
 
     /**
-     * Says what a recovery is about to replay over what it restored, and shouts about any record the replay would skip.
+     * Summarizes replay against the restored commit and refuses a proven sequence-number collision.
      *
      * <p>Core's recovery skips an operation whose sequence number the restored commit has already processed. That is
      * right when the commit holds that operation, and silent loss when it holds a different one under the same number:
      * a fleet run lost acknowledged writes whose records were in the log at a takeover and never reached the
-     * successor's commit. Each record at or below the processed checkpoint is checked for its document in the commit:
-     * one that is not there is logged as an error -- it may have been deleted since, which is not a loss -- and one
-     * whose sequence number a different live document holds is a proven collision, and the open is refused. A shard
-     * that will not open is an outage someone sees; a shard opened without an acknowledged write is a loss nobody does.
+     * successor's commit. Each record at or below the processed checkpoint is checked for its document in the commit.
+     * A missing document may have been deleted since. A sequence number held by a different live document
+     * establishes a collision and causes the open to be refused.
      */
     private void reportReplay(ShardId shardId, Translog.Snapshot operations) {
         final long processed = getProcessedLocalCheckpoint();
@@ -126,7 +125,7 @@ public final class ServerlessWriterEngine extends InternalEngine {
         final java.util.Set<Long> terms = new java.util.TreeSet<>();
         int atOrBelow = 0;
         int skippedAbsent = 0;
-        String collision = null;
+        ReplayCollision collision = null;
         try (org.opensearch.index.engine.Engine.Searcher searcher = acquireSearcher("serverless-replay-check", SearcherScope.INTERNAL)) {
             for (Translog.Operation operation; (operation = operations.next()) != null;) {
                 min = Math.min(min, operation.seqNo());
@@ -150,42 +149,38 @@ public final class ServerlessWriterEngine extends InternalEngine {
                 if (found == 0) {
                     skippedAbsent++;
                     final String holder = holderOf(searcher, operation.seqNo());
-                    logger.error(
-                        "{} replay would SKIP record {} (seqNo {}, term {}): the restored commit has processed through {} and does not "
-                            + "hold this document; seqNo {} is held there by {}",
-                        shardId,
-                        id,
-                        operation.seqNo(),
-                        operation.primaryTerm(),
-                        processed,
-                        operation.seqNo(),
-                        holder == null ? "no live document (deleted since, or merged away)" : "document " + holder
-                    );
                     if (holder != null && holder.equals(id) == false) {
-                        collision = "record "
-                            + id
-                            + " at seqNo "
-                            + operation.seqNo()
-                            + " term "
-                            + operation.primaryTerm()
-                            + " collides with document "
-                            + holder
-                            + " in the restored commit";
+                        collision = new ReplayCollision(operation.seqNo(), operation.primaryTerm());
                     }
                 }
             }
         } catch (Exception e) {
-            logger.warn("could not check the replay of " + shardId + " against its restored commit", e);
-        }
-        if (collision != null) {
-            throw new EngineException(
-                shardId,
-                "refusing to open: two acknowledged operations share a sequence number and replay would drop one -- " + collision
+            logger.warn(
+                "Could not compare replay with the restored commit for shard {} (error_type={})",
+                shardId.id(),
+                e.getClass().getSimpleName()
             );
         }
+        if (collision != null) {
+            logger.error(
+                new org.opensearch.serverless.logging.ServerlessLogMessage(
+                    "Shard open refused because two acknowledged operations share a sequence number",
+                    java.util.Map.of(
+                        "event", "wal_replay_sequence_collision",
+                        "index_uuid", shardId.getIndex().getUUID(),
+                        "shard", shardId.id(),
+                        "sequence_number", collision.sequenceNumber(),
+                        "primary_term", collision.primaryTerm(),
+                        "processed_checkpoint", processed
+                    )
+                )
+            );
+            throw new EngineException(shardId, "refusing to open: replay would drop an acknowledged operation at " + collision);
+        }
         logger.debug(
-            "{} replaying {} records (seqNo {}..{}, terms {}) over a commit processed through {}; {} at or below it, {} absent from it",
-            shardId,
+            "Replay for index UUID {} shard {} has {} records (seqNo {}..{}, terms {}), checkpoint {}, {} at or below it, {} absent",
+            shardId.getIndex().getUUID(),
+            shardId.id(),
             operations.totalOperations(),
             operations.totalOperations() == 0 ? "-" : min,
             operations.totalOperations() == 0 ? "-" : max,
@@ -195,6 +190,8 @@ public final class ServerlessWriterEngine extends InternalEngine {
             skippedAbsent
         );
     }
+
+    private record ReplayCollision(long sequenceNumber, long primaryTerm) {}
 
     /** The id of the live document holding a sequence number in the commit, or null if none does. */
     private static String holderOf(org.opensearch.index.engine.Engine.Searcher searcher, long seqNo) throws IOException {

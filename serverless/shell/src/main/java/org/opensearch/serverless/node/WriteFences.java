@@ -207,9 +207,10 @@ public final class WriteFences {
                 node.descriptorRefresh.applyDescriptor(shardId.getIndexName(), descriptor.get());
                 node.descriptorRefresh.descriptorReadAtNanos.put(shardId.getIndexName(), startedAt);
             } catch (Exception e) {
-                NodeContext.logger.warn(
-                    "could not apply the descriptor of " + shardId.getIndexName() + " read by the incarnation fence",
-                    e
+                NodeContext.logger.debug(
+                    "Could not apply the descriptor during an index incarnation check (shard={}, error_type={})",
+                    shardId.id(),
+                    e.getClass().getSimpleName()
                 );
             }
             if (incarnationConfirmedAtNanos.size() > 4096) {
@@ -607,7 +608,7 @@ public final class WriteFences {
             try {
                 head = plane.heads().read(shardId.getIndexName(), shardId.id());
             } catch (java.io.IOException e) {
-                NodeContext.logger.debug("could not read the head of {} to answer a forwarded write; refusing it", shardId);
+                NodeContext.logger.debug("Refusing a forwarded write because ownership could not be verified (shard={})", shardId.id());
                 return false;
             }
             node.sightings().noteHead(shardId.getIndexName(), shardId.id(), head.orElse(null));
@@ -623,7 +624,11 @@ public final class WriteFences {
                 true
             );
         } catch (Exception e) {
-            NodeContext.logger.warn("could not release " + shardId + " after its head stopped naming this node", e);
+            NodeContext.logger.warn(
+                "Could not release a shard after losing ownership (shard={}, error_type={})",
+                shardId.id(),
+                e.getClass().getSimpleName()
+            );
         }
         node.signals.ownershipDoubted(shardId.getIndexName(), shardId.id());
         return false;
