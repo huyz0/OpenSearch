@@ -9,11 +9,11 @@
 package org.opensearch.telemetry.tracing.channels;
 
 import org.opensearch.Version;
-import org.opensearch.core.action.ActionListener;
 import org.opensearch.core.transport.TransportResponse;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanScope;
 import org.opensearch.telemetry.tracing.Tracer;
+import org.opensearch.telemetry.tracing.noop.NoopSpan;
 import org.opensearch.transport.BaseTcpTransportChannel;
 import org.opensearch.transport.TcpTransportChannel;
 import org.opensearch.transport.TransportChannel;
@@ -29,6 +29,7 @@ public class TraceableTcpTransportChannel extends BaseTcpTransportChannel {
     private final TransportChannel delegate;
     private final Span span;
     private final Tracer tracer;
+    private final Runnable finish;
 
     /**
      * Constructor.
@@ -41,6 +42,7 @@ public class TraceableTcpTransportChannel extends BaseTcpTransportChannel {
         this.delegate = delegate;
         this.span = span;
         this.tracer = tracer;
+        this.finish = PendingTransportSpans.track(delegate.getChannel(), span);
     }
 
     /**
@@ -52,21 +54,7 @@ public class TraceableTcpTransportChannel extends BaseTcpTransportChannel {
      * @return transport channel
      */
     public static TransportChannel create(TcpTransportChannel delegate, final Span span, final Tracer tracer) {
-        if (tracer.isRecording() == true) {
-            delegate.getChannel().addCloseListener(new ActionListener<Void>() {
-                @Override
-                public void onResponse(Void unused) {
-                    onFailure(null);
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    span.addEvent("The TransportChannel was closed without sending the response");
-                    span.setError(e);
-                    span.endSpan();
-                }
-            });
-
+        if (span != NoopSpan.INSTANCE && tracer.isRecording()) {
             return new TraceableTcpTransportChannel(delegate, span, tracer);
         } else {
             return delegate;
@@ -91,7 +79,7 @@ public class TraceableTcpTransportChannel extends BaseTcpTransportChannel {
             span.setError(ex);
             throw ex;
         } finally {
-            span.endSpan();
+            finish.run();
         }
     }
 
@@ -99,7 +87,7 @@ public class TraceableTcpTransportChannel extends BaseTcpTransportChannel {
         try (SpanScope scope = tracer.withSpanInScope(span)) {
             delegate.sendResponseBatch(response);
         } finally {
-            span.endSpan();
+            finish.run();
         }
     }
 
@@ -107,7 +95,7 @@ public class TraceableTcpTransportChannel extends BaseTcpTransportChannel {
         try (SpanScope scope = tracer.withSpanInScope(span)) {
             delegate.completeStream();
         } finally {
-            span.endSpan();
+            finish.run();
         }
     }
 
@@ -117,7 +105,7 @@ public class TraceableTcpTransportChannel extends BaseTcpTransportChannel {
             delegate.sendResponse(exception);
         } finally {
             span.setError(exception);
-            span.endSpan();
+            finish.run();
         }
     }
 

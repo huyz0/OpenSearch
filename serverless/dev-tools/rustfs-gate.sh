@@ -73,6 +73,8 @@ if [[ $mode == smoke ]]; then
     --tests '*ServerlessSearchPathTests.testWriterActivationLeavesAPinnedReaderIntact' \
     --tests '*ServerlessLogMessageTests' --tests '*ServerlessTelemetryTests' --tests '*ServerlessTransportAuthTests' \
     --tests '*ServerlessStatsTests' --tests '*ZoneTrafficTests.testUnknownActionsShareOneBucket' \
+    --tests '*ServerlessTraceBoundsTests' \
+    :plugins:telemetry-otel:test --tests '*OTelTraceLoadTests' \
     :serverless:testkit:s3Test --tests '*RustfsBlobContainerConformanceTests.testPutIfAbsentBlobWritesAdmitExactlyOne' \
     --tests '*RustfsBlobContainerConformanceTests.testCompareAndSwapAdmitsExactlyOneWinner' \
     --tests '*ServerlessOnObjectStoreTests.testASuccessorRecoversFromTheBucketAlone' \

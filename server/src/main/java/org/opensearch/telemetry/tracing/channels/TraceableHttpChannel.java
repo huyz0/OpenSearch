@@ -14,6 +14,7 @@ import org.opensearch.http.HttpResponse;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.Tracer;
 import org.opensearch.telemetry.tracing.listener.TraceableActionListener;
+import org.opensearch.telemetry.tracing.noop.NoopSpan;
 
 import java.net.InetSocketAddress;
 import java.util.Objects;
@@ -49,7 +50,7 @@ public class TraceableHttpChannel implements HttpChannel {
      * @return http channel
      */
     public static HttpChannel create(HttpChannel delegate, Span span, Tracer tracer) {
-        if (tracer.isRecording() == true) {
+        if (span != NoopSpan.INSTANCE && tracer.isRecording()) {
             return new TraceableHttpChannel(delegate, span, tracer);
         } else {
             return delegate;

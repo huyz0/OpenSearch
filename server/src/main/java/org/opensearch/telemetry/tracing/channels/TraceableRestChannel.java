@@ -18,6 +18,7 @@ import org.opensearch.rest.StreamingRestChannel;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanScope;
 import org.opensearch.telemetry.tracing.Tracer;
+import org.opensearch.telemetry.tracing.noop.NoopSpan;
 
 import java.io.IOException;
 import java.util.Objects;
@@ -53,7 +54,7 @@ public class TraceableRestChannel<T extends RestChannel> implements RestChannel 
      * @return rest channel
      */
     public static RestChannel create(RestChannel delegate, Span span, Tracer tracer) {
-        if (tracer.isRecording() == true) {
+        if (span != NoopSpan.INSTANCE && tracer.isRecording()) {
             if (delegate instanceof StreamingRestChannel streamingRestChannel) {
                 return new TraceableStreamingRestChannel(streamingRestChannel, span, tracer);
             }
