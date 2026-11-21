@@ -718,7 +718,11 @@ hints until recovery; reverse lookups verify them against published membership.
 `GET /_serverless/stats` reports node-local capacity and activity, including shard
 ownership, circuit breakers and write pressure. Add `?nodes=_all` for a fleet
 snapshot that reports peers it could not reach. For regular collection, scrape
-each node locally so a scrape does not fan out across the fleet.
+each node locally so a scrape does not fan out across the fleet. To inspect a
+node's shard inventory, add `?include_shards=true` to a local request. The sample
+contains at most 100 shards and `held_shards_truncated` indicates that more were
+held. Zone traffic keeps a fixed breakdown of core shell actions. All other
+actions share the `_other` bucket, and their bytes still contribute to the totals.
 
 For exported metrics or traces, install the OpenSearch `telemetry-otel` plugin
 (or another OpenSearch telemetry provider) on the participating nodes. Add

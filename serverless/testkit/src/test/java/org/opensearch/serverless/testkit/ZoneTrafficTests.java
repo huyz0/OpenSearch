@@ -45,6 +45,16 @@ public class ZoneTrafficTests extends OpenSearchTestCase {
     private static final long TTL = 300_000L;
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"}}}";
 
+    public void testUnknownActionsShareOneBucket() {
+        final ZoneTraffic meter = new ZoneTraffic();
+        meter.record(ZoneTraffic.Path.CROSS_ZONE, ForwardedSearchRequest.ACTION, 7);
+        for (int i = 0; i < 1_000; i++) {
+            meter.record(ZoneTraffic.Path.CROSS_ZONE, "plugin:dynamic/" + i, 2);
+        }
+        assertEquals(java.util.Map.of(ForwardedSearchRequest.ACTION, 7L, "_other", 2_000L), meter.byAction(ZoneTraffic.Path.CROSS_ZONE));
+        assertEquals(2_007L, meter.total(ZoneTraffic.Path.CROSS_ZONE));
+    }
+
     public void testTheZoneIsTheAwarenessAttribute() {
         assertEquals("us-east-1a", Zones.localZone(Settings.builder().put("node.attr.zone", "us-east-1a").build()));
         assertNull("no attribute, no zone", Zones.localZone(Settings.EMPTY));

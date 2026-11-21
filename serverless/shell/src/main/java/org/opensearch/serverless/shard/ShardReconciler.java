@@ -919,4 +919,35 @@ public final class ShardReconciler {
     public Set<ShardId> heldShards() {
         return Set.copyOf(open.keySet());
     }
+
+    /** Returns a bounded sample of the local shard inventory. */
+    public java.util.List<ShardId> heldShardSample(int limit) {
+        return open.keySet().stream().limit(limit).toList();
+    }
+
+    /** Returns the size of the current local shard inventory. */
+    public int heldShardCount() {
+        return open.size();
+    }
+
+    /** Aggregate counts by kind from a single pass over the local shard inventory. */
+    public record ShardCounts(int writers, int readers, int frozen) {
+    }
+
+    /** Counts held shards by kind without copying their identifiers. */
+    public ShardCounts shardCounts() {
+        int writers = 0;
+        int activeReaders = 0;
+        int frozen = 0;
+        for (ShardId shard : open.keySet()) {
+            if (isFrozen(shard)) {
+                frozen++;
+            } else if (isReader(shard)) {
+                activeReaders++;
+            } else {
+                writers++;
+            }
+        }
+        return new ShardCounts(writers, activeReaders, frozen);
+    }
 }

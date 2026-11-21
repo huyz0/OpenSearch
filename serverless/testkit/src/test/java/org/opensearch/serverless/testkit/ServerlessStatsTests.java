@@ -161,7 +161,7 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
     public void testStatsReportWhatTheNodeIsActuallyHolding() throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
         final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
-        plane.createIndex(new IndexDescriptor("counted", "uuid-counted-000000", 3, MAPPING, null));
+        plane.createIndex(new IndexDescriptor("counted", "uuid-counted-000000", 101, MAPPING, null));
 
         try (ServerlessNode node = new ServerlessNode(nodeSettings("stats-shards", null))) {
             node.startup().start();
@@ -174,7 +174,7 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
             assertTrue("and say what it is willing to do: " + before.body(), before.body().contains("\"ingest\""));
 
             final BackgroundReconciler loop = new BackgroundReconciler(node, plane);
-            for (int shard = 0; shard < 3; shard++) {
+            for (int shard = 0; shard < 101; shard++) {
                 loop.want("counted", shard);
             }
             loop.tick(clock.get());
@@ -182,9 +182,18 @@ public class ServerlessStatsTests extends OpenSearchTestCase {
             final Response after = send(node, "GET", "/_serverless/stats", null);
             // The number moved, which is the whole point: a constant that happened to look right would
             // pass an assertion that only checked the field was there.
-            assertTrue("three shards held: " + after.body(), after.body().contains("\"open\":3"));
-            assertTrue("all of them writers: " + after.body(), after.body().contains("\"writers\":3"));
-            assertTrue("and none readers: " + after.body(), after.body().contains("\"readers\":0"));
+            assertTrue(after.body(), after.body().contains("\"open\":101"));
+            assertTrue(after.body(), after.body().contains("\"writers\":101"));
+            assertTrue(after.body(), after.body().contains("\"readers\":0"));
+            assertFalse(after.body(), after.body().contains("held_shards"));
+            assertFalse(after.body(), after.body().contains("uuid-counted"));
+            final var detailed = send(node, "GET", "/_serverless/stats?include_shards=true", null);
+            assertEquals(detailed.body(), 200, detailed.status());
+            assertTrue(detailed.body(), detailed.body().contains("\"held_shards_truncated\":true"));
+            assertEquals(100, detailed.body().split("uuid-counted-000000", -1).length - 1);
+            final var fleet = send(node, "GET", "/_serverless/stats?nodes=_all", null);
+            assertEquals(fleet.body(), 200, fleet.status());
+            assertFalse(fleet.body(), fleet.body().contains("held_shards"));
         }
     }
 

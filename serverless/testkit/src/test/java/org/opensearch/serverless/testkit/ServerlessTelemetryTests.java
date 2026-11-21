@@ -153,6 +153,28 @@ public class ServerlessTelemetryTests extends OpenSearchTestCase {
         });
     }
 
+    public void testDistinctRequestSelectorsShareOneMetricsSeries() throws Exception {
+        FeatureFlags.TestUtils.with(FeatureFlags.TELEMETRY, () -> {
+            final var telemetry = new RecordingPlugin();
+            final var settings = Settings.builder()
+                .put(settings("metrics-cardinality"))
+                .put(TelemetrySettings.TRACER_FEATURE_ENABLED_SETTING.getKey(), false)
+                .build();
+            try (
+                var node = new ServerlessNode(settings, List.of(telemetry));
+                HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
+            ) {
+                node.startup().start();
+                for (int i = 0; i < 64; i++) {
+                    assertEquals(503, request(client, node, "/_serverless/stats?nodes=selector-" + i, "trace-" + i).statusCode());
+                }
+                final Map<String, Object> tags = Map.of("method", "GET", "status", 503L);
+                assertEquals(Map.of(tags, 64.0), telemetry.responses.getCounterValueForTags());
+                assertEquals(java.util.Set.of(tags), telemetry.latency.getHistogramValueForTags().keySet());
+            }
+        });
+    }
+
     private Settings settings(String name) {
         return Settings.builder()
             .put("node.name", name)

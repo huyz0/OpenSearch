@@ -72,6 +72,7 @@ if [[ $mode == smoke ]]; then
     --tests '*ServerlessAuthorizationTests.testAFilterRefusesAWriteForOneCallerAndNotAnother' \
     --tests '*ServerlessSearchPathTests.testWriterActivationLeavesAPinnedReaderIntact' \
     --tests '*ServerlessLogMessageTests' --tests '*ServerlessTelemetryTests' --tests '*ServerlessTransportAuthTests' \
+    --tests '*ServerlessStatsTests' --tests '*ZoneTrafficTests.testUnknownActionsShareOneBucket' \
     :serverless:testkit:s3Test --tests '*RustfsBlobContainerConformanceTests.testPutIfAbsentBlobWritesAdmitExactlyOne' \
     --tests '*RustfsBlobContainerConformanceTests.testCompareAndSwapAdmitsExactlyOneWinner' \
     --tests '*ServerlessOnObjectStoreTests.testASuccessorRecoversFromTheBucketAlone' \
