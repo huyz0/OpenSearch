@@ -10,15 +10,18 @@ package org.opensearch.serverless.shell;
 import org.opensearch.cluster.ClusterName;
 import org.opensearch.common.settings.ClusterSettings;
 import org.opensearch.rest.RestController;
+import org.opensearch.rest.RestHandler;
 import org.opensearch.serverless.node.SearchReadiness;
 import org.opensearch.serverless.plugins.PluginActions;
 import org.opensearch.serverless.plugins.PluginInjector;
 import org.opensearch.serverless.rest.ServerlessHealthHandler;
 import org.opensearch.serverless.rest.ServerlessRootHandler;
 import org.opensearch.serverless.warm.SearchDrain;
+import org.opensearch.telemetry.metrics.noop.NoopMetricsRegistry;
 import org.opensearch.usage.UsageService;
 
 import java.util.Set;
+import java.util.function.UnaryOperator;
 
 /**
  * Wires {@link ServerlessNode}'s REST and transport layers: the REST controller, authenticated plugin hops, and
@@ -37,12 +40,13 @@ final class NodeWiring {
      * exist, and returns 404/501 rather than an empty success.
      */
     RestController buildRestController(ClusterSettings clusterSettings) {
+        final UnaryOperator<RestHandler> authentication = node.plugins().restHandlerWrapper(node.threadPool().getThreadContext(), Set.of());
+        final RestRequestMetrics metrics = node.telemetry.metrics() == NoopMetricsRegistry.INSTANCE
+            ? null
+            : new RestRequestMetrics(node.telemetry.metrics());
         final RestController controller = new RestController(
             Set.of(),
-            // The seam a plugin authenticates on: it sees every request before the handler does, can
-            // refuse it, and can leave an identity in the ThreadContext. Passed here because the
-            // controller takes it at construction, which is why plugins are held before this runs.
-            node.plugins().restHandlerWrapper(node.threadPool().getThreadContext(), Set.of()),
+            metrics == null ? authentication : handler -> metrics.wrap(handler, authentication),
             node.nodeClient(),
             node.services().circuitBreakerService(),
             new UsageService()
@@ -215,7 +219,7 @@ final class NodeWiring {
      * @param fromPlugins what the network module composed from the installed plugins
      * @return the composed interceptor
      */
-    org.opensearch.transport.TransportInterceptor authenticatedPluginHops(org.opensearch.transport.TransportInterceptor fromPlugins) {
+    org.opensearch.transport.TransportInterceptor authenticatedPeerHops(org.opensearch.transport.TransportInterceptor fromPlugins) {
         final org.opensearch.transport.TransportInterceptor shell = new org.opensearch.serverless.transport.PluginHopAuthentication(
             () -> node.router(),
             name -> node.pluginActionNames.contains(name)
@@ -313,8 +317,8 @@ final class NodeWiring {
             new org.opensearch.env.Environment(node.settings(), null),
             // An action asks for these where a classic node's injector binds them; the shell traces and meters
             // its own work, so a plugin's spans and metrics go nowhere rather than failing its start.
-            org.opensearch.telemetry.tracing.noop.NoopTracer.INSTANCE,
-            org.opensearch.telemetry.metrics.noop.NoopMetricsRegistry.INSTANCE,
+            node.telemetry.tracer(),
+            node.telemetry.metrics(),
             // Core services the shell does not run, which plugins take as constructor arguments and use only on
             // paths that do not arise here. The security plugin takes all three: the repositories to check a
             // snapshot restore against (the shell's snapshots go to its own store, so none are registered),

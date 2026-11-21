@@ -109,7 +109,8 @@ public final class ServerlessBootstrap implements Closeable {
         "http.",
         "transport.",
         "network.",
-        "thread_pool."
+        "thread_pool.",
+        "telemetry."
     );
 
     private final ServerlessNode node;
@@ -204,7 +205,10 @@ public final class ServerlessBootstrap implements Closeable {
         ReconcileScheduler openedScheduler = null;
         try {
             node.startup().start();
-            logger.debug("Node services started (elapsed_ms={})", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
+            logger.debug(
+                "Node services started (elapsed_ms={})",
+                java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt)
+            );
 
             final org.opensearch.serverless.store.ObjectStoreHandle store = org.opensearch.serverless.store.ObjectStores.create(
                 complete,
@@ -214,7 +218,10 @@ public final class ServerlessBootstrap implements Closeable {
             openedStore = store;
             final MetadataPlane plane = new MetadataPlane(store.blobStore(), BlobPath.cleanPath(), System::currentTimeMillis, ttl);
             openedPlane = plane;
-            logger.debug("Object store opened (elapsed_ms={})", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
+            logger.debug(
+                "Object store opened (elapsed_ms={})",
+                java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt)
+            );
             node.setMetadataPlane(plane);
             logger.debug(
                 "Metadata plane attached (elapsed_ms={})",
@@ -283,10 +290,14 @@ public final class ServerlessBootstrap implements Closeable {
                 new org.opensearch.serverless.logging.ServerlessLogMessage(
                     "Serverless node started",
                     java.util.Map.of(
-                        "event", "serverless_node_started",
-                        "store_type", storeType,
-                        "lease_ttl_ms", ttl,
-                        "duration_ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt)
+                        "event",
+                        "serverless_node_started",
+                        "store_type",
+                        storeType,
+                        "lease_ttl_ms",
+                        ttl,
+                        "duration_ms",
+                        java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt)
                     )
                 )
             );
@@ -410,7 +421,10 @@ public final class ServerlessBootstrap implements Closeable {
                 logger.info("handed over {} shard(s) on shutdown", handed);
             }
         } catch (Exception e) {
-            logger.warn("Shard handover failed. Peers will take over after the lease expires (error_type={})", e.getClass().getSimpleName());
+            logger.warn(
+                "Shard handover failed. Peers will take over after the lease expires (error_type={})",
+                e.getClass().getSimpleName()
+            );
         }
         try {
             // Drop the lease rather than let it lapse. Without this a node that shut down cleanly stays
@@ -419,7 +433,10 @@ public final class ServerlessBootstrap implements Closeable {
             // of a failover, and it costs one delete.
             plane.membership().release(node.localNode().getId());
         } catch (Exception e) {
-            logger.warn("Lease release failed. Peers will consider this node live until expiry (error_type={})", e.getClass().getSimpleName());
+            logger.warn(
+                "Lease release failed. Peers will consider this node live until expiry (error_type={})",
+                e.getClass().getSimpleName()
+            );
         }
         node.close();
         try {
@@ -457,7 +474,9 @@ public final class ServerlessBootstrap implements Closeable {
             }
         }
 
-        final ServerlessBootstrap bootstrap = start(settings.build());
+        final Settings nodeSettings = settings.build();
+        org.opensearch.common.util.FeatureFlags.initializeFeatureFlags(nodeSettings);
+        final ServerlessBootstrap bootstrap = start(nodeSettings);
 
         // A readiness file, the way a daemon tells an orchestrator it is up. Written last, after the node
         // is actually serving, so its existence means something. A file rather than a line on stdout

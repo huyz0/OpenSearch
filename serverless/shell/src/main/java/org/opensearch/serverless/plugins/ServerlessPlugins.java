@@ -148,8 +148,7 @@ public final class ServerlessPlugins {
             componentsByPlugin.put(plugin, built);
         }
         registry.seal();
-        // Then the telemetry-aware overload, as core calls it: a second pass over the plugins implementing it,
-        // with no-op telemetry, which is what a classic node without a telemetry plugin hands them too.
+        // The telemetry-aware overload runs after the ordinary plugin components are registered.
         for (Plugin plugin : plugins) {
             if (plugin instanceof org.opensearch.plugins.TelemetryAwarePlugin telemetryAware) {
                 final java.util.Collection<Object> built = telemetryAware.createComponents(
@@ -164,8 +163,8 @@ public final class ServerlessPlugins {
                     host.namedWriteableRegistry(),
                     host.indexNameExpressionResolver(),
                     () -> null,
-                    org.opensearch.telemetry.tracing.noop.NoopTracer.INSTANCE,
-                    org.opensearch.telemetry.metrics.noop.NoopMetricsRegistry.INSTANCE
+                    host.tracer(),
+                    host.metricsRegistry()
                 );
                 componentsByPlugin.computeIfAbsent(plugin, p -> new ArrayList<>()).addAll(built);
             }
@@ -405,7 +404,11 @@ public final class ServerlessPlugins {
                 try {
                     clusterPlugin.onNodeStarted(localNode);
                 } catch (Exception e) {
-                    logger.error("Plugin failed during node start (plugin={}, error_type={})", plugin.getClass().getName(), e.getClass().getSimpleName());
+                    logger.error(
+                        "Plugin failed during node start (plugin={}, error_type={})",
+                        plugin.getClass().getName(),
+                        e.getClass().getSimpleName()
+                    );
                 }
             }
         }
@@ -463,6 +466,13 @@ public final class ServerlessPlugins {
         final java.util.Set<org.opensearch.common.settings.Setting<?>> known = new java.util.HashSet<>(
             ClusterSettings.BUILT_IN_CLUSTER_SETTINGS
         );
+        if (org.opensearch.common.util.FeatureFlags.isEnabled(org.opensearch.common.util.FeatureFlags.TELEMETRY)) {
+            known.add(org.opensearch.telemetry.TelemetrySettings.TRACER_ENABLED_SETTING);
+            known.add(org.opensearch.telemetry.TelemetrySettings.TRACER_SAMPLER_PROBABILITY);
+            known.add(org.opensearch.telemetry.TelemetrySettings.TRACER_FEATURE_ENABLED_SETTING);
+            known.add(org.opensearch.telemetry.TelemetrySettings.METRICS_FEATURE_ENABLED_SETTING);
+            known.add(org.opensearch.telemetry.TelemetrySettings.METRICS_PUBLISH_INTERVAL_SETTING);
+        }
         for (Plugin plugin : plugins) {
             for (org.opensearch.common.settings.Setting<?> setting : plugin.getSettings()) {
                 if (setting.hasNodeScope()) {

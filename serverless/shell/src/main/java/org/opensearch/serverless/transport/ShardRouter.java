@@ -292,15 +292,13 @@ public final class ShardRouter {
         final ForwardedStatsRequest request = new ForwardedStatsRequest();
         final PlainActionFuture<ForwardedStatsResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        try (var ignored = withMac(ForwardedStatsRequest.ACTION, request, peer)) {
-            transportService.sendRequest(
-                peer,
-                ForwardedStatsRequest.ACTION,
-                request,
-                TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedStatsResponse::new, this, peer, ForwardedStatsRequest.ACTION)
-            );
-        }
+        transportService.sendRequest(
+            peer,
+            ForwardedStatsRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedStatsResponse::new, this, peer, ForwardedStatsRequest.ACTION)
+        );
         return await(future, timeout, peer, ForwardedStatsRequest.ACTION);
     }
 
@@ -348,15 +346,13 @@ public final class ShardRouter {
             }
         }
         final PlainActionFuture<T> future = PlainActionFuture.newFuture();
-        try (var ignored = withMac(action, request, peer)) {
-            transportService.sendRequest(
-                peer,
-                action,
-                request,
-                TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, reader, this, peer, action)
-            );
-        }
+        transportService.sendRequest(
+            peer,
+            action,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, reader, this, peer, action)
+        );
         return await(future, timeout, peer, action);
     }
 
@@ -415,9 +411,7 @@ public final class ShardRouter {
      * <p>Each hop signs afresh. A signed frame carries no reusable deployment token; legacy token
      * authentication remains available only when this node cannot yet sign.
      *
-     * <p>Package-private rather than private because {@link PluginHopAuthentication} signs a plugin's own
-     * transport request with it. One implementation, so a plugin's hop and the shell's own are authenticated
-     * the same way and cannot drift apart.
+     * <p>The send interceptor calls this after transport tracing has populated the headers.
      */
     org.opensearch.common.util.concurrent.ThreadContext.StoredContext withMac(
         String action,
@@ -638,15 +632,13 @@ public final class ShardRouter {
     public ForwardedIndexResponse forwardIndex(DiscoveryNode peer, ForwardedIndexRequest request) throws IOException {
         final PlainActionFuture<ForwardedIndexResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        try (var ignored = withMac(ForwardedIndexRequest.ACTION, request, peer)) {
-            transportService.sendRequest(
-                peer,
-                ForwardedIndexRequest.ACTION,
-                request,
-                TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedIndexResponse::new, this, peer, ForwardedIndexRequest.ACTION)
-            );
-        }
+        transportService.sendRequest(
+            peer,
+            ForwardedIndexRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedIndexResponse::new, this, peer, ForwardedIndexRequest.ACTION)
+        );
         return await(future, timeout, peer, ForwardedIndexRequest.ACTION);
     }
 
@@ -665,15 +657,13 @@ public final class ShardRouter {
     public ForwardedBulkResponse forwardBulk(DiscoveryNode peer, ForwardedBulkRequest request) throws IOException {
         final PlainActionFuture<ForwardedBulkResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = bulkForwardTimeout(request);
-        try (var ignored = withMac(ForwardedBulkRequest.ACTION, request, peer)) {
-            transportService.sendRequest(
-                peer,
-                ForwardedBulkRequest.ACTION,
-                request,
-                TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedBulkResponse::new, this, peer, ForwardedBulkRequest.ACTION)
-            );
-        }
+        transportService.sendRequest(
+            peer,
+            ForwardedBulkRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedBulkResponse::new, this, peer, ForwardedBulkRequest.ACTION)
+        );
         return await(future, timeout, peer, ForwardedBulkRequest.ACTION);
     }
 
@@ -738,15 +728,13 @@ public final class ShardRouter {
         // The write bound, not the search one. A get is a point lookup on the owner rather than a fan-out,
         // so it is the cheaper of the two and has no reason to wait as long as a query.
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        try (var ignored = withMac(ForwardedGetRequest.ACTION, request, peer)) {
-            transportService.sendRequest(
-                peer,
-                ForwardedGetRequest.ACTION,
-                request,
-                TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedGetResponse::new, this, peer, ForwardedGetRequest.ACTION)
-            );
-        }
+        transportService.sendRequest(
+            peer,
+            ForwardedGetRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedGetResponse::new, this, peer, ForwardedGetRequest.ACTION)
+        );
         return await(future, timeout, peer, ForwardedGetRequest.ACTION);
     }
 
@@ -762,15 +750,13 @@ public final class ShardRouter {
         // The get bound rather than the search one, for the reason a get uses it: this is a point lookup on
         // one shard with no fan-out to wait behind.
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        try (var ignored = withMac(ForwardedExplainRequest.ACTION, request, peer)) {
-            transportService.sendRequest(
-                peer,
-                ForwardedExplainRequest.ACTION,
-                request,
-                TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedExplainResponse::new, this, peer, ForwardedExplainRequest.ACTION)
-            );
-        }
+        transportService.sendRequest(
+            peer,
+            ForwardedExplainRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedExplainResponse::new, this, peer, ForwardedExplainRequest.ACTION)
+        );
         return await(future, timeout, peer, ForwardedExplainRequest.ACTION);
     }
 
@@ -784,15 +770,13 @@ public final class ShardRouter {
     public ForwardedSearchResponse forwardSearch(DiscoveryNode peer, ForwardedSearchRequest request) throws IOException {
         final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
         final TimeValue timeout = searchForwardTimeout();
-        try (var ignored = withMac(ForwardedSearchRequest.ACTION, request, peer)) {
-            transportService.sendRequest(
-                peer,
-                ForwardedSearchRequest.ACTION,
-                request,
-                TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedSearchResponse::new, this, peer, ForwardedSearchRequest.ACTION)
-            );
-        }
+        transportService.sendRequest(
+            peer,
+            ForwardedSearchRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedSearchResponse::new, this, peer, ForwardedSearchRequest.ACTION)
+        );
         return future.actionGet(timeout);
     }
 
@@ -809,15 +793,13 @@ public final class ShardRouter {
     public ForwardedSearchResponse forwardFrozenSearch(DiscoveryNode peer, ForwardedFrozenSearchRequest request) throws IOException {
         final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
         final TimeValue timeout = searchForwardTimeout();
-        try (var ignored = withMac(ForwardedFrozenSearchRequest.ACTION, request, peer)) {
-            transportService.sendRequest(
-                peer,
-                ForwardedFrozenSearchRequest.ACTION,
-                request,
-                TransportRequestOptions.builder().withTimeout(timeout).build(),
-                new Handler<>(future, ForwardedSearchResponse::new, this, peer, ForwardedFrozenSearchRequest.ACTION)
-            );
-        }
+        transportService.sendRequest(
+            peer,
+            ForwardedFrozenSearchRequest.ACTION,
+            request,
+            TransportRequestOptions.builder().withTimeout(timeout).build(),
+            new Handler<>(future, ForwardedSearchResponse::new, this, peer, ForwardedFrozenSearchRequest.ACTION)
+        );
         return future.actionGet(timeout);
     }
 
