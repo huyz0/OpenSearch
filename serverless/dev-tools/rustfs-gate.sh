@@ -71,6 +71,7 @@ if [[ $mode == smoke ]]; then
     :serverless:testkit:test --tests '*RequestBudget*' --tests '*IdleIndexRequestTests' --tests '*NodeLogTakeoverTests' \
     --tests '*ServerlessAuthorizationTests.testAFilterRefusesAWriteForOneCallerAndNotAnother' \
     --tests '*ServerlessSearchPathTests.testWriterActivationLeavesAPinnedReaderIntact' \
+    --tests '*ServerlessLogMessageTests' \
     :serverless:testkit:s3Test --tests '*RustfsBlobContainerConformanceTests.testPutIfAbsentBlobWritesAdmitExactlyOne' \
     --tests '*RustfsBlobContainerConformanceTests.testCompareAndSwapAdmitsExactlyOneWinner' \
     --tests '*ServerlessOnObjectStoreTests.testASuccessorRecoversFromTheBucketAlone' \
@@ -78,6 +79,7 @@ if [[ $mode == smoke ]]; then
     --tests '*RustfsNodeLogTakeoverTests.testTakeoverDistinguishesTheTwoOutcomesOfAnAmbiguousAppend' \
     --tests '*RustfsNodeLogTakeoverIntegrationTests.testACrashedWritersUnpublishedWritesSurviveTwoTakeovers' \
     :serverless:testkit:processTest --tests '*ServerlessBucketContentionTests.testFullFleetHardStopRecoversUnpublishedWritesFromTheSameBucket' \
+    --tests '*ServerlessFleetTests.testRestErrorsDoNotLogQueryParameters' \
     -Dtests.serverless.rustfs.endpoint="$endpoint" -Dtests.serverless.s3.endpoint="$endpoint" \
     -Dtests.serverless.s3.access_key=rustfsadmin -Dtests.serverless.s3.secret_key=rustfsadmin -Dtests.serverless.rustfs.gate=true
 
@@ -100,6 +102,7 @@ smoke = {
     "testTakeoverDistinguishesTheTwoOutcomesOfAnAmbiguousAppend",
     "testACrashedWritersUnpublishedWritesSurviveTwoTakeovers",
     "testFullFleetHardStopRecoversUnpublishedWritesFromTheSameBucket",
+    "testRestErrorsDoNotLogQueryParameters",
 }
 if argv[1] == "smoke":
     required = smoke

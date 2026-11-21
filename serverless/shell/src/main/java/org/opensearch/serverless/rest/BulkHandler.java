@@ -451,7 +451,7 @@ public final class BulkHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a bulk failure", nested);
+                    RestReplies.logResponseFailure(logger, "bulk", nested);
                 }
             }
         }

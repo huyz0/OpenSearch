@@ -176,7 +176,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a list failure", nested);
+                    RestReplies.logResponseFailure(logger, "list_indices", nested);
                 }
             }
         });
@@ -314,7 +314,7 @@ public final class ListIndicesHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
-            logger.error("failed to report a list refusal", e);
+            RestReplies.logResponseFailure(logger, "list_indices", e);
         }
     }
 }

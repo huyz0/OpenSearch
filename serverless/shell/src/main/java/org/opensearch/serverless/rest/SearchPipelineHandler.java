@@ -152,7 +152,7 @@ public final class SearchPipelineHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a pipeline failure", nested);
+                    RestReplies.logResponseFailure(logger, "search_pipeline", nested);
                 }
             }
         });
@@ -280,7 +280,7 @@ public final class SearchPipelineHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
-            logger.error("failed to report a search-pipeline refusal", e);
+            RestReplies.logResponseFailure(logger, "search_pipeline", e);
         }
     }
 }

@@ -188,8 +188,8 @@ final class ShardEviction {
             reconciler.node.nodeCapacity().noteEvicted(handOff);
             evicted++;
         }
-        if (evicted > 0) {
-            BackgroundReconciler.logger.info(
+        if (evicted > 0 && BackgroundReconciler.logger.isDebugEnabled()) {
+            BackgroundReconciler.logger.debug(
                 "{} {} shard(s), {} held against a cap of {} (floor {})",
                 handOff ? "handed off" : "evicted to make room",
                 evicted,
@@ -278,7 +278,11 @@ final class ShardEviction {
         } catch (Exception e) {
             // Releasing is an optimisation. Failing to do it costs money and nothing else, so it is
             // logged and retried on the next pass rather than propagated into the tick.
-            BackgroundReconciler.logger.warn("could not release shard " + shardId, e);
+            BackgroundReconciler.logger.warn(
+                "Could not release a shard during eviction (shard={}, error_type={})",
+                shardId.id(),
+                e.getClass().getSimpleName()
+            );
             return false;
         }
     }
@@ -351,7 +355,7 @@ final class ShardEviction {
             ) == false) {
             // Somebody else's head now, or the swap lost. Keep the shard and try again next pass;
             // closing it while the head still points here is the one outcome to avoid.
-            BackgroundReconciler.logger.warn("could not release the head for {}; keeping it open", shardId);
+            BackgroundReconciler.logger.debug("Keeping a shard open after its head release failed (shard={})", shardId.id());
             return false;
         }
         reconciler.node.reconciler().releaseShard(shardId, reason);
@@ -375,9 +379,10 @@ final class ShardEviction {
                     published.map(org.opensearch.serverless.store.CommitManifest::digest).orElse(null)
                 );
         } catch (Exception e) {
-            BackgroundReconciler.logger.warn(
-                "could not clear the writer mark of " + shardId + " in its digest rollup; searches will not skip it",
-                e
+            BackgroundReconciler.logger.debug(
+                "Searches will keep checking a shard whose writer mark could not be cleared (shard={}, error_type={})",
+                shardId.id(),
+                e.getClass().getSimpleName()
             );
         }
         // And forget the claim, so a node that churns through shards does not read a head per stale
@@ -389,7 +394,11 @@ final class ShardEviction {
             try {
                 reconciler.plane.forgetIfNothing(shardId.getIndexName());
             } catch (Exception e) {
-                BackgroundReconciler.logger.debug("could not take empty " + shardId + " out of its rollup", e);
+                BackgroundReconciler.logger.debug(
+                    "Could not remove an empty shard from its rollup (shard={}, error_type={})",
+                    shardId.id(),
+                    e.getClass().getSimpleName()
+                );
             }
         }
         return true;

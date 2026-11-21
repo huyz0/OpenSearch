@@ -170,8 +170,8 @@ public final class NodeStorage {
                         // An unexpected layout means we cannot say which shard this is, and guessing would
                         // attach one shard's directory to another's data. Local-only is the safe answer.
                         NodeContext.logger.warn(
-                            "could not derive a shard number from " + location + "; serving it from local disk only",
-                            e
+                            "Could not identify the shard from its local directory layout (error_type={})",
+                            e.getClass().getSimpleName()
                         );
                         return local;
                     }

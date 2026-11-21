@@ -60,6 +60,8 @@ public class RequestBudgetTests extends OpenSearchTestCase {
             .put("http.port", "0")
             .put("transport.port", "0")
             .put("serverless.roles", roles)
+            // Count base operations without duplicating a PUT when the test worker stalls.
+            .put(org.opensearch.serverless.nodelog.NodeLogSettings.HEDGE_AFTER_MILLIS.getKey(), 0L)
             .build();
     }
 

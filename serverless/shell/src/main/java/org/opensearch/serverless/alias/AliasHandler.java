@@ -137,7 +137,7 @@ public final class AliasHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report an alias operation failure", nested);
+                    RestReplies.logResponseFailure(logger, "alias", nested);
                 }
             }
         };

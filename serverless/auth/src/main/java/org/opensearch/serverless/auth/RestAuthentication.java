@@ -193,7 +193,10 @@ final class RestAuthentication {
                     try {
                         channel.sendResponse(new BytesRestResponse(channel, e));
                     } catch (Exception nested) {
-                        ServerlessAuthPlugin.LOGGER.error("failed to report an authentication failure", nested);
+                        ServerlessAuthPlugin.LOGGER.debug(
+                            "Could not send the authentication error response (error_type={})",
+                            nested.getClass().getSimpleName()
+                        );
                     }
                 } finally {
                     Arrays.fill(password, '\0');

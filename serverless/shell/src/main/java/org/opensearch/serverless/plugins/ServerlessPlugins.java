@@ -405,7 +405,7 @@ public final class ServerlessPlugins {
                 try {
                     clusterPlugin.onNodeStarted(localNode);
                 } catch (Exception e) {
-                    logger.error("plugin " + plugin.getClass().getName() + " failed on node start", e);
+                    logger.error("Plugin failed during node start (plugin={}, error_type={})", plugin.getClass().getName(), e.getClass().getSimpleName());
                 }
             }
         }
@@ -536,7 +536,7 @@ public final class ServerlessPlugins {
             try {
                 plugin.close();
             } catch (Exception e) {
-                logger.warn("plugin " + plugin.getClass().getName() + " failed to close", e);
+                logger.warn("Plugin failed to close (plugin={}, error_type={})", plugin.getClass().getName(), e.getClass().getSimpleName());
             }
         }
     }

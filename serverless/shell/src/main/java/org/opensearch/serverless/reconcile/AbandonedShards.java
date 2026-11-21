@@ -70,8 +70,8 @@ final class AbandonedShards {
                 }
             } catch (Exception e) {
                 BackgroundReconciler.logger.warn(
-                    "could not read the lease of departed node " + deadNodeId + "; its shards wait for requests",
-                    e
+                    "Could not read a departed node's lease. Shard takeover will wait (error_type={})",
+                    e.getClass().getSimpleName()
                 );
                 return List.of();
             }
@@ -80,8 +80,8 @@ final class AbandonedShards {
                 claims = reconciler.plane.claimsOf(deadNodeId);
             } catch (Exception e) {
                 BackgroundReconciler.logger.warn(
-                    "could not list the claims of departed node " + deadNodeId + "; its shards wait for requests",
-                    e
+                    "Could not read departed-node claims. Shard takeover will wait (error_type={})",
+                    e.getClass().getSimpleName()
                 );
                 return List.of();
             }
@@ -211,8 +211,8 @@ final class AbandonedShards {
             }
         } catch (Exception e) {
             BackgroundReconciler.logger.debug(
-                "could not settle " + claim + " of departed node " + deadNodeId + "; it waits for a request",
-                e
+                "Could not settle a departed-node claim. Takeover will wait for demand (error_type={})",
+                e.getClass().getSimpleName()
             );
             return false;
         }
@@ -226,7 +226,7 @@ final class AbandonedShards {
         try {
             enrolled = reconciler.plane.membership().enrolledIds();
         } catch (Exception e) {
-            BackgroundReconciler.logger.debug("janitor could not read the members index", e);
+            BackgroundReconciler.logger.debug("Janitor could not read membership (error_type={})", e.getClass().getSimpleName());
             return;
         }
         int looked = 0;
@@ -251,7 +251,10 @@ final class AbandonedShards {
                     );
                 }
             } catch (Exception e) {
-                BackgroundReconciler.logger.debug("janitor could not collect the write log of " + nodeId, e);
+                BackgroundReconciler.logger.debug(
+                    "Janitor could not collect a departed node's WAL (error_type={})",
+                    e.getClass().getSimpleName()
+                );
             }
         }
     }
@@ -316,7 +319,10 @@ final class AbandonedShards {
                     try {
                         settleForJanitor(claim.getKey(), claim.getValue(), nodeId, -1L, counts, replaysLeft);
                     } catch (Exception e) {
-                        BackgroundReconciler.logger.debug("janitor could not settle " + claim + " of " + nodeId, e);
+                        BackgroundReconciler.logger.debug(
+                            "Janitor could not settle a departed-node claim (error_type={})",
+                            e.getClass().getSimpleName()
+                        );
                     }
                 }
             }
@@ -366,7 +372,10 @@ final class AbandonedShards {
                                 }
                             }
                         } catch (Exception e) {
-                            BackgroundReconciler.logger.debug("janitor could not take " + entry.getKey() + " out of its rollup", e);
+                            BackgroundReconciler.logger.debug(
+                                "Janitor could not remove a shard from its rollup (error_type={})",
+                                e.getClass().getSimpleName()
+                            );
                         }
                         continue;
                     }
@@ -390,8 +399,9 @@ final class AbandonedShards {
                             }
                         } catch (Exception e) {
                             BackgroundReconciler.logger.debug(
-                                "janitor could not settle the mark on " + entry.getKey() + "[" + shard + "]",
-                                e
+                                "Janitor could not settle a writer mark (shard={}, error_type={})",
+                                shard,
+                                e.getClass().getSimpleName()
                             );
                         }
                     }
@@ -472,7 +482,11 @@ final class AbandonedShards {
                     () -> reconciler.eviction.letGo(shardId, "replayed and published by the janitor; nobody is using it")
                 );
             } catch (Exception e) {
-                BackgroundReconciler.logger.debug("could not give back " + shardId + " after the janitor replayed it", e);
+                BackgroundReconciler.logger.debug(
+                    "Janitor could not release a recovered shard (shard={}, error_type={})",
+                    shardId.id(),
+                    e.getClass().getSimpleName()
+                );
             }
         });
     }

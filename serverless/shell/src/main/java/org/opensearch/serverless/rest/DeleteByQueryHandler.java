@@ -236,7 +236,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a delete_by_query failure", nested);
+                    RestReplies.logResponseFailure(logger, "delete_by_query", nested);
                 }
             }
         });
@@ -295,7 +295,7 @@ public final class DeleteByQueryHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException nested) {
-            logger.error("failed to report a delete_by_query failure", nested);
+            RestReplies.logResponseFailure(logger, "delete_by_query", nested);
         }
     }
 

@@ -417,7 +417,7 @@ public final class NodeWritePath {
                     node.push.acked(shardId, records, tailPush);
                 } catch (RuntimeException e) {
                     // The write is acknowledged whatever happens here; its readers see it at the next commit.
-                    LOG.debug("could not keep acknowledged records of {} for its search nodes", shardId, e);
+                    LOG.debug("Could not retain acknowledged records for readers (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
                 }
             }
             timings.add(WriteAckTimings.Step.TAIL_PUSH, System.nanoTime() - appended);

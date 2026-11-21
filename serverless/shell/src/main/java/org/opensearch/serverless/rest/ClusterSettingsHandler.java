@@ -144,7 +144,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                     try {
                         channel.sendResponse(RestReplies.failure(channel, e));
                     } catch (IOException nested) {
-                        logger.error("failed to report a cluster settings read failure", nested);
+                        RestReplies.logResponseFailure(logger, "cluster_settings", nested);
                     }
                 }
             });
@@ -272,7 +272,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a cluster settings write failure", nested);
+                    RestReplies.logResponseFailure(logger, "cluster_settings", nested);
                 }
             }
         });

@@ -319,7 +319,11 @@ final class ShardPublishing {
         try (org.apache.lucene.index.DirectoryReader reader = org.apache.lucene.index.DirectoryReader.open(commit)) {
             return org.opensearch.serverless.store.PruningDigest.compute(reader, name -> shard.mapperService().fieldType(name));
         } catch (Exception e) {
-            ShardReconciler.logger.warn("could not compute the pruning digest of " + shard.shardId() + "; publishing without one", e);
+            ShardReconciler.logger.debug(
+                "Publishing without the pruning digest (shard={}, error_type={})",
+                shard.shardId().id(),
+                e.getClass().getSimpleName()
+            );
             return org.opensearch.serverless.store.PruningDigest.EMPTY;
         } finally {
             shard.store().decRef();

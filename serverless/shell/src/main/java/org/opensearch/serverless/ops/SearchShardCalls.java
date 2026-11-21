@@ -9,11 +9,13 @@ package org.opensearch.serverless.ops;
 
 import org.opensearch.core.index.shard.ShardId;
 import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.serverless.logging.ServerlessLogMessage;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Asks one shard of a search for its answer: the local copy when it is open here, otherwise the owner or a
@@ -75,11 +77,7 @@ final class SearchShardCalls {
                 // found its commit superseded and released it -- used to be this shard's final answer,
                 // with a peer that could have served it never asked. It is now the first attempt, not
                 // the only one; if nobody else can answer either, its reason is still the one reported.
-                if (e instanceof org.opensearch.serverless.write.ShardBehindLogException behind && behind.notCaughtUp()) {
-                    LOG.debug("shard {} of {} here may not hold a refreshed write; trying elsewhere", shard, index);
-                } else {
-                    LOG.warn("shard " + shard + " of " + index + " was open here and could not answer; trying elsewhere", e);
-                }
+                logCopyFailure(descriptor, shard, "local", e);
                 lastFailure = e;
             }
         }
@@ -140,7 +138,7 @@ final class SearchShardCalls {
             } catch (Exception e) {
                 // Try the next candidate. A shard that failed to answer is not a shard with no matches,
                 // so it only counts as searched if one of them succeeded.
-                LOG.warn("shard " + shard + " of " + index + " was not served by " + target, e);
+                logCopyFailure(descriptor, shard, "preferred_or_owner", e);
                 lastFailure = e;
                 refusedAtTheCap |= atTheCap(e);
             }
@@ -167,7 +165,7 @@ final class SearchShardCalls {
                     return answer;
                 }
             } catch (Exception e) {
-                LOG.debug("shard " + shard + " of " + index + " was not served by " + spare, e);
+                logCopyFailure(descriptor, shard, "spare", e);
                 lastFailure = e;
             }
         }
@@ -185,6 +183,28 @@ final class SearchShardCalls {
             throw new IOException(lastFailure);
         }
         return null;
+    }
+
+    private static void logCopyFailure(
+        org.opensearch.serverless.cluster.IndexDescriptor descriptor,
+        int shard,
+        String candidate,
+        Exception failure
+    ) {
+        if (LOG.isDebugEnabled()) {
+            LOG.debug(
+                new ServerlessLogMessage(
+                    "Search copy could not answer",
+                    Map.of(
+                        "event", "search_copy_failed",
+                        "index_uuid", descriptor.uuid(),
+                        "shard", shard,
+                        "candidate", candidate,
+                        "error_type", failure.getClass().getSimpleName()
+                    )
+                )
+            );
+        }
     }
 
     /**
@@ -351,7 +371,14 @@ final class SearchShardCalls {
             } catch (Exception e) {
                 // Try the next candidate, same as the live path: a shard that failed to answer is not a
                 // shard with no matches, so it only counts as searched once one candidate has succeeded.
-                LOG.warn("shard " + shard + " of the point in time " + pit.id() + " was not served by " + target, e);
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug(
+                        new ServerlessLogMessage(
+                            "Point-in-time copy could not answer",
+                            Map.of("event", "pit_copy_failed", "shard", shard, "error_type", e.getClass().getSimpleName())
+                        )
+                    );
+                }
             }
         }
         // No candidate answered -- empty membership, everyone unreachable, or this node holds no search

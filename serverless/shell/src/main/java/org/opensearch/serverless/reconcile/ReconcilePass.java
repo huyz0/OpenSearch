@@ -78,7 +78,10 @@ final class ReconcilePass {
                         }
                         reconciler.lastPins = pins;
                     } catch (Exception e) {
-                        BackgroundReconciler.logger.warn("could not read the deployment's pins; the sweep gate keeps its last reading", e);
+                        BackgroundReconciler.logger.warn(
+                            "Keeping the previous retention pins after a read failed (error_type={})",
+                            e.getClass().getSimpleName()
+                        );
                     }
                 }
                 // Descriptor tombstones past their quarantine, rarely: a name created and deleted daily used
@@ -113,7 +116,7 @@ final class ReconcilePass {
                 try {
                     activated.addAll(reconciler.node.activation().syncFrom(reconciler.plane));
                 } catch (Exception e) {
-                    BackgroundReconciler.logger.warn("periodic resync against the metadata plane failed; the next one will retry", e);
+                    BackgroundReconciler.logger.debug("Periodic metadata resync will retry (error_type={})", e.getClass().getSimpleName());
                 }
             }
             // Only what was published, so the sweep costs nothing at all on a shard nobody is writing to.

@@ -214,7 +214,7 @@ public abstract class NodeContext extends NodeCore {
                 // -- it is unroutable, and a client's write would be refused with nowhere to send it.
                 nodeLogs.nodeLog(plane).renew();
             } catch (java.io.IOException e) {
-                logger.warn("could not publish this node's lease; peers will not be able to route to it", e);
+                logger.warn("Initial lease publication failed and peers cannot route to this node (error_type={})", e.getClass().getSimpleName());
             }
         }
         afterPlaneSet();

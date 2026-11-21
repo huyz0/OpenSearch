@@ -300,12 +300,7 @@ public final class GarbageCollector {
                 // A record the plane could not read. What it holds is unknowable, so nothing is deleted
                 // while it stands; what was on watch stays on watch, so the grace is not restarted when
                 // the record is repaired or removed.
-                logger.warn(
-                    "not sweeping shard {} of {}: the point in time [{}] could not be read and may hold any of its files",
-                    shardId,
-                    indexName,
-                    pit.id()
-                );
+                logger.debug("Keeping shard files while a point in time is unreadable (shard={})", shardId);
                 return new ShardSweep(List.of(), previousCandidates == null ? Set.of() : Set.copyOf(previousCandidates));
             }
         }
@@ -822,7 +817,7 @@ public final class GarbageCollector {
     private static boolean hasUnreadableView(List<PointInTime> views) {
         for (PointInTime pit : views) {
             if (pit.isPlaceholder()) {
-                logger.warn("not sweeping orphaned shards: the point in time [{}] could not be read and may hold any of them", pit.id());
+                logger.debug("Keeping orphaned shards while a point in time is unreadable");
                 return true;
             }
         }
@@ -855,7 +850,7 @@ public final class GarbageCollector {
             return false;
         }
         if (pinnedBySnapshot(snapshots, uuid, shard) || pinnedByView(views, indexName, uuid, shard)) {
-            logger.info("leaving {} in place: a live snapshot or point in time still names its blobs", container);
+            logger.debug("Keeping orphaned shard files referenced by a snapshot or point in time");
             return false;
         }
         try {

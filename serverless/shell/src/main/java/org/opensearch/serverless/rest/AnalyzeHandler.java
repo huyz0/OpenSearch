@@ -149,13 +149,13 @@ public final class AnalyzeHandler extends BaseRestHandler {
                         )
                     );
                 } catch (IOException nested) {
-                    logger.error("failed to report an analyze refusal", nested);
+                    RestReplies.logResponseFailure(logger, "analyze", nested);
                 }
             } catch (Exception e) {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report an analyze failure", nested);
+                    RestReplies.logResponseFailure(logger, "analyze", nested);
                 }
             }
         });

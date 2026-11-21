@@ -208,7 +208,7 @@ public final class CatalogHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a catalog failure", nested);
+                    RestReplies.logResponseFailure(logger, "catalog", nested);
                 }
             }
         };

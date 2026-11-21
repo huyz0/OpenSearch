@@ -68,9 +68,8 @@ final class AliasMutations {
             }
             if (done == false) {
                 MetadataPlane.LOGGER.warn(
-                    "alias [{}] may still name the deleted index [{}]; it is being changed concurrently",
-                    name,
-                    deleted.name()
+                    "A concurrently modified alias may still refer to a deleted index (index_uuid={})",
+                    deleted.uuid()
                 );
             }
         }
@@ -296,7 +295,7 @@ final class AliasMutations {
                 return;
             }
         }
-        MetadataPlane.LOGGER.warn("could not remove stale alias hint [{}] from [{}]", alias, index);
+        MetadataPlane.LOGGER.debug("Could not remove a stale alias hint after concurrent changes");
     }
 
     /**

@@ -233,7 +233,7 @@ final class PointInTimeStore {
                     live.add(expiry.live());
                 }
             } catch (Exception failure) {
-                LOGGER.warn("could not read point in time {}; treating it as live", id, failure);
+                LOGGER.debug("Treating an unreadable point in time as live (error_type={})", failure.getClass().getSimpleName());
                 live.add(new PointInTime(id, "", Long.MAX_VALUE, Map.of()));
             }
         }
@@ -251,7 +251,7 @@ final class PointInTimeStore {
                     removed++;
                 }
             } catch (Exception failure) {
-                LOGGER.warn("could not expire point in time {}; leaving it alone", id, failure);
+                LOGGER.debug("Keeping a point in time after expiration failed (error_type={})", failure.getClass().getSimpleName());
             }
         }
         return removed;

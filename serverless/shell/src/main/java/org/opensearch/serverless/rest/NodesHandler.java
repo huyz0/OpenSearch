@@ -267,7 +267,7 @@ public final class NodesHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
-            logger.error("failed to report a nodes refusal", e);
+            RestReplies.logResponseFailure(logger, "nodes", e);
         }
     }
 
@@ -308,7 +308,7 @@ public final class NodesHandler extends BaseRestHandler {
             try {
                 channel.sendResponse(RestReplies.failure(channel, e));
             } catch (IOException nested) {
-                logger.error("failed to report a nodes failure", nested);
+                RestReplies.logResponseFailure(logger, "nodes", nested);
             }
         }
     }

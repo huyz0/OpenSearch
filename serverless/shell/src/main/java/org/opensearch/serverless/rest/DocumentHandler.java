@@ -360,7 +360,7 @@ public final class DocumentHandler extends BaseRestHandler {
                     : RestReplies.failure(channel, failure)
             );
         } catch (IOException nested) {
-            logger.error("failed to report a write failure", nested);
+            RestReplies.logResponseFailure(logger, "document", nested);
         }
     }
 

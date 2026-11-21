@@ -129,7 +129,7 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a validate or resolve failure", nested);
+                    RestReplies.logResponseFailure(logger, "validate_and_resolve", nested);
                 }
             }
         });
@@ -273,7 +273,7 @@ public final class ValidateAndResolveHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
-            logger.error("failed to report a refusal", e);
+            RestReplies.logResponseFailure(logger, "validate_and_resolve", e);
         }
     }
 }

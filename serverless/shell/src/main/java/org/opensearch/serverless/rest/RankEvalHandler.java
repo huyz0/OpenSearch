@@ -147,7 +147,7 @@ public final class RankEvalHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a rank-eval failure", nested);
+                    RestReplies.logResponseFailure(logger, "rank_eval", nested);
                 }
             }
         });

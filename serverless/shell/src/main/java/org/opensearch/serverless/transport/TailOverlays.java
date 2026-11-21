@@ -364,7 +364,12 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
                 }
             } catch (Exception e) {
                 // The pushes still come; until they do, the commit is what the reader serves.
-                LOG.debug("could not fetch the acknowledged tail of {} from [{}]", shardId, writer, e);
+                LOG.debug(
+                    "Could not fetch the acknowledged tail (shard={}, writer_node_id={}, error_type={})",
+                    shardId.id(),
+                    writer,
+                    e.getClass().getSimpleName()
+                );
             }
         };
         if (router.refreshVisibility().waitsForSearchNodes()) {
@@ -492,7 +497,12 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
                         }
                     }
                 } catch (Exception e) {
-                    LOG.debug("could not ask the writer [{}] of {} for a grant", writer, shardId, e);
+                    LOG.debug(
+                        "Could not request a tail grant (writer_node_id={}, shard={}, error_type={})",
+                        writer,
+                        shardId.id(),
+                        e.getClass().getSimpleName()
+                    );
                 }
             }
         }
@@ -511,7 +521,12 @@ public final class TailOverlays implements OverlayReadOnlyEngine.Tail {
             } catch (Exception e) {
                 // A writer that cannot be reached is treated as one that died: the reader serves its commit, as it does
                 // for any acknowledged write until the shard is taken over, rather than fail every search meanwhile.
-                LOG.debug("could not reach the writer [{}] of {}; serving its commit", writer, shardId, e);
+                LOG.debug(
+                    "Using the published commit after a writer lookup failed (writer_node_id={}, shard={}, error_type={})",
+                    writer,
+                    shardId.id(),
+                    e.getClass().getSimpleName()
+                );
                 unreachable.incrementAndGet();
                 return true;
             }

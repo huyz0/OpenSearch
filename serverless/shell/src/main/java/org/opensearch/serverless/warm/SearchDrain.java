@@ -82,7 +82,10 @@ public final class SearchDrain {
         try {
             node.leases().renewLease(plane);
         } catch (Exception e) {
-            LOG.warn("could not drop the search role from this node's lease; coordinators see it go when the lease does", e);
+            LOG.warn(
+                "Could not remove the search role. Routing will stop when the lease expires (error_type={})",
+                e.getClass().getSimpleName()
+            );
         }
         final String self = node.localNode().getId();
         final List<String> peers = new ArrayList<>();
@@ -96,7 +99,7 @@ public final class SearchDrain {
                 }
             }
         } catch (Exception e) {
-            LOG.warn("could not read the members to hand this node's shards to; they warm from searches instead", e);
+            LOG.warn("Could not find peers for search handoff. They will warm on demand (error_type={})", e.getClass().getSimpleName());
         }
         peers.sort(null);
         final long deadline = System.nanoTime() + SearchSettings.DRAIN_MAX_WAIT.get(node.settings()).nanos();
@@ -119,7 +122,7 @@ public final class SearchDrain {
                 }
             } catch (Exception e) {
                 failed++;
-                LOG.warn("search peer [" + peer + "] did not take over this node's shards", e);
+                LOG.debug("Search handoff to peer failed (error_type={})", e.getClass().getSimpleName());
             }
         }
         if (peers.isEmpty() == false) {

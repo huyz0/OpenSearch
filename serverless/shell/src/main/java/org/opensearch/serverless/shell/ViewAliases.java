@@ -72,7 +72,7 @@ final class ViewAliases {
             return ClusterState.builder(state).metadata(metadata).build();
         } catch (RuntimeException e) {
             // An alias that clashes with an index name in the view: the indices without their aliases rather than no view.
-            logger.debug("not adding the indices' aliases to the local view", e);
+            logger.debug("Omitting aliases from the local view (error_type={})", e.getClass().getSimpleName());
             return state;
         }
     }
@@ -95,7 +95,7 @@ final class ViewAliases {
             try {
                 alias = plane.resolveForRouting(name).alias();
             } catch (Exception e) {
-                logger.debug("could not read alias [" + name + "] for index [" + descriptor.name() + "]", e);
+                logger.debug("Omitting an unreadable alias (index_uuid={}, error_type={})", descriptor.uuid(), e.getClass().getSimpleName());
                 continue;
             }
             if (alias == null || alias.dataStream() || alias.indices().contains(descriptor.name()) == false) {

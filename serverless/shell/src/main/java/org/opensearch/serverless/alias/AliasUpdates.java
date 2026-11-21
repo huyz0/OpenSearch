@@ -80,7 +80,7 @@ final class AliasUpdates {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report an alias failure", nested);
+                    RestReplies.logResponseFailure(logger, "alias", nested);
                 }
             }
         }

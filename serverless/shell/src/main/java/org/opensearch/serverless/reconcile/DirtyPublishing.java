@@ -287,7 +287,7 @@ final class DirtyPublishing {
             try {
                 each.get();
             } catch (java.util.concurrent.ExecutionException e) {
-                BackgroundReconciler.logger.warn("a publish failed outside its own handling", e.getCause());
+                BackgroundReconciler.logger.warn("Unexpected failure waiting for a shard publish (error_type={})", e.getClass().getSimpleName());
             }
         }
         return published;
@@ -359,7 +359,12 @@ final class DirtyPublishing {
                     return null;
                 });
             } catch (Exception releaseFailure) {
-                BackgroundReconciler.logger.warn("could not release " + shardId + " after a fenced publish", releaseFailure);
+                BackgroundReconciler.logger.warn(
+                    "Could not release a fenced writer (index_uuid={}, shard={}, error_type={})",
+                    shardId.getIndex().getUUID(),
+                    shardId.id(),
+                    releaseFailure.getClass().getSimpleName()
+                );
             }
             reconciler.lastPublishedMaxSeqNo.remove(shardId);
             reconciler.lastPublishedAtMillis.remove(shardId);
@@ -370,7 +375,12 @@ final class DirtyPublishing {
             // the marks were drained before this loop began, so an exception out of it silently left
             // the rest unpublished for up to a backstop interval. This shard is re-marked and the
             // loop goes on.
-            BackgroundReconciler.logger.warn("could not publish " + shardId + "; it is re-marked and will be retried", e);
+            BackgroundReconciler.logger.debug(
+                "Shard publish will retry (index_uuid={}, shard={}, error_type={})",
+                shardId.getIndex().getUUID(),
+                shardId.id(),
+                e.getClass().getSimpleName()
+            );
             reconciler.dirty.add(shardId);
             return false;
         }
@@ -417,7 +427,12 @@ final class DirtyPublishing {
                     // Fenced: the next pass's head check releases it, as a fenced publish does.
                     reconciler.fenced.add(shardId);
                 } catch (Exception e) {
-                    BackgroundReconciler.logger.warn("could not write " + shardId + "'s staged commit; its next publish will", e);
+                    BackgroundReconciler.logger.debug(
+                        "Next publish will retry the staged commit (index_uuid={}, shard={}, error_type={})",
+                        shardId.getIndex().getUUID(),
+                        shardId.id(),
+                        e.getClass().getSimpleName()
+                    );
                 }
             }
             for (java.util.Map.Entry<String, java.util.List<ShardId>> bucket : byBucket.entrySet()) {
@@ -473,9 +488,11 @@ final class DirtyPublishing {
             if (entry.getValue() instanceof org.opensearch.serverless.store.StaleWriterException) {
                 reconciler.fenced.add(entry.getKey());
             } else {
-                BackgroundReconciler.logger.warn(
-                    "could not write " + entry.getKey() + "'s staged commit to bucket [" + bucketId + "]; its next checkpoint will",
-                    entry.getValue()
+                BackgroundReconciler.logger.debug(
+                    "Bucket checkpoint will retry a staged commit (index_uuid={}, shard={}, error_type={})",
+                    entry.getKey().getIndex().getUUID(),
+                    entry.getKey().id(),
+                    entry.getValue().getClass().getSimpleName()
                 );
             }
         }

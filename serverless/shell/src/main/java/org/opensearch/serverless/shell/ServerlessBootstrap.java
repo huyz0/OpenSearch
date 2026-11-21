@@ -197,14 +197,14 @@ public final class ServerlessBootstrap implements Closeable {
         // scheduler with nothing in its log to say where.
         final long bootAt = System.nanoTime();
         final ServerlessNode node = new ServerlessNode(complete);
-        logger.info("startup: node built in {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
+        logger.debug("Node constructed (elapsed_ms={})", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
         org.opensearch.serverless.store.ObjectStoreHandle openedStore = null;
         MetadataPlane openedPlane = null;
         BackgroundReconciler openedLoop = null;
         ReconcileScheduler openedScheduler = null;
         try {
             node.startup().start();
-            logger.info("startup: node started at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
+            logger.debug("Node services started (elapsed_ms={})", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
 
             final org.opensearch.serverless.store.ObjectStoreHandle store = org.opensearch.serverless.store.ObjectStores.create(
                 complete,
@@ -214,10 +214,10 @@ public final class ServerlessBootstrap implements Closeable {
             openedStore = store;
             final MetadataPlane plane = new MetadataPlane(store.blobStore(), BlobPath.cleanPath(), System::currentTimeMillis, ttl);
             openedPlane = plane;
-            logger.info("startup: store open at {} ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
+            logger.debug("Object store opened (elapsed_ms={})", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt));
             node.setMetadataPlane(plane);
-            logger.info(
-                "startup: lease published at {} ms",
+            logger.debug(
+                "Metadata plane attached (elapsed_ms={})",
                 java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt)
             );
             // A search node that joined to warm copies its peers' cache and opens its shards, then turns ready.
@@ -280,12 +280,15 @@ public final class ServerlessBootstrap implements Closeable {
             scheduler.start();
 
             logger.info(
-                "serverless node [{}] running: {} store, lease ttl {}ms, http {}, on-demand activation {}",
-                node.localNode().getName(),
-                storeType,
-                ttl,
-                node.boundHttpAddress().publishAddress(),
-                ActivationSettings.ON_DEMAND.get(complete)
+                new org.opensearch.serverless.logging.ServerlessLogMessage(
+                    "Serverless node started",
+                    java.util.Map.of(
+                        "event", "serverless_node_started",
+                        "store_type", storeType,
+                        "lease_ttl_ms", ttl,
+                        "duration_ms", java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - bootAt)
+                    )
+                )
             );
             return new ServerlessBootstrap(node, plane, loop, scheduler, store);
         } catch (Exception | Error failure) {
@@ -342,7 +345,7 @@ public final class ServerlessBootstrap implements Closeable {
             );
         }
         keystore.decrypt(new char[0]);
-        logger.info("loaded {} secure setting(s) from {}", keystore.getSettingNames().size(), configPath);
+        logger.debug("Loaded the serverless keystore");
         return Settings.builder().put(settings).setSecureSettings(keystore).build();
     }
 
@@ -407,7 +410,7 @@ public final class ServerlessBootstrap implements Closeable {
                 logger.info("handed over {} shard(s) on shutdown", handed);
             }
         } catch (Exception e) {
-            logger.warn("could not hand over this node's shards; peers will take them over when the lease lapses", e);
+            logger.warn("Shard handover failed. Peers will take over after the lease expires (error_type={})", e.getClass().getSimpleName());
         }
         try {
             // Drop the lease rather than let it lapse. Without this a node that shut down cleanly stays
@@ -416,14 +419,14 @@ public final class ServerlessBootstrap implements Closeable {
             // of a failover, and it costs one delete.
             plane.membership().release(node.localNode().getId());
         } catch (Exception e) {
-            logger.warn("could not release this node's lease; peers will treat it as alive until the TTL elapses", e);
+            logger.warn("Lease release failed. Peers will consider this node live until expiry (error_type={})", e.getClass().getSimpleName());
         }
         node.close();
         try {
             // Last, because everything above may still be talking to it.
             store.close();
         } catch (Exception e) {
-            logger.warn("could not close the object store cleanly", e);
+            logger.warn("Could not close the object store cleanly (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -437,6 +440,12 @@ public final class ServerlessBootstrap implements Closeable {
      * @throws Exception if startup fails
      */
     public static void main(String[] args) throws Exception {
+        // Core's REST error loggers can include raw paths, query parameters and exception text.
+        org.opensearch.common.logging.Loggers.setLevel(LogManager.getLogger("rest.suppressed"), org.apache.logging.log4j.Level.OFF);
+        org.opensearch.common.logging.Loggers.setLevel(
+            LogManager.getLogger(org.opensearch.rest.RestController.class),
+            org.apache.logging.log4j.Level.OFF
+        );
         final Settings.Builder settings = Settings.builder();
         // BootstrapInfo rather than System.getProperties(): the latter hands out a mutable view of the
         // JVM's properties and is forbidden across this codebase for that reason.
@@ -477,7 +486,7 @@ public final class ServerlessBootstrap implements Closeable {
             try {
                 bootstrap.close();
             } catch (Exception e) {
-                logger.warn("unclean shutdown", e);
+                logger.warn("Serverless shutdown was incomplete (error_type={})", e.getClass().getSimpleName());
             } finally {
                 stopped.countDown();
             }

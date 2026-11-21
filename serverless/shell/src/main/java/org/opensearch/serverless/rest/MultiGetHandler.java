@@ -142,7 +142,7 @@ public final class MultiGetHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a multi-get failure", nested);
+                    RestReplies.logResponseFailure(logger, "multi_get", nested);
                 }
             }
         });

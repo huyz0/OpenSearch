@@ -267,13 +267,15 @@ public class NodeLogTakeoverIntegrationTests extends OpenSearchTestCase {
                 third.setMetadataPlane(plane);
                 takeAll(third, plane, clock);
                 assertFound(third, unpublished);
-                for (int shard = 0; shard < SHARDS; shard++) {
-                    assertEquals(
-                        "replayed and published, the head names no other log",
-                        List.of(),
-                        plane.heads().read("alpha", shard).orElseThrow().writers()
-                    );
-                }
+                assertBusy(() -> {
+                    for (int shard = 0; shard < SHARDS; shard++) {
+                        assertEquals(
+                            "replayed and published, the head names no other log",
+                            List.of(),
+                            plane.heads().read("alpha", shard).orElseThrow().writers()
+                        );
+                    }
+                });
             }
         } finally {
             closeQuietly(first);

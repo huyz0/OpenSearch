@@ -148,7 +148,7 @@ final class ObjectStoreIndexInput extends BufferedIndexInput {
                     cache.fetchAhead(key(from), () -> fetchSpan(from, (long) blocks * blockSize));
                 } catch (IOException | RuntimeException e) {
                     // The read the hint was for fetches for itself, and reports the failure if it is real.
-                    logger.debug("fetch ahead of " + blobName + " block " + from + " failed", e);
+                    logger.debug("Object-store read-ahead failed (block={}, error_type={})", from, e.getClass().getSimpleName());
                 }
             });
         } catch (RejectedExecutionException e) {

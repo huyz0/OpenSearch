@@ -213,7 +213,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a field capabilities failure", nested);
+                    RestReplies.logResponseFailure(logger, "field_capabilities", nested);
                 }
             }
         });
@@ -416,7 +416,7 @@ public final class FieldCapabilitiesHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.error(channel, status, type, reason));
         } catch (IOException e) {
-            logger.error("failed to report a field capabilities refusal", e);
+            RestReplies.logResponseFailure(logger, "field_capabilities", e);
         }
     }
 }

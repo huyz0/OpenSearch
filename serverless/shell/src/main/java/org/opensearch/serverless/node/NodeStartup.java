@@ -92,7 +92,7 @@ public final class NodeStartup {
             try {
                 node.threadPool.generic().execute(() -> node.leases.onShardFailed(failed, cause));
             } catch (Exception rejected) {
-                NodeContext.logger.warn("could not schedule the release of failed shard " + failed, rejected);
+                NodeContext.logger.warn("Could not schedule failed shard release (error_type={})", rejected.getClass().getSimpleName());
             }
         });
         node.started = true;

@@ -157,7 +157,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
         try {
             channel.sendResponse(RestReplies.failure(channel, e));
         } catch (IOException nested) {
-            logger.error("failed to report a search template " + what + " failure", nested);
+            RestReplies.logResponseFailure(logger, "search_template", nested);
         }
     }
 
@@ -272,7 +272,7 @@ public final class SearchTemplateHandler extends BaseRestHandler {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a multi-search-template failure", nested);
+                    RestReplies.logResponseFailure(logger, "search_template", nested);
                 }
             }
         });

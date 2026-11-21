@@ -214,7 +214,7 @@ public final class CommitPush {
                     } catch (Exception e) {
                         // Lost: the reader's register look moves it, as before pushes existed.
                         sendFailures.incrementAndGet();
-                        LOG.debug("could not push the commit of {} to [{}]", shardId, target, e);
+                        LOG.debug("Could not push a commit (shard={}, target_node_id={}, error_type={})", shardId.id(), target, e.getClass().getSimpleName());
                     }
                 });
             }
@@ -241,7 +241,7 @@ public final class CommitPush {
             return directory == null ? Map.of() : directory.localBlocks(commit, added, inlineBytes);
         } catch (Exception e) {
             // A file merged away since the publish, or a shard closing: the reader reads the store, as before.
-            LOG.debug("could not read the new files of {}'s pushed commit", shardId, e);
+            LOG.debug("Could not read files for a pushed commit (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
             return Map.of();
         }
     }
@@ -263,7 +263,7 @@ public final class CommitPush {
             final String self = router.node.localNode().getId();
             return ranked.stream().filter(id -> id.equals(self) == false).toList();
         } catch (RuntimeException e) {
-            LOG.debug("could not rank the readers of {}", shardId, e);
+            LOG.debug("Could not rank readers for a commit push (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
             return List.of();
         }
     }
@@ -375,7 +375,7 @@ public final class CommitPush {
                 reopened.incrementAndGet();
             }
         } catch (Exception e) {
-            LOG.debug("could not move the reader of {} onto its pushed commit", shardId, e);
+            LOG.debug("Could not advance a reader to its pushed commit (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
         } finally {
             if (again) {
                 router.node.threadPool()

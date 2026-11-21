@@ -162,7 +162,7 @@ public final class DescriptorStore {
         } catch (IOException | RuntimeException e) {
             // After a delete, its pending entry stays, and the stripe never confirms the name again: safe, and slower.
             org.apache.logging.log4j.LogManager.getLogger(DescriptorStore.class)
-                .warn("could not record a change to [" + name + "] in its change stripe", e);
+                .warn("Could not record a descriptor change in its stripe (error_type={})", e.getClass().getSimpleName());
         }
     }
 

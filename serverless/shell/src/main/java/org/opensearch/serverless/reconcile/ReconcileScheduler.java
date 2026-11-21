@@ -12,6 +12,7 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.index.shard.ShardId;
+import org.opensearch.serverless.logging.ServerlessLogMessage;
 import org.opensearch.serverless.node.ReconcileSignals;
 import org.opensearch.threadpool.Scheduler;
 import org.opensearch.threadpool.ThreadPool;
@@ -126,6 +127,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
     final AtomicBoolean activationPending = new AtomicBoolean();
     final java.util.Set<Map.Entry<String, Integer>> doubted = java.util.concurrent.ConcurrentHashMap.newKeySet();
     final AtomicLong renewals = new AtomicLong();
+    private final AtomicBoolean renewalFailed = new AtomicBoolean();
     final AtomicLong publishes = new AtomicLong();
     final AtomicLong activations = new AtomicLong();
     final AtomicLong backstops = new AtomicLong();
@@ -210,7 +212,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 janitorForgotten.addAndGet(pass.claimsForgotten());
                 return pass;
             } catch (Exception e) {
-                logger.warn("janitor pass failed; the next one will try again", e);
+                logger.debug("Janitor pass will retry (error_type={})", e.getClass().getSimpleName());
                 return null;
             }
         }
@@ -431,7 +433,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 try {
                     loop.refreshMembership(renewalInterval.millis());
                 } catch (Exception e) {
-                    logger.warn("could not refresh the membership view; departures are noticed late", e);
+                    logger.debug("Using cached membership after a refresh failed (error_type={})", e.getClass().getSimpleName());
                 }
             } finally {
                 // In a finally, and renewLeaseNow never throws: a renewal loop that stops rescheduling
@@ -494,12 +496,23 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             takeovers.pruneDepartureHistory();
             renewals.incrementAndGet();
             try {
-                return loop.renewLease();
+                final var released = loop.renewLease();
+                if (renewalFailed.getAndSet(false)) {
+                    logger.info(new ServerlessLogMessage("Lease renewal recovered", Map.of("event", "lease_renewal_recovered")));
+                }
+                return released;
             } catch (Exception e) {
                 // Never propagate out of a scheduled task: an exception cancels a fixed-delay schedule, so
                 // one unreachable-object-store blip would silently stop this node renewing anything, for
                 // good, and the node would look healthy right up until its leases lapsed.
-                logger.warn("lease renewal failed; will retry on the next interval", e);
+                if (renewalFailed.compareAndSet(false, true)) {
+                    logger.warn(
+                        new ServerlessLogMessage(
+                            "Lease renewal failed and will be retried",
+                            Map.of("event", "lease_renewal_failed", "error_type", e.getClass().getSimpleName())
+                        )
+                    );
+                }
                 return java.util.Set.of();
             }
         }
@@ -520,7 +533,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             try {
                 released.addAll(loop.verifyHeads());
             } catch (Exception e) {
-                logger.warn("shard-head verification failed; the backstop will retry", e);
+                logger.debug("Shard ownership verification will retry (error_type={})", e.getClass().getSimpleName());
             }
             // Before its deadline, whether or not the shard publishes again.
             loop.checkpointDue();
@@ -528,7 +541,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 try {
                     loop.refreshReaders();
                 } catch (Exception e) {
-                    logger.warn("reader refresh failed; the backstop will retry", e);
+                    logger.debug("Reader refresh will retry (error_type={})", e.getClass().getSimpleName());
                 }
             }
             if (released.isEmpty() == false) {
@@ -598,7 +611,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             try {
                 released.addAll(loop.verifyHeads());
             } catch (Exception e) {
-                logger.warn("shard-head verification failed; the backstop will retry", e);
+                logger.debug("Shard ownership verification will retry (error_type={})", e.getClass().getSimpleName());
             }
             if (released.isEmpty() == false) {
                 ownershipDoubted(released.iterator().next().getIndexName(), released.iterator().next().id());
@@ -652,7 +665,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 } while (closed == false && loop.hasDirtyDue(clock.getAsLong(), minIntervalMillis, maxUnpublished) && ++rounds < 10);
                 return all;
             } catch (Exception e) {
-                logger.warn("edge-triggered publish failed; the backstop will retry", e);
+                logger.debug("The backstop will retry publication (error_type={})", e.getClass().getSimpleName());
                 return all;
             } finally {
                 publishRunning.set(false);
@@ -688,7 +701,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
                 taken.addAll(loop.activateOnDemand(pending));
                 return taken;
             } catch (Exception e) {
-                logger.warn("failure-triggered activation failed; the backstop will retry", e);
+                logger.debug("The backstop will retry activation (error_type={})", e.getClass().getSimpleName());
                 return java.util.Set.of();
             }
         }
@@ -708,7 +721,7 @@ public final class ReconcileScheduler implements ReconcileSignals, Closeable {
             try {
                 return loop.tick(clock.getAsLong());
             } catch (Exception e) {
-                logger.warn("backstop reconciliation pass failed; will retry on the next interval", e);
+                logger.warn("The backstop reconciliation pass will retry (error_type={})", e.getClass().getSimpleName());
                 return null;
             }
         }

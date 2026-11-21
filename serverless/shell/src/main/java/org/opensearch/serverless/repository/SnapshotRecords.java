@@ -132,7 +132,7 @@ public final class SnapshotRecords {
                     blobStore.blobContainer(SnapshotPaths.snapshotData(base, record.storageGeneration())).delete();
                 } catch (Exception failure) {
                     cleared = false;
-                    logger.warn("could not clear storage for deleted snapshot " + record.key(), failure);
+                    logger.warn("Could not reclaim storage for a deleted snapshot (error_type={})", failure.getClass().getSimpleName());
                 }
             } else {
                 for (var index : record.indices().entrySet()) {
@@ -141,7 +141,7 @@ public final class SnapshotRecords {
                             blobStore.blobContainer(SnapshotPaths.snapshotShardData(base, record, index.getKey(), shard)).delete();
                         } catch (Exception failure) {
                             cleared = false;
-                            logger.warn("could not clear legacy snapshot storage for " + record.key(), failure);
+                            logger.warn("Could not reclaim legacy snapshot storage (error_type={})", failure.getClass().getSimpleName());
                         }
                     }
                 }

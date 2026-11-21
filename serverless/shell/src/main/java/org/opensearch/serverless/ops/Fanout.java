@@ -122,7 +122,7 @@ public final class Fanout {
             } catch (Exception e) {
                 // Left null. The caller decides what an unanswered shard means; for a search it is a hole in
                 // the coverage it already reports, and for a bulk it is a failed group.
-                logger.warn("a fanned-out task failed", e);
+                logger.debug("Fan-out task failed (error_type={})", e.getClass().getSimpleName());
             } finally {
                 done.countDown();
             }

@@ -115,14 +115,14 @@ public final class StoredScripts {
                     fresh.put(each.getKey(), parse(each.getValue()));
                 } catch (Exception e) {
                     // One unparseable record is not a reason to drop every other script.
-                    logger.warn("stored script [" + each.getKey() + "] could not be parsed and is skipped", e);
+                    logger.debug("Skipping an unreadable stored script (error_type={})", e.getClass().getSimpleName());
                 }
             }
             scripts = Map.copyOf(fresh);
             appliedVersion = version;
             return true;
         } catch (IOException e) {
-            logger.warn("could not refresh stored scripts", e);
+            logger.debug("Could not refresh stored scripts (error_type={})", e.getClass().getSimpleName());
             return false;
         } finally {
             refreshGeneration++;

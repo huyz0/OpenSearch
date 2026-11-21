@@ -155,7 +155,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
 
     @Override
     protected void hookOnError(Throwable throwable) {
-        logger.debug("a streamed batch's body failed", throwable);
+        logger.debug("Bulk request stream failed (error_type={})", throwable.getClass().getSimpleName());
         finish(RestStatus.BAD_REQUEST, "body_failed", "the batch's body could not be read: " + throwable.getMessage());
     }
 
@@ -267,7 +267,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
             return;
         } catch (Exception e) {
             done.close();
-            logger.debug("a streamed batch's slice failed", e);
+            logger.debug("Bulk request batch failed (error_type={})", e.getClass().getSimpleName());
             fail(e);
             return;
         }
@@ -305,7 +305,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
             }
         } catch (Exception e) {
             done.close();
-            logger.debug("a streamed batch's slice failed", e);
+            logger.debug("Bulk request batch failed (error_type={})", e.getClass().getSimpleName());
             fail(e);
             return;
         }
@@ -391,7 +391,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
             }
             handler.respond(channel, all, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt), allRefreshed);
         } catch (Exception e) {
-            logger.error("failed to send a streamed batch's response", e);
+            logger.debug("Could not send the bulk response (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -415,7 +415,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
         try {
             send(RestReplies.error(channel, status, type, reason));
         } catch (Exception e) {
-            logger.error("failed to report a streamed batch's failure", e);
+            logger.debug("Could not send the bulk error response (error_type={})", e.getClass().getSimpleName());
         }
     }
 
@@ -430,7 +430,7 @@ final class BulkStream extends BaseSubscriber<HttpChunk> {
         try {
             send(RestReplies.failure(channel, failure));
         } catch (Exception e) {
-            logger.error("failed to report a streamed batch's failure", e);
+            logger.debug("Could not send the bulk error response (error_type={})", e.getClass().getSimpleName());
         }
     }
 }

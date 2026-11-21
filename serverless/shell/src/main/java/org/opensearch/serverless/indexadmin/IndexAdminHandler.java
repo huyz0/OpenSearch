@@ -93,7 +93,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
             try {
                 channel.sendResponse(new BytesRestResponse(channel, e));
             } catch (IOException nested) {
-                logger.error("failed to report an index administration failure", nested);
+                RestReplies.logResponseFailure(logger, "index_admin", nested);
             }
         }
     }
@@ -552,7 +552,7 @@ public final class IndexAdminHandler extends BaseRestHandler {
                 answer.run();
             } catch (IOException e) {
                 org.apache.logging.log4j.LogManager.getLogger(IndexAdminHandler.class)
-                    .warn("could not answer a delete after it settled", e);
+                    .debug("Could not send the index deletion response (error_type={})", e.getClass().getSimpleName());
             }
         },
             org.opensearch.common.unit.TimeValue.timeValueMillis(org.opensearch.serverless.node.WriteFences.DELETE_SETTLE_MILLIS),

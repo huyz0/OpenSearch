@@ -269,7 +269,7 @@ final class SearchPlanner {
                     try {
                         channel.sendResponse(RestReplies.failure(channel, e));
                     } catch (IOException nested) {
-                        logger.error("failed to report a frozen search failure", nested);
+                        RestReplies.logResponseFailure(logger, "search", nested);
                     }
                 }
             });
@@ -333,7 +333,7 @@ final class SearchPlanner {
                 try {
                     channel.sendResponse(RestReplies.failure(channel, e));
                 } catch (IOException nested) {
-                    logger.error("failed to report a search failure", nested);
+                    RestReplies.logResponseFailure(logger, "search", nested);
                 }
             }
         });
@@ -357,7 +357,7 @@ final class SearchPlanner {
         try {
             metadata.membership().refreshIfOlderThan(Math.max(1_000L, metadata.leaseTtlMillis() / 2));
         } catch (Exception e) {
-            logger.warn("could not refresh membership before searching", e);
+            logger.debug("Using the cached membership for search after a refresh failed (error_type={})", e.getClass().getSimpleName());
         }
     }
 

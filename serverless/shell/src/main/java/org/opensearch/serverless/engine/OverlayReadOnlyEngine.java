@@ -148,7 +148,7 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
             opened = tail == null ? null : new Overlay(config, tail, parser, getProcessedLocalCheckpoint());
         } catch (IOException | RuntimeException e) {
             // Without an overlay the reader is what it always was: the commit.
-            LOG.warn("could not open the tail overlay of {}; it serves its commit only", shardId, e);
+            LOG.debug("Reader serving the published commit after its tail failed to open (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
         }
         this.overlay = opened;
     }
@@ -231,7 +231,7 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
             try {
                 manager.maybeRefreshBlocking();
             } catch (IOException | RuntimeException e) {
-                LOG.debug("could not refresh the tail overlay of {}", shardId, e);
+                LOG.debug("Could not refresh the reader tail (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
             }
         }
 
@@ -319,7 +319,11 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
                 try {
                     parsed = parser.apply(record);
                 } catch (RuntimeException e) {
-                    LOG.debug("could not parse a pushed record of {}; it waits for the commit", shardId, e);
+                    LOG.debug(
+                        "Reader awaits the published commit after a pushed record failed to parse (shard={}, error_type={})",
+                        shardId.id(),
+                        e.getClass().getSimpleName()
+                    );
                     tail.skipped(shardId);
                     return false;
                 }
@@ -393,7 +397,7 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
             try {
                 manager.close();
             } catch (IOException | RuntimeException e) {
-                LOG.debug("closing the tail overlay manager of {}", shardId, e);
+                LOG.debug("Could not close the tail overlay manager (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
             }
             try {
                 if (writer != null) {
@@ -402,7 +406,7 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
                     directory.close();
                 }
             } catch (IOException | RuntimeException e) {
-                LOG.debug("closing the tail overlay of {}", shardId, e);
+                LOG.debug("Could not close the tail overlay (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
             } finally {
                 tail.untrack(shardId);
             }
