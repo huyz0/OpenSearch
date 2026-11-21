@@ -115,7 +115,7 @@ public final class NodeCapacity {
     public Capacity capacity() {
         return new Capacity(
             admission.maxShardsHeld(),
-            node.reconciler == null ? 0 : node.reconciler.heldShards().size(),
+            node.reconciler == null ? 0 : node.reconciler.heldShardCount(),
             readerOpensRefusedAtCap.get(),
             activationsRefusedAtCap.get(),
             evictedForRoom.get(),

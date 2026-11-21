@@ -11,9 +11,17 @@ package org.opensearch.serverless.transport;
 import org.opensearch.core.common.io.stream.StreamOutput;
 import org.opensearch.core.common.io.stream.Writeable;
 import org.opensearch.serverless.cluster.Zones;
+import org.opensearch.serverless.forwarding.ForwardedBulkRequest;
+import org.opensearch.serverless.forwarding.ForwardedExplainRequest;
+import org.opensearch.serverless.forwarding.ForwardedFrozenSearchRequest;
+import org.opensearch.serverless.forwarding.ForwardedGetRequest;
+import org.opensearch.serverless.forwarding.ForwardedIndexRequest;
+import org.opensearch.serverless.forwarding.ForwardedSearchRequest;
+import org.opensearch.serverless.forwarding.ForwardedStatsRequest;
 
 import java.io.IOException;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.LongAdder;
@@ -43,6 +51,23 @@ public final class ZoneTraffic {
         /** Either side declares no zone. */
         UNKNOWN
     }
+
+    private static final Set<String> COUNTED_ACTIONS = Set.of(
+        CacheBlocksRequest.ACTION,
+        CommitPushRequest.ACTION,
+        ForwardedBulkRequest.ACTION,
+        ForwardedExplainRequest.ACTION,
+        ForwardedFrozenSearchRequest.ACTION,
+        ForwardedGetRequest.ACTION,
+        ForwardedIndexRequest.ACTION,
+        ForwardedSearchRequest.ACTION,
+        ForwardedStatsRequest.ACTION,
+        HandOffRequest.ACTION,
+        HotSetRequest.ACTION,
+        NewestCommitRequest.ACTION,
+        TailFetchRequest.ACTION,
+        TailPushRequest.ACTION
+    );
 
     private final Map<Path, Map<String, LongAdder>> byAction = new ConcurrentHashMap<>();
 
@@ -76,7 +101,8 @@ public final class ZoneTraffic {
      */
     public void record(Path path, String action, long bytes) {
         if (bytes > 0) {
-            byAction.get(path).computeIfAbsent(action, a -> new LongAdder()).add(bytes);
+            final String bucket = COUNTED_ACTIONS.contains(action) ? action : "_other";
+            byAction.get(path).computeIfAbsent(bucket, ignored -> new LongAdder()).add(bytes);
         }
     }
 

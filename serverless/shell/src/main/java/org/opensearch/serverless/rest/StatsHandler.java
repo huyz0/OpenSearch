@@ -27,7 +27,6 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Set;
 import java.util.function.Supplier;
 
 /**
@@ -64,6 +63,8 @@ import java.util.function.Supplier;
  * {@code implied_s3_requests}, which is labelled as the estimate it is.
  */
 public final class StatsHandler extends BaseRestHandler {
+
+    private static final int SHARD_DETAIL_LIMIT = 100;
 
     private final Supplier<NodeContext> node;
     private final Supplier<MetadataPlane> plane;
@@ -103,6 +104,10 @@ public final class StatsHandler extends BaseRestHandler {
         final NodeContext serving = node.get();
         final MetadataPlane metadata = plane.get();
         final String nodes = request.param("nodes");
+        final boolean includeShards = request.paramAsBoolean("include_shards", false);
+        if (includeShards && nodes != null) {
+            throw new IllegalArgumentException("include_shards is available for local stats only");
+        }
         final String[] targets = nodes == null ? new String[] { serving.localNode().getId() } : nodes.split(",");
         // Filters may block or consult external authorization state, even for the local document.
         return channel -> serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.MANAGEMENT).execute(() -> {
@@ -121,7 +126,7 @@ public final class StatsHandler extends BaseRestHandler {
                             if (nodes == null && java.util.Arrays.equals(selected, targets)) {
                                 try (XContentBuilder builder = channel.newBuilder()) {
                                     builder.startObject();
-                                    describe(builder, serving, metadata);
+                                    describe(builder, serving, metadata, includeShards);
                                     builder.endObject();
                                     return new BytesRestResponse(RestStatus.OK, builder);
                                 }
@@ -343,35 +348,21 @@ public final class StatsHandler extends BaseRestHandler {
      * @throws IOException if writing fails
      */
     public static void describe(XContentBuilder builder, NodeContext serving, MetadataPlane metadata) throws IOException {
+        describe(builder, serving, metadata, false);
+    }
+
+    private static void describe(XContentBuilder builder, NodeContext serving, MetadataPlane metadata, boolean includeShards)
+        throws IOException {
         {
             builder.field("node", serving.localNode().getId());
             builder.field("name", serving.localNode().getName());
 
-            // What it is serving, split the way the design splits it: a writer holds a shard-head and
-            // can accept writes, a reader holds a commit and cannot. Reporting one number for both
-            // would hide the distinction the whole architecture turns on.
-            final Set<ShardId> open = serving.reconciler().openShards();
-            final Set<ShardId> frozen = serving.reconciler().frozenShards();
-            // A frozen view is a reader the reconciler keeps in its reader set and leaves out of its
-            // open set, so "open minus readers" went to zero with one writer and one view open, and
-            // negative with two views and none. Counted directly instead: a writer is an open shard
-            // that is not a reader, and a reader is a reader that is not a view.
-            final Set<ShardId> readers = new java.util.HashSet<>(serving.reconciler().readerShards());
-            readers.removeAll(frozen);
-            long writers = 0;
-            for (ShardId shard : open) {
-                if (readers.contains(shard) == false) {
-                    writers++;
-                }
-            }
+            final var shards = serving.reconciler().shardCounts();
             builder.startObject("shards");
-            builder.field("open", open.size());
-            builder.field("readers", readers.size());
-            builder.field("writers", writers);
-            // Counted apart from both: a frozen view is a reader that no policy will take away, so
-            // folding it into the reader count would make a node look like it had readers it could
-            // shed.
-            builder.field("frozen_views", frozen.size());
+            builder.field("open", shards.writers() + shards.readers());
+            builder.field("readers", shards.readers());
+            builder.field("writers", shards.writers());
+            builder.field("frozen_views", shards.frozen());
             builder.endObject();
 
             // What to scale on. Shards held against the cap says how full; the refusals and evictions say what being
@@ -486,7 +477,9 @@ public final class StatsHandler extends BaseRestHandler {
             localSegments(builder, serving);
             scheduler(builder, serving);
             lease(builder, serving, metadata);
-            heldShards(builder, serving, readers, frozen);
+            if (includeShards) {
+                heldShards(builder, serving);
+            }
         }
     }
 
@@ -630,22 +623,23 @@ public final class StatsHandler extends BaseRestHandler {
         builder.endObject();
     }
 
-    /**
-     * Every shard this node holds, one line each: which, as what, at what term, how far it has written,
-     * and when it was last asked for anything. The per-node list the fleet-wide view deliberately does
-     * not offer, and it is cheap because it is read from memory.
-     */
-    private static void heldShards(XContentBuilder builder, NodeContext serving, Set<ShardId> readers, Set<ShardId> frozen)
-        throws IOException {
-        final List<ShardId> held = new ArrayList<>(serving.reconciler().heldShards());
+    /** A bounded diagnostic sample from the local shard inventory. */
+    private static void heldShards(XContentBuilder builder, NodeContext serving) throws IOException {
+        final var reconciler = serving.reconciler();
+        final List<ShardId> held = new ArrayList<>(reconciler.heldShardSample(SHARD_DETAIL_LIMIT + 1));
+        final boolean truncated = held.size() > SHARD_DETAIL_LIMIT;
+        if (truncated) {
+            held.removeLast();
+        }
         held.sort(Comparator.comparing(ShardId::getIndexName).thenComparing(s -> s.getIndex().getUUID()).thenComparingInt(ShardId::id));
+        builder.field("held_shards_truncated", truncated);
         builder.startArray("held_shards");
         for (ShardId shard : held) {
             builder.startObject();
             builder.field("index", shard.getIndexName());
             builder.field("uuid", shard.getIndex().getUUID());
             builder.field("shard", shard.id());
-            builder.field("kind", frozen.contains(shard) ? "frozen_view" : readers.contains(shard) ? "reader" : "writer");
+            builder.field("kind", reconciler.isFrozen(shard) ? "frozen_view" : reconciler.isReader(shard) ? "reader" : "writer");
             final var opened = serving.reconciler().shard(shard);
             if (opened != null) {
                 try {
