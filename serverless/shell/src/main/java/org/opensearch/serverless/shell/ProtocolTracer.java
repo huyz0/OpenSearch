@@ -8,8 +8,10 @@
 
 package org.opensearch.serverless.shell;
 
+import org.opensearch.common.concurrent.CompletableContext;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.telemetry.tracing.AttributeNames;
+import org.opensearch.telemetry.tracing.CompletionAwareSpan;
 import org.opensearch.telemetry.tracing.ScopedSpan;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanContext;
@@ -24,29 +26,56 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledFuture;
 import java.util.function.Predicate;
+import java.util.function.Supplier;
 
 /** Restricts the data exported by the core HTTP and transport instrumentation. */
-record ProtocolTracer(Tracer delegate, Predicate<String> registeredAction) implements Tracer {
+record ProtocolTracer(Tracer delegate, Predicate<String> registeredAction, TraceAdmission admission) implements Tracer {
 
     @Override
     public Span startSpan(SpanCreationContext context) {
-        return isRecording() ? new ProtocolSpan(delegate.startSpan(safeContext(context))) : NoopSpan.INSTANCE;
+        return admit(() -> delegate.startSpan(safeContext(context)));
     }
 
     @Override
     public Span startSpan(SpanCreationContext context, Map<String, Collection<String>> headers) {
-        if (isRecording() == false) {
+        return admit(() -> {
+            Map<String, Collection<String>> propagation = new HashMap<>();
+            headers.forEach((name, values) -> {
+                String key = name.toLowerCase(Locale.ROOT);
+                if (key.equals("traceparent") || key.equals("tracestate")) {
+                    propagation.put(key, values);
+                }
+            });
+            return delegate.startSpan(safeContext(context), propagation);
+        });
+    }
+
+    private Span admit(Supplier<Span> create) {
+        if (isRecording() == false || admission.tryAcquire() == false) {
             return NoopSpan.INSTANCE;
         }
-        Map<String, Collection<String>> propagation = new HashMap<>();
-        headers.forEach((name, values) -> {
-            String key = name.toLowerCase(Locale.ROOT);
-            if (key.equals("traceparent") || key.equals("tracestate")) {
-                propagation.put(key, values);
-            }
-        });
-        return new ProtocolSpan(delegate.startSpan(safeContext(context), propagation));
+        final Span span;
+        try {
+            span = create.get();
+        } catch (RuntimeException | Error exception) {
+            admission.release();
+            throw exception;
+        }
+        if (span == NoopSpan.INSTANCE) {
+            admission.release();
+            return span;
+        }
+        final ProtocolSpan tracked = new ProtocolSpan(span);
+        try {
+            tracked.expiry = admission.expire(tracked::endSpan);
+            return tracked;
+        } catch (RejectedExecutionException shutdown) {
+            tracked.endSpan();
+            return NoopSpan.INSTANCE;
+        }
     }
 
     private SpanCreationContext safeContext(SpanCreationContext context) {
@@ -74,7 +103,11 @@ record ProtocolTracer(Tracer delegate, Predicate<String> registeredAction) imple
 
     @Override
     public ScopedSpan startScopedSpan(SpanCreationContext context) {
-        return isRecording() ? delegate.startScopedSpan(safeContext(context)) : NoopTracer.INSTANCE.startScopedSpan(context);
+        if (startSpan(context) instanceof ProtocolSpan span) {
+            span.scope = withSpanInScope(span);
+            return span;
+        }
+        return ScopedSpan.NO_OP;
     }
 
     @Override
@@ -82,7 +115,7 @@ record ProtocolTracer(Tracer delegate, Predicate<String> registeredAction) imple
         if (span == NoopSpan.INSTANCE) {
             return NoopTracer.INSTANCE.withSpanInScope(span);
         }
-        return delegate.withSpanInScope(span instanceof ProtocolSpan protocolSpan ? protocolSpan.delegate() : span);
+        return delegate.withSpanInScope(span instanceof ProtocolSpan protocolSpan ? protocolSpan.delegate : span);
     }
 
     @Override
@@ -95,10 +128,42 @@ record ProtocolTracer(Tracer delegate, Predicate<String> registeredAction) imple
         // NodeTelemetry owns the provider and closes it after the network services stop.
     }
 
-    private record ProtocolSpan(Span delegate) implements Span {
+    private final class ProtocolSpan implements CompletionAwareSpan, ScopedSpan {
+        private final Span delegate;
+        private final CompletableContext<Void> completion = new CompletableContext<>();
+        private volatile ScheduledFuture<?> expiry;
+        private SpanScope scope;
+
+        private ProtocolSpan(Span delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void close() {
+            try {
+                scope.close();
+            } finally {
+                endSpan();
+            }
+        }
+
         @Override
         public void endSpan() {
-            delegate.endSpan();
+            if (completion.complete(null)) {
+                try {
+                    if (expiry != null) {
+                        expiry.cancel(false);
+                    }
+                    delegate.endSpan();
+                } finally {
+                    admission.release();
+                }
+            }
+        }
+
+        @Override
+        public void addCompletionListener(Runnable listener) {
+            completion.addListener((unused, failure) -> listener.run());
         }
 
         @Override
@@ -132,8 +197,25 @@ record ProtocolTracer(Tracer delegate, Predicate<String> registeredAction) imple
         }
 
         @Override
+        public void addAttribute(String key, long value) {
+            delegate.addAttribute(key, value);
+        }
+
+        @Override
+        public void addAttribute(String key, double value) {
+            delegate.addAttribute(key, value);
+        }
+
+        @Override
+        public void addAttribute(String key, boolean value) {
+            delegate.addAttribute(key, value);
+        }
+
+        @Override
         public void setError(Exception exception) {
-            delegate.setError(new ProtocolFailure(exception.getClass().getSimpleName()));
+            if (exception != null) {
+                delegate.setError(new ProtocolFailure(exception.getClass().getSimpleName()));
+            }
         }
 
         @Override

@@ -730,7 +730,13 @@ For exported metrics or traces, install the OpenSearch `telemetry-otel` plugin
 Set `-Dtelemetry.feature.metrics.enabled=true` to export metrics. For tracing, set
 both `-Dtelemetry.feature.tracer.enabled=true` and
 `-Dtelemetry.tracer.enabled=true`. The provider handles exporter configuration and
-sampling. The OpenSearch trace sampling probability defaults to 1%.
+sampling. The OpenTelemetry provider uses a 1% root sampling default, with a separate action sampling policy,
+honors the parent's sampling decision, and queues at most 2,048 spans by default.
+Independently, each shell node admits at most 512 HTTP and peer span starts per
+second sustained, with a burst of 512 and at most 1,024 active spans. A span
+still active after five minutes is ended. When a limit is reached, requests
+continue and the trace can be incomplete. The limits cover protocol tracing
+even when upstream callers mark every trace as sampled.
 
 The shell records `opensearch.serverless.rest.responses` and
 `opensearch.serverless.rest.response_time` by HTTP method and status for requests

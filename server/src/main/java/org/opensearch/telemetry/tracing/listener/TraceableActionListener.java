@@ -12,6 +12,7 @@ import org.opensearch.core.action.ActionListener;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanScope;
 import org.opensearch.telemetry.tracing.Tracer;
+import org.opensearch.telemetry.tracing.noop.NoopSpan;
 
 import java.util.Objects;
 
@@ -46,7 +47,7 @@ public class TraceableActionListener<Response> implements ActionListener<Respons
      * @return action listener
      */
     public static <Response> ActionListener<Response> create(ActionListener<Response> delegate, Span span, Tracer tracer) {
-        if (tracer.isRecording() == true) {
+        if (span != NoopSpan.INSTANCE && tracer.isRecording()) {
             return new TraceableActionListener<Response>(delegate, span, tracer);
         } else {
             return delegate;

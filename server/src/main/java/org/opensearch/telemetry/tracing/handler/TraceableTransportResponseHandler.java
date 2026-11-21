@@ -13,6 +13,7 @@ import org.opensearch.core.transport.TransportResponse;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanScope;
 import org.opensearch.telemetry.tracing.Tracer;
+import org.opensearch.telemetry.tracing.noop.NoopSpan;
 import org.opensearch.transport.TransportException;
 import org.opensearch.transport.TransportResponseHandler;
 import org.opensearch.transport.stream.StreamTransportResponse;
@@ -55,7 +56,7 @@ public class TraceableTransportResponseHandler<T extends TransportResponse> impl
         Span span,
         Tracer tracer
     ) {
-        if (tracer.isRecording() == true) {
+        if (span != NoopSpan.INSTANCE && tracer.isRecording()) {
             return new TraceableTransportResponseHandler<S>(delegate, span, tracer);
         } else {
             return delegate;

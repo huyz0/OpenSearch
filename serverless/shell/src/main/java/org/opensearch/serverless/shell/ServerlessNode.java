@@ -231,7 +231,11 @@ public final class ServerlessNode extends NodeContext implements Closeable {
             this.restController = wiring.buildRestController(clusterSettings);
             final Tracer protocolTracer = telemetry.tracer() == NoopTracer.INSTANCE
                 ? NoopTracer.INSTANCE
-                : new ProtocolTracer(telemetry.tracer(), action -> transportService.getRequestHandler(action) != null);
+                : new ProtocolTracer(
+                    telemetry.tracer(),
+                    action -> transportService.getRequestHandler(action) != null,
+                    new TraceAdmission(threadPool.scheduler())
+                );
             final NetworkModule networkModule = services.buildNetworkModule(clusterSettings, restController, protocolTracer);
             final Transport transport = networkModule.getTransportSupplier().get();
             this.transportService = new TransportService(

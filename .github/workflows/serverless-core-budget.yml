@@ -16,7 +16,7 @@ permissions:
 env:
   # Lines added plus removed in upstream files, as serverless/dev-tools/core-diff.sh counts them. Lower it when a change
   # shrinks the core patch; raise it only in a pull request that says which core change needs the room.
-  CORE_BUDGET_LINES: 1320
+  CORE_BUDGET_LINES: 1360
 
 jobs:
   core-budget:
