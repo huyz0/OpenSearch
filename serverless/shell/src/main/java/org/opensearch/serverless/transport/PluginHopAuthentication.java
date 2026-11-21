@@ -43,7 +43,7 @@ import java.util.function.Supplier;
  * called without naming the shell. A plugin does what it does on a classic node and the hop is signed
  * underneath it.
  *
- * <p>On send, sign declared plugin actions and the shell's internal actions after the transport has
+ * <p>On send, sign declared plugin actions and requests marked by the shell's router after the transport has
  * put the outgoing span in scope. This keeps every transmitted header covered by the MAC. The transport
  * handshake is outside both sets of actions.
  *
@@ -92,8 +92,8 @@ public final class PluginHopAuthentication implements TransportInterceptor {
                 TransportRequestOptions options,
                 TransportResponseHandler<T> handler
             ) {
-                final ShardRouter signer = action.startsWith("internal:serverless/") ? router.get() : signerFor(action);
-                if (signer == null) {
+                final ShardRouter signer = router.get();
+                if (signer == null || (signer.shouldSign(request) == false && Boolean.TRUE.equals(isPluginAction.apply(action)) == false)) {
                     sender.sendRequest(connection, action, request, options, handler);
                     return;
                 }

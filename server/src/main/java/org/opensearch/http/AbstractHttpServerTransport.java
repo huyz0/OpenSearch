@@ -55,13 +55,10 @@ import org.opensearch.core.xcontent.NamedXContentRegistry;
 import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
 import org.opensearch.rest.StreamingRestChannel;
-import org.opensearch.telemetry.tracing.AttributeNames;
 import org.opensearch.telemetry.tracing.Span;
 import org.opensearch.telemetry.tracing.SpanBuilder;
-import org.opensearch.telemetry.tracing.SpanCreationContext;
 import org.opensearch.telemetry.tracing.SpanScope;
 import org.opensearch.telemetry.tracing.Tracer;
-import org.opensearch.telemetry.tracing.attributes.Attributes;
 import org.opensearch.telemetry.tracing.channels.TraceableHttpChannel;
 import org.opensearch.telemetry.tracing.channels.TraceableRestChannel;
 import org.opensearch.threadpool.ThreadPool;
@@ -369,12 +366,7 @@ public abstract class AbstractHttpServerTransport extends AbstractLifecycleCompo
         try (ThreadContext.StoredContext ignore = threadContext.stashContext()) {
             // Streaming requests enter here without the HTTP span created by incomingRequest.
             final Span span = channel instanceof StreamingRestChannel && tracer.isRecording()
-                ? tracer.startSpan(
-                    SpanCreationContext.server()
-                        .name("HTTP stream")
-                        .attributes(Attributes.create().addAttribute(AttributeNames.HTTP_METHOD, restRequest.method().name())),
-                    extractHeaders(restRequest.getHeaders())
-                )
+                ? tracer.startSpan(SpanBuilder.from(restRequest), extractHeaders(restRequest.getHeaders()))
                 : tracer.startSpan(SpanBuilder.from(restRequest));
             try (final SpanScope spanScope = tracer.withSpanInScope(span)) {
                 if (channel != null) {

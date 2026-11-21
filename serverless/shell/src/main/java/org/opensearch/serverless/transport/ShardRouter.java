@@ -292,7 +292,7 @@ public final class ShardRouter {
         final ForwardedStatsRequest request = new ForwardedStatsRequest();
         final PlainActionFuture<ForwardedStatsResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        transportService.sendRequest(
+        sendSignedRequest(
             peer,
             ForwardedStatsRequest.ACTION,
             request,
@@ -346,7 +346,7 @@ public final class ShardRouter {
             }
         }
         final PlainActionFuture<T> future = PlainActionFuture.newFuture();
-        transportService.sendRequest(
+        sendSignedRequest(
             peer,
             action,
             request,
@@ -385,6 +385,26 @@ public final class ShardRouter {
 
     /** The header a forwarded request carries its deployment secret in, during the move to the MAC. */
     static final String TOKEN_HEADER = "x-serverless-transport-token";
+    private static final String REQUEST_TO_SIGN = "serverless_peer_request_to_sign";
+
+    private <T extends org.opensearch.core.transport.TransportResponse> void sendSignedRequest(
+        DiscoveryNode peer,
+        String action,
+        org.opensearch.transport.TransportRequest request,
+        TransportRequestOptions options,
+        TransportResponseHandler<T> handler
+    ) {
+        final var context = transportService.getThreadPool().getThreadContext();
+        try (var ignored = context.newStoredContext(true, java.util.List.of(REQUEST_TO_SIGN))) {
+            // Only this router's forwarding entry points opt in to signing shell actions.
+            context.putTransient(REQUEST_TO_SIGN, request);
+            transportService.sendRequest(peer, action, request, options, handler);
+        }
+    }
+
+    boolean shouldSign(org.opensearch.transport.TransportRequest request) {
+        return transportService.getThreadPool().getThreadContext().getTransient(REQUEST_TO_SIGN) == request;
+    }
 
     /**
      * The header that says the forwarded request originated inside a plugin, which is the only caller that
@@ -632,7 +652,7 @@ public final class ShardRouter {
     public ForwardedIndexResponse forwardIndex(DiscoveryNode peer, ForwardedIndexRequest request) throws IOException {
         final PlainActionFuture<ForwardedIndexResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        transportService.sendRequest(
+        sendSignedRequest(
             peer,
             ForwardedIndexRequest.ACTION,
             request,
@@ -657,7 +677,7 @@ public final class ShardRouter {
     public ForwardedBulkResponse forwardBulk(DiscoveryNode peer, ForwardedBulkRequest request) throws IOException {
         final PlainActionFuture<ForwardedBulkResponse> future = PlainActionFuture.newFuture();
         final org.opensearch.common.unit.TimeValue timeout = bulkForwardTimeout(request);
-        transportService.sendRequest(
+        sendSignedRequest(
             peer,
             ForwardedBulkRequest.ACTION,
             request,
@@ -728,7 +748,7 @@ public final class ShardRouter {
         // The write bound, not the search one. A get is a point lookup on the owner rather than a fan-out,
         // so it is the cheaper of the two and has no reason to wait as long as a query.
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        transportService.sendRequest(
+        sendSignedRequest(
             peer,
             ForwardedGetRequest.ACTION,
             request,
@@ -750,7 +770,7 @@ public final class ShardRouter {
         // The get bound rather than the search one, for the reason a get uses it: this is a point lookup on
         // one shard with no fan-out to wait behind.
         final org.opensearch.common.unit.TimeValue timeout = forwardTimeout();
-        transportService.sendRequest(
+        sendSignedRequest(
             peer,
             ForwardedExplainRequest.ACTION,
             request,
@@ -770,7 +790,7 @@ public final class ShardRouter {
     public ForwardedSearchResponse forwardSearch(DiscoveryNode peer, ForwardedSearchRequest request) throws IOException {
         final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
         final TimeValue timeout = searchForwardTimeout();
-        transportService.sendRequest(
+        sendSignedRequest(
             peer,
             ForwardedSearchRequest.ACTION,
             request,
@@ -793,7 +813,7 @@ public final class ShardRouter {
     public ForwardedSearchResponse forwardFrozenSearch(DiscoveryNode peer, ForwardedFrozenSearchRequest request) throws IOException {
         final PlainActionFuture<ForwardedSearchResponse> future = PlainActionFuture.newFuture();
         final TimeValue timeout = searchForwardTimeout();
-        transportService.sendRequest(
+        sendSignedRequest(
             peer,
             ForwardedFrozenSearchRequest.ACTION,
             request,

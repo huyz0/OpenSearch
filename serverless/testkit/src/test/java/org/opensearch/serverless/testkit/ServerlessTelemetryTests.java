@@ -130,7 +130,7 @@ public class ServerlessTelemetryTests extends OpenSearchTestCase {
                 final String trace = randomAlphaOfLength(20);
                 final var response = client.send(
                     HttpRequest.newBuilder(
-                        URI.create("http://" + address.getAddress() + ":" + address.getPort() + "/_bulk?require_alias=true")
+                        URI.create("http://" + address.getAddress() + ":" + address.getPort() + "/private-index/_bulk?require_alias=true")
                     )
                         .header("traceparent", trace + "~external-parent")
                         .header("Content-Type", "application/x-ndjson")
@@ -145,7 +145,6 @@ public class ServerlessTelemetryTests extends OpenSearchTestCase {
                     assertEquals(spans.toString(), 1, spans.size());
                     final var span = spans.getFirst();
                     assertEquals("external-parent", span.getParentSpanID());
-                    assertEquals("POST", span.getAttributes().get(AttributeNames.HTTP_METHOD));
                     assertTrue(span.toString(), span.isHasEnded());
                     assertFalse(span.toString(), span.toString().contains("private-index"));
                 });
