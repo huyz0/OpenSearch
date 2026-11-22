@@ -19,6 +19,7 @@ import org.opensearch.telemetry.tracing.sampler.RequestSampler;
 import java.util.concurrent.TimeUnit;
 
 import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.api.metrics.MeterProvider;
 import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.propagation.ContextPropagators;
 import io.opentelemetry.sdk.OpenTelemetrySdk;
@@ -26,6 +27,7 @@ import io.opentelemetry.sdk.metrics.InstrumentSelector;
 import io.opentelemetry.sdk.metrics.InstrumentType;
 import io.opentelemetry.sdk.metrics.SdkMeterProvider;
 import io.opentelemetry.sdk.metrics.View;
+import io.opentelemetry.sdk.metrics.export.MetricReader;
 import io.opentelemetry.sdk.metrics.export.PeriodicMetricReader;
 import io.opentelemetry.sdk.metrics.internal.view.Base2ExponentialHistogramAggregation;
 import io.opentelemetry.sdk.resources.Resource;
@@ -78,9 +80,33 @@ public final class OTelResourceProvider {
         ContextPropagators contextPropagators,
         Sampler sampler
     ) {
+        return get(
+            settings,
+            spanExporter,
+            contextPropagators,
+            sampler,
+            PeriodicMetricReader.builder(OTelMetricsExporterFactory.create(settings))
+                .setInterval(TelemetrySettings.METRICS_PUBLISH_INTERVAL_SETTING.get(settings).getSeconds(), TimeUnit.SECONDS)
+                .build()
+        );
+    }
+
+    static OpenTelemetrySdk get(
+        Settings settings,
+        SpanExporter spanExporter,
+        ContextPropagators contextPropagators,
+        Sampler sampler,
+        MetricReader metricReader
+    ) {
         Resource resource = createResource(settings);
-        SdkTracerProvider sdkTracerProvider = createSdkTracerProvider(settings, spanExporter, sampler, resource);
-        SdkMeterProvider sdkMeterProvider = createSdkMetricProvider(settings, resource);
+        SdkMeterProvider sdkMeterProvider = createSdkMetricProvider(resource, metricReader);
+        final SdkTracerProvider sdkTracerProvider;
+        try {
+            sdkTracerProvider = createSdkTracerProvider(settings, spanExporter, sampler, resource, sdkMeterProvider);
+        } catch (RuntimeException | Error failure) {
+            sdkMeterProvider.shutdown();
+            throw failure;
+        }
         return OpenTelemetrySdk.builder()
             .setTracerProvider(sdkTracerProvider)
             .setMeterProvider(sdkMeterProvider)
@@ -92,14 +118,10 @@ public final class OTelResourceProvider {
         return Resource.create(Attributes.of(ServiceAttributes.SERVICE_NAME, OTEL_SERVICE_NAME_SETTING.get(settings)));
     }
 
-    private static SdkMeterProvider createSdkMetricProvider(Settings settings, Resource resource) {
+    private static SdkMeterProvider createSdkMetricProvider(Resource resource, MetricReader metricReader) {
         return SdkMeterProvider.builder()
             .setResource(resource)
-            .registerMetricReader(
-                PeriodicMetricReader.builder(OTelMetricsExporterFactory.create(settings))
-                    .setInterval(TelemetrySettings.METRICS_PUBLISH_INTERVAL_SETTING.get(settings).getSeconds(), TimeUnit.SECONDS)
-                    .build()
-            )
+            .registerMetricReader(metricReader)
             .registerView(
                 InstrumentSelector.builder().setType(InstrumentType.HISTOGRAM).build(),
                 View.builder().setAggregation(Base2ExponentialHistogramAggregation.getDefault()).build()
@@ -111,21 +133,24 @@ public final class OTelResourceProvider {
         Settings settings,
         SpanExporter spanExporter,
         Sampler sampler,
-        Resource resource
+        Resource resource,
+        SdkMeterProvider meterProvider
     ) {
         return SdkTracerProvider.builder()
-            .addSpanProcessor(spanProcessor(settings, spanExporter))
+            .addSpanProcessor(spanProcessor(settings, spanExporter, meterProvider))
             .setResource(resource)
             .setSampler(sampler)
             .build();
     }
 
-    private static BatchSpanProcessor spanProcessor(Settings settings, SpanExporter spanExporter) {
-        return BatchSpanProcessor.builder(spanExporter)
+    private static BatchSpanProcessor spanProcessor(Settings settings, SpanExporter spanExporter, SdkMeterProvider meterProvider) {
+        final var builder = BatchSpanProcessor.builder(spanExporter)
             .setScheduleDelay(TRACER_EXPORTER_DELAY_SETTING.get(settings).getSeconds(), TimeUnit.SECONDS)
             .setMaxExportBatchSize(TRACER_EXPORTER_BATCH_SIZE_SETTING.get(settings))
-            .setMaxQueueSize(TRACER_EXPORTER_MAX_QUEUE_SIZE_SETTING.get(settings))
-            .build();
+            .setMaxQueueSize(TRACER_EXPORTER_MAX_QUEUE_SIZE_SETTING.get(settings));
+        return builder.setMeterProvider(
+            TelemetrySettings.METRICS_FEATURE_ENABLED_SETTING.get(settings) ? meterProvider : MeterProvider.noop()
+        ).build();
     }
 
 }

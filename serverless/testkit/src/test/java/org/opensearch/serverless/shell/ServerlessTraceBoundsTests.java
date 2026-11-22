@@ -18,6 +18,7 @@ import org.opensearch.telemetry.tracing.channels.TraceableTcpTransportChannel;
 import org.opensearch.telemetry.tracing.noop.NoopSpan;
 import org.opensearch.telemetry.tracing.noop.NoopTracer;
 import org.opensearch.test.OpenSearchTestCase;
+import org.opensearch.test.telemetry.TestInMemoryCounter;
 import org.opensearch.transport.TcpChannel;
 import org.opensearch.transport.TcpTransportChannel;
 
@@ -48,11 +49,12 @@ public class ServerlessTraceBoundsTests extends OpenSearchTestCase {
 
     public void testSampledParentsCannotBypassTheRateLimit() {
         final var clock = new AtomicLong();
+        final var dropped = new TestInMemoryCounter();
         final Tracer provider = provider();
         final var tracer = new ProtocolTracer(
             provider,
             action -> true,
-            new TraceAdmission(new TokenBucket(clock::get, 1, 2), new Semaphore(5), mock(ScheduledExecutorService.class), 1)
+            new TraceAdmission(new TokenBucket(clock::get, 1, 2), new Semaphore(5), mock(ScheduledExecutorService.class), 1, dropped)
         );
         for (int i = 0; i < 2; i++) {
             final Span admitted = tracer.startSpan(SpanCreationContext.server(), SAMPLED);
@@ -60,7 +62,7 @@ public class ServerlessTraceBoundsTests extends OpenSearchTestCase {
             admitted.endSpan();
         }
         for (int i = 0; i < 1_000; i++) {
-            assertSame(NoopSpan.INSTANCE, tracer.startSpan(SpanCreationContext.server(), SAMPLED));
+            assertSame(NoopSpan.INSTANCE, tracer.startSpan(SpanCreationContext.server().name("request-" + i), SAMPLED));
         }
         clock.incrementAndGet();
         final Span admitted = tracer.startSpan(SpanCreationContext.server(), SAMPLED);
@@ -68,6 +70,7 @@ public class ServerlessTraceBoundsTests extends OpenSearchTestCase {
         admitted.endSpan();
         assertSame(NoopSpan.INSTANCE, tracer.startSpan(SpanCreationContext.server(), SAMPLED));
         verify(provider, times(3)).startSpan(any(SpanCreationContext.class), eq(SAMPLED));
+        assertEquals(Map.of(Map.of("reason", "rate_limit"), 1_001.0), dropped.getCounterValueForTags());
     }
 
     public void testActiveSpanLimitRecoversOnExpiryAndCompletion() {
@@ -76,6 +79,7 @@ public class ServerlessTraceBoundsTests extends OpenSearchTestCase {
         final Span second = mock(Span.class);
         when(provider.startSpan(any(SpanCreationContext.class), anyMap())).thenReturn(first, second);
         final var scheduler = mock(ScheduledExecutorService.class);
+        final var dropped = new TestInMemoryCounter();
         final var expirations = new ArrayList<Runnable>();
         when(scheduler.schedule(any(Runnable.class), eq(100L), eq(TimeUnit.NANOSECONDS))).thenAnswer(invocation -> {
             expirations.add(invocation.getArgument(0));
@@ -84,7 +88,7 @@ public class ServerlessTraceBoundsTests extends OpenSearchTestCase {
         final var tracer = new ProtocolTracer(
             provider,
             action -> true,
-            new TraceAdmission(new TokenBucket(() -> 0L, 1, 10), new Semaphore(1), scheduler, 100)
+            new TraceAdmission(new TokenBucket(() -> 0L, 1, 10), new Semaphore(1), scheduler, 100, dropped)
         );
         final Span active = tracer.startSpan(SpanCreationContext.server(), SAMPLED);
         assertNotSame(NoopSpan.INSTANCE, active);
@@ -109,6 +113,7 @@ public class ServerlessTraceBoundsTests extends OpenSearchTestCase {
         next.endSpan();
         expirations.getLast().run();
         verify(second, times(1)).endSpan();
+        assertEquals(Map.of(Map.of("reason", "in_flight_limit"), 2.0), dropped.getCounterValueForTags());
         assertNotSame(NoopSpan.INSTANCE, tracer.startSpan(SpanCreationContext.server(), SAMPLED));
     }
 

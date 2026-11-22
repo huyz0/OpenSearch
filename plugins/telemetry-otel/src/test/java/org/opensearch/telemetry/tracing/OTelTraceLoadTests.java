@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.opentelemetry.api.GlobalOpenTelemetry;
+import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanContext;
 import io.opentelemetry.api.trace.TraceFlags;
@@ -30,6 +31,7 @@ import io.opentelemetry.api.trace.TraceState;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.context.propagation.ContextPropagators;
 import io.opentelemetry.sdk.common.CompletableResultCode;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import io.opentelemetry.sdk.trace.data.SpanData;
 import io.opentelemetry.sdk.trace.export.SpanExporter;
 import io.opentelemetry.sdk.trace.samplers.Sampler;
@@ -38,6 +40,7 @@ public class OTelTraceLoadTests extends OpenSearchTestCase {
     public void testSamplingAndExporterBackpressure() throws Exception {
         final Settings settings = Settings.builder()
             .put(TelemetrySettings.TRACER_SAMPLER_PROBABILITY.getKey(), 0)
+            .put(TelemetrySettings.METRICS_FEATURE_ENABLED_SETTING.getKey(), true)
             .put(OTelTelemetrySettings.TRACER_EXPORTER_MAX_QUEUE_SIZE_SETTING.getKey(), 8)
             .put(OTelTelemetrySettings.TRACER_EXPORTER_BATCH_SIZE_SETTING.getKey(), 1)
             .build();
@@ -47,8 +50,9 @@ public class OTelTraceLoadTests extends OpenSearchTestCase {
         );
         final Sampler sampler = Sampler.parentBased(new RequestSampler(OTelSamplerFactory.create(telemetry, settings)));
         final var exporter = new PausedExporter();
+        final var metrics = InMemoryMetricReader.create();
         GlobalOpenTelemetry.resetForTest();
-        try (var sdk = OTelResourceProvider.get(settings, exporter, ContextPropagators.noop(), sampler)) {
+        try (var sdk = OTelResourceProvider.get(settings, exporter, ContextPropagators.noop(), sampler, metrics)) {
             try {
                 final var tracer = sdk.getTracer("trace-load-test");
                 final Span root = tracer.spanBuilder("root").setNoParent().startSpan();
@@ -72,6 +76,21 @@ public class OTelTraceLoadTests extends OpenSearchTestCase {
                 assertTrue("span producers waited for a stalled exporter", drainedWithoutExporter);
                 assertTrue(sdk.getSdkTracerProvider().forceFlush().join(10, TimeUnit.SECONDS).isSuccess());
                 assertEquals("one in-flight export plus the bounded queue", 9, exporter.exported.get());
+                final var processedSpans = metrics.collectAllMetrics()
+                    .stream()
+                    .filter(metric -> metric.getName().equals("processedSpans"))
+                    .findFirst()
+                    .orElseThrow();
+                assertEquals("io.opentelemetry.sdk.trace", processedSpans.getInstrumentationScopeInfo().getName());
+                final var dropped = processedSpans.getLongSumData()
+                    .getPoints()
+                    .stream()
+                    .filter(point -> Boolean.TRUE.equals(point.getAttributes().get(AttributeKey.booleanKey("dropped"))))
+                    .toList();
+                assertEquals(1, dropped.size());
+                assertEquals("BatchSpanProcessor", dropped.getFirst().getAttributes().get(AttributeKey.stringKey("processorType")));
+                assertEquals(2, dropped.getFirst().getAttributes().size());
+                assertEquals(992, dropped.getFirst().getValue());
             } finally {
                 exporter.resume.succeed();
             }
