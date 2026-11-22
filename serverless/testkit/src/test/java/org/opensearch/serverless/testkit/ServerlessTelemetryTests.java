@@ -214,6 +214,7 @@ public class ServerlessTelemetryTests extends OpenSearchTestCase {
         @Override
         public Optional<Telemetry> getTelemetry(TelemetrySettings settings) {
             final MetricsTelemetry metrics = mock(MetricsTelemetry.class);
+            when(metrics.createCounter(anyString(), anyString(), anyString())).thenReturn(new TestInMemoryCounter());
             when(metrics.createCounter(eq(RESPONSES), anyString(), anyString())).thenReturn(responses);
             when(metrics.createHistogram(eq(RESPONSE_TIME), anyString(), anyString())).thenReturn(latency);
             return Optional.of(new MockTelemetry(settings) {

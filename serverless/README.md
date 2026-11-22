@@ -738,6 +738,13 @@ still active after five minutes is ended. When a limit is reached, requests
 continue and the trace can be incomplete. The limits cover protocol tracing
 even when upstream callers mark every trace as sampled.
 
+With metrics and tracing enabled, `opensearch.serverless.trace.dropped_spans`
+counts span starts refused by the shell. Its only tag is `reason`, with values
+`rate_limit` and `in_flight_limit`. Expected sampling decisions and spans ended
+at the age limit are outside this counter. The OpenTelemetry exporter queue
+reports its own drops through the SDK's `processedSpans` counter, with
+`dropped=true` and `processorType=BatchSpanProcessor`.
+
 The shell records `opensearch.serverless.rest.responses` and
 `opensearch.serverless.rest.response_time` by HTTP method and status for requests
 dispatched to registered handlers. The histogram measures milliseconds to response

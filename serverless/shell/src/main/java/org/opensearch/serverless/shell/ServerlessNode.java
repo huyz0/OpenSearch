@@ -234,7 +234,7 @@ public final class ServerlessNode extends NodeContext implements Closeable {
                 : new ProtocolTracer(
                     telemetry.tracer(),
                     action -> transportService.getRequestHandler(action) != null,
-                    new TraceAdmission(threadPool.scheduler())
+                    new TraceAdmission(threadPool.scheduler(), telemetry.metrics())
                 );
             final NetworkModule networkModule = services.buildNetworkModule(clusterSettings, restController, protocolTracer);
             final Transport transport = networkModule.getTransportSupplier().get();
