@@ -250,6 +250,10 @@ public final class ServerlessNode extends NodeContext implements Closeable {
                 protocolTracer
             );
             this.httpServerTransport = networkModule.getHttpServerTransportSupplier().get();
+            // Built with the HTTP transport, started and stopped with it. The list is empty unless
+            // aux.transport.types names a transport a plugin registered; a name nothing registered fails
+            // here, at construction, as it does on a classic node.
+            this.auxTransports = java.util.List.copyOf(networkModule.getAuxServerTransportList());
             success = true;
         } finally {
             if (success == false) {
@@ -325,6 +329,7 @@ public final class ServerlessNode extends NodeContext implements Closeable {
         //
         // ServerlessPlugins#closeAll must be invoked here. Skipping it is invisible while every plugin is a
         // test plugin holding nothing; a plugin that owns a thread pool leaks it out of every node.
+        IOUtils.closeWhileHandlingException(auxTransports);
         IOUtils.closeWhileHandlingException(httpServerTransport);
         pluginIndices().stop();
         pluginClusterSettings().stop();

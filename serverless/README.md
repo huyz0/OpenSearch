@@ -769,6 +769,18 @@ then on: 1 KB documents at 40/s offered, 15.6/s acked at p50 24 s, then 39.6/s a
 15.9/s with most refused or failed, then 600/s at p50 144 / p99 276 ms; the page mix at 100/s, 14.8/s at p50 60 s,
 then 99.4/s with 4 KB pages at p50 156 / p99 304 ms. See `large-document-results.md`.
 
+## Client protocols
+
+HTTP/1.1 and HTTP/2 over clear text (h2c, by upgrade or prior knowledge) are served on both HTTP transports, `netty4` and
+the streaming `reactor-netty4`; `ServerlessProtocolsTests` makes an HTTP/2 request to each and compares it with HTTP/1.1.
+HTTP/2 over TLS (ALPN `h2`) and HTTP/3 need TLS parameters, which the shell has none of itself: a plugin that supplies a
+`SecureHttpTransportSettingsProvider` (the security plugin) provides them, and HTTP/3 also needs
+`http.protocol.http3.enabled: true` and Netty's native QUIC library. gRPC is the stock `transport-grpc` plugin, an
+auxiliary transport (`DocumentService.Bulk`, `SearchService.Search`, `CreatePit`, `DeletePit`, plus gRPC health and
+reflection): the shell starts the transports `aux.transport.types` names with the node and stops them with it, and
+opens no port when the setting is empty. `ServerlessGrpcTests` (`:serverless:testkit:grpcTest`) loads the plugin and
+makes a gRPC health call to a shell node. The Rust node's side is in `docs/protocols.md` of `huyz0/opensearch-serverless`.
+
 ## Big bulk requests
 
 A `_bulk` taken whole holds its body several times over while it is parsed and applied, so many 100 MB batches at once

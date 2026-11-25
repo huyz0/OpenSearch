@@ -22,12 +22,40 @@ sourceSets {
   }
 }
 
+// The real gRPC transport on a shell node. Its own source set and classpath: the stock transport-grpc module
+// pins grpc 1.75 and the cloud-storage plugins on the main test classpath pin 1.71.
+sourceSets {
+  grpcTest {
+    java.srcDir 'src/grpcTest/java'
+  }
+}
+
 configurations {
+  grpcTestImplementation
+  grpcTestRuntimeOnly
   gcsEmulatorTestImplementation.extendsFrom testImplementation
   gcsEmulatorTestRuntimeOnly.extendsFrom testRuntimeOnly
 }
 
+evaluationDependsOn(':modules:lang-painless:spi')
+
 dependencies {
+  // painless and grpc both publish a module called org.opensearch.plugin:spi, so the build can hold only one
+  // of them by coordinates; the painless one goes in as a jar.
+  grpcTestRuntimeOnly files(rootProject.project(':modules:lang-painless:spi').tasks.named('jar').map { it.archiveFile })
+  grpcTestImplementation project(':server')
+  grpcTestImplementation project(':serverless:shell')
+  grpcTestImplementation project(':modules:transport-netty4')
+  grpcTestImplementation project(':modules:transport-grpc')
+  grpcTestImplementation project(':modules:transport-grpc:spi')
+  grpcTestImplementation "org.opensearch:protobufs:${versions.opensearchprotobufs}"
+  grpcTestImplementation project(':test:framework')
+  grpcTestImplementation "io.grpc:grpc-api:${versions.grpc}"
+  grpcTestImplementation "io.grpc:grpc-stub:${versions.grpc}"
+  grpcTestImplementation "io.grpc:grpc-services:${versions.grpc}"
+  grpcTestImplementation "io.grpc:grpc-netty-shaded:${versions.grpc}"
+  grpcTestImplementation "io.grpc:grpc-protobuf:${versions.grpc}"
+  grpcTestRuntimeOnly project(':libs:opensearch-plugin-classloader')
   implementation project(':server')
   implementation project(':serverless:shell')
   implementation project(':serverless:auth')
@@ -259,7 +287,15 @@ tasks.register('emulatorTest', Test) {
   }
 }
 
+tasks.register('grpcTest', Test) {
+  testClassesDirs = sourceSets.grpcTest.output.classesDirs
+  classpath = sourceSets.grpcTest.runtimeClasspath
+  systemProperty 'tests.security.manager', 'false'
+  systemProperty 'opensearch.set.netty.runtime.available.processors', 'false'
+}
+
 tasks.named('check').configure {
+  dependsOn 'grpcTest'
   dependsOn 'processTest'
   dependsOn 'pluginTest'
   dependsOn 'tlsTest'
@@ -383,4 +419,14 @@ tasks.register('largeDocTest', Test) {
     }
   }
   outputs.upToDateWhen { false }
+}
+
+// The build fails on any version conflict; the gRPC module and the test framework disagree on a few libraries,
+// and the newer of each serves both.
+['grpcTestCompileClasspath', 'grpcTestRuntimeClasspath'].each { name ->
+  configurations.named(name).configure {
+    resolutionStrategy.preferProjectModules()
+    resolutionStrategy.force 'com.google.guava:guava:33.4.0-jre', 'com.google.errorprone:error_prone_annotations:2.30.0',
+      'com.google.code.gson:gson:2.11.0'
+  }
 }
