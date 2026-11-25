@@ -284,6 +284,12 @@ public final class MetadataPlane {
      * @throws IOException if a register cannot be read
      */
     public Optional<WriteTarget> writeTarget(String name) throws IOException {
+        // An index a snapshot restore has not finished takes no write, and is answered as one that is not there,
+        // as a Rust node answers it: the shards are part-way copied and a write would land on them.
+        return resolveWriteTarget(name).filter(target -> target.index().isRestoring() == false);
+    }
+
+    private Optional<WriteTarget> resolveWriteTarget(String name) throws IOException {
         final DescriptorResolution resolved = resolveForRouting(name);
         if (resolved.index() != null) {
             return Optional.of(new WriteTarget(resolved.index(), null));

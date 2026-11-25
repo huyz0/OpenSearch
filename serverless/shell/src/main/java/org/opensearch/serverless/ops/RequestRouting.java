@@ -71,7 +71,9 @@ final class RequestRouting {
         // Every use here is placement -- a shard number and a uuid -- so the routing cache answers it: a
         // stale uuid lands on a shard that refuses to answer for a deleted incarnation (see
         // WriteFences#INCARNATION_FENCE_MILLIS) or on none at all.
-        return once(described, index, () -> plane.describeForRouting(index));
+        // An index a restore has not finished takes no write: it is answered as an index that is not there, as a
+        // Rust node answers it, so a half-restored shard is never written to.
+        return once(described, index, () -> plane.describeForRouting(index).filter(d -> d.isRestoring() == false));
     }
 
     Optional<String> ownerOnce(String index, int shard) throws IOException {
