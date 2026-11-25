@@ -69,6 +69,10 @@ public final class NodeStartup {
         }
         node.transportService.acceptIncomingRequests();
         node.httpServerTransport.start();
+        // After HTTP, so a client that finds the node over gRPC finds one that already answers REST.
+        for (org.opensearch.transport.AuxTransport aux : node.auxTransports) {
+            aux.start();
+        }
 
         // The identity in the initial view carried a placeholder address, because the real one is not
         // known until the transport binds. Replace it now that it is.

@@ -62,6 +62,11 @@ public abstract class NodeCore {
     protected RestController restController;
     public TransportService transportService;
     public HttpServerTransport httpServerTransport;
+    /**
+     * The auxiliary transports plugins register and {@code aux.transport.types} enables, such as the gRPC
+     * transport. Empty unless an operator enables one, so a node without the setting opens no extra port.
+     */
+    public java.util.List<org.opensearch.transport.AuxTransport> auxTransports = java.util.List.of();
     protected NodeClient nodeClient;
     public volatile DiscoveryNode localNode;
     volatile MembershipSource membershipSource;
