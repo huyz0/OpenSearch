@@ -633,6 +633,23 @@ public final class IndexDescriptor {
         return extraSettings;
     }
 
+    /** The setting a snapshot restore holds on an index until every shard has landed. */
+    public static final String RESTORE_IN_PROGRESS_SETTING = "index.restore.in_progress";
+
+    /** What an index that carries the restore mark answers instead of its data. */
+    public static final String RESTORING_WHY =
+        "the index is being restored, or a restore of it was interrupted: delete it and restore it again";
+
+    /**
+     * Whether a restore marked this index and has not cleared the mark: a restore still copying, or one that
+     * died part-way and left shards that are not the snapshot's. Such an index serves no search and takes no write.
+     *
+     * @return true if the restore mark is set
+     */
+    public boolean isRestoring() {
+        return extraSettings.hasValue(RESTORE_IN_PROGRESS_SETTING);
+    }
+
     /**
      * Returns the mapping source, or null.
      *

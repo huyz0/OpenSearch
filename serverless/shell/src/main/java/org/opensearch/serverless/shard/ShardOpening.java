@@ -572,6 +572,24 @@ final class ShardOpening {
      * write-ahead log, never from a local translog: this deletes the local one, on every open, which is
      * why fsyncing it per operation buys nothing.
      */
+    /**
+     * Returns the translog UUID the commit names, writing a fresh one into the commit first when it names none.
+     *
+     * <p>A commit another engine wrote -- a Rust writer's, or one a restore copied from a snapshot of such a shard --
+     * carries no {@code translog_uuid}. Passing the missing value on gave the new translog a header with no UUID, and
+     * recovery failed with a null pointer reading it.
+     */
+    static String ensureTranslogUuid(org.opensearch.index.store.Store store, org.apache.lucene.index.SegmentInfos commit)
+        throws IOException {
+        final String present = commit.getUserData().get(org.opensearch.index.translog.Translog.TRANSLOG_UUID_KEY);
+        if (present != null && present.isEmpty() == false) {
+            return present;
+        }
+        final String fresh = org.opensearch.common.UUIDs.randomBase64UUID();
+        store.associateIndexWithNewTranslog(fresh);
+        return fresh;
+    }
+
     /** Returns the local checkpoint of the restored commit, the one the new translog starts from. */
     long bootstrapTranslogFor(IndexShard shard) throws IOException {
         shard.store().bootstrapNewHistory();
@@ -579,7 +597,7 @@ final class ShardOpening {
         final long localCheckpoint = Long.parseLong(
             segmentInfos.userData.get(org.opensearch.index.seqno.SequenceNumbers.LOCAL_CHECKPOINT_KEY)
         );
-        final String translogUUID = segmentInfos.getUserData().get(org.opensearch.index.translog.Translog.TRANSLOG_UUID_KEY);
+        final String translogUUID = ensureTranslogUuid(shard.store(), segmentInfos);
         org.opensearch.index.translog.Translog.createEmptyTranslog(
             shard.shardPath().resolveTranslog(),
             shard.shardId(),

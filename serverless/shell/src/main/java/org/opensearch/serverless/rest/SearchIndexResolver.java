@@ -86,6 +86,11 @@ final class SearchIndexResolver {
         return resolveIndices(metadata, serving, index, ignoreUnavailable, throughRequestPath, null, 0L);
     }
 
+    /** The refusal for an index a restore has not finished: the shape a Rust node answers with. */
+    private static IndexResolution restoring() {
+        return IndexResolution.refuse(RestStatus.SERVICE_UNAVAILABLE, "cluster_block_exception", IndexDescriptor.RESTORING_WHY);
+    }
+
     /**
      * Resolves names, dropping the pattern matches the digest rollups prove the search cannot match.
      *
@@ -295,6 +300,9 @@ final class SearchIndexResolver {
                         "[" + name + "] belongs to a plugin and is not reachable through the request path"
                     );
                 }
+                if (resolved.index().isRestoring()) {
+                    return restoring();
+                }
                 indices.put(name, resolved.index());
                 continue;
             }
@@ -322,6 +330,9 @@ final class SearchIndexResolver {
                         "system_index",
                         "[" + target + "] belongs to a plugin and is not reachable through the request path"
                     );
+                }
+                if (behind.get().isRestoring()) {
+                    return restoring();
                 }
                 indices.put(target, behind.get());
             }
