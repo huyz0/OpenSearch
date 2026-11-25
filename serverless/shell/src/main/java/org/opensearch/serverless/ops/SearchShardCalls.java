@@ -115,6 +115,8 @@ final class SearchShardCalls {
         // The owner is the last resort, and its head is read only when the placement candidates could
         // not answer: a head read per shard per search was the largest single cost of a hot search.
         boolean triedOwner = false;
+        final long openWait = serving.searchSettings().coldOpenWaitMillis();
+        boolean stillOpening = false;
         for (int attempt = 0; attempt <= targets.size(); attempt++) {
             final String target;
             if (attempt < targets.size()) {
@@ -131,10 +133,25 @@ final class SearchShardCalls {
             }
             tried.add(target);
             try (org.opensearch.common.lease.Releasable inFlight = spread.begin(target)) {
-                final SearchFanout.ShardAnswer answer = askTarget(serving, metadata, descriptor, shard, target, perShard, nowInMillis);
+                final SearchFanout.ShardAnswer answer = askTarget(
+                    serving,
+                    metadata,
+                    descriptor,
+                    shard,
+                    target,
+                    perShard,
+                    nowInMillis,
+                    openWait
+                );
                 if (answer != null) {
                     return answer;
                 }
+            } catch (ColdOpenWait.StillOpening e) {
+                // Its open carries on in the background. The other copies are asked first, and this one again
+                // only if none of them answers.
+                stillOpening = true;
+                logCopyFailure(descriptor, shard, "preferred_or_owner", e);
+                lastFailure = e;
             } catch (Exception e) {
                 // Try the next candidate. A shard that failed to answer is not a shard with no matches,
                 // so it only counts as searched if one of them succeeded.
@@ -166,6 +183,19 @@ final class SearchShardCalls {
                 }
             } catch (Exception e) {
                 logCopyFailure(descriptor, shard, "spare", e);
+                lastFailure = e;
+            }
+        }
+        if (stillOpening) {
+            // No other copy answered. The open that outlasted the wait is the way to an answer, so wait for it.
+            final String self = serving.localNode().getId();
+            try {
+                final SearchFanout.ShardAnswer answer = askTarget(serving, metadata, descriptor, shard, self, perShard, nowInMillis);
+                if (answer != null) {
+                    return answer;
+                }
+            } catch (Exception e) {
+                logCopyFailure(descriptor, shard, "preferred_or_owner", e);
                 lastFailure = e;
             }
         }
@@ -232,7 +262,7 @@ final class SearchShardCalls {
         return org.opensearch.serverless.cluster.HotShardSpread.of(serving, serving.settings());
     }
 
-    /** Asks one node for a shard: this one by opening a reader, another over the wire; null if it cannot be reached. */
+    /** Asks one node for a shard, waiting as long as a local open takes. */
     static SearchFanout.ShardAnswer askTarget(
         NodeContext serving,
         MetadataPlane metadata,
@@ -242,11 +272,34 @@ final class SearchShardCalls {
         SearchSourceBuilder perShard,
         long nowInMillis
     ) throws Exception {
+        return askTarget(serving, metadata, descriptor, shard, target, perShard, nowInMillis, 0L);
+    }
+
+    /**
+     * Asks one node for a shard: this one by opening a reader, another over the wire; null if it cannot be reached.
+     *
+     * @param openWaitMillis how long to wait for a local open before giving up on this node; zero waits for it
+     * @throws ColdOpenWait.StillOpening if the local open did not finish in that time
+     */
+    static SearchFanout.ShardAnswer askTarget(
+        NodeContext serving,
+        MetadataPlane metadata,
+        org.opensearch.serverless.cluster.IndexDescriptor descriptor,
+        int shard,
+        String target,
+        SearchSourceBuilder perShard,
+        long nowInMillis,
+        long openWaitMillis
+    ) throws Exception {
         final String index = descriptor.name();
         if (serving.localNode().getId().equals(target)) {
             // We are the placement for this shard but do not hold it yet. Open it here rather
             // than asking ourselves over the network.
-            final ShardId opened = serving.readers().serveAsReader(metadata, index, shard, descriptor.uuid());
+            final ShardId opened = ColdOpenWait.await(
+                serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC),
+                openWaitMillis,
+                () -> serving.readers().serveAsReader(metadata, index, shard, descriptor.uuid())
+            );
             serving.shards().markUsed(opened);
             return new SearchFanout.ShardAnswer(queryHere(serving, opened, perShard, nowInMillis));
         }

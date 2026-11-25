@@ -43,6 +43,14 @@ public final class SearchSettings implements SettingsProvider {
         Property.NodeScope
     );
 
+    /** The {@code serverless.search.cold_open.wait_millis} setting. */
+    public static final Setting<Long> COLD_OPEN_WAIT_MILLIS = Setting.longSetting(
+        "serverless.search.cold_open.wait_millis",
+        10_000L,
+        0L,
+        Property.NodeScope
+    );
+
     /** The {@code serverless.search.rollup.cache_millis} setting. */
     public static final Setting<Long> ROLLUP_CACHE_MILLIS = Setting.longSetting(
         "serverless.search.rollup.cache_millis",
@@ -154,6 +162,18 @@ public final class SearchSettings implements SettingsProvider {
         return Math.max(1, SearchSettings.FANOUT_CONCURRENCY.get(settings));
     }
 
+    /**
+     * How long a search waits for this node to open a reader before it asks another copy, in milliseconds.
+     *
+     * <p>Zero waits for the open as before. The open is not cancelled when the wait ends: it finishes in the
+     * background and the next search finds it. If no other copy answers, the search returns to wait for it.
+     *
+     * @return the wait
+     */
+    public long coldOpenWaitMillis() {
+        return Math.max(0L, SearchSettings.COLD_OPEN_WAIT_MILLIS.get(settings));
+    }
+
     /** How many indices a prefix pattern must match before a search reads its group's digest rollups. */
     public static final int DEFAULT_ROLLUP_MIN_INDICES = 32;
 
@@ -200,6 +220,7 @@ public final class SearchSettings implements SettingsProvider {
         return List.of(
             PATTERN_MAX_INDICES,
             FANOUT_CONCURRENCY,
+            COLD_OPEN_WAIT_MILLIS,
             ROLLUP_CACHE_MILLIS,
             ROLLUP_MIN_INDICES,
             MAX_ACTIVATIONS_PER_QUERY,
