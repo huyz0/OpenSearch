@@ -17,6 +17,7 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
+import org.opensearch.serverless.rest.ClusterSettingsHandler;
 import org.opensearch.serverless.rest.StoredScriptHandler;
 import org.opensearch.serverless.rest.TemplateHandler;
 import org.opensearch.serverless.script.StoredScripts;
@@ -210,12 +211,26 @@ final class SnapshotGlobalState {
         final List<String> failed = new ArrayList<>();
         int applied = 0;
         if (state.settings().isEmpty() == false) {
-            try {
-                metadata.clusterConfig().update(new LinkedHashMap<>(state.settings()));
-                applied += state.settings().size();
-            } catch (Exception e) {
-                LOGGER.warn("global state could not merge its persistent settings", e);
-                failed.add(SETTINGS);
+            // Each key is held to what PUT /_cluster/settings holds it to; one the route would refuse is listed, not written.
+            final Map<String, Object> admitted = new LinkedHashMap<>();
+            for (Map.Entry<String, Object> setting : state.settings().entrySet()) {
+                try {
+                    ClusterSettingsHandler.admit(serving, Map.of(setting.getKey(), setting.getValue()));
+                    admitted.put(setting.getKey(), setting.getValue());
+                } catch (Exception e) {
+                    LOGGER.warn("global state skips setting [{}]: {}", setting.getKey(), e.getMessage());
+                    failed.add(SETTINGS + "/" + setting.getKey());
+                }
+            }
+            if (admitted.isEmpty() == false) {
+                try {
+                    final Settings written = metadata.clusterConfig().update(admitted);
+                    ClusterSettingsHandler.applyWritten(serving, written);
+                    applied += admitted.size();
+                } catch (Exception e) {
+                    LOGGER.warn("global state could not merge its persistent settings", e);
+                    failed.add(SETTINGS);
+                }
             }
         }
         for (Map.Entry<String, Map<String, Map<String, Object>>> set : state.sets().entrySet()) {

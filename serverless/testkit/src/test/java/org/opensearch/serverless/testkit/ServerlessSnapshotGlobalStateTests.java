@@ -358,6 +358,21 @@ public class ServerlessSnapshotGlobalStateTests extends OpenSearchTestCase {
         });
     }
 
+    public void testASettingThePutRouteRefusesIsListedAndTheRestAreApplied() throws Exception {
+        with(true, null, (node, plane) -> {
+            final String refused = org.opensearch.serverless.bucket.BucketSettings.CLUSTER_POLICY.getKey();
+            assertEquals(400, send(node, "PUT", "/_cluster/settings", "{\"persistent\":{\"" + refused + "\":\"not-a-policy\"}}").status());
+            plane.finishSnapshot(plane.createSnapshot(withState(plane, Map.of("persistent_settings", Map.of(refused, "not-a-policy", "gs.ok", "1")))));
+            final Response restored = restore(node, "stateful", "\"include_global_state\":true");
+            assertEquals(restored.body(), 200, restored.status());
+            assertTrue(restored.body(), restored.body().contains("\"global_state_restored\":1"));
+            assertTrue(restored.body(), restored.body().contains("\"failed_global_state\":[\"persistent_settings/" + refused + "\"]"));
+            assertEquals("1", plane.clusterConfig().read().settings().get("gs.ok"));
+            assertNull(plane.clusterConfig().read().settings().get(refused));
+            assertTrue(plane.describe("copy").isPresent());
+        });
+    }
+
     public void testAMalformedStateIsUnreadableOnlyToTheRestoreThatUsesIt() throws Exception {
         with(true, null, (node, plane) -> {
             plane.finishSnapshot(plane.createSnapshot(withState(plane, "not an object")));
