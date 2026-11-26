@@ -43,6 +43,18 @@ final class SnapshotGlobalState {
     /** The most bytes of state one record embeds. */
     static final int MAX_BYTES = 4 * 1024 * 1024;
 
+    /** The most documents a set holds, the bound its PUT route keeps. */
+    static final int MAX_DOCUMENTS = org.opensearch.serverless.template.TemplateStore.MAX_TEMPLATES;
+
+    /** The most bytes the persistent settings hold. */
+    static final long MAX_SETTINGS_BYTES = 256L * 1024;
+
+    /** The most bytes one encoded snapshot record may have: the bound the Rust readers' record buffer holds. */
+    static final long MAX_RECORD_BYTES = 16L * 1024 * 1024;
+
+    /** The bound in force; a test lowers it to exercise the refusal without building a 16 MiB record. */
+    static volatile long maxRecordBytes = MAX_RECORD_BYTES;
+
     /** How long a foreground restore spends putting documents back before the rest go to the failed list. */
     private static final long RESTORE_BUDGET_NANOS = java.util.concurrent.TimeUnit.MINUTES.toNanos(2);
 
@@ -58,11 +70,33 @@ final class SnapshotGlobalState {
         TooLargeException(String set) {
             super("the global state is over " + MAX_BYTES + " bytes once [" + set + "] is added; delete some of it or take without it");
         }
+
+        private TooLargeException(long bytes, long limit) {
+            super("the snapshot record would be " + bytes + " bytes with its global state, over the " + limit + " byte bound");
+        }
+
+        static TooLargeException record(long bytes, long limit) {
+            return new TooLargeException(bytes, limit);
+        }
+    }
+
+    /** Thrown by a take when a set changed under its read twice; nothing has been written. */
+    static final class ChangedException extends Exception {
+        ChangedException(String set) {
+            super("[" + set + "] changed while the global state was being read; retry the snapshot");
+        }
     }
 
     /** Thrown by a restore whose snapshot's {@code global_state} is not what a take writes. */
     static final class UnreadableException extends IOException {
         UnreadableException(String reason) {
+            super(reason);
+        }
+    }
+
+    /** Thrown by a restore whose state would push a set or the settings past its bound; nothing has been written. */
+    static final class BoundException extends Exception {
+        BoundException(String reason) {
             super(reason);
         }
     }
@@ -83,7 +117,7 @@ final class SnapshotGlobalState {
      * @throws TooLargeException when the encoded state would pass {@link #MAX_BYTES}
      * @throws IOException if a store cannot be read
      */
-    static Map<String, Object> capture(MetadataPlane metadata) throws IOException, TooLargeException {
+    static Map<String, Object> capture(MetadataPlane metadata) throws IOException, TooLargeException, ChangedException {
         final Map<String, Object> state = new LinkedHashMap<>();
         long bytes = 0;
         final Settings settings = metadata.clusterConfig().read().settings();
@@ -111,7 +145,7 @@ final class SnapshotGlobalState {
     }
 
     /** A walk over one set: hands each document to the visitor, one body at a time. */
-    private interface Walk {
+    interface Walk {
         void over(org.opensearch.common.CheckedBiConsumer<String, String, IOException> visitor) throws IOException;
     }
 
@@ -123,24 +157,30 @@ final class SnapshotGlobalState {
     }
 
     // ALLOC: one document body (at most 1 MiB, bounded by the store's put) at a time, plus the parsed documents kept, at most MAX_BYTES.
-    private static long add(Map<String, Object> state, String set, Walk walk, long bytes) throws TooLargeException, IOException {
-        final Map<String, Object> parsed = new TreeMap<>();
-        final long[] total = { bytes };
-        try {
-            walk.over((name, source) -> {
-                total[0] += name.getBytes(StandardCharsets.UTF_8).length + source.getBytes(StandardCharsets.UTF_8).length + 8L;
-                if (total[0] > MAX_BYTES) {
-                    throw new Stop(set);
-                }
-                parsed.put(name, XContentHelper.convertToMap(new BytesArray(source), false, XContentType.JSON).v2());
-            });
-        } catch (Stop stop) {
-            throw new TooLargeException(set);
+    static long add(Map<String, Object> state, String set, Walk walk, long bytes) throws TooLargeException, ChangedException, IOException {
+        // A document deleted mid-walk restarts the set from its marker once; a second restart fails the take.
+        for (int attempt = 0; attempt < 2; attempt++) {
+            final Map<String, Object> parsed = new TreeMap<>();
+            final long[] total = { bytes };
+            try {
+                walk.over((name, source) -> {
+                    total[0] += name.getBytes(StandardCharsets.UTF_8).length + source.getBytes(StandardCharsets.UTF_8).length + 8L;
+                    if (total[0] > MAX_BYTES) {
+                        throw new Stop(set);
+                    }
+                    parsed.put(name, XContentHelper.convertToMap(new BytesArray(source), false, XContentType.JSON).v2());
+                });
+            } catch (Stop stop) {
+                throw new TooLargeException(set);
+            } catch (org.opensearch.serverless.template.TemplateStore.StateChangedException changed) {
+                continue;
+            }
+            if (parsed.isEmpty() == false) {
+                state.put(set, parsed);
+            }
+            return total[0];
         }
-        if (parsed.isEmpty() == false) {
-            state.put(set, parsed);
-        }
-        return total[0];
+        throw new ChangedException(set);
     }
 
     /**
@@ -192,6 +232,88 @@ final class SnapshotGlobalState {
             sets.put(set, byName);
         }
         return new Parsed(settings, sets);
+    }
+
+    /**
+     * Refuses, before anything is written, a restore that would take a set past its document bound or the settings past
+     * the register bound. One marker read per set present, and one read of the settings.
+     *
+     * @param metadata the plane whose stores take the state
+     * @param state the state to apply
+     * @throws BoundException if a bound would be passed
+     * @throws IOException if a marker cannot be read
+     */
+    static void checkBounds(MetadataPlane metadata, Parsed state) throws BoundException, IOException {
+        if (state.settings().isEmpty() == false) {
+            final Settings held = metadata.clusterConfig().read().settings();
+            final Map<String, String> merged = new TreeMap<>();
+            for (String key : held.keySet()) {
+                if (held.get(key) != null) {
+                    merged.put(key, held.get(key));
+                }
+            }
+            for (Map.Entry<String, Object> entry : state.settings().entrySet()) {
+                merged.put(entry.getKey(), String.valueOf(entry.getValue()));
+            }
+            long bytes = 0;
+            for (Map.Entry<String, String> entry : merged.entrySet()) {
+                bytes += entry.getKey().getBytes(StandardCharsets.UTF_8).length + entry.getValue().getBytes(StandardCharsets.UTF_8).length
+                    + 8L;
+            }
+            if (bytes > MAX_SETTINGS_BYTES) {
+                throw new BoundException(
+                    "restoring the global state would take "
+                        + SETTINGS
+                        + " to "
+                        + bytes
+                        + " bytes, over the "
+                        + MAX_SETTINGS_BYTES
+                        + " byte bound"
+                );
+            }
+        }
+        for (Map.Entry<String, Map<String, Map<String, Object>>> set : state.sets().entrySet()) {
+            final java.util.Set<String> existing = switch (set.getKey()) {
+                case INDEX_TEMPLATES -> metadata.indexTemplates().names();
+                case COMPONENT_TEMPLATES -> metadata.componentTemplates().names();
+                case INGEST_PIPELINES -> metadata.pipelines().names();
+                case SEARCH_PIPELINES -> metadata.searchPipelines().names();
+                default -> metadata.scripts().names();
+            };
+            long total = existing.size();
+            for (String name : set.getValue().keySet()) {
+                if (existing.contains(name) == false) {
+                    total++;
+                }
+            }
+            if (total > MAX_DOCUMENTS) {
+                throw new BoundException(
+                    "restoring the global state would take "
+                        + set.getKey()
+                        + " to "
+                        + total
+                        + " documents, over the bound of "
+                        + MAX_DOCUMENTS
+                );
+            }
+        }
+    }
+
+    /**
+     * Refuses a take whose finished record, state included, is over the record bound.
+     *
+     * @param record the finished record
+     * @throws TooLargeException if it is
+     * @throws IOException if it cannot be encoded
+     */
+    static void checkRecordFits(org.opensearch.serverless.repository.SnapshotRecord record) throws TooLargeException, IOException {
+        if (record.globalState() == null) {
+            return;
+        }
+        final long bytes = record.toBytes().length();
+        if (bytes > maxRecordBytes) {
+            throw TooLargeException.record(bytes, maxRecordBytes);
+        }
     }
 
     /**

@@ -175,7 +175,12 @@ final class ShardHibernation {
                 e.getClass().getSimpleName()
             );
         }
-        BackgroundReconciler.logger.debug("Shard hibernated (shard={}, primary_term={}, idle_ms={})", shardId.id(), term, nowMillis - lastUsed);
+        BackgroundReconciler.logger.debug(
+            "Shard hibernated (shard={}, primary_term={}, idle_ms={})",
+            shardId.id(),
+            term,
+            nowMillis - lastUsed
+        );
         return true;
     }
 

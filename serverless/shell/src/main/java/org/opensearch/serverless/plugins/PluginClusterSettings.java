@@ -124,7 +124,10 @@ public final class PluginClusterSettings {
                 clusterSettings().applySettings(part);
                 applied = part;
             } catch (RuntimeException e) {
-                logger.warn("Keeping previous plugin cluster settings after an update failed (error_type={})", e.getClass().getSimpleName());
+                logger.warn(
+                    "Keeping previous plugin cluster settings after an update failed (error_type={})",
+                    e.getClass().getSimpleName()
+                );
             }
         }
     }

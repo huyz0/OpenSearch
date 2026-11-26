@@ -214,7 +214,12 @@ public final class CommitPush {
                     } catch (Exception e) {
                         // Lost: the reader's register look moves it, as before pushes existed.
                         sendFailures.incrementAndGet();
-                        LOG.debug("Could not push a commit (shard={}, target_node_id={}, error_type={})", shardId.id(), target, e.getClass().getSimpleName());
+                        LOG.debug(
+                            "Could not push a commit (shard={}, target_node_id={}, error_type={})",
+                            shardId.id(),
+                            target,
+                            e.getClass().getSimpleName()
+                        );
                     }
                 });
             }
@@ -375,7 +380,11 @@ public final class CommitPush {
                 reopened.incrementAndGet();
             }
         } catch (Exception e) {
-            LOG.debug("Could not advance a reader to its pushed commit (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
+            LOG.debug(
+                "Could not advance a reader to its pushed commit (shard={}, error_type={})",
+                shardId.id(),
+                e.getClass().getSimpleName()
+            );
         } finally {
             if (again) {
                 router.node.threadPool()

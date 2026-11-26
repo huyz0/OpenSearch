@@ -258,9 +258,7 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                 throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
             }
         }
-        final Object visibility = flat.get(
-            org.opensearch.serverless.transport.ReaderPushSettings.REFRESH_VISIBILITY_CLUSTER.getKey()
-        );
+        final Object visibility = flat.get(org.opensearch.serverless.transport.ReaderPushSettings.REFRESH_VISIBILITY_CLUSTER.getKey());
         if (visibility != null) {
             try {
                 org.opensearch.serverless.transport.RefreshVisibility.check(String.valueOf(visibility));

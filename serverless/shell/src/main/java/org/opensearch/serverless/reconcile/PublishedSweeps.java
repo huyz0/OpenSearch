@@ -283,7 +283,11 @@ final class PublishedSweeps {
                 } catch (Exception e) {
                     // Reclaiming space is the one job here whose failure costs only money, so it never
                     // interrupts a pass and never escalates.
-                    BackgroundReconciler.logger.debug("Shard sweep will retry (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
+                    BackgroundReconciler.logger.debug(
+                        "Shard sweep will retry (shard={}, error_type={})",
+                        shardId.id(),
+                        e.getClass().getSimpleName()
+                    );
                 }
             }
             return deleted;

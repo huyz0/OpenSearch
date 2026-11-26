@@ -168,7 +168,11 @@ public final class UnitSplitMover {
                 openHalf(left, toLeft);
                 openHalf(right, toRight);
                 if (hold.forwardTo(target) == false) {
-                    logger.debug("Abandoning split after its write hold expired (index_uuid={}, shard={})", parent.getIndex().getUUID(), parent.id());
+                    logger.debug(
+                        "Abandoning split after its write hold expired (index_uuid={}, shard={})",
+                        parent.getIndex().getUUID(),
+                        parent.id()
+                    );
                     abandon(indexName, split, left, right);
                     return Optional.empty();
                 }
@@ -305,7 +309,11 @@ public final class UnitSplitMover {
                     parent.getIndex().getUUID(),
                     node.localNode().getEphemeralId()
                 ) == false) {
-                logger.warn("Retired shard remains open after head release failed (index_uuid={}, shard={})", parent.getIndex().getUUID(), parent.id());
+                logger.warn(
+                    "Retired shard remains open after head release failed (index_uuid={}, shard={})",
+                    parent.getIndex().getUUID(),
+                    parent.id()
+                );
                 return null;
             }
             node.reconciler().releaseShard(parent, "retired by a split");

@@ -148,7 +148,11 @@ public final class OverlayReadOnlyEngine extends ReadOnlyEngine {
             opened = tail == null ? null : new Overlay(config, tail, parser, getProcessedLocalCheckpoint());
         } catch (IOException | RuntimeException e) {
             // Without an overlay the reader is what it always was: the commit.
-            LOG.debug("Reader serving the published commit after its tail failed to open (shard={}, error_type={})", shardId.id(), e.getClass().getSimpleName());
+            LOG.debug(
+                "Reader serving the published commit after its tail failed to open (shard={}, error_type={})",
+                shardId.id(),
+                e.getClass().getSimpleName()
+            );
         }
         this.overlay = opened;
     }

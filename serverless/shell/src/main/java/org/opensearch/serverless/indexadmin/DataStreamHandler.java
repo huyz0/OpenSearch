@@ -340,7 +340,10 @@ public final class DataStreamHandler extends BaseRestHandler {
             try {
                 metadata.deleteIndex(backing, created.uuid());
             } catch (Exception cleanup) {
-                logger.warn("Could not clean up a backing index after data stream creation failed (error_type={})", cleanup.getClass().getSimpleName());
+                logger.warn(
+                    "Could not clean up a backing index after data stream creation failed (error_type={})",
+                    cleanup.getClass().getSimpleName()
+                );
             }
             throw new RestReplies.RefusedException(
                 RestStatus.BAD_REQUEST,

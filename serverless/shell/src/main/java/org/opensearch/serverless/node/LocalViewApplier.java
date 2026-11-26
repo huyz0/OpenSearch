@@ -261,7 +261,11 @@ public final class LocalViewApplier {
                 nodes.add(peerNode(lease));
                 changed = true;
             } catch (Exception e) {
-                logger.debug("Omitting a node from the local view (node_id={}, error_type={})", lease.nodeId(), e.getClass().getSimpleName());
+                logger.debug(
+                    "Omitting a node from the local view (node_id={}, error_type={})",
+                    lease.nodeId(),
+                    e.getClass().getSimpleName()
+                );
             }
         }
         final ClusterState withPeers = changed ? ClusterState.builder(state).nodes(nodes).build() : state;

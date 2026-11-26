@@ -95,7 +95,11 @@ final class ViewAliases {
             try {
                 alias = plane.resolveForRouting(name).alias();
             } catch (Exception e) {
-                logger.debug("Omitting an unreadable alias (index_uuid={}, error_type={})", descriptor.uuid(), e.getClass().getSimpleName());
+                logger.debug(
+                    "Omitting an unreadable alias (index_uuid={}, error_type={})",
+                    descriptor.uuid(),
+                    e.getClass().getSimpleName()
+                );
                 continue;
             }
             if (alias == null || alias.dataStream() || alias.indices().contains(descriptor.name()) == false) {

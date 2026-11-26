@@ -108,6 +108,18 @@ public final class StoredScriptStore {
     }
 
     /**
+     * Reads the ids of every script without reading a body: one marker read.
+     *
+     * @return the ids
+     * @throws IOException if the marker cannot be read
+     */
+    public java.util.Set<String> names() throws IOException {
+        final java.util.Set<String> found = new java.util.TreeSet<>(scripts.names());
+        found.remove(VERSION_BLOB);
+        return found;
+    }
+
+    /**
      * Visits every script one body at a time, keeping none; see {@link TemplateStore#forEachDocument}.
      *
      * @param visitor receives each id and stored JSON

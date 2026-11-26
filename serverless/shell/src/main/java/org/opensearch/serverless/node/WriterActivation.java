@@ -259,10 +259,7 @@ public final class WriterActivation {
                 // activation thread behind that scan, on one lock, for as long as the store took to answer four hundred
                 // reads -- a store slowed to seconds a request stopped a whole fleet taking any shard for an hour. The
                 // activation is asked again once the scan is done.
-                NodeContext.logger.debug(
-                    "Deferring writer activation until ownership verification completes (shard={})",
-                    shardNumber
-                );
+                NodeContext.logger.debug("Deferring writer activation until ownership verification completes (shard={})", shardNumber);
                 return java.util.Optional.empty();
             }
         }
