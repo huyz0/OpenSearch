@@ -176,6 +176,7 @@ public final class SnapshotRecord {
         private final Map<Integer, CommitManifest> shards;
         private final Object aliases;
         private final Object aliasesTruncated;
+        private final List<Integer> failedShards;
 
         /**
          * Creates a captured index with no settings.
@@ -234,6 +235,33 @@ public final class SnapshotRecord {
             Object aliases,
             Object aliasesTruncated
         ) {
+            this(uuid, numberOfShards, mapping, settings, shards, aliases, aliasesTruncated, List.of());
+        }
+
+        /**
+         * Creates a captured index that may be missing shards.
+         *
+         * @param uuid the index's uuid at the moment of capture
+         * @param numberOfShards its shard count
+         * @param mapping its mapping source, or null for none
+         * @param settings the index's settings, structured; empty for none
+         * @param shards the commit of each shard that had one
+         * @param aliases the {@code aliases} member, or null
+         * @param aliasesTruncated the {@code aliases_truncated} member, or null
+         * @param failedShards the shards that had no commit when the snapshot was taken, ascending; with {@code shards}
+         *     they cover every shard exactly once
+         */
+        public SnapshottedIndex(
+            String uuid,
+            int numberOfShards,
+            String mapping,
+            Map<String, Object> settings,
+            Map<Integer, CommitManifest> shards,
+            Object aliases,
+            Object aliasesTruncated,
+            List<Integer> failedShards
+        ) {
+            this.failedShards = List.copyOf(failedShards);
             this.aliases = aliases;
             this.aliasesTruncated = aliasesTruncated;
             this.uuid = uuid;
@@ -241,6 +269,26 @@ public final class SnapshotRecord {
             this.mapping = mapping;
             this.settings = settings == null ? Map.of() : Map.copyOf(settings);
             this.shards = Map.copyOf(shards);
+        }
+
+        /**
+         * Returns the shards that had no commit when the snapshot was taken.
+         *
+         * @return the shard numbers, ascending; empty for an index captured in full
+         */
+        public List<Integer> failedShards() {
+            return failedShards;
+        }
+
+        /**
+         * Copies this entry with other aliases.
+         *
+         * @param newAliases the {@code aliases} member, or null
+         * @param newTruncated the {@code aliases_truncated} member, or null
+         * @return the copy
+         */
+        public SnapshottedIndex withAliases(Object newAliases, Object newTruncated) {
+            return new SnapshottedIndex(uuid, numberOfShards, mapping, settings, shards, newAliases, newTruncated, failedShards);
         }
 
         /**
@@ -458,6 +506,9 @@ public final class SnapshotRecord {
                 if (captured.aliasesTruncated() != null) {
                     builder.field("aliases_truncated", captured.aliasesTruncated());
                 }
+                if (captured.failedShards().isEmpty() == false) {
+                    builder.field("failed_shards", captured.failedShards());
+                }
                 builder.startArray("shards");
                 for (Map.Entry<Integer, CommitManifest> shard : captured.shards().entrySet()) {
                     builder.startObject();
@@ -577,9 +628,25 @@ public final class SnapshotRecord {
                         }
                         shards.put((int) shard, new CommitManifest(term, files, null, lengths));
                     }
-                    if (shards.isEmpty() == false && shards.size() != shardCount) {
-                        throw malformed("a completed index must contain every shard");
+                }
+                final List<Integer> failedShards = new ArrayList<>();
+                if (indexBody.containsKey("failed_shards")) {
+                    if (indexBody.get("failed_shards") instanceof List<?> == false) {
+                        throw malformed("failed_shards must be an array");
                     }
+                    long previous = -1;
+                    for (Object failedShard : (List<?>) indexBody.get("failed_shards")) {
+                        final long number = requiredLong(failedShard, "failed shard");
+                        if (number <= previous || number >= shardCount || shards.containsKey((int) number)) {
+                            throw malformed("failed shards must be ascending, below the shard count and not captured");
+                        }
+                        failedShards.add((int) number);
+                        previous = number;
+                    }
+                }
+                // Every shard exactly once between the captured and the failed, or neither: the in-progress marker.
+                if ((shards.isEmpty() && failedShards.isEmpty()) == false && shards.size() + failedShards.size() != shardCount) {
+                    throw malformed("a completed index must account for every shard");
                 }
                 indices.put(
                     requiredString(entry.getKey(), "index name"),
@@ -590,7 +657,8 @@ public final class SnapshotRecord {
                         settings,
                         shards,
                         indexBody.get("aliases"),
-                        indexBody.get("aliases_truncated")
+                        indexBody.get("aliases_truncated"),
+                        failedShards
                     )
                 );
             }
@@ -600,7 +668,8 @@ public final class SnapshotRecord {
             if (generation != null && Names.looksLikeAnId(generation) == false) {
                 throw malformed("invalid storage generation");
             }
-            return new SnapshotRecord(repo, name, uuid, shallow, startTime, endTime, indices, body.get("global_state")).withStorageGeneration(generation);
+            return new SnapshotRecord(repo, name, uuid, shallow, startTime, endTime, indices, body.get("global_state"))
+                .withStorageGeneration(generation);
         }
     }
 
@@ -649,7 +718,22 @@ public final class SnapshotRecord {
      * @return true while the capture of that index has not finished
      */
     public static boolean capturing(SnapshottedIndex index) {
-        return index.shards().isEmpty() && index.numberOfShards() > 0;
+        return index.shards().isEmpty() && index.failedShards().isEmpty() && index.numberOfShards() > 0;
+    }
+
+    /**
+     * Reports whether a snapshot is partial: finished, and some index has shards that had no commit.
+     *
+     * @param snapshot the record
+     * @return true if any index it holds has failed shards
+     */
+    public static boolean partial(SnapshotRecord snapshot) {
+        for (SnapshottedIndex index : snapshot.indices().values()) {
+            if (index.failedShards().isEmpty() == false) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

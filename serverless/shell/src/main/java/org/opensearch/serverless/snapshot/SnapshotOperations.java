@@ -32,6 +32,7 @@ import org.opensearch.serverless.store.SegmentPublisher;
 
 import java.io.IOException;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -103,7 +104,7 @@ final class SnapshotOperations {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.startObject("snapshot");
-            writeSnapshotInfo(builder, record, includeGlobalState);
+            writeSnapshotInfo(builder, record, includeGlobalState, false);
             builder.endObject();
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
@@ -166,6 +167,7 @@ final class SnapshotOperations {
             described.put(trimmed, descriptor.get());
         }
 
+        final boolean keepFailedShards = serving != null && SnapshotSettings.PARTIAL_SHARDS.get(serving.settings());
         final String snapshotUuid = UUIDs.randomBase64UUID();
         final Map<String, SnapshotRecord.SnapshottedIndex> provisional = new LinkedHashMap<>();
         for (Map.Entry<String, IndexDescriptor> index : described.entrySet()) {
@@ -196,10 +198,15 @@ final class SnapshotOperations {
                 final String trimmed = index.getKey();
                 final IndexDescriptor descriptor = index.getValue();
                 final Map<Integer, CommitManifest> shards = new LinkedHashMap<>();
+                final List<Integer> failed = new ArrayList<>();
                 boolean complete = true;
                 for (int shard : descriptor.unitIds()) {
                     final Optional<CommitManifest> manifest = metadata.segmentPublisher(trimmed, descriptor.uuid(), shard).readManifest();
                     if (manifest.isEmpty()) {
+                        if (partial && keepFailedShards) {
+                            failed.add(shard);
+                            continue;
+                        }
                         if (partial) {
                             complete = false;
                             break;
@@ -238,9 +245,16 @@ final class SnapshotOperations {
                         descriptor.numberOfShards(),
                         descriptor.mapping(),
                         SnapshotBlobs.settingsOf(descriptor),
-                        stored
+                        stored,
+                        null,
+                        null,
+                        failed
                     )
                 );
+            }
+            if (described.isEmpty() == false && captured.values().stream().allMatch(index -> index.shards().isEmpty())) {
+                // Nothing was captured anywhere: a record of no commits is not a snapshot of anything.
+                throw new SnapshotHandler.NothingPublishedException();
             }
 
             final long endTime = metadata.clock().getAsLong();
@@ -302,17 +316,7 @@ final class SnapshotOperations {
             final SnapshotRecord.SnapshottedIndex was = index.getValue();
             withAliases.put(
                 index.getKey(),
-                aliases == null
-                    ? was
-                    : new SnapshotRecord.SnapshottedIndex(
-                        was.uuid(),
-                        was.numberOfShards(),
-                        was.mapping(),
-                        was.settings(),
-                        was.shards(),
-                        aliases.aliases(),
-                        aliases.truncated() ? Boolean.TRUE : null
-                    )
+                aliases == null ? was : was.withAliases(aliases.aliases(), aliases.truncated() ? Boolean.TRUE : null)
             );
         }
         return withAliases;
@@ -334,7 +338,7 @@ final class SnapshotOperations {
             builder.startObject();
             builder.startArray("snapshots");
             builder.startObject();
-            writeSnapshotInfo(builder, record.get(), true);
+            writeSnapshotInfo(builder, record.get(), true, true);
             builder.endObject();
             builder.endArray();
             builder.endObject();
@@ -367,7 +371,7 @@ final class SnapshotOperations {
                     continue;
                 }
                 builder.startObject();
-                writeSnapshotInfo(builder, record, true);
+                writeSnapshotInfo(builder, record, true, false);
                 builder.endObject();
             }
             builder.endArray();
@@ -435,6 +439,11 @@ final class SnapshotOperations {
         } catch (SnapshotHandler.SnapshotInProgressException e) {
             channel.sendResponse(RestReplies.error(channel, RestStatus.CONFLICT, "snapshot_in_progress", e.getMessage()));
             return;
+        } catch (SnapshotHandler.PartialSnapshotRestoreException e) {
+            channel.sendResponse(
+                RestReplies.error(channel, RestStatus.INTERNAL_SERVER_ERROR, "snapshot_restore_exception", e.getMessage())
+            );
+            return;
         } catch (SnapshotHandler.InvalidAliasNameException e) {
             channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "invalid_alias_name_exception", e.getMessage()));
             return;
@@ -463,8 +472,8 @@ final class SnapshotOperations {
             builder.field("indices", outcome.targets().values());
             builder.startObject("shards");
             builder.field("total", outcome.totalShards());
-            builder.field("failed", 0);
-            builder.field("successful", outcome.totalShards());
+            builder.field("failed", outcome.failedShards());
+            builder.field("successful", outcome.totalShards() - outcome.failedShards());
             builder.endObject();
             if (outcome.aliasesRestored() != null) {
                 builder.field("aliases_restored", outcome.aliasesRestored());
@@ -485,8 +494,8 @@ final class SnapshotOperations {
      * What one restore did: every source index's target name, how many shards it copied, and, when it was asked for
      * aliases, how many it added, which it could not, and which restored indices had more aliases than the snapshot named.
      */
-    record RestoreOutcome(Map<String, String> targets, int totalShards, Integer aliasesRestored, List<String> failedAliases, List<
-        String> truncatedIndices) {
+    record RestoreOutcome(Map<String, String> targets, int totalShards, int failedShards, Integer aliasesRestored, List<
+        String> failedAliases, List<String> truncatedIndices) {
     }
 
     /**
@@ -512,6 +521,16 @@ final class SnapshotOperations {
             if (record.indices().containsKey(name) == false) {
                 throw new SnapshotHandler.IndexNotCapturedException(name);
             }
+        }
+
+        final boolean partialRestore = SnapshotRequestBodies.readBoolean(body.get("partial"), false);
+        int failedShards = 0;
+        for (String name : requested) {
+            final List<Integer> failed = record.indices().get(name).failedShards();
+            if (failed.isEmpty() == false && partialRestore == false) {
+                throw new SnapshotHandler.PartialSnapshotRestoreException(name, failed);
+            }
+            failedShards += failed.size();
         }
 
         final Object patternField = body.get("rename_pattern");
@@ -632,14 +651,25 @@ final class SnapshotOperations {
             throw e;
         }
         if (aliasPlan == null) {
-            return new RestoreOutcome(targets, shardsRestored, null, List.of(), List.of());
+            return new RestoreOutcome(targets, shardsRestored + failedShards, failedShards, null, List.of(), List.of());
         }
         // After every index is whole, outside the rollback above: an alias that fails never deletes an index.
         final List<String> failed = SnapshotAliasRestore.apply(metadata, aliasPlan.byAlias(), aliasesBefore);
-        return new RestoreOutcome(targets, shardsRestored, aliasPlan.byAlias().size() - failed.size(), failed, aliasPlan.truncated());
+        return new RestoreOutcome(
+            targets,
+            shardsRestored + failedShards,
+            failedShards,
+            aliasPlan.byAlias().size() - failed.size(),
+            failed,
+            aliasPlan.truncated()
+        );
     }
 
-    void writeSnapshotInfo(XContentBuilder builder, SnapshotRecord record, boolean includeGlobalState) throws IOException {
+    /** The most failure entries one snapshot answer lists; the failed count stays exact. */
+    static final int MAX_FAILURES = 1000;
+
+    void writeSnapshotInfo(XContentBuilder builder, SnapshotRecord record, boolean includeGlobalState, boolean withFailures)
+        throws IOException {
         builder.field("snapshot", record.name());
         builder.field("uuid", record.uuid());
         builder.field("version_id", Version.CURRENT.id);
@@ -650,18 +680,35 @@ final class SnapshotOperations {
         builder.field("include_global_state", includeGlobalState);
         // A record whose indices have no commits yet is a capture still running -- see
         // SnapshotRecord.capturing -- and says so rather than reporting a success with no shards.
-        builder.field("state", SnapshotRecord.inProgress(record) ? "IN_PROGRESS" : "SUCCESS");
+        builder.field("state", SnapshotRecord.inProgress(record) ? "IN_PROGRESS" : SnapshotRecord.partial(record) ? "PARTIAL" : "SUCCESS");
         builder.field("start_time", Instant.ofEpochMilli(record.startTimeMillis()).toString());
         builder.field("start_time_in_millis", record.startTimeMillis());
         builder.field("end_time", Instant.ofEpochMilli(record.endTimeMillis()).toString());
         builder.field("end_time_in_millis", record.endTimeMillis());
         builder.field("duration_in_millis", record.endTimeMillis() - record.startTimeMillis());
-        builder.startArray("failures").endArray();
-        final int shards = record.indices().values().stream().mapToInt(i -> i.shards().size()).sum();
+        int captured = 0;
+        int failed = 0;
+        builder.startArray("failures");
+        for (Map.Entry<String, SnapshotRecord.SnapshottedIndex> index : record.indices().entrySet()) {
+            captured += index.getValue().shards().size();
+            for (int shard : index.getValue().failedShards()) {
+                if (withFailures && failed < MAX_FAILURES) {
+                    builder.startObject();
+                    builder.field("index", index.getKey());
+                    builder.field("index_uuid", index.getValue().uuid());
+                    builder.field("shard_id", shard);
+                    builder.field("reason", "no commit was published when the snapshot was taken");
+                    builder.field("status", "INTERNAL_SERVER_ERROR");
+                    builder.endObject();
+                }
+                failed++;
+            }
+        }
+        builder.endArray();
         builder.startObject("shards");
-        builder.field("total", shards);
-        builder.field("failed", 0);
-        builder.field("successful", shards);
+        builder.field("total", captured + failed);
+        builder.field("failed", failed);
+        builder.field("successful", captured);
         builder.endObject();
     }
 }

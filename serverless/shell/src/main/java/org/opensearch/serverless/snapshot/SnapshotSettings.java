@@ -26,4 +26,16 @@ public final class SnapshotSettings {
         false,
         Property.NodeScope
     );
+
+    /**
+     * Whether a take with {@code partial=true} keeps an index whose shard published no commit, recording the shards without
+     * one, instead of leaving the index out. Off, {@code partial=true} keeps its old meaning. A record with failed shards
+     * cannot be read safely by a node without the matching reader, so this is turned on only when every node reading the
+     * repository has it.
+     */
+    public static final Setting<Boolean> PARTIAL_SHARDS = Setting.boolSetting(
+        "serverless.snapshots.take.partial_shards",
+        false,
+        Property.NodeScope
+    );
 }
