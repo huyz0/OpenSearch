@@ -64,7 +64,7 @@ public class ServerlessSnapshotAliasTests extends OpenSearchTestCase {
 
     private void withIndices(boolean capture, Body body, String... indices) throws Exception {
         final AtomicLong clock = new AtomicLong(1_000L);
-        metered = new org.opensearch.serverless.store.MeteredBlobStore(new FsBlobStore(1024, createTempDir(), false));
+        metered = new CountingBlobStore(new FsBlobStore(1024, createTempDir(), false));
         final MetadataPlane plane = new MetadataPlane(metered, BlobPath.cleanPath(), clock::get, TTL);
         for (String index : indices) {
             plane.createIndex(new IndexDescriptor(index, "uuid-" + index + "-0000000", 1, MAPPING, null));
@@ -90,7 +90,7 @@ public class ServerlessSnapshotAliasTests extends OpenSearchTestCase {
         }
     }
 
-    private org.opensearch.serverless.store.MeteredBlobStore metered;
+    private CountingBlobStore metered;
 
     private static void take(ServerlessNode node, String name, String indices) throws Exception {
         final Response taken = send(node, "PUT", "/_snapshot/backups/" + name, "{\"indices\":\"" + indices + "\"}");
@@ -140,6 +140,42 @@ public class ServerlessSnapshotAliasTests extends OpenSearchTestCase {
             }, "one", "two", "three");
         }
         assertEquals("two distinct aliases, however many indices they name", 2L, reads[1] - reads[0]);
+    }
+
+    /** The two budget rows of a snapshot with aliases: what aliases add to a take and to a restore, measured as differences. */
+    public void testSnapshotAliasBudgets() throws Exception {
+        final long[] take = new long[2];
+        for (int on = 0; on < 2; on++) {
+            final int mode = on;
+            withIndices(on == 1, (node, plane) -> {
+                plane.createAlias(new AliasRecord("read", List.of("one")));
+                plane.createAlias(new AliasRecord("write", List.of("one")).withWriteMember("one"));
+                final long before = metered.total();
+                take(node, "s", "one");
+                take[mode] = metered.total() - before;
+            }, "one");
+        }
+        RequestBudgets.check("snapshot.take_aliases.extra_requests", take[1] - take[0], "take with aliases minus take without");
+        withIndices(true, (node, plane) -> {
+            plane.createAlias(new AliasRecord("read", List.of("one")));
+            plane.createAlias(new AliasRecord("write", List.of("one")));
+            take(node, "s", "one");
+            plane.createAlias(new AliasRecord("other", List.of("one")));
+            long before = metered.total();
+            assertEquals(200, restore(node, "s", "{\"rename_pattern\":\"one\",\"rename_replacement\":\"plain\"}").status());
+            final long plain = metered.total() - before;
+            before = metered.total();
+            assertEquals(
+                200,
+                restore(
+                    node,
+                    "s",
+                    "{\"rename_pattern\":\"one\",\"rename_replacement\":\"withal\",\"include_aliases\":true,"
+                        + "\"rename_alias_pattern\":\"^(.*)$\",\"rename_alias_replacement\":\"$1-r\"}"
+                ).status()
+            );
+            RequestBudgets.check("snapshot.restore_aliases.extra_requests", metered.total() - before - plain, "restore with aliases minus plain");
+        }, "one");
     }
 
     public void testATakeIgnoresAStaleHintAndAStream() throws Exception {
