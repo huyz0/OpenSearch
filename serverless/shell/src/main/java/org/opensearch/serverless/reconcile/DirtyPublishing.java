@@ -287,7 +287,10 @@ final class DirtyPublishing {
             try {
                 each.get();
             } catch (java.util.concurrent.ExecutionException e) {
-                BackgroundReconciler.logger.warn("Unexpected failure waiting for a shard publish (error_type={})", e.getClass().getSimpleName());
+                BackgroundReconciler.logger.warn(
+                    "Unexpected failure waiting for a shard publish (error_type={})",
+                    e.getClass().getSimpleName()
+                );
             }
         }
         return published;

@@ -72,19 +72,16 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
 
     public void testRestErrorsDoNotLogQueryParameters() throws Exception {
         final Path home = createTempDir();
-        final Path logConfiguration = Files.writeString(
-            home.resolve("logging.properties"),
-            """
-                appender.console.type = Console
-                appender.console.name = console
-                appender.console.layout.type = PatternLayout
-                appender.console.layout.pattern = %level %logger %message%n
-                rootLogger.level = info
-                rootLogger.appenderRef.console.ref = console
-                logger.suppressed.name = rest.suppressed
-                logger.suppressed.level = debug
-                """
-        );
+        final Path logConfiguration = Files.writeString(home.resolve("logging.properties"), """
+            appender.console.type = Console
+            appender.console.name = console
+            appender.console.layout.type = PatternLayout
+            appender.console.layout.pattern = %level %logger %message%n
+            rootLogger.level = info
+            rootLogger.appenderRef.console.ref = console
+            logger.suppressed.name = rest.suppressed
+            logger.suppressed.level = debug
+            """);
         final String privateValue = "private-" + randomAlphaOfLength(20);
         try (
             NodeProcess node = NodeProcess.start(
@@ -99,7 +96,10 @@ public class ServerlessFleetTests extends OpenSearchTestCase {
             assertEquals(refused.body(), 400, refused.status());
             assertTrue(refused.body(), refused.body().contains("unrecognized parameter"));
             assertBusy(() -> assertTrue(node.output().stream().anyMatch(line -> line.contains("Serverless node started"))));
-            assertFalse("Request query parameters appeared in the node log", node.output().stream().anyMatch(line -> line.contains(privateValue)));
+            assertFalse(
+                "Request query parameters appeared in the node log",
+                node.output().stream().anyMatch(line -> line.contains(privateValue))
+            );
         }
     }
 

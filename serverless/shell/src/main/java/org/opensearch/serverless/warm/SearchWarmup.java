@@ -86,11 +86,16 @@ public final class SearchWarmup {
                     new ServerlessLogMessage(
                         "Search warm-up finished",
                         Map.of(
-                            "event", "search_warmup_finished",
-                            "shards_opened", outcome.opened(),
-                            "shards_failed", outcome.openFailed(),
-                            "blocks_copied", outcome.copy().blocksCopied(),
-                            "duration_ms", outcome.tookMillis()
+                            "event",
+                            "search_warmup_finished",
+                            "shards_opened",
+                            outcome.opened(),
+                            "shards_failed",
+                            outcome.openFailed(),
+                            "blocks_copied",
+                            outcome.copy().blocksCopied(),
+                            "duration_ms",
+                            outcome.tookMillis()
                         )
                     )
                 );

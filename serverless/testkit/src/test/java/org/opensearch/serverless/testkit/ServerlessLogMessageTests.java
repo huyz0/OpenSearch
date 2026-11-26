@@ -27,7 +27,8 @@ public class ServerlessLogMessageTests extends OpenSearchTestCase {
     public void testStandardLayoutWritesOperationalFieldsOutsideTheMessage() {
         final var layout = OpenSearchJsonLayout.newBuilder().setType("server").setOpenSearchMessageFields("event,shard,error_type").build();
         final var message = new ServerlessLogMessage("Search copy could not answer", Map.of("event", "search_copy_failed", "shard", 3));
-        final var event = Log4jLogEvent.newBuilder().setLoggerName("org.opensearch.serverless.ops.SearchFanout")
+        final var event = Log4jLogEvent.newBuilder()
+            .setLoggerName("org.opensearch.serverless.ops.SearchFanout")
             .setLevel(Level.DEBUG)
             .setMessage(message)
             .build();

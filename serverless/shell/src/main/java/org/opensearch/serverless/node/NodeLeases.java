@@ -491,11 +491,7 @@ public final class NodeLeases {
             NodeContext.logger.info(
                 new ServerlessLogMessage(
                     "Write acknowledgements resumed after shard ownership verification",
-                    Map.of(
-                        "event", "write_acknowledgements_resumed",
-                        "lease_epoch", epoch,
-                        "released_shards", released.size()
-                    )
+                    Map.of("event", "write_acknowledgements_resumed", "lease_epoch", epoch, "released_shards", released.size())
                 )
             );
         }
@@ -634,10 +630,14 @@ public final class NodeLeases {
                     new ServerlessLogMessage(
                         "Failed writer closed. Recovery was requested",
                         Map.of(
-                            "event", "writer_recovery_requested",
-                            "index_uuid", shardId.getIndex().getUUID(),
-                            "shard", shardId.id(),
-                            "error_type", cause == null ? "unknown" : cause.getClass().getSimpleName()
+                            "event",
+                            "writer_recovery_requested",
+                            "index_uuid",
+                            shardId.getIndex().getUUID(),
+                            "shard",
+                            shardId.id(),
+                            "error_type",
+                            cause == null ? "unknown" : cause.getClass().getSimpleName()
                         )
                     )
                 );

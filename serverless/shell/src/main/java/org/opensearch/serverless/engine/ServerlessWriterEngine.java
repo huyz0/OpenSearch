@@ -166,12 +166,18 @@ public final class ServerlessWriterEngine extends InternalEngine {
                 new org.opensearch.serverless.logging.ServerlessLogMessage(
                     "Shard open refused because two acknowledged operations share a sequence number",
                     java.util.Map.of(
-                        "event", "wal_replay_sequence_collision",
-                        "index_uuid", shardId.getIndex().getUUID(),
-                        "shard", shardId.id(),
-                        "sequence_number", collision.sequenceNumber(),
-                        "primary_term", collision.primaryTerm(),
-                        "processed_checkpoint", processed
+                        "event",
+                        "wal_replay_sequence_collision",
+                        "index_uuid",
+                        shardId.getIndex().getUUID(),
+                        "shard",
+                        shardId.id(),
+                        "sequence_number",
+                        collision.sequenceNumber(),
+                        "primary_term",
+                        collision.primaryTerm(),
+                        "processed_checkpoint",
+                        processed
                     )
                 )
             );
@@ -191,7 +197,8 @@ public final class ServerlessWriterEngine extends InternalEngine {
         );
     }
 
-    private record ReplayCollision(long sequenceNumber, long primaryTerm) {}
+    private record ReplayCollision(long sequenceNumber, long primaryTerm) {
+    }
 
     /** The id of the live document holding a sequence number in the commit, or null if none does. */
     private static String holderOf(org.opensearch.index.engine.Engine.Searcher searcher, long seqNo) throws IOException {

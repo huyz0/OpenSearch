@@ -232,7 +232,11 @@ final class ShardActivation {
             } catch (IllegalArgumentException e) {
                 // Belt and braces behind the name check above: whatever the descriptor store refuses about
                 // this one claim is that claim's problem, not the resync's.
-                MetadataPlane.LOGGER.debug("Ignoring an invalid assignment (node_id={}, error_type={})", nodeId, e.getClass().getSimpleName());
+                MetadataPlane.LOGGER.debug(
+                    "Ignoring an invalid assignment (node_id={}, error_type={})",
+                    nodeId,
+                    e.getClass().getSimpleName()
+                );
                 continue;
             }
             if (descriptor.isEmpty()) {

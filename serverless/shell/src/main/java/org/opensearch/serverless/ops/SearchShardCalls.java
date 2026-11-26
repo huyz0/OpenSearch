@@ -226,11 +226,16 @@ final class SearchShardCalls {
                 new ServerlessLogMessage(
                     "Search copy could not answer",
                     Map.of(
-                        "event", "search_copy_failed",
-                        "index_uuid", descriptor.uuid(),
-                        "shard", shard,
-                        "candidate", candidate,
-                        "error_type", failure.getClass().getSimpleName()
+                        "event",
+                        "search_copy_failed",
+                        "index_uuid",
+                        descriptor.uuid(),
+                        "shard",
+                        shard,
+                        "candidate",
+                        candidate,
+                        "error_type",
+                        failure.getClass().getSimpleName()
                     )
                 )
             );

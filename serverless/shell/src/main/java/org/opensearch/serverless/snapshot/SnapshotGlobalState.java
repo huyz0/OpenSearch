@@ -80,6 +80,13 @@ final class SnapshotGlobalState {
         }
     }
 
+    /** Thrown by a take when a set changed under its read twice; nothing has been written. */
+    static final class ChangedException extends Exception {
+        ChangedException(String set) {
+            super("[" + set + "] changed while the global state was being read; retry the snapshot");
+        }
+    }
+
     /** Thrown by a restore whose snapshot's {@code global_state} is not what a take writes. */
     static final class UnreadableException extends IOException {
         UnreadableException(String reason) {
@@ -110,7 +117,7 @@ final class SnapshotGlobalState {
      * @throws TooLargeException when the encoded state would pass {@link #MAX_BYTES}
      * @throws IOException if a store cannot be read
      */
-    static Map<String, Object> capture(MetadataPlane metadata) throws IOException, TooLargeException {
+    static Map<String, Object> capture(MetadataPlane metadata) throws IOException, TooLargeException, ChangedException {
         final Map<String, Object> state = new LinkedHashMap<>();
         long bytes = 0;
         final Settings settings = metadata.clusterConfig().read().settings();
@@ -138,7 +145,7 @@ final class SnapshotGlobalState {
     }
 
     /** A walk over one set: hands each document to the visitor, one body at a time. */
-    private interface Walk {
+    interface Walk {
         void over(org.opensearch.common.CheckedBiConsumer<String, String, IOException> visitor) throws IOException;
     }
 
@@ -150,24 +157,30 @@ final class SnapshotGlobalState {
     }
 
     // ALLOC: one document body (at most 1 MiB, bounded by the store's put) at a time, plus the parsed documents kept, at most MAX_BYTES.
-    private static long add(Map<String, Object> state, String set, Walk walk, long bytes) throws TooLargeException, IOException {
-        final Map<String, Object> parsed = new TreeMap<>();
-        final long[] total = { bytes };
-        try {
-            walk.over((name, source) -> {
-                total[0] += name.getBytes(StandardCharsets.UTF_8).length + source.getBytes(StandardCharsets.UTF_8).length + 8L;
-                if (total[0] > MAX_BYTES) {
-                    throw new Stop(set);
-                }
-                parsed.put(name, XContentHelper.convertToMap(new BytesArray(source), false, XContentType.JSON).v2());
-            });
-        } catch (Stop stop) {
-            throw new TooLargeException(set);
+    static long add(Map<String, Object> state, String set, Walk walk, long bytes) throws TooLargeException, ChangedException, IOException {
+        // A document deleted mid-walk restarts the set from its marker once; a second restart fails the take.
+        for (int attempt = 0; attempt < 2; attempt++) {
+            final Map<String, Object> parsed = new TreeMap<>();
+            final long[] total = { bytes };
+            try {
+                walk.over((name, source) -> {
+                    total[0] += name.getBytes(StandardCharsets.UTF_8).length + source.getBytes(StandardCharsets.UTF_8).length + 8L;
+                    if (total[0] > MAX_BYTES) {
+                        throw new Stop(set);
+                    }
+                    parsed.put(name, XContentHelper.convertToMap(new BytesArray(source), false, XContentType.JSON).v2());
+                });
+            } catch (Stop stop) {
+                throw new TooLargeException(set);
+            } catch (org.opensearch.serverless.template.TemplateStore.StateChangedException changed) {
+                continue;
+            }
+            if (parsed.isEmpty() == false) {
+                state.put(set, parsed);
+            }
+            return total[0];
         }
-        if (parsed.isEmpty() == false) {
-            state.put(set, parsed);
-        }
-        return total[0];
+        throw new ChangedException(set);
     }
 
     /**

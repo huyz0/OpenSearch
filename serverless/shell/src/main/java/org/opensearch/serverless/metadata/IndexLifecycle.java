@@ -120,7 +120,12 @@ final class IndexLifecycle {
                 // Best effort, and it has to be: this is called on paths that may not exist at all, and a
                 // store that cannot delete must not turn creating an index into a failure. What it costs
                 // when it fails is storage, which is recoverable, against a create that is not.
-                MetadataPlane.LOGGER.warn("Could not clear shard storage (index_uuid={}, shard={}, error_type={})", uuid, shard, e.getClass().getSimpleName());
+                MetadataPlane.LOGGER.warn(
+                    "Could not clear shard storage (index_uuid={}, shard={}, error_type={})",
+                    uuid,
+                    shard,
+                    e.getClass().getSimpleName()
+                );
             }
         }
     }

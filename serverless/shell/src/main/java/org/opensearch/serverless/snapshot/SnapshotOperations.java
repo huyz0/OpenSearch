@@ -104,6 +104,9 @@ final class SnapshotOperations {
         } catch (SnapshotAlreadyExistsException e) {
             channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "snapshot_already_exists", e.getMessage()));
             return;
+        } catch (SnapshotGlobalState.ChangedException e) {
+            channel.sendResponse(RestReplies.error(channel, RestStatus.CONFLICT, "snapshot_state_changed", e.getMessage()));
+            return;
         } catch (SnapshotGlobalState.TooLargeException e) {
             channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "snapshot_too_large", e.getMessage()));
             return;

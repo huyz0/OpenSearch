@@ -119,6 +119,13 @@ public final class TemplateStore {
         }
     }
 
+    /** Thrown by {@link #forEachDocument} when a document the marker named was deleted before its body was read. */
+    public static final class StateChangedException extends IOException {
+        public StateChangedException(String message) {
+            super(message);
+        }
+    }
+
     /** A name the register indexes whose bytes are not there: the one state a reader cannot resolve alone. */
     private static final class MissingContentException extends IOException {
         MissingContentException(String name, String hash) {
@@ -396,10 +403,19 @@ public final class TemplateStore {
      * can stop the walk (by throwing from the visitor) before the rest is read.
      *
      * @param visitor receives each name and source
+     * @throws StateChangedException if a document was deleted between the marker read and its body
      * @throws IOException if the marker or a body cannot be read, or the visitor throws
      */
     public void forEachDocument(org.opensearch.common.CheckedBiConsumer<String, String, IOException> visitor) throws IOException {
-        final Marker marker = readMarker();
+        try {
+            walkDocuments(readMarker(), visitor);
+        } catch (MissingContentException e) {
+            throw new StateChangedException(e.getMessage());
+        }
+    }
+
+    private void walkDocuments(Marker marker, org.opensearch.common.CheckedBiConsumer<String, String, IOException> visitor)
+        throws IOException {
         if (marker.legacy()) {
             for (Map.Entry<String, String> entry : all(marker).entrySet()) {
                 visitor.accept(entry.getKey(), entry.getValue());
