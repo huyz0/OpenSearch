@@ -282,6 +282,21 @@ public final class TemplateHandler extends BaseRestHandler {
         String body,
         boolean create
     ) throws IOException, RestReplies.RefusedException {
+        validateBody(node.get(), component, body);
+        store.put(name, body, create);
+        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
+    }
+
+    /**
+     * Checks a template body the way a PUT does, so a template put by another route (a snapshot restore) is held to the same rules.
+     *
+     * @param serving the node whose settings validation applies
+     * @param component whether the body is a component template
+     * @param body the template's JSON
+     * @throws RestReplies.RefusedException if the body is refused
+     */
+    public static void validateBody(org.opensearch.serverless.node.NodeContext serving, boolean component, String body)
+        throws RestReplies.RefusedException {
         final Map<String, Object> parsed;
         try {
             parsed = org.opensearch.common.xcontent.XContentHelper.convertToMap(
@@ -356,13 +371,11 @@ public final class TemplateHandler extends BaseRestHandler {
                 );
             }
             try {
-                IndexAdminHandler.validateIndexSettings(settings, false, node.get());
+                IndexAdminHandler.validateIndexSettings(settings, false, serving);
             } catch (RestReplies.RefusedException e) {
                 throw new RestReplies.RefusedException(e.status, e.type, e.getMessage());
             }
         }
-        store.put(name, body, create);
-        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
 
     private static Map<String, String> get(TemplateStore store, String name) throws IOException, RestReplies.RefusedException {

@@ -30,6 +30,7 @@ final class SnapshotRequestBodies {
         "rename_pattern",
         "rename_replacement",
         "partial",
+        "include_global_state",
         "include_aliases",
         "rename_alias_pattern",
         "rename_alias_replacement"
@@ -41,7 +42,6 @@ final class SnapshotRequestBodies {
      * an unknown key -- that a known key was honoured.
      */
     static final java.util.Map<String, String> RESTORE_REFUSED_KEYS = java.util.Map.ofEntries(
-        java.util.Map.entry("include_global_state", "there is no global state in a snapshot here to restore"),
         java.util.Map.entry(
             "index_settings",
             "the settings an index had when it was captured are restored with it, unchanged; change them on the "
@@ -131,6 +131,10 @@ final class SnapshotRequestBodies {
         final Object partial = body.get("partial");
         if (partial != null && partial instanceof Boolean == false && "true".equals(partial) == false && "false".equals(partial) == false) {
             return "partial must be a boolean";
+        }
+        final Object state = body.get("include_global_state");
+        if (state != null && state instanceof Boolean == false && "true".equals(state) == false && "false".equals(state) == false) {
+            return "include_global_state must be a boolean";
         }
         final Object include = body.get("include_aliases");
         if (include != null && include instanceof Boolean == false && "true".equals(include) == false && "false".equals(include) == false) {

@@ -187,6 +187,25 @@ public final class StoredScriptHandler extends BaseRestHandler {
         String context,
         StoredScriptSource source
     ) throws IOException {
+        admit(serving, context, source);
+        try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
+            builder.startObject().field("script");
+            source.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
+            builder.endObject();
+            store.put(id, org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString());
+        }
+        serving.services().storedScripts().refresh(true);
+        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
+    }
+
+    /**
+     * Checks a stored script the way a PUT does, so a script put by another route (a snapshot restore) is held to the same rules.
+     *
+     * @param serving the node whose script service compiles it
+     * @param context the script context it was stored for, or null
+     * @param source the script
+     */
+    public static void admit(NodeContext serving, String context, StoredScriptSource source) {
         if (source == null) {
             throw new IllegalArgumentException("a stored script source is required");
         }
@@ -209,14 +228,6 @@ public final class StoredScriptHandler extends BaseRestHandler {
                 throw new IllegalArgumentException("the script does not compile: " + e.getMessage(), e);
             }
         }
-        try (var builder = org.opensearch.common.xcontent.XContentFactory.jsonBuilder()) {
-            builder.startObject().field("script");
-            source.toXContent(builder, org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS);
-            builder.endObject();
-            store.put(id, org.opensearch.core.common.bytes.BytesReference.bytes(builder).utf8ToString());
-        }
-        serving.services().storedScripts().refresh(true);
-        return new org.opensearch.action.support.clustermanager.AcknowledgedResponse(true);
     }
 
     @SuppressWarnings({ "rawtypes", "unchecked" })

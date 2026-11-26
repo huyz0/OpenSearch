@@ -380,6 +380,30 @@ public final class TemplateStore {
         }
     }
 
+    /**
+     * Visits every document, in name order, reading one body at a time and keeping none, so a caller with a byte bound
+     * can stop the walk (by throwing from the visitor) before the rest is read.
+     *
+     * @param visitor receives each name and source
+     * @throws IOException if the marker or a body cannot be read, or the visitor throws
+     */
+    public void forEachDocument(org.opensearch.common.CheckedBiConsumer<String, String, IOException> visitor) throws IOException {
+        final Marker marker = readMarker();
+        if (marker.legacy()) {
+            for (Map.Entry<String, String> entry : all(marker).entrySet()) {
+                visitor.accept(entry.getKey(), entry.getValue());
+            }
+            return;
+        }
+        final Snapshot cached = cache.snapshot;
+        for (Map.Entry<String, String> entry : new TreeMap<>(marker.entries()).entrySet()) {
+            final String held = cached == null || entry.getValue().equals(cached.hashes().get(entry.getKey()))
+                ? (cached == null ? null : cached.contents().get(entry.getKey()))
+                : null;
+            visitor.accept(entry.getKey(), held != null ? held : readContent(entry.getKey(), entry.getValue()));
+        }
+    }
+
     private Map<String, String> all(Marker marker) throws IOException {
         // One register read tells whether the copy is current; the bytes are read only for entries whose
         // hash moved since the copy was taken.
