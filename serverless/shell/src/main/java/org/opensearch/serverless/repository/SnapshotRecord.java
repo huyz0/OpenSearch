@@ -60,6 +60,7 @@ public final class SnapshotRecord {
     private final long startTimeMillis;
     private final long endTimeMillis;
     private final Map<String, SnapshottedIndex> indices;
+    private final Object globalState;
 
     /**
      * Creates a record.
@@ -83,7 +84,32 @@ public final class SnapshotRecord {
         long endTimeMillis,
         Map<String, SnapshottedIndex> indices
     ) {
-        this(repo, name, uuid, shallow, startTimeMillis, endTimeMillis, indices, null);
+        this(repo, name, uuid, shallow, startTimeMillis, endTimeMillis, indices, null, null);
+    }
+
+    /**
+     * Creates a record that carries cluster-wide state.
+     *
+     * @param repo the repository it belongs to
+     * @param name the snapshot's name within that repository
+     * @param uuid the identifier returned to clients
+     * @param shallow whether the snapshot referenced live blobs rather than copying them
+     * @param startTimeMillis when capture began
+     * @param endTimeMillis when capture finished
+     * @param indices each captured index
+     * @param globalState the {@code global_state} member as parsed or built, kept unvalidated, or null for none
+     */
+    public SnapshotRecord(
+        String repo,
+        String name,
+        String uuid,
+        boolean shallow,
+        long startTimeMillis,
+        long endTimeMillis,
+        Map<String, SnapshottedIndex> indices,
+        Object globalState
+    ) {
+        this(repo, name, uuid, shallow, startTimeMillis, endTimeMillis, indices, null, globalState);
     }
 
     private SnapshotRecord(
@@ -94,8 +120,10 @@ public final class SnapshotRecord {
         long startTimeMillis,
         long endTimeMillis,
         Map<String, SnapshottedIndex> indices,
-        String storageGeneration
+        String storageGeneration,
+        Object globalState
     ) {
+        this.globalState = globalState;
         this.storageGeneration = storageGeneration;
         this.repo = repo;
         this.name = name;
@@ -104,6 +132,16 @@ public final class SnapshotRecord {
         this.startTimeMillis = startTimeMillis;
         this.endTimeMillis = endTimeMillis;
         this.indices = Map.copyOf(indices);
+    }
+
+    /**
+     * Returns the {@code global_state} member as the record held it: opaque and unvalidated, because a record is listed,
+     * described, adopted and rewritten by code that must not fail on it or drop it.
+     *
+     * @return the member, or null when the record had none
+     */
+    public Object globalState() {
+        return globalState;
     }
 
     /**
@@ -125,7 +163,7 @@ public final class SnapshotRecord {
         if (generation != null && Names.looksLikeAnId(generation) == false) {
             throw new IllegalArgumentException("invalid snapshot storage generation");
         }
-        return new SnapshotRecord(repo, name, uuid, shallow, startTimeMillis, endTimeMillis, indices, generation);
+        return new SnapshotRecord(repo, name, uuid, shallow, startTimeMillis, endTimeMillis, indices, generation, globalState);
     }
 
     /** One index as a snapshot captured it: its shape, and every shard's commit. */
@@ -399,6 +437,9 @@ public final class SnapshotRecord {
             builder.field("shallow", shallow);
             builder.field("start_time_in_millis", startTimeMillis);
             builder.field("end_time_in_millis", endTimeMillis);
+            if (globalState != null) {
+                builder.field("global_state", globalState);
+            }
             builder.startObject("indices");
             for (Map.Entry<String, SnapshottedIndex> index : indices.entrySet()) {
                 builder.startObject(index.getKey());
@@ -559,7 +600,7 @@ public final class SnapshotRecord {
             if (generation != null && Names.looksLikeAnId(generation) == false) {
                 throw malformed("invalid storage generation");
             }
-            return new SnapshotRecord(repo, name, uuid, shallow, startTime, endTime, indices).withStorageGeneration(generation);
+            return new SnapshotRecord(repo, name, uuid, shallow, startTime, endTime, indices, body.get("global_state")).withStorageGeneration(generation);
         }
     }
 
