@@ -381,6 +381,17 @@ public final class TemplateStore {
     }
 
     /**
+     * Reads the names of every document without reading a body: one marker read.
+     *
+     * @return the names
+     * @throws IOException if the marker cannot be read
+     */
+    public java.util.Set<String> names() throws IOException {
+        final Marker marker = readMarker();
+        return marker.legacy() ? new java.util.TreeSet<>(all(marker).keySet()) : new java.util.TreeSet<>(marker.entries().keySet());
+    }
+
+    /**
      * Visits every document, in name order, reading one body at a time and keeping none, so a caller with a byte bound
      * can stop the walk (by throwing from the visitor) before the rest is read.
      *

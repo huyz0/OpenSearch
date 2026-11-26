@@ -328,11 +328,15 @@ public class ServerlessSnapshotGlobalStateTests extends OpenSearchTestCase {
 
     /** A shallow record of index "one" at its live commit, carrying the given state: a take's record, written by hand. */
     private static SnapshotRecord withState(MetadataPlane plane, Object globalState) throws Exception {
+        return withState(plane, "stateful", globalState);
+    }
+
+    private static SnapshotRecord withState(MetadataPlane plane, String name, Object globalState) throws Exception {
         final CommitManifest live = plane.segmentPublisher("one", "uuid-one-0000000000", 0).readManifest().orElseThrow();
         return new SnapshotRecord(
             "backups",
-            "stateful",
-            "uuid-stateful",
+            name,
+            "uuid-" + name,
             true,
             1_000L,
             2_000L,
@@ -362,7 +366,9 @@ public class ServerlessSnapshotGlobalStateTests extends OpenSearchTestCase {
         with(true, null, (node, plane) -> {
             final String refused = org.opensearch.serverless.bucket.BucketSettings.CLUSTER_POLICY.getKey();
             assertEquals(400, send(node, "PUT", "/_cluster/settings", "{\"persistent\":{\"" + refused + "\":\"not-a-policy\"}}").status());
-            plane.finishSnapshot(plane.createSnapshot(withState(plane, Map.of("persistent_settings", Map.of(refused, "not-a-policy", "gs.ok", "1")))));
+            plane.finishSnapshot(
+                plane.createSnapshot(withState(plane, Map.of("persistent_settings", Map.of(refused, "not-a-policy", "gs.ok", "1"))))
+            );
             final Response restored = restore(node, "stateful", "\"include_global_state\":true");
             assertEquals(restored.body(), 200, restored.status());
             assertTrue(restored.body(), restored.body().contains("\"global_state_restored\":1"));
@@ -370,6 +376,52 @@ public class ServerlessSnapshotGlobalStateTests extends OpenSearchTestCase {
             assertEquals("1", plane.clusterConfig().read().settings().get("gs.ok"));
             assertNull(plane.clusterConfig().read().settings().get(refused));
             assertTrue(plane.describe("copy").isPresent());
+        });
+    }
+
+    public void testARestoreThatWouldPassASetBoundIsRefusedBeforeAnyWrite() throws Exception {
+        with(true, null, (node, plane) -> {
+            for (int i = 0; i < 999; i++) {
+                plane.indexTemplates().put("t" + i, "{\"index_patterns\":[\"a-*\"]}");
+            }
+            final Map<String, Object> two = new LinkedHashMap<>();
+            two.put("new-1", Map.of("index_patterns", List.of("n-*")));
+            two.put("new-2", Map.of("index_patterns", List.of("n-*")));
+            plane.finishSnapshot(
+                plane.createSnapshot(withState(plane, Map.of("persistent_settings", Map.of("gs.z", "9"), "index_templates", two)))
+            );
+            final long before = counting.total();
+            final Response refused = restore(node, "stateful", "\"include_global_state\":true");
+            assertEquals(refused.body(), 400, refused.status());
+            assertTrue(refused.body(), refused.body().contains("illegal_argument_exception"));
+            assertTrue(refused.body(), refused.body().contains("index_templates"));
+            assertTrue("no index was created", plane.describe("copy").isEmpty());
+            assertNull("no setting was applied", plane.clusterConfig().read().settings().get("gs.z"));
+            assertTrue(plane.indexTemplates().get("new-1").isEmpty());
+            assertTrue("only reads before the refusal", counting.total() - before < 40);
+
+            // One new name and one that replaces an existing one fits exactly.
+            final Map<String, Object> fits = new LinkedHashMap<>();
+            fits.put("new-1", Map.of("index_patterns", List.of("n-*")));
+            fits.put("t0", Map.of("index_patterns", List.of("n-*")));
+            plane.finishSnapshot(plane.createSnapshot(withState(plane, "fits", Map.of("index_templates", fits))));
+            final Response ok = restore(node, "fits", "\"include_global_state\":true");
+            assertEquals(ok.body(), 200, ok.status());
+            assertTrue(ok.body(), ok.body().contains("\"global_state_restored\":2"));
+        });
+    }
+
+    public void testASettingsStateOverTheRegisterBoundIsRefusedBeforeAnyWrite() throws Exception {
+        with(true, null, (node, plane) -> {
+            final Map<String, Object> big = new LinkedHashMap<>();
+            for (int i = 0; i < 3; i++) {
+                big.put("gs.big" + i, "x".repeat(100_000));
+            }
+            plane.finishSnapshot(plane.createSnapshot(withState(plane, Map.of("persistent_settings", big))));
+            final Response refused = restore(node, "stateful", "\"include_global_state\":true");
+            assertEquals(refused.body(), 400, refused.status());
+            assertTrue(refused.body(), refused.body().contains("persistent_settings"));
+            assertTrue(plane.describe("copy").isEmpty());
         });
     }
 

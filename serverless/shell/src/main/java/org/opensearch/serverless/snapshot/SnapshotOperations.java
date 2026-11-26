@@ -283,6 +283,7 @@ final class SnapshotOperations {
                 withAliases(metadata, serving, described, captured),
                 globalState
             ).withStorageGeneration(reservation.storageGeneration());
+            SnapshotGlobalState.checkRecordFits(finished);
             metadata.finishSnapshot(finished);
             return finished;
         } catch (Exception e) {
@@ -478,6 +479,9 @@ final class SnapshotOperations {
         } catch (SnapshotHandler.SnapshotUnreadableException e) {
             channel.sendResponse(RestReplies.error(channel, RestStatus.INTERNAL_SERVER_ERROR, "snapshot_unreadable", e.getMessage()));
             return;
+        } catch (SnapshotGlobalState.BoundException e) {
+            channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage()));
+            return;
         } catch (SnapshotHandler.RestoreConflictException e) {
             // Reported, not counted as a success. The manifest compare-and-swap result used to be
             // discarded, so a shard that a writer had already published on the fresh index stayed empty
@@ -600,6 +604,7 @@ final class SnapshotOperations {
             } catch (IOException unreadable) {
                 throw SnapshotHandler.SnapshotUnreadableException.ofGlobalState(repo, snapshot, unreadable.getMessage());
             }
+            SnapshotGlobalState.checkBounds(metadata, globalState);
         }
 
         final boolean includeAliases = SnapshotRequestBodies.readBoolean(body.get("include_aliases"), false);
