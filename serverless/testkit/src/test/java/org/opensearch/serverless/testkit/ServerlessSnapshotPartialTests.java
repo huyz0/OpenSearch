@@ -174,6 +174,10 @@ public class ServerlessSnapshotPartialTests extends OpenSearchTestCase {
             assertTrue(restored.body(), restored.body().contains("\"shards\":{\"total\":3,\"failed\":2,\"successful\":1}"));
             assertEquals(2, plane.describe("c-two").orElseThrow().numberOfShards());
             assertEquals(200, send(node, "GET", "/c-one/_doc/1", null).status());
+            // The failed shards come back as shards that were never written: empty to a search.
+            final Response searched = send(node, "POST", "/c-two/_search", "{\"query\":{\"match_all\":{}}}");
+            assertEquals(searched.body(), 200, searched.status());
+            assertTrue(searched.body(), searched.body().contains("\"hits\":[]"));
         });
     }
 
