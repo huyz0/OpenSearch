@@ -25,7 +25,14 @@ final class SnapshotRequestBodies {
     private SnapshotRequestBodies() {}
 
     /** What a restore here reads. Everything else core's restore accepts is refused with its reason, below. */
-    static final Set<String> RESTORE_KNOWN_KEYS = Set.of("indices", "rename_pattern", "rename_replacement");
+    static final Set<String> RESTORE_KNOWN_KEYS = Set.of(
+        "indices",
+        "rename_pattern",
+        "rename_replacement",
+        "include_aliases",
+        "rename_alias_pattern",
+        "rename_alias_replacement"
+    );
 
     /**
      * Core's other restore fields, each with why it is refused rather than accepted and ignored. An
@@ -35,9 +42,6 @@ final class SnapshotRequestBodies {
     static final java.util.Map<String, String> RESTORE_REFUSED_KEYS = java.util.Map.ofEntries(
         java.util.Map.entry("partial", "a restore here creates every shard of an index or refuses; there is no partial index to make"),
         java.util.Map.entry("include_global_state", "there is no global state in a snapshot here to restore"),
-        java.util.Map.entry("include_aliases", "aliases are not captured in a snapshot here"),
-        java.util.Map.entry("rename_alias_pattern", "aliases are not captured in a snapshot here"),
-        java.util.Map.entry("rename_alias_replacement", "aliases are not captured in a snapshot here"),
         java.util.Map.entry(
             "index_settings",
             "the settings an index had when it was captured are restored with it, unchanged; change them on the "
@@ -55,7 +59,11 @@ final class SnapshotRequestBodies {
         ),
         java.util.Map.entry("source_remote_store_repository", "there is one object store here, and it is the repository"),
         java.util.Map.entry("source_remote_translog_repository", "there is one object store here, and it is the repository"),
-        java.util.Map.entry("alias_write_index_policy", "aliases are not captured in a snapshot here"),
+        java.util.Map.entry(
+            "alias_write_index_policy",
+            "a restored index is the write index of an alias only when the snapshot said so and the alias has none; "
+                + "the policy is not configurable"
+        ),
         java.util.Map.entry("ignore_unavailable", "a restore names the indices it wants; one the snapshot did not capture is a 404"),
         java.util.Map.entry("allow_no_indices", "a restore names the indices it wants; patterns are not matched against the snapshot"),
         java.util.Map.entry("expand_wildcards", "a restore names the indices it wants; patterns are not matched against the snapshot")
@@ -110,6 +118,25 @@ final class SnapshotRequestBodies {
                 org.opensearch.serverless.cluster.Names.validateId(each, what);
             } catch (IllegalArgumentException e) {
                 return e.getMessage();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Why a restore's alias options cannot be read, or null when they can: {@code include_aliases} must be a boolean, and
+     * the rename pattern, when it will be used, a regular expression.
+     */
+    static String invalidAliasOption(Map<String, Object> body) {
+        final Object include = body.get("include_aliases");
+        if (include != null && include instanceof Boolean == false && "true".equals(include) == false && "false".equals(include) == false) {
+            return "include_aliases must be a boolean";
+        }
+        if (readBoolean(include, false) && body.get("rename_alias_pattern") != null && body.get("rename_alias_replacement") != null) {
+            try {
+                java.util.regex.Pattern.compile(String.valueOf(body.get("rename_alias_pattern")));
+            } catch (java.util.regex.PatternSyntaxException e) {
+                return "rename_alias_pattern is not a regular expression: " + e.getDescription();
             }
         }
         return null;

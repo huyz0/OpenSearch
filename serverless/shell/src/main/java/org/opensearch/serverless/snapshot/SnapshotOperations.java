@@ -44,6 +44,8 @@ import java.util.regex.Pattern;
  */
 final class SnapshotOperations {
 
+    private static final org.apache.logging.log4j.Logger LOGGER = org.apache.logging.log4j.LogManager.getLogger(SnapshotOperations.class);
+
     private final SnapshotHandler handler;
 
     SnapshotOperations(SnapshotHandler handler) {
@@ -242,8 +244,15 @@ final class SnapshotOperations {
             }
 
             final long endTime = metadata.clock().getAsLong();
-            final SnapshotRecord finished = new SnapshotRecord(repo, snapshot, snapshotUuid, shallow, startTime, endTime, captured)
-                .withStorageGeneration(reservation.storageGeneration());
+            final SnapshotRecord finished = new SnapshotRecord(
+                repo,
+                snapshot,
+                snapshotUuid,
+                shallow,
+                startTime,
+                endTime,
+                withAliases(metadata, serving, described, captured)
+            ).withStorageGeneration(reservation.storageGeneration());
             metadata.finishSnapshot(finished);
             return finished;
         } catch (Exception e) {
@@ -263,6 +272,50 @@ final class SnapshotOperations {
             }
             throw e;
         }
+    }
+
+    /**
+     * The captured indices, each with the aliases that named it when {@link SnapshotSettings#CAPTURE_ALIASES} is on; the
+     * same map, untouched and with no register read, when it is off.
+     */
+    private static Map<String, SnapshotRecord.SnapshottedIndex> withAliases(
+        MetadataPlane metadata,
+        NodeContext serving,
+        Map<String, IndexDescriptor> described,
+        Map<String, SnapshotRecord.SnapshottedIndex> captured
+    ) throws IOException {
+        if (serving == null || captured.isEmpty() || SnapshotSettings.CAPTURE_ALIASES.get(serving.settings()) == false) {
+            return captured;
+        }
+        final Map<String, IndexDescriptor> read = new LinkedHashMap<>();
+        for (String name : captured.keySet()) {
+            read.put(name, described.get(name));
+        }
+        final Map<String, SnapshotAliasCapture.Captured> found = SnapshotAliasCapture.capture(
+            metadata,
+            serving.threadPool().executor(org.opensearch.threadpool.ThreadPool.Names.GENERIC),
+            read
+        );
+        final Map<String, SnapshotRecord.SnapshottedIndex> withAliases = new LinkedHashMap<>();
+        for (Map.Entry<String, SnapshotRecord.SnapshottedIndex> index : captured.entrySet()) {
+            final SnapshotAliasCapture.Captured aliases = found.get(index.getKey());
+            final SnapshotRecord.SnapshottedIndex was = index.getValue();
+            withAliases.put(
+                index.getKey(),
+                aliases == null
+                    ? was
+                    : new SnapshotRecord.SnapshottedIndex(
+                        was.uuid(),
+                        was.numberOfShards(),
+                        was.mapping(),
+                        was.settings(),
+                        was.shards(),
+                        aliases.aliases(),
+                        aliases.truncated() ? Boolean.TRUE : null
+                    )
+            );
+        }
+        return withAliases;
     }
 
     void handleDescribe(org.opensearch.rest.RestChannel channel, MetadataPlane metadata, String repo, String snapshot) throws Exception {
@@ -382,6 +435,15 @@ final class SnapshotOperations {
         } catch (SnapshotHandler.SnapshotInProgressException e) {
             channel.sendResponse(RestReplies.error(channel, RestStatus.CONFLICT, "snapshot_in_progress", e.getMessage()));
             return;
+        } catch (SnapshotHandler.InvalidAliasNameException e) {
+            channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "invalid_alias_name_exception", e.getMessage()));
+            return;
+        } catch (SnapshotHandler.TooManyAliasesException e) {
+            channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", e.getMessage()));
+            return;
+        } catch (SnapshotHandler.SnapshotUnreadableException e) {
+            channel.sendResponse(RestReplies.error(channel, RestStatus.INTERNAL_SERVER_ERROR, "snapshot_unreadable", e.getMessage()));
+            return;
         } catch (SnapshotHandler.RestoreConflictException e) {
             // Reported, not counted as a success. The manifest compare-and-swap result used to be
             // discarded, so a shard that a writer had already published on the fresh index stayed empty
@@ -404,14 +466,27 @@ final class SnapshotOperations {
             builder.field("failed", 0);
             builder.field("successful", outcome.totalShards());
             builder.endObject();
+            if (outcome.aliasesRestored() != null) {
+                builder.field("aliases_restored", outcome.aliasesRestored());
+                if (outcome.failedAliases().isEmpty() == false) {
+                    builder.field("failed_aliases", outcome.failedAliases());
+                }
+                if (outcome.truncatedIndices().isEmpty() == false) {
+                    builder.field("aliases_truncated", outcome.truncatedIndices());
+                }
+            }
             builder.endObject();
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
         }
     }
 
-    /** What one restore did: every source index's target name, and how many shards it copied. */
-    record RestoreOutcome(Map<String, String> targets, int totalShards) {
+    /**
+     * What one restore did: every source index's target name, how many shards it copied, and, when it was asked for
+     * aliases, how many it added, which it could not, and which restored indices had more aliases than the snapshot named.
+     */
+    record RestoreOutcome(Map<String, String> targets, int totalShards, Integer aliasesRestored, List<String> failedAliases, List<
+        String> truncatedIndices) {
     }
 
     /**
@@ -465,6 +540,29 @@ final class SnapshotOperations {
                 throw new IndexAlreadyExistsException(target);
             }
             targets.put(original, target);
+        }
+
+        final boolean includeAliases = SnapshotRequestBodies.readBoolean(body.get("include_aliases"), false);
+        SnapshotAliasRestore.Plan aliasPlan = null;
+        Map<String, org.opensearch.serverless.metadata.DescriptorResolution> aliasesBefore = Map.of();
+        if (includeAliases) {
+            final Object aliasPattern = body.get("rename_alias_pattern");
+            final Object aliasReplacement = body.get("rename_alias_replacement");
+            final boolean renameAliases = aliasPattern != null && aliasReplacement != null;
+            try {
+                aliasPlan = SnapshotAliasRestore.plan(
+                    record,
+                    targets,
+                    renameAliases ? Pattern.compile(String.valueOf(aliasPattern)) : null,
+                    renameAliases ? String.valueOf(aliasReplacement) : null
+                );
+            } catch (IOException unreadable) {
+                throw new SnapshotHandler.SnapshotUnreadableException(repo, snapshot, unreadable.getMessage());
+            }
+            aliasesBefore = SnapshotAliasRestore.resolve(metadata, aliasPlan.byAlias());
+            if (aliasPlan.truncated().isEmpty() == false) {
+                LOGGER.info("restoring [{}/{}] with aliases of {} cut by the take", repo, snapshot, aliasPlan.truncated());
+            }
         }
 
         final BlobStore blobStore = metadata.blobStore();
@@ -533,7 +631,12 @@ final class SnapshotOperations {
             }
             throw e;
         }
-        return new RestoreOutcome(targets, shardsRestored);
+        if (aliasPlan == null) {
+            return new RestoreOutcome(targets, shardsRestored, null, List.of(), List.of());
+        }
+        // After every index is whole, outside the rollback above: an alias that fails never deletes an index.
+        final List<String> failed = SnapshotAliasRestore.apply(metadata, aliasPlan.byAlias(), aliasesBefore);
+        return new RestoreOutcome(targets, shardsRestored, aliasPlan.byAlias().size() - failed.size(), failed, aliasPlan.truncated());
     }
 
     void writeSnapshotInfo(XContentBuilder builder, SnapshotRecord record, boolean includeGlobalState) throws IOException {
