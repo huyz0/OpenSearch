@@ -139,6 +139,12 @@ public final class SnapshotHandler extends BaseRestHandler {
                     RestReplies.error(channel, RestStatus.BAD_REQUEST, "unknown_parameter", "Unknown parameter " + unknown)
                 );
             }
+            final String badAliasOption = SnapshotRequestBodies.invalidAliasOption(body);
+            if (badAliasOption != null) {
+                return channel -> channel.sendResponse(
+                    RestReplies.error(channel, RestStatus.BAD_REQUEST, "illegal_argument_exception", badAliasOption)
+                );
+            }
             return channel -> dispatch(
                 channel,
                 () -> operations.handleRestore(channel, metadata, repo, snapshotParam, body, waitForCompletion)
@@ -286,6 +292,27 @@ public final class SnapshotHandler extends BaseRestHandler {
     static final class SnapshotMissingException extends Exception {
         SnapshotMissingException(String repo, String snapshot) {
             super("no such snapshot: " + repo + "/" + snapshot);
+        }
+    }
+
+    /** Thrown from inside {@link SnapshotOperations#handleRestore}'s gate when a restored alias cannot have the name it would get. */
+    static final class InvalidAliasNameException extends Exception {
+        InvalidAliasNameException(String reason) {
+            super(reason);
+        }
+    }
+
+    /** Thrown from inside {@link SnapshotOperations#handleRestore}'s gate when a restore would add more aliases than a take records. */
+    static final class TooManyAliasesException extends Exception {
+        TooManyAliasesException(int bound) {
+            super("a restore adds at most " + bound + " distinct aliases; restore fewer indices, or restore without include_aliases");
+        }
+    }
+
+    /** Thrown from inside {@link SnapshotOperations#handleRestore}'s gate when a record's alias fields are not what a take writes. */
+    static final class SnapshotUnreadableException extends Exception {
+        SnapshotUnreadableException(String repo, String snapshot, String reason) {
+            super("snapshot " + repo + "/" + snapshot + " cannot be restored with its aliases: " + reason);
         }
     }
 

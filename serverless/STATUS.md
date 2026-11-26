@@ -126,7 +126,15 @@ response shape — `GET /_snapshot` with no name, `wait_for_completion`, the `Sn
 envelopes — matches real OpenSearch's own `_snapshot` API; every operation is synchronous regardless of
 `wait_for_completion`, since there is no background task registry to run one against. Classic OpenSearch's
 repository-plugin API surface (`RepositoriesService`) is untouched and still yields null to a plugin — this
-is a shell-native surface, not a workaround. Not yet built: a repository genuinely on a distinct backend
+is a shell-native surface, not a workaround. **Aliases.** With `serverless.snapshots.take.capture_aliases` on (default
+off, so a take is byte for byte what it was and reads no alias register), a take records each captured index's aliases
+in its entry (`"aliases": {"name": {"is_write_index": true}}`, at most 64, `"aliases_truncated": true` past that), reading
+each distinct alias once. A restore with `include_aliases: true` adds them after every index is restored, renamed by
+`rename_alias_pattern`/`rename_alias_replacement`, one mutation for each distinct alias; a restored index is an alias's
+write index only if the snapshot said so and the alias has no write target. The restore answers `aliases_restored`, and
+`failed_aliases` when one could not be added: an alias failure never deletes an index. Absent, `include_aliases` is
+`false` (core's default is `true`). A node that predates the fields ignores them and restores without aliases. Not yet
+built: a repository genuinely on a distinct backend
 (S3 while the deployment runs on GCS, say) — shallow-vs-standard turned out orthogonal to that question and
 didn't require answering it.
 

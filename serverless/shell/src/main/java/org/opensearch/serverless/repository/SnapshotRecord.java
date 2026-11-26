@@ -43,6 +43,12 @@ import java.util.Map;
  * {@link #capturing}): the record is written naming every index before any manifest is
  * read, and rewritten with the commits once every one has been. Records written before settings were
  * captured have no {@code settings} and parse unchanged.
+ *
+ * <p><b>An index entry may name the aliases that pointed at it</b> ({@code aliases}, and {@code aliases_truncated}
+ * when more than {@link SnapshotAliases#MAX_ALIASES} did), written only by a take with
+ * {@code serverless.snapshots.take.capture_aliases} on. Both are carried exactly as read and never validated here, so a
+ * record is listed, described, adopted and rewritten whatever they hold; {@link SnapshotAliases#read} is the one reader
+ * that checks them, for a restore that asked for aliases. A record without them reads as an index with no aliases.
  */
 public final class SnapshotRecord {
 
@@ -130,6 +136,8 @@ public final class SnapshotRecord {
         private final String mapping;
         private final Map<String, Object> settings;
         private final Map<Integer, CommitManifest> shards;
+        private final Object aliases;
+        private final Object aliasesTruncated;
 
         /**
          * Creates a captured index with no settings.
@@ -161,11 +169,58 @@ public final class SnapshotRecord {
             Map<String, Object> settings,
             Map<Integer, CommitManifest> shards
         ) {
+            this(uuid, numberOfShards, mapping, settings, shards, null, null);
+        }
+
+        /**
+         * Creates a captured index with the aliases that named it.
+         *
+         * <p>The two alias fields are kept exactly as given, unvalidated: a record is listed, described, adopted and
+         * rewritten by code that must not fail on an alias entry it does not use, and only a restore reads them, through
+         * {@link SnapshotAliases#read}.
+         *
+         * @param uuid the index's uuid at the moment of capture
+         * @param numberOfShards its shard count
+         * @param mapping its mapping source, or null for none
+         * @param settings the index's settings, structured; empty for none
+         * @param shards each shard's commit at the moment of capture
+         * @param aliases the {@code aliases} member as parsed or as {@link SnapshotAliases#encode} built it, or null for none
+         * @param aliasesTruncated the {@code aliases_truncated} member as parsed, or null for none
+         */
+        public SnapshottedIndex(
+            String uuid,
+            int numberOfShards,
+            String mapping,
+            Map<String, Object> settings,
+            Map<Integer, CommitManifest> shards,
+            Object aliases,
+            Object aliasesTruncated
+        ) {
+            this.aliases = aliases;
+            this.aliasesTruncated = aliasesTruncated;
             this.uuid = uuid;
             this.numberOfShards = numberOfShards;
             this.mapping = mapping;
             this.settings = settings == null ? Map.of() : Map.copyOf(settings);
             this.shards = Map.copyOf(shards);
+        }
+
+        /**
+         * Returns the {@code aliases} member as the record held it, unvalidated.
+         *
+         * @return the member, or null when the record had none
+         */
+        public Object aliases() {
+            return aliases;
+        }
+
+        /**
+         * Returns the {@code aliases_truncated} member as the record held it, unvalidated.
+         *
+         * @return the member, or null when the record had none
+         */
+        public Object aliasesTruncated() {
+            return aliasesTruncated;
         }
 
         /**
@@ -356,6 +411,12 @@ public final class SnapshotRecord {
                 if (captured.settings().isEmpty() == false) {
                     builder.field("settings", captured.settings());
                 }
+                if (captured.aliases() != null) {
+                    builder.field("aliases", captured.aliases());
+                }
+                if (captured.aliasesTruncated() != null) {
+                    builder.field("aliases_truncated", captured.aliasesTruncated());
+                }
                 builder.startArray("shards");
                 for (Map.Entry<Integer, CommitManifest> shard : captured.shards().entrySet()) {
                     builder.startObject();
@@ -395,7 +456,7 @@ public final class SnapshotRecord {
             if (parser.nextToken() != XContentParser.Token.START_OBJECT) {
                 throw malformed("expected an object");
             }
-            final var body = parser.map();
+            final var body = parser.mapOrdered();
             if (parser.nextToken() != null) {
                 throw malformed("trailing content");
             }
@@ -481,7 +542,15 @@ public final class SnapshotRecord {
                 }
                 indices.put(
                     requiredString(entry.getKey(), "index name"),
-                    new SnapshottedIndex(indexUuid, (int) shardCount, (String) mapping, settings, shards)
+                    new SnapshottedIndex(
+                        indexUuid,
+                        (int) shardCount,
+                        (String) mapping,
+                        settings,
+                        shards,
+                        indexBody.get("aliases"),
+                        indexBody.get("aliases_truncated")
+                    )
                 );
             }
             final String generation = body.containsKey("storage_generation")
