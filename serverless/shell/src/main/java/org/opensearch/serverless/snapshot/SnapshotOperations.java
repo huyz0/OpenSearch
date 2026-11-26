@@ -703,7 +703,7 @@ final class SnapshotOperations {
         Integer stateRestored = null;
         List<String> failedState = List.of();
         if (globalState != null) {
-            final SnapshotGlobalState.Restored restored = SnapshotGlobalState.restore(metadata, serving, globalState);
+            final SnapshotGlobalState.Restored restored = SnapshotGlobalState.restore(metadata, serving, handler.checks, globalState);
             stateRestored = restored.applied();
             failedState = restored.failed();
         }

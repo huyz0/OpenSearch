@@ -17,9 +17,6 @@ import org.opensearch.core.common.bytes.BytesReference;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.serverless.metadata.MetadataPlane;
 import org.opensearch.serverless.node.NodeContext;
-import org.opensearch.serverless.rest.ClusterSettingsHandler;
-import org.opensearch.serverless.rest.StoredScriptHandler;
-import org.opensearch.serverless.rest.TemplateHandler;
 import org.opensearch.serverless.script.StoredScripts;
 import org.opensearch.serverless.template.StoredScriptStore;
 
@@ -203,10 +200,11 @@ final class SnapshotGlobalState {
      *
      * @param metadata the plane whose stores take the state
      * @param serving the node whose validators the PUT routes use, or null to store without them
+     * @param checks the checks each entry's PUT route makes
      * @param state the state to apply, from {@link #read}
      * @return how many entries were applied and which were not
      */
-    static Restored restore(MetadataPlane metadata, NodeContext serving, Parsed state) {
+    static Restored restore(MetadataPlane metadata, NodeContext serving, GlobalStateChecks checks, Parsed state) {
         final long deadline = System.nanoTime() + RESTORE_BUDGET_NANOS;
         final List<String> failed = new ArrayList<>();
         int applied = 0;
@@ -215,7 +213,7 @@ final class SnapshotGlobalState {
             final Map<String, Object> admitted = new LinkedHashMap<>();
             for (Map.Entry<String, Object> setting : state.settings().entrySet()) {
                 try {
-                    ClusterSettingsHandler.admit(serving, Map.of(setting.getKey(), setting.getValue()));
+                    checks.settings(serving, Map.of(setting.getKey(), setting.getValue()));
                     admitted.put(setting.getKey(), setting.getValue());
                 } catch (Exception e) {
                     LOGGER.warn("global state skips setting [{}]: {}", setting.getKey(), e.getMessage());
@@ -225,7 +223,7 @@ final class SnapshotGlobalState {
             if (admitted.isEmpty() == false) {
                 try {
                     final Settings written = metadata.clusterConfig().update(admitted);
-                    ClusterSettingsHandler.applyWritten(serving, written);
+                    checks.settingsWritten(serving, written);
                     applied += admitted.size();
                 } catch (Exception e) {
                     LOGGER.warn("global state could not merge its persistent settings", e);
@@ -241,7 +239,7 @@ final class SnapshotGlobalState {
                     continue;
                 }
                 try {
-                    put(metadata, serving, set.getKey(), document.getKey(), json(document.getValue()));
+                    put(metadata, serving, checks, set.getKey(), document.getKey(), json(document.getValue()));
                     applied++;
                 } catch (Exception e) {
                     LOGGER.warn("global state could not put [{}]: {}", label, e.getMessage());
@@ -252,17 +250,18 @@ final class SnapshotGlobalState {
         return new Restored(applied, failed);
     }
 
-    private static void put(MetadataPlane metadata, NodeContext serving, String set, String name, String body) throws Exception {
+    private static void put(MetadataPlane metadata, NodeContext serving, GlobalStateChecks checks, String set, String name, String body)
+        throws Exception {
         switch (set) {
             case INDEX_TEMPLATES -> {
                 if (serving != null) {
-                    TemplateHandler.validateBody(serving, false, body);
+                    checks.template(serving, false, body);
                 }
                 metadata.indexTemplates().put(name, body);
             }
             case COMPONENT_TEMPLATES -> {
                 if (serving != null) {
-                    TemplateHandler.validateBody(serving, true, body);
+                    checks.template(serving, true, body);
                 }
                 metadata.componentTemplates().put(name, body);
             }
@@ -283,7 +282,7 @@ final class SnapshotGlobalState {
                     throw new IllegalArgumentException("stored script ids beginning with an underscore are reserved for APIs");
                 }
                 if (serving != null) {
-                    StoredScriptHandler.admit(serving, null, StoredScripts.parse(body));
+                    checks.storedScript(serving, StoredScripts.parse(body));
                 }
                 final StoredScriptStore scripts = metadata.scripts();
                 scripts.put(name, body);

@@ -109,7 +109,40 @@ final class NodeWiring {
             guarded.apply(new org.opensearch.serverless.snapshot.RepositoryHandler(() -> node.metadataPlane(), () -> node))
         );
         controller.registerHandler(
-            guarded.apply(new org.opensearch.serverless.snapshot.SnapshotHandler(() -> node.metadataPlane(), () -> node))
+            guarded.apply(
+                new org.opensearch.serverless.snapshot.SnapshotHandler(
+                    () -> node.metadataPlane(),
+                    () -> node,
+                    new org.opensearch.serverless.snapshot.GlobalStateChecks() {
+                        @Override
+                        public void template(org.opensearch.serverless.node.NodeContext serving, boolean component, String body)
+                            throws Exception {
+                            org.opensearch.serverless.rest.TemplateHandler.validateBody(serving, component, body);
+                        }
+
+                        @Override
+                        public void storedScript(
+                            org.opensearch.serverless.node.NodeContext serving,
+                            org.opensearch.script.StoredScriptSource source
+                        ) {
+                            org.opensearch.serverless.rest.StoredScriptHandler.admit(serving, null, source);
+                        }
+
+                        @Override
+                        public void settings(org.opensearch.serverless.node.NodeContext serving, java.util.Map<String, Object> flat) {
+                            org.opensearch.serverless.rest.ClusterSettingsHandler.admit(serving, flat);
+                        }
+
+                        @Override
+                        public void settingsWritten(
+                            org.opensearch.serverless.node.NodeContext serving,
+                            org.opensearch.common.settings.Settings written
+                        ) {
+                            org.opensearch.serverless.rest.ClusterSettingsHandler.applyWritten(serving, written);
+                        }
+                    }
+                )
+            )
         );
         // The one piece of /_cluster/* not refused below: cluster/config is one register, exactly
         // like an index descriptor, and this node can answer for it the same honest way it answers for an

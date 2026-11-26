@@ -55,6 +55,7 @@ public final class SnapshotHandler extends BaseRestHandler {
 
     final Supplier<MetadataPlane> plane;
     final Supplier<NodeContext> node;
+    final GlobalStateChecks checks;
     /** Runs the snapshot requests this handler parsed. */
     final SnapshotOperations operations = new SnapshotOperations(this);
 
@@ -63,9 +64,11 @@ public final class SnapshotHandler extends BaseRestHandler {
      *
      * @param plane supplies the metadata plane
      * @param node supplies the node, whose action gate the plugins' filters live behind
+     * @param checks the checks a restored global-state entry must pass
      */
-    public SnapshotHandler(Supplier<MetadataPlane> plane, Supplier<NodeContext> node) {
+    public SnapshotHandler(Supplier<MetadataPlane> plane, Supplier<NodeContext> node, GlobalStateChecks checks) {
         this.plane = plane;
+        this.checks = checks;
         this.node = node;
     }
 
