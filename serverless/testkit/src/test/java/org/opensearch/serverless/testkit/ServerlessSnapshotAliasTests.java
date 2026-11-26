@@ -174,7 +174,11 @@ public class ServerlessSnapshotAliasTests extends OpenSearchTestCase {
                         + "\"rename_alias_pattern\":\"^(.*)$\",\"rename_alias_replacement\":\"$1-r\"}"
                 ).status()
             );
-            RequestBudgets.check("snapshot.restore_aliases.extra_requests", metered.total() - before - plain, "restore with aliases minus plain");
+            RequestBudgets.check(
+                "snapshot.restore_aliases.extra_requests",
+                metered.total() - before - plain,
+                "restore with aliases minus plain"
+            );
         }, "one");
     }
 

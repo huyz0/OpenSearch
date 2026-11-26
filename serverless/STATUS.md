@@ -133,7 +133,7 @@ each distinct alias once. A restore with `include_aliases: true` adds them after
 `rename_alias_pattern`/`rename_alias_replacement`, one mutation for each distinct alias; a restored index is an alias's
 write index only if the snapshot said so and the alias has no write target. The restore answers `aliases_restored`, and
 `failed_aliases` when one could not be added: an alias failure never deletes an index. Absent, `include_aliases` is
-`false` (core's default is `true`). A node that predates the fields ignores them and restores without aliases. Not yet
+`false` (core's default is `true`). A node that predates the fields ignores them and restores without aliases. **Partial snapshots.** With `serverless.snapshots.take.partial_shards` on (default off) and `partial=true`, a take keeps an index whose shards published no commit and records them in the entry's `failed_shards`; the snapshot answers `PARTIAL`, with `failures` on GET by name (at most 1,000) and exact `shards.failed`. A restore of such an index needs `partial=true` (else 500 `snapshot_restore_exception`), and the failed shards come back empty. A take that captured no shard anywhere is 409 `nothing_published`. A record with `failed_shards` is unreadable to a node without this reader, so the setting stays off until every node sharing the repository has it. Not yet
 built: a repository genuinely on a distinct backend
 (S3 while the deployment runs on GCS, say) — shallow-vs-standard turned out orthogonal to that question and
 didn't require answering it.

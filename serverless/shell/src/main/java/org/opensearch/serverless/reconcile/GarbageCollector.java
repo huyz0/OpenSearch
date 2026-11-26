@@ -884,7 +884,7 @@ public final class GarbageCollector {
      * argument does not depend on the plane's.
      */
     private static boolean capturing(SnapshotRecord.SnapshottedIndex captured) {
-        return captured.shards().isEmpty() && captured.numberOfShards() > 0;
+        return captured.shards().isEmpty() && captured.failedShards().isEmpty() && captured.numberOfShards() > 0;
     }
 
     private static boolean pinnedByView(List<PointInTime> views, String indexName, String uuid, int shard) {

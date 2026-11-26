@@ -269,8 +269,25 @@ public final class SnapshotHandler extends BaseRestHandler {
 
     /** Thrown from inside {@link SnapshotOperations#handleCreate}'s gate when a shard has nothing published to capture. */
     static final class NothingPublishedException extends Exception {
+        NothingPublishedException() {
+            super("no shard of any named index had published a commit, so there is nothing to capture");
+        }
+
         NothingPublishedException(String indexName, int shard) {
             super("shard " + shard + " of " + indexName + " has published nothing yet, so there is no commit to capture");
+        }
+    }
+
+    /** Thrown from inside a restore's gate when an index has failed shards and the request did not say {@code partial}. */
+    static final class PartialSnapshotRestoreException extends Exception {
+        PartialSnapshotRestoreException(String indexName, List<Integer> failedShards) {
+            super(
+                "index ["
+                    + indexName
+                    + "] was captured without shards "
+                    + failedShards
+                    + "; restore it with partial=true to bring back the shards that were captured"
+            );
         }
     }
 
