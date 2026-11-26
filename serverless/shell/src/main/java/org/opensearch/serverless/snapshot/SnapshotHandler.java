@@ -55,6 +55,7 @@ public final class SnapshotHandler extends BaseRestHandler {
 
     final Supplier<MetadataPlane> plane;
     final Supplier<NodeContext> node;
+    final GlobalStateChecks checks;
     /** Runs the snapshot requests this handler parsed. */
     final SnapshotOperations operations = new SnapshotOperations(this);
 
@@ -63,9 +64,11 @@ public final class SnapshotHandler extends BaseRestHandler {
      *
      * @param plane supplies the metadata plane
      * @param node supplies the node, whose action gate the plugins' filters live behind
+     * @param checks the checks a restored global-state entry must pass
      */
-    public SnapshotHandler(Supplier<MetadataPlane> plane, Supplier<NodeContext> node) {
+    public SnapshotHandler(Supplier<MetadataPlane> plane, Supplier<NodeContext> node, GlobalStateChecks checks) {
         this.plane = plane;
+        this.checks = checks;
         this.node = node;
     }
 
@@ -192,12 +195,11 @@ public final class SnapshotHandler extends BaseRestHandler {
                 }
                 final boolean ignoreUnavailable = SnapshotRequestBodies.readBoolean(body.get("ignore_unavailable"), false);
                 final boolean partial = SnapshotRequestBodies.readBoolean(body.get("partial"), false);
-                // Read, and reported as what happened rather than as what was asked: there is no global
-                // state here to capture, so a snapshot never includes it. Core's default is true, and
-                // refusing that default would refuse every client that sends it; echoing true would report
-                // a capture that did not happen.
-                SnapshotRequestBodies.readBoolean(body.get("include_global_state"), true);
-                final boolean includeGlobalState = false;
+                // Asked for only by saying so: stock's take default is true, here it stays false because capturing costs a read of
+                // every set. A take that asks with the setting off captures nothing and says so in the answer.
+                final boolean includeGlobalState = SnapshotRequestBodies.readBoolean(body.get("include_global_state"), false)
+                    && node.get() != null
+                    && SnapshotSettings.CAPTURE_GLOBAL_STATE.get(node.get().settings());
                 return channel -> dispatch(
                     channel,
                     () -> operations.handleCreate(
@@ -329,7 +331,15 @@ public final class SnapshotHandler extends BaseRestHandler {
     /** Thrown from inside {@link SnapshotOperations#handleRestore}'s gate when a record's alias fields are not what a take writes. */
     static final class SnapshotUnreadableException extends Exception {
         SnapshotUnreadableException(String repo, String snapshot, String reason) {
-            super("snapshot " + repo + "/" + snapshot + " cannot be restored with its aliases: " + reason);
+            this(repo, snapshot, "aliases", reason);
+        }
+
+        private SnapshotUnreadableException(String repo, String snapshot, String what, String reason) {
+            super("snapshot " + repo + "/" + snapshot + " cannot be restored with its " + what + ": " + reason);
+        }
+
+        static SnapshotUnreadableException ofGlobalState(String repo, String snapshot, String reason) {
+            return new SnapshotUnreadableException(repo, snapshot, "global state", reason);
         }
     }
 

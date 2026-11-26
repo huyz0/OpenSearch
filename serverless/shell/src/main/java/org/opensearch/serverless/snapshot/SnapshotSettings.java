@@ -38,4 +38,16 @@ public final class SnapshotSettings {
         false,
         Property.NodeScope
     );
+
+    /**
+     * Whether a take that asks for {@code include_global_state} embeds the persistent settings, templates, pipelines and
+     * stored scripts in the record. Off, a take writes the record it always wrote and reads none of them. It stays off until
+     * every node that restores or rewrites the repository's snapshots carries the member through: a node that does not
+     * drops it silently on its next rewrite.
+     */
+    public static final Setting<Boolean> CAPTURE_GLOBAL_STATE = Setting.boolSetting(
+        "serverless.snapshots.take.capture_global_state",
+        false,
+        Property.NodeScope
+    );
 }

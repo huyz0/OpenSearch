@@ -351,7 +351,6 @@ public class ServerlessSnapshotAliasTests extends OpenSearchTestCase {
         withIndices(true, (node, plane) -> {
             take(node, "s", "one");
             assertEquals(501, restore(node, "s", "{\"alias_write_index_policy\":\"keep\"}").status());
-            assertEquals(501, restore(node, "s", "{\"include_global_state\":true}").status());
             assertEquals(400, restore(node, "s", "{\"include_aliases\":\"maybe\"}").status());
             assertEquals(400, restore(node, "s", "{\"include_aliases\":3}").status());
             assertTrue(plane.describe("one").isPresent());

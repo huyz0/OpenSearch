@@ -108,6 +108,20 @@ public final class StoredScriptStore {
     }
 
     /**
+     * Visits every script one body at a time, keeping none; see {@link TemplateStore#forEachDocument}.
+     *
+     * @param visitor receives each id and stored JSON
+     * @throws IOException if a read fails or the visitor throws
+     */
+    public void forEachDocument(org.opensearch.common.CheckedBiConsumer<String, String, IOException> visitor) throws IOException {
+        scripts.forEachDocument((id, source) -> {
+            if (VERSION_BLOB.equals(id) == false) {
+                visitor.accept(id, source);
+            }
+        });
+    }
+
+    /**
      * Reads the marker.
      *
      * @return the number of changes ever made, or 0 when none has been

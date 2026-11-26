@@ -68,17 +68,26 @@ final class SnapshotOperations {
         List<String> indexNames,
         boolean ignoreUnavailable,
         boolean partial,
-        boolean includeGlobalState,
+        boolean captureGlobalState,
         boolean waitForCompletion
     ) throws Exception {
         final SnapshotRecord record;
         try {
+            if (captureGlobalState) {
+                // The state is configuration manage_snapshots cannot write directly, so this is checked on its own, after the
+                // body was read and before anything is read or written.
+                handler.gated(
+                    SnapshotGlobalState.ACTION,
+                    new org.opensearch.action.admin.cluster.snapshots.create.CreateSnapshotRequest(repo, snapshot),
+                    () -> null
+                );
+            }
             record = handler.gated(
                 org.opensearch.action.admin.cluster.snapshots.create.CreateSnapshotAction.NAME,
                 new org.opensearch.action.admin.cluster.snapshots.create.CreateSnapshotRequest(repo, snapshot),
                 // capture() writes the record itself: the provisional one before a manifest is read, and the
                 // finished one over it. A second createSnapshot here found its own record and refused.
-                () -> capture(metadata, repo, snapshot, indexNames, ignoreUnavailable, partial)
+                () -> capture(metadata, repo, snapshot, indexNames, ignoreUnavailable, partial, captureGlobalState)
             );
         } catch (RepositoryMissingException e) {
             channel.sendResponse(RestReplies.error(channel, RestStatus.NOT_FOUND, "repository_missing_exception", e.getMessage()));
@@ -95,6 +104,9 @@ final class SnapshotOperations {
         } catch (SnapshotAlreadyExistsException e) {
             channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "snapshot_already_exists", e.getMessage()));
             return;
+        } catch (SnapshotGlobalState.TooLargeException e) {
+            channel.sendResponse(RestReplies.error(channel, RestStatus.BAD_REQUEST, "snapshot_too_large", e.getMessage()));
+            return;
         }
 
         if (waitForCompletion == false) {
@@ -104,7 +116,7 @@ final class SnapshotOperations {
         try (XContentBuilder builder = channel.newBuilder()) {
             builder.startObject();
             builder.startObject("snapshot");
-            writeSnapshotInfo(builder, record, includeGlobalState, false);
+            writeSnapshotInfo(builder, record, false);
             builder.endObject();
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
@@ -135,7 +147,8 @@ final class SnapshotOperations {
         String snapshot,
         List<String> indexNames,
         boolean ignoreUnavailable,
-        boolean partial
+        boolean partial,
+        boolean captureGlobalState
     ) throws Exception {
         final Optional<RepositoryDescriptor> repoDescriptor = metadata.describeRepository(repo);
         if (repoDescriptor.isEmpty()) {
@@ -167,6 +180,8 @@ final class SnapshotOperations {
             described.put(trimmed, descriptor.get());
         }
 
+        // Read first, before any shard work, so a refusal for size costs no copy and a take that fails leaves nothing behind.
+        final Map<String, Object> globalState = captureGlobalState ? SnapshotGlobalState.capture(metadata) : null;
         final boolean keepFailedShards = serving != null && SnapshotSettings.PARTIAL_SHARDS.get(serving.settings());
         final String snapshotUuid = UUIDs.randomBase64UUID();
         final Map<String, SnapshotRecord.SnapshottedIndex> provisional = new LinkedHashMap<>();
@@ -265,7 +280,8 @@ final class SnapshotOperations {
                 shallow,
                 startTime,
                 endTime,
-                withAliases(metadata, serving, described, captured)
+                withAliases(metadata, serving, described, captured),
+                globalState
             ).withStorageGeneration(reservation.storageGeneration());
             metadata.finishSnapshot(finished);
             return finished;
@@ -338,7 +354,7 @@ final class SnapshotOperations {
             builder.startObject();
             builder.startArray("snapshots");
             builder.startObject();
-            writeSnapshotInfo(builder, record.get(), true, true);
+            writeSnapshotInfo(builder, record.get(), true);
             builder.endObject();
             builder.endArray();
             builder.endObject();
@@ -371,7 +387,7 @@ final class SnapshotOperations {
                     continue;
                 }
                 builder.startObject();
-                writeSnapshotInfo(builder, record, true, false);
+                writeSnapshotInfo(builder, record, false);
                 builder.endObject();
             }
             builder.endArray();
@@ -419,6 +435,15 @@ final class SnapshotOperations {
     ) throws Exception {
         final RestoreOutcome outcome;
         try {
+            if (SnapshotRequestBodies.readBoolean(body.get("include_global_state"), false)) {
+                // Checked on its own after the body was read and before anything is read or written: the state is configuration
+                // the snapshot actions cannot write directly.
+                handler.gated(
+                    SnapshotGlobalState.ACTION,
+                    new org.opensearch.action.admin.cluster.snapshots.restore.RestoreSnapshotRequest(repo, snapshot),
+                    () -> null
+                );
+            }
             outcome = handler.gated(
                 org.opensearch.action.admin.cluster.snapshots.restore.RestoreSnapshotAction.NAME,
                 new org.opensearch.action.admin.cluster.snapshots.restore.RestoreSnapshotRequest(repo, snapshot),
@@ -484,6 +509,12 @@ final class SnapshotOperations {
                     builder.field("aliases_truncated", outcome.truncatedIndices());
                 }
             }
+            if (outcome.globalStateRestored() != null) {
+                builder.field("global_state_restored", outcome.globalStateRestored());
+                if (outcome.failedGlobalState().isEmpty() == false) {
+                    builder.field("failed_global_state", outcome.failedGlobalState());
+                }
+            }
             builder.endObject();
             builder.endObject();
             channel.sendResponse(new BytesRestResponse(RestStatus.OK, builder));
@@ -495,7 +526,7 @@ final class SnapshotOperations {
      * aliases, how many it added, which it could not, and which restored indices had more aliases than the snapshot named.
      */
     record RestoreOutcome(Map<String, String> targets, int totalShards, int failedShards, Integer aliasesRestored, List<
-        String> failedAliases, List<String> truncatedIndices) {
+        String> failedAliases, List<String> truncatedIndices, Integer globalStateRestored, List<String> failedGlobalState) {
     }
 
     /**
@@ -559,6 +590,16 @@ final class SnapshotOperations {
                 throw new IndexAlreadyExistsException(target);
             }
             targets.put(original, target);
+        }
+
+        // Read strictly before the first write: a malformed state refuses the restore rather than half of it.
+        SnapshotGlobalState.Parsed globalState = null;
+        if (SnapshotRequestBodies.readBoolean(body.get("include_global_state"), false)) {
+            try {
+                globalState = SnapshotGlobalState.read(record.globalState());
+            } catch (IOException unreadable) {
+                throw SnapshotHandler.SnapshotUnreadableException.ofGlobalState(repo, snapshot, unreadable.getMessage());
+            }
         }
 
         final boolean includeAliases = SnapshotRequestBodies.readBoolean(body.get("include_aliases"), false);
@@ -650,26 +691,38 @@ final class SnapshotOperations {
             }
             throw e;
         }
-        if (aliasPlan == null) {
-            return new RestoreOutcome(targets, shardsRestored + failedShards, failedShards, null, List.of(), List.of());
+        // After every index is whole, outside the rollback above: nothing applied here ever removes an index.
+        Integer aliasesRestored = null;
+        List<String> failedAliases = List.of();
+        List<String> truncated = List.of();
+        if (aliasPlan != null) {
+            failedAliases = SnapshotAliasRestore.apply(metadata, aliasPlan.byAlias(), aliasesBefore);
+            aliasesRestored = aliasPlan.byAlias().size() - failedAliases.size();
+            truncated = aliasPlan.truncated();
         }
-        // After every index is whole, outside the rollback above: an alias that fails never deletes an index.
-        final List<String> failed = SnapshotAliasRestore.apply(metadata, aliasPlan.byAlias(), aliasesBefore);
+        Integer stateRestored = null;
+        List<String> failedState = List.of();
+        if (globalState != null) {
+            final SnapshotGlobalState.Restored restored = SnapshotGlobalState.restore(metadata, serving, handler.checks, globalState);
+            stateRestored = restored.applied();
+            failedState = restored.failed();
+        }
         return new RestoreOutcome(
             targets,
             shardsRestored + failedShards,
             failedShards,
-            aliasPlan.byAlias().size() - failed.size(),
-            failed,
-            aliasPlan.truncated()
+            aliasesRestored,
+            failedAliases,
+            truncated,
+            stateRestored,
+            failedState
         );
     }
 
     /** The most failure entries one snapshot answer lists; the failed count stays exact. */
     static final int MAX_FAILURES = 1000;
 
-    void writeSnapshotInfo(XContentBuilder builder, SnapshotRecord record, boolean includeGlobalState, boolean withFailures)
-        throws IOException {
+    void writeSnapshotInfo(XContentBuilder builder, SnapshotRecord record, boolean withFailures) throws IOException {
         builder.field("snapshot", record.name());
         builder.field("uuid", record.uuid());
         builder.field("version_id", Version.CURRENT.id);
@@ -677,7 +730,8 @@ final class SnapshotOperations {
         builder.field("remote_store_index_shallow_copy", record.shallow());
         builder.field("indices", record.indices().keySet());
         builder.startArray("data_streams").endArray();
-        builder.field("include_global_state", includeGlobalState);
+        // True only when the take captured it: a snapshot that asked and was not given the state says false.
+        builder.field("include_global_state", record.globalState() != null);
         // A record whose indices have no commits yet is a capture still running -- see
         // SnapshotRecord.capturing -- and says so rather than reporting a success with no shards.
         builder.field("state", SnapshotRecord.inProgress(record) ? "IN_PROGRESS" : SnapshotRecord.partial(record) ? "PARTIAL" : "SUCCESS");

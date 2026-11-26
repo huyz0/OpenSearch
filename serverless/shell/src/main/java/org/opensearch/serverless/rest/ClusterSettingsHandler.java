@@ -206,62 +206,9 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                             RestStatus.NOT_IMPLEMENTED
                         );
                     }
-                    final Object bucketPolicy = flat.get(org.opensearch.serverless.bucket.BucketSettings.CLUSTER_POLICY.getKey());
-                    if (bucketPolicy != null) {
-                        try {
-                            org.opensearch.serverless.bucket.BucketPolicy.check(String.valueOf(bucketPolicy));
-                        } catch (IllegalArgumentException e) {
-                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
-                        }
-                    }
-                    final Object placement = flat.get(org.opensearch.serverless.node.NodeSettings.SEGMENT_PLACEMENT_CLUSTER.getKey());
-                    if (placement != null) {
-                        try {
-                            org.opensearch.serverless.node.SegmentPlacement.check(String.valueOf(placement));
-                        } catch (IllegalArgumentException e) {
-                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
-                        }
-                    }
-                    final Object overlay = flat.get(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_CLUSTER.getKey());
-                    if (overlay != null) {
-                        try {
-                            org.opensearch.serverless.transport.TailOverlays.check(String.valueOf(overlay));
-                        } catch (IllegalArgumentException e) {
-                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
-                        }
-                    }
-                    final Object visibility = flat.get(
-                        org.opensearch.serverless.transport.ReaderPushSettings.REFRESH_VISIBILITY_CLUSTER.getKey()
-                    );
-                    if (visibility != null) {
-                        try {
-                            org.opensearch.serverless.transport.RefreshVisibility.check(String.valueOf(visibility));
-                        } catch (IllegalArgumentException e) {
-                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
-                        }
-                    }
-                    final Object checkpoint = flat.get(org.opensearch.serverless.node.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey());
-                    if (checkpoint != null) {
-                        try {
-                            org.opensearch.serverless.node.LogCommitCheckpoint.check(node.get(), checkpoint);
-                        } catch (IllegalArgumentException e) {
-                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
-                        }
-                    }
-                    if (node.get() != null) {
-                        try {
-                            node.get().pluginClusterSettings().check(flat);
-                        } catch (IllegalArgumentException e) {
-                            throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
-                        }
-                    }
+                    admit(node.get(), flat);
                     final Settings written = metadata.clusterConfig().update(flat);
-                    // This node's next publishes follow at once; the others within their next read of the register.
-                    org.opensearch.serverless.node.SegmentPlacement.applyCluster(node.get(), written);
-                    // And this node's plugins see their settings change when the write returns, as on a classic node.
-                    if (node.get() != null) {
-                        node.get().pluginClusterSettings().apply(written);
-                    }
+                    applyWritten(node.get(), written);
                     return nativeResponse(written);
                 }, org.opensearch.serverless.action.ActionGate.identity(ClusterUpdateSettingsResponse.class));
                 try (var builder = channel.newBuilder()) {
@@ -276,6 +223,81 @@ public final class ClusterSettingsHandler extends BaseRestHandler {
                 }
             }
         });
+    }
+
+    /**
+     * Checks persistent settings the way {@code PUT /_cluster/settings} does, so settings written by another route (a
+     * snapshot restore) are held to the same rules.
+     *
+     * @param serving the node whose plugins and settings the checks consult, or null
+     * @param flat dotted key to scalar value
+     * @throws org.opensearch.OpenSearchStatusException if a value is refused
+     */
+    public static void admit(org.opensearch.serverless.node.NodeContext serving, Map<String, Object> flat) {
+        final Object bucketPolicy = flat.get(org.opensearch.serverless.bucket.BucketSettings.CLUSTER_POLICY.getKey());
+        if (bucketPolicy != null) {
+            try {
+                org.opensearch.serverless.bucket.BucketPolicy.check(String.valueOf(bucketPolicy));
+            } catch (IllegalArgumentException e) {
+                throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+            }
+        }
+        final Object placement = flat.get(org.opensearch.serverless.node.NodeSettings.SEGMENT_PLACEMENT_CLUSTER.getKey());
+        if (placement != null) {
+            try {
+                org.opensearch.serverless.node.SegmentPlacement.check(String.valueOf(placement));
+            } catch (IllegalArgumentException e) {
+                throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+            }
+        }
+        final Object overlay = flat.get(org.opensearch.serverless.transport.ReaderPushSettings.TAIL_OVERLAY_CLUSTER.getKey());
+        if (overlay != null) {
+            try {
+                org.opensearch.serverless.transport.TailOverlays.check(String.valueOf(overlay));
+            } catch (IllegalArgumentException e) {
+                throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+            }
+        }
+        final Object visibility = flat.get(
+            org.opensearch.serverless.transport.ReaderPushSettings.REFRESH_VISIBILITY_CLUSTER.getKey()
+        );
+        if (visibility != null) {
+            try {
+                org.opensearch.serverless.transport.RefreshVisibility.check(String.valueOf(visibility));
+            } catch (IllegalArgumentException e) {
+                throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+            }
+        }
+        final Object checkpoint = flat.get(org.opensearch.serverless.node.WriteSettings.LOG_COMMITS_CHECKPOINT_MILLIS.getKey());
+        if (checkpoint != null) {
+            try {
+                org.opensearch.serverless.node.LogCommitCheckpoint.check(serving, checkpoint);
+            } catch (IllegalArgumentException e) {
+                throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+            }
+        }
+        if (serving != null) {
+            try {
+                serving.pluginClusterSettings().check(flat);
+            } catch (IllegalArgumentException e) {
+                throw new org.opensearch.OpenSearchStatusException(e.getMessage(), RestStatus.BAD_REQUEST);
+            }
+        }
+    }
+
+    /**
+     * Makes settings just written to the register take effect on this node.
+     *
+     * @param serving the node, or null
+     * @param written the register's settings after the write
+     */
+    public static void applyWritten(org.opensearch.serverless.node.NodeContext serving, Settings written) {
+        // This node's next publishes follow at once; the others within their next read of the register.
+        org.opensearch.serverless.node.SegmentPlacement.applyCluster(serving, written);
+        // And this node's plugins see their settings change when the write returns, as on a classic node.
+        if (serving != null) {
+            serving.pluginClusterSettings().apply(written);
+        }
     }
 
     /** Serializes through the public Settings API so lists and null removals retain their types. */
