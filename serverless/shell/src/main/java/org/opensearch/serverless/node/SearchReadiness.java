@@ -8,6 +8,8 @@
 
 package org.opensearch.serverless.node;
 
+import org.opensearch.serverless.membership.NodeLease;
+
 import java.util.LinkedHashSet;
 import java.util.Map;
 import java.util.Set;
@@ -49,6 +51,10 @@ public final class SearchReadiness {
 
     private final boolean servesSearches;
     private volatile State state;
+    private volatile long searchSince = -1L;
+    private final org.opensearch.serverless.cluster.ReaderRamp.Controller controller =
+        org.opensearch.serverless.cluster.ReaderRamp.Controller.withDefaults(new org.opensearch.serverless.cluster.ReaderRamp.Totals(0, 0));
+    private volatile int ramp = -1;
 
     SearchReadiness(boolean servesSearches, boolean warmOnJoin) {
         this.servesSearches = servesSearches;
@@ -63,10 +69,13 @@ public final class SearchReadiness {
      */
     public static SearchReadiness of(NodeContext node) {
         synchronized (BY_NODE) {
-            return BY_NODE.computeIfAbsent(
-                node,
-                n -> new SearchReadiness(n.roles().contains(NodeContext.ROLE_SEARCH), SearchSettings.WARM_ON_JOIN.get(n.settings()))
-            );
+            return BY_NODE.computeIfAbsent(node, n -> {
+                // Process-wide, like the placement it bounds: set once, before the first lease says search.
+                org.opensearch.serverless.cluster.ReaderRamp.setConfig(
+                    org.opensearch.serverless.cluster.ReaderPlacementSettings.rampConfig(n.settings())
+                );
+                return new SearchReadiness(n.roles().contains(NodeContext.ROLE_SEARCH), SearchSettings.WARM_ON_JOIN.get(n.settings()));
+            });
         }
     }
 
@@ -118,6 +127,37 @@ public final class SearchReadiness {
             }
             state = State.DRAINING;
             return true;
+        }
+    }
+
+    /**
+     * Says in a lease, once the node is ready to be sent searches, since when it has held the search role and how warm it
+     * judges itself: the two things every ranker needs to compute the node's share of shards during its slow start.
+     *
+     * <p>The node judges itself by what its searches cost: with the slow start on, each renewal reads the searches answered
+     * and the store reads made since the last one ({@link org.opensearch.serverless.cluster.ReaderRamp.Controller}).
+     *
+     * @param lease the lease about to be written
+     * @param blobReads the store reads this node has made so far, or a negative number when they are not counted
+     * @return the lease, with the slow start's fields when the node serves searches and is ready
+     */
+    public NodeLease stamp(NodeLease lease, long blobReads) {
+        if (ready() == false || servesSearches == false) {
+            return lease;
+        }
+        synchronized (this) {
+            if (searchSince < 0) {
+                searchSince = System.currentTimeMillis();
+            }
+            if (blobReads >= 0 && org.opensearch.serverless.cluster.ReaderRamp.config().isOn()) {
+                ramp = controller.observe(
+                    new org.opensearch.serverless.cluster.ReaderRamp.Totals(
+                        org.opensearch.serverless.cluster.ReaderRamp.searchesTotal(),
+                        blobReads * 1000L
+                    )
+                );
+            }
+            return lease.withSearchRamp(searchSince, ramp);
         }
     }
 

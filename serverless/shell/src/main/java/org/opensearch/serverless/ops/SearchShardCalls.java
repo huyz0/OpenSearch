@@ -459,6 +459,8 @@ final class SearchShardCalls {
         SearchSourceBuilder perShard,
         long nowInMillis
     ) throws IOException {
+        // The joiner's slow start judges its warmth by what a search costs it.
+        org.opensearch.serverless.cluster.ReaderRamp.countSearch();
         final boolean frozen = serving.reconciler().isFrozen(shardId);
         if (frozen == false) {
             // Before the query too, so it runs on the mapping in force now; see WriteFences#ensureIncarnationLive.

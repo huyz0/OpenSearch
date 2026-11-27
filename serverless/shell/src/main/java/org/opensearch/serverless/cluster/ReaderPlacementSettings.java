@@ -51,11 +51,42 @@ public final class ReaderPlacementSettings implements SettingsProvider {
         Property.NodeScope
     );
 
+    /** By when a joining reader is fully ramped, whatever it says about its cache; zero turns the slow start off. */
+    public static final Setting<org.opensearch.common.unit.TimeValue> RAMP_MAX_DURATION = Setting.timeSetting(
+        "serverless.search.reader_ramp.max_duration",
+        org.opensearch.common.unit.TimeValue.ZERO,
+        Property.NodeScope
+    );
+
+    /** The soonest a joining reader may be fully ramped, however warm it says it is. */
+    public static final Setting<org.opensearch.common.unit.TimeValue> RAMP_MIN_DURATION = Setting.timeSetting(
+        "serverless.search.reader_ramp.min_duration",
+        org.opensearch.common.unit.TimeValue.timeValueSeconds(30),
+        Property.NodeScope
+    );
+
+    /**
+     * Reads the slow start's bounds from a node's settings.
+     *
+     * @param settings the node's settings
+     * @return the bounds; off unless the maximum is set
+     */
+    public static ReaderRamp.Config rampConfig(org.opensearch.common.settings.Settings settings) {
+        return new ReaderRamp.Config(RAMP_MIN_DURATION.get(settings).millis(), RAMP_MAX_DURATION.get(settings).millis());
+    }
+
     /** Used by {@link java.util.ServiceLoader}. */
     public ReaderPlacementSettings() {}
 
     @Override
     public List<Setting<?>> settings() {
-        return List.of(SPREAD_TARGET_PER_SECOND, SPREAD_MAX_READERS, ZONE_LOCAL_MIN_PER_SECOND, ZONE_LOCAL_SPILL_IN_FLIGHT);
+        return List.of(
+            SPREAD_TARGET_PER_SECOND,
+            SPREAD_MAX_READERS,
+            ZONE_LOCAL_MIN_PER_SECOND,
+            ZONE_LOCAL_SPILL_IN_FLIGHT,
+            RAMP_MAX_DURATION,
+            RAMP_MIN_DURATION
+        );
     }
 }

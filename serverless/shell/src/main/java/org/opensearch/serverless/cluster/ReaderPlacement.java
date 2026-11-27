@@ -54,6 +54,33 @@ public final class ReaderPlacement {
      * @return candidate node ids, most preferred first; empty if no node advertises the role
      */
     public static List<String> candidatesFor(String indexName, int shardId, Collection<NodeLease> members, String role, int limit) {
+        final ReaderRamp.Config ramp = ReaderRamp.config();
+        return candidatesFor(indexName, shardId, members, role, limit, ramp, ramp.isOn() ? System.currentTimeMillis() : 0L);
+    }
+
+    /**
+     * Returns the search nodes that should serve a shard, best first, with a joining reader's slow start: a node whose ramp
+     * has not yet admitted the shard ranks after every node that has been admitted, each group in the usual order. With the
+     * slow start off this is {@link #candidatesFor(String, int, Collection, String, int)} unchanged.
+     *
+     * @param indexName the index
+     * @param shardId the shard number
+     * @param members the currently live leases
+     * @param role the role a node must advertise to be a candidate
+     * @param limit how many candidates to return
+     * @param ramp the slow start's bounds
+     * @param now the time, epoch milliseconds
+     * @return candidate node ids, most preferred first; empty if no node advertises the role
+     */
+    public static List<String> candidatesFor(
+        String indexName,
+        int shardId,
+        Collection<NodeLease> members,
+        String role,
+        int limit,
+        ReaderRamp.Config ramp,
+        long now
+    ) {
         if (limit < 0) {
             throw new IllegalArgumentException("candidate limit must be non-negative");
         }
@@ -61,13 +88,18 @@ public final class ReaderPlacement {
             return List.of();
         }
         final String key = indexName + "#" + shardId;
-        final Comparator<Candidate> preferred = Comparator.comparingInt(Candidate::weight).reversed().thenComparing(Candidate::nodeId);
+        final Comparator<Candidate> preferred = Comparator.comparing(Candidate::admitted)
+            .reversed()
+            .thenComparing(Comparator.comparingInt(Candidate::weight).reversed())
+            .thenComparing(Candidate::nodeId);
         // The worst retained candidate is first. The common two-reader route retains only two entries,
         // hashes each eligible member once, and never sorts the whole fleet for each searched shard.
         final PriorityQueue<Candidate> best = new PriorityQueue<>(Math.min(limit, 16), preferred.reversed());
         for (NodeLease lease : members) {
             if (lease.roles().contains(role)) {
-                final Candidate candidate = new Candidate(lease.nodeId(), Murmur3HashFunction.hash(lease.nodeId() + "/" + key));
+                final boolean admitted = ramp.isOn() == false
+                    || ReaderRamp.admitted(lease.nodeId(), indexName, shardId, ReaderRamp.permille(lease, now, ramp));
+                final Candidate candidate = new Candidate(lease.nodeId(), Murmur3HashFunction.hash(lease.nodeId() + "/" + key), admitted);
                 if (best.size() < limit) {
                     best.add(candidate);
                 } else if (preferred.compare(candidate, best.peek()) < 0) {
@@ -81,6 +113,6 @@ public final class ReaderPlacement {
         return ranked.stream().map(Candidate::nodeId).toList();
     }
 
-    private record Candidate(String nodeId, int weight) {
+    private record Candidate(String nodeId, int weight, boolean admitted) {
     }
 }
