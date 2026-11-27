@@ -209,8 +209,7 @@ public final class NodeLease {
      * Returns this lease carrying a reader's slow start: when the node first advertised the search role, and how warm it
      * judges its cache.
      *
-     * <p>Every ranker computes the node's share of shards from these two and its own clock ({@link
-     * org.opensearch.serverless.cluster.ReaderRamp}); a lease without them is a fully ramped reader.
+     * <p>Every ranker computes the node's share of shards from these two and its own clock (the reader ramp, in the cluster package); a lease without them is a fully ramped reader.
      *
      * @param searchSince epoch milliseconds the node first advertised the search role, or a negative number when unknown
      * @param ramp the node's own judgement of how warm it is, 0 to 1000, or a negative number when it does not say

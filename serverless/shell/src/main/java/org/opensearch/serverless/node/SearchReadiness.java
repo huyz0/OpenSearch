@@ -139,17 +139,17 @@ public final class SearchReadiness {
      *
      * @param lease the lease about to be written
      * @param blobReads the store reads this node has made so far, or a negative number when they are not counted
-     * @return the lease, with the slow start's fields when the node serves searches and is ready
+     * @return the lease, with the slow start's fields when the switch is on and the node serves searches and is ready; otherwise unchanged
      */
     public NodeLease stamp(NodeLease lease, long blobReads) {
-        if (ready() == false || servesSearches == false) {
+        if (ready() == false || servesSearches == false || org.opensearch.serverless.cluster.ReaderRamp.config().isOn() == false) {
             return lease;
         }
         synchronized (this) {
             if (searchSince < 0) {
                 searchSince = System.currentTimeMillis();
             }
-            if (blobReads >= 0 && org.opensearch.serverless.cluster.ReaderRamp.config().isOn()) {
+            if (blobReads >= 0) {
                 ramp = controller.observe(
                     new org.opensearch.serverless.cluster.ReaderRamp.Totals(
                         org.opensearch.serverless.cluster.ReaderRamp.searchesTotal(),
