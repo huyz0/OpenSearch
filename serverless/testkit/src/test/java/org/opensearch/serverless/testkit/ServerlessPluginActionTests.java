@@ -66,6 +66,8 @@ import java.util.concurrent.atomic.AtomicLong;
 public class ServerlessPluginActionTests extends OpenSearchTestCase {
 
     private static final long TTL = 30_000L;
+    /** The name the plugin's action answers with a 404, as ISM does for a policy that is not there. */
+    private static final String MISSING = "no-such-thing";
     private static final String MAPPING = "{\"properties\":{\"msg\":{\"type\":\"text\"}}}";
 
     /** The plugin's own action: count what an index holds, by asking the shell. */
@@ -144,6 +146,10 @@ public class ServerlessPluginActionTests extends OpenSearchTestCase {
 
         @Override
         protected void doExecute(Task task, CountRequest request, ActionListener<CountResponse> listener) {
+            if (request.index.equals(MISSING)) {
+                listener.onFailure(new org.opensearch.OpenSearchStatusException("Policy not found", RestStatus.NOT_FOUND));
+                return;
+            }
             try {
                 final var response = client.search(
                     new org.opensearch.action.search.SearchRequest(new String[] { request.index }).source(
@@ -262,6 +268,34 @@ public class ServerlessPluginActionTests extends OpenSearchTestCase {
             // And directly, which is how a plugin's own code calls it.
             final CountResponse direct = node.services().client().execute(CountAction.INSTANCE, new CountRequest("alpha")).actionGet();
             assertEquals("the same answer through the client", 2L, direct.count);
+        }
+    }
+
+    /**
+     * A plugin action's own status reaches the caller: a not-found stays a 404.
+     *
+     * <p>The shell ran the action through a future and rethrew what {@code get()} raised, so every status the
+     * plugin chose came back as a 500 {@code execution_exception} wrapping it. ISM answers a missing policy
+     * with a 404 on a stock node; here it was a 500.
+     */
+    public void testAPluginActionsStatusSurvives() throws Exception {
+        final AtomicLong clock = new AtomicLong(1_000L);
+        final MetadataPlane plane = new MetadataPlane(new FsBlobStore(1024, createTempDir(), false), BlobPath.cleanPath(), clock::get, TTL);
+
+        try (ServerlessNode node = new ServerlessNode(nodeSettings("plugin-action-status"), List.of(new CountingPlugin()))) {
+            node.startup().start();
+            node.setMetadataPlane(plane);
+
+            final var over = send(node, "GET", "/_testkit/count/" + MISSING, null);
+            assertEquals(over.body(), 404, over.status());
+            assertTrue(over.body(), over.body().contains("Policy not found"));
+            assertFalse("not wrapped: " + over.body(), over.body().contains("execution_exception"));
+
+            final var thrown = expectThrows(
+                org.opensearch.OpenSearchStatusException.class,
+                () -> node.services().client().execute(CountAction.INSTANCE, new CountRequest(MISSING)).actionGet()
+            );
+            assertEquals(RestStatus.NOT_FOUND, thrown.status());
         }
     }
 
