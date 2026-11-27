@@ -273,7 +273,9 @@ public final class ServerlessClient extends AbstractClient {
         final org.opensearch.action.support.PlainActionFuture<ActionResponse> future = org.opensearch.action.support.PlainActionFuture
             .newFuture();
         action.execute(request, future);
-        return future.get();
+        // actionGet rethrows the plugin's own exception (and its status), where get() would bury it in an
+        // ExecutionException that reaches the caller as a 500.
+        return future.actionGet();
     }
 
     private IndexResponse index(IndexRequest request, ShardOperations operations, MetadataPlane metadata) throws Exception {
