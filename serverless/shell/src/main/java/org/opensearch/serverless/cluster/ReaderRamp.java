@@ -143,7 +143,7 @@ public final class ReaderRamp {
         private Totals seen;
 
         /**
-         * A controller at ramp 0.
+         * A controller at its first step.
          *
          * @param step how far a qualifying window raises the ramp
          * @param warmGetsPerSearchMilli the most store GETs a search may average, in thousandths, for a window to qualify
@@ -154,6 +154,9 @@ public final class ReaderRamp {
             this.step = step;
             this.warmGetsPerSearchMilli = warmGetsPerSearchMilli;
             this.minSearches = Math.max(1, minSearches);
+            // A node ranked behind every shard gets no search, so it could never gather the evidence to move; the first
+            // step admits it a tenth of its shards, and the floor curve still holds that back until the time has passed.
+            this.ramp = Math.max(0, Math.min(FULL, step));
             this.seen = start;
         }
 

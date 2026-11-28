@@ -127,10 +127,11 @@ public class ReaderRampTests extends OpenSearchTestCase {
 
     public void testControllerStepsUpOnWarmWindowsAndHoldsOtherwise() {
         final var c = ReaderRamp.Controller.withDefaults(new ReaderRamp.Totals(0, 0));
-        assertEquals(0, c.observe(new ReaderRamp.Totals(19, 0)));
-        assertEquals(100, c.observe(new ReaderRamp.Totals(20, 0)));
-        assertEquals(100, c.observe(new ReaderRamp.Totals(50, 90_000)));
-        assertEquals(200, c.observe(new ReaderRamp.Totals(70, 110_000)));
+        assertEquals(100, c.ramp());
+        assertEquals(100, c.observe(new ReaderRamp.Totals(19, 0)));
+        assertEquals(200, c.observe(new ReaderRamp.Totals(20, 0)));
+        assertEquals(200, c.observe(new ReaderRamp.Totals(50, 90_000)));
+        assertEquals(300, c.observe(new ReaderRamp.Totals(70, 110_000)));
         for (int i = 0; i < 20; i++) {
             c.observe(new ReaderRamp.Totals(90 + i * 20L, 110_000));
         }
