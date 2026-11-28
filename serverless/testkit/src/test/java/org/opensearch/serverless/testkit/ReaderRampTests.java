@@ -125,6 +125,22 @@ public class ReaderRampTests extends OpenSearchTestCase {
         return "joiner".equals(ReaderPlacement.candidatesFor("idx", shard, fleet, "search", 1, cfg, now).get(0));
     }
 
+    public void testANodeThatGetsNoSearchStepsUpAfterAFewRenewals() {
+        final var c = ReaderRamp.Controller.withDefaults(new ReaderRamp.Totals(0, 0));
+        assertEquals(100, c.observe(new ReaderRamp.Totals(0, 0)));
+        assertEquals(100, c.observe(new ReaderRamp.Totals(1, 0)));
+        assertEquals(200, c.observe(new ReaderRamp.Totals(2, 0)));
+        assertEquals(200, c.observe(new ReaderRamp.Totals(2, 0)));
+        assertEquals(300, c.observe(new ReaderRamp.Totals(30, 0)));
+        assertEquals(300, c.observe(new ReaderRamp.Totals(30, 0)));
+        assertEquals(300, c.observe(new ReaderRamp.Totals(30, 0)));
+        assertEquals(400, c.observe(new ReaderRamp.Totals(30, 0)));
+        for (int i = 0; i < 40; i++) {
+            c.observe(new ReaderRamp.Totals(30, 0));
+        }
+        assertEquals(1000, c.ramp());
+    }
+
     public void testControllerStepsUpOnWarmWindowsAndHoldsOtherwise() {
         final var c = ReaderRamp.Controller.withDefaults(new ReaderRamp.Totals(0, 0));
         assertEquals(100, c.ramp());

@@ -77,15 +77,8 @@ public class ReaderRampMeterTests extends OpenSearchTestCase {
     }
 
     /** One arm's numbers. */
-    private record Arm(
-        List<Double> all,
-        List<Double> joiner,
-        List<Double> peers,
-        double joinerFirstMillis,
-        long blobReads,
-        int fullAtStep,
-        int[] joinerSearchesPer10
-    ) {
+    private record Arm(List<Double> all, List<Double> joiner, List<Double> peers, double joinerFirstMillis, long blobReads, int fullAtStep,
+        int[] joinerSearchesPer10) {
     }
 
     private Arm run(

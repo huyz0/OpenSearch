@@ -54,7 +54,7 @@ public final class ReaderPlacementSettings implements SettingsProvider {
     /** By when a joining reader is fully ramped, whatever it says about its cache; zero turns the slow start off. */
     public static final Setting<org.opensearch.common.unit.TimeValue> RAMP_MAX_DURATION = Setting.timeSetting(
         "serverless.search.reader_ramp.max_duration",
-        org.opensearch.common.unit.TimeValue.ZERO,
+        org.opensearch.common.unit.TimeValue.timeValueMinutes(5),
         Property.NodeScope
     );
 

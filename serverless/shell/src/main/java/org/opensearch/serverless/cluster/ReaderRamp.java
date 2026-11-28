@@ -28,6 +28,8 @@ public final class ReaderRamp {
     /** The full ramp: the node takes all its share. */
     public static final int FULL = 1000;
 
+    private static final int IDLE_RENEWALS = 3;
+
     /** The bounds on a ramp, milliseconds; a {@code maxMillis} that is not positive is off, every node is full. */
     public record Config(long minMillis, long maxMillis) {
         /** No slow start. */
@@ -141,6 +143,7 @@ public final class ReaderRamp {
         private final long minSearches;
         private int ramp;
         private Totals seen;
+        private int idle;
 
         /**
          * A controller at its first step.
@@ -179,8 +182,17 @@ public final class ReaderRamp {
         public synchronized int observe(Totals now) {
             final long searches = Math.max(0, now.searches() - seen.searches());
             if (searches < minSearches) {
+                // Too few searches to judge: little traffic means little cold cost, so after a few renewals the ramp steps
+                // up and admits more shards (a node admitted to none of its shards would otherwise wait for the ceiling).
+                idle++;
+                if (idle >= IDLE_RENEWALS) {
+                    idle = 0;
+                    seen = now;
+                    ramp = Math.max(0, Math.min(FULL, ramp + step));
+                }
                 return ramp;
             }
+            idle = 0;
             final long gets = Math.max(0, now.getsMilli() - seen.getsMilli());
             seen = now;
             if (gets / searches <= warmGetsPerSearchMilli) {
