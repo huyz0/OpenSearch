@@ -51,6 +51,8 @@ public final class NodeLease {
     private final int refused;
     private final List<NodeLogEpoch> nodeLog;
     private final String zone;
+    private final long searchSince;
+    private final int ramp;
 
     /**
      * Creates a lease.
@@ -109,6 +111,8 @@ public final class NodeLease {
         this.refused = -1;
         this.nodeLog = List.of();
         this.zone = null;
+        this.searchSince = -1L;
+        this.ramp = -1;
     }
 
     private NodeLease(NodeLease lease, boolean revoked, long expiresAtMillis, int held, int cap) {
@@ -143,6 +147,8 @@ public final class NodeLease {
         this.refused = refused;
         this.nodeLog = List.copyOf(nodeLog);
         this.zone = lease.zone;
+        this.searchSince = lease.searchSince;
+        this.ramp = lease.ramp;
     }
 
     private NodeLease(NodeLease lease, String zone) {
@@ -160,6 +166,27 @@ public final class NodeLease {
         this.refused = lease.refused;
         this.nodeLog = lease.nodeLog;
         this.zone = zone == null || zone.isBlank() ? null : zone;
+        this.searchSince = lease.searchSince;
+        this.ramp = lease.ramp;
+    }
+
+    private NodeLease(NodeLease lease, long searchSince, int ramp) {
+        this.nodeId = lease.nodeId;
+        this.ephemeralId = lease.ephemeralId;
+        this.address = lease.address;
+        this.roles = lease.roles;
+        this.expiresAtMillis = lease.expiresAtMillis;
+        this.name = lease.name;
+        this.version = lease.version;
+        this.revoked = lease.revoked;
+        this.held = lease.held;
+        this.cap = lease.cap;
+        this.inUse = lease.inUse;
+        this.refused = lease.refused;
+        this.nodeLog = lease.nodeLog;
+        this.zone = lease.zone;
+        this.searchSince = searchSince < 0 ? -1L : searchSince;
+        this.ramp = ramp < 0 ? -1 : Math.min(ramp, 1000);
     }
 
     /**
@@ -176,6 +203,38 @@ public final class NodeLease {
      */
     public NodeLease withZone(String zone) {
         return new NodeLease(this, zone);
+    }
+
+    /**
+     * Returns this lease carrying a reader's slow start: when the node first advertised the search role, and how warm it
+     * judges its cache.
+     *
+     * <p>Every ranker computes the node's share of shards from these two and its own clock (the reader ramp, in the cluster package); a lease without them is a fully ramped reader.
+     *
+     * @param searchSince epoch milliseconds the node first advertised the search role, or a negative number when unknown
+     * @param ramp the node's own judgement of how warm it is, 0 to 1000, or a negative number when it does not say
+     * @return the copy
+     */
+    public NodeLease withSearchRamp(long searchSince, int ramp) {
+        return new NodeLease(this, searchSince, ramp);
+    }
+
+    /**
+     * Returns when the node first advertised the search role.
+     *
+     * @return epoch milliseconds, or -1 when the lease does not say
+     */
+    public long searchSince() {
+        return searchSince;
+    }
+
+    /**
+     * Returns the node's own judgement of how warm its cache is.
+     *
+     * @return 0 to 1000, or -1 when the lease does not say
+     */
+    public int ramp() {
+        return ramp;
     }
 
     /**
@@ -422,6 +481,12 @@ public final class NodeLease {
             if (zone != null) {
                 builder.field("zone", zone);
             }
+            if (searchSince >= 0) {
+                builder.field("search_since", searchSince);
+            }
+            if (ramp >= 0) {
+                builder.field("ramp_permille", ramp);
+            }
             if (nodeLog.isEmpty() == false) {
                 builder.startArray("node_log");
                 for (NodeLogEpoch epoch : nodeLog) {
@@ -465,6 +530,8 @@ public final class NodeLease {
             int inUse = -1;
             int refused = -1;
             String zone = null;
+            long searchSince = -1L;
+            int ramp = -1;
             final Set<String> roles = new LinkedHashSet<>();
             final List<NodeLogEpoch> nodeLog = new ArrayList<>();
             String field = null;
@@ -497,6 +564,8 @@ public final class NodeLease {
                         case "in_use" -> inUse = parser.intValue();
                         case "refused" -> refused = parser.intValue();
                         case "zone" -> zone = parser.text();
+                        case "search_since" -> searchSince = parser.longValue();
+                        case "ramp_permille" -> ramp = Math.max(0, Math.min(1000, parser.intValue()));
                         default -> {
                             // forward compatibility: ignore fields written by a newer node
                         }
@@ -513,7 +582,7 @@ public final class NodeLease {
                 cap,
                 inUse,
                 refused
-            ).withNodeLog(nodeLog).withZone(zone);
+            ).withNodeLog(nodeLog).withZone(zone).withSearchRamp(searchSince, ramp);
             return revoked ? lease.revokedCopy() : lease;
         }
     }

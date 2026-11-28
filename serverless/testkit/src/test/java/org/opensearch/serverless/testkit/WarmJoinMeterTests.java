@@ -44,6 +44,7 @@ public class WarmJoinMeterTests extends OpenSearchTestCase {
         return Settings.builder()
             .put("node.name", name)
             .put("cluster.name", "serverless-warm-meter")
+            .put("serverless.search.reader_ramp.max_duration", "0s")
             .put("path.home", createTempDir())
             .put("network.host", "127.0.0.1")
             .put("http.port", "0")

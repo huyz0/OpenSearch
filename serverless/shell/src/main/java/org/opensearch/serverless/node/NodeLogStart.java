@@ -96,23 +96,30 @@ public final class NodeLogStart {
         // Stamped from when the renewal began: the lease is valid at least that long after it.
         final long startedAt = plane.clock().getAsLong();
         ownLeaseValidUntilMillis = 0L;
+        final SearchReadiness readiness = SearchReadiness.of(node);
+        final long blobReads = plane.blobStore() instanceof org.opensearch.serverless.store.MeteredBlobStore metered
+            ? metered.blobReads()
+            : -1L;
         plane.membership()
             .renew(
-                new org.opensearch.serverless.membership.NodeLease(
-                    node.localNode.getId(),
-                    node.localNode.getEphemeralId(),
-                    node.localNode.getAddress().toString(),
-                    // Less the search role while the node warms or drains, so no coordinator ranks it as a reader.
-                    SearchReadiness.of(node).advertised(node.roles),
-                    0L,
-                    node.localNode.getName(),
-                    org.opensearch.Version.CURRENT.toString()
-                ).withLoad(
-                    node.reconciler == null ? 0 : node.reconciler.heldShards().size(),
-                    node.nodeCapacity().admission.maxShardsHeld(),
-                    node.nodeCapacity().inUseLastMinute(),
-                    node.nodeCapacity().refusedLastMinute()
-                ).withNodeLog(nodeLogEpochs).withZone(org.opensearch.serverless.cluster.Zones.localZone(node.settings()))
+                readiness.stamp(
+                    new org.opensearch.serverless.membership.NodeLease(
+                        node.localNode.getId(),
+                        node.localNode.getEphemeralId(),
+                        node.localNode.getAddress().toString(),
+                        // Less the search role while the node warms or drains, so no coordinator ranks it as a reader.
+                        readiness.advertised(node.roles),
+                        0L,
+                        node.localNode.getName(),
+                        org.opensearch.Version.CURRENT.toString()
+                    ).withLoad(
+                        node.reconciler == null ? 0 : node.reconciler.heldShards().size(),
+                        node.nodeCapacity().admission.maxShardsHeld(),
+                        node.nodeCapacity().inUseLastMinute(),
+                        node.nodeCapacity().refusedLastMinute()
+                    ).withNodeLog(nodeLogEpochs).withZone(org.opensearch.serverless.cluster.Zones.localZone(node.settings())),
+                    blobReads
+                )
             );
         ownLeaseValidUntilMillis = startedAt + plane.leaseTtlMillis();
     }
