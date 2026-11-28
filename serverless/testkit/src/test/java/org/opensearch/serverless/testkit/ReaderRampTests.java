@@ -57,7 +57,7 @@ public class ReaderRampTests extends OpenSearchTestCase {
         fleet.add(lease("joiner", 1_000, 200));
         int ranked = 0;
         for (String row : rows) {
-            final String[] f = row.split("\t");
+            final String[] f = row.split(" ");
             switch (f[0]) {
                 case "R" -> {
                     final NodeLease l = lease("n", Long.parseLong(f[1]), "-".equals(f[2]) ? -1 : Integer.parseInt(f[2]));
